@@ -39,7 +39,9 @@ FROM deps AS test
 COPY --from=image-check /image-check.ok /tmp/image-check.ok
 RUN bun install --frozen-lockfile
 COPY . .
-RUN bun run check && bun test
+# `bun test`를 바로 부르지 않는다. 시험이 0개인 파일이 있어도 0으로 끝나기 때문이다. `bun run test`(test/run.ts)는
+# JUnit 결과에서 파일마다 실제로 실행된 시험 수를 확인하고, 결과가 없거나 0개인 파일이 있으면 실패한다.
+RUN bun run check && bun run test
 
 # 역할을 고르지 않으면 실패하는 진입점을 기본으로 둔다. 파드는 command로 역할을 고른다(README "이미지 계약").
 # ENTRYPOINT를 비워 command가 그대로 돌게 한다. 기반 이미지의 ENTRYPOINT(bun)에 기대지 않는다.

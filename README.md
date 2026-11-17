@@ -32,7 +32,7 @@ Dockerfile 단계는 `deps` → `runtime-files` → `image-check` → `test` →
 
 - `deps`: 기반 이미지(slim)의 `bun --version`이 `.bun-version`과 같다.
 - `image-check`: 최종 이미지의 파일 내용(`runtime-files`)을 셸이 있는 단계에 복사해 본다. distroless 안의 bun이 `.bun-version`과 같고, 이름이 `hc`인 파일이 하나도 없고, `/etc/claude-code`가 없다. 최종 단계는 셸이 없어 `RUN`을 쓸 수 없기 때문이다.
-- `test`: `image-check`의 결과 파일을 받아 오므로 그 검사 뒤에만 돈다. 타입 검사(`bun run check`)와 `bun test`를 돌린다. 공용 빌드가 PR과 main push에서 `--target test`로 이 단계를 돌린다.
+- `test`: `image-check`의 결과 파일을 받아 오므로 그 검사 뒤에만 돈다. 타입 검사(`bun run check`)와 시험(`bun run test`, 아래 "시험")을 돌린다. 공용 빌드가 PR과 main push에서 `--target test`로 이 단계를 돌린다.
 
 ## 버전 고정
 
@@ -51,12 +51,19 @@ Renovate가 PR을 연다(자동 병합 없음). Bun 묶음(두 FROM, `.bun-versi
 ```bash
 bun install
 bun run check   # 타입 검사
-bun test
+bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
 `test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드에 듣는 API가 없다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`).
 
-`bun test`는 시험 파일이 0개면 실패하지만, 시험이 0개인 파일만 있으면 통과한다. 그래서 `test/repo.test.ts`가 시험 파일마다 시험이 있고 건너뛰는 표시가 없는지 본다.
+**`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
+
+- 결과 파일이 없다(Bun은 실행된 시험이 0개면 결과 파일을 쓰지 않는다).
+- 실행된 시험이 0개다.
+- Bun이 고르는 이름(`*.test.ts` 등, `node_modules` 밖)의 시험 파일 가운데 실행된 시험이 0개인 파일이 있다.
+- skip·todo로 남은 시험이 있다.
+
+`.only`와 `.if(false)`는 시험을 결과에서 아예 빼므로 위 확인으로 잡히지 않는다. 그래서 `test/repo.test.ts`가 `test/`의 소스에서 이 표시들을 막는다. 일부 시험만 돌리려면 `bun test <이름>`을 쓴다(`bun run test`는 인자를 받지 않는다).
 
 ## 폴더
 
@@ -66,7 +73,7 @@ src/main/
 ├── executor.ts     # 작업자 실행기 진입점(자리)
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
-test/               # bun test
+test/               # 시험(*.test.ts)과 시험 명령(run.ts)
 ```
 
 ## 공개 저장소

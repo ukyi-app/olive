@@ -17,14 +17,11 @@ test("repo: Renovate는 자동 병합을 끄고 이미지를 digest로 고정한
   expect(renovate.extends).toContain("docker:pinDigests");
 });
 
-// bun test는 시험 파일이 0개면 실패하지만, 시험이 0개인 파일만 있으면 0으로 끝난다. 그 구멍을 여기서 막는다.
-test("repo: 시험 파일마다 시험이 하나 이상 있고 건너뛰는 표시가 없다", async () => {
-  const files = await list("test/**/*.test.ts");
-  expect(files.length).toBeGreaterThan(1);
+// 파일마다 실행된 시험 수는 test/run.ts가 JUnit 결과로 확인한다. 그런데 `.only`는 같은 파일의 다른 시험을,
+// `.if(false)`는 그 시험을 결과에 skip으로도 남기지 않고 빼 버린다. 파일에 하나만 남아도 그 확인을 통과하므로 소스에서 막는다.
+test("repo: 시험 파일에 건너뛰거나 골라 돌리는 표시가 없다", async () => {
   const skipped = new RegExp(String.raw`\b(test|it|describe)\.(skip|only|todo|if|skipIf|todoIf)\b`);
-  for (const file of files) {
-    const source = await readText(file);
-    expect(/^\s*test\(/m.test(source), file).toBe(true);
-    expect(skipped.test(source), file).toBe(false);
+  for (const file of await list("test/**/*.test.ts")) {
+    expect(skipped.test(await readText(file)), file).toBe(false);
   }
 });
