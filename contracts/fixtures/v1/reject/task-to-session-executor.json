@@ -1,0 +1,51 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/task-to-session-executor",
+  "description": "작업 취소를 세션 실행기에",
+  "base": "accept/session-stop",
+  "changed": [
+    "message.header.action",
+    "message.body.reason"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "wrong_direction"
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/session/olive-session-0/st-5e55",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/session/olive-session-0/st-5e55",
+      "action": "task_cancel",
+      "request_id": "00000000-0000-4000-8000-000000009002",
+      "stop_generation": 3,
+      "run_generation": 5,
+      "body_digest": "21eb45c49cb0dd765a5fbe54981a6807afc4d74d65e367a3fef04c6a19a3def8",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000002"
+    },
+    "signature": "1WgJ7eUouARmDsO2nMB8TO6wCYm8K9fs-MNlVhm35kMvQReJiqqeW9X8_oOLftO-w7GCAPISxOka0-4_N5oHBQ",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000201",
+      "reason": "requested"
+    }
+  },
+  "signing_input": "{\"action\":\"task_cancel\",\"body_digest\":\"21eb45c49cb0dd765a5fbe54981a6807afc4d74d65e367a3fef04c6a19a3def8\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000002\",\"recipient\":\"executor/session/olive-session-0/st-5e55\",\"request_id\":\"00000000-0000-4000-8000-000000009002\",\"run_generation\":5,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

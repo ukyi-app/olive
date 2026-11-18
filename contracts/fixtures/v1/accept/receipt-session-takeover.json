@@ -1,0 +1,50 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/receipt-session-takeover",
+  "description": "세션 인수 영수증(D-50)",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/session/olive-session-0/st-5e55",
+      "recipient": "supervisor",
+      "action": "receipt_session_takeover",
+      "request_id": "00000000-0000-4000-8000-00000000900b",
+      "stop_generation": 3,
+      "run_generation": 4,
+      "body_digest": "b10ddcc6b10fa85539abb4f9f2d3b5fd801eb9b9bf33350843a8b08641694597",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "0000000000000000000000000000000b"
+    },
+    "signature": "3p3o4YSb-3OMPH-nQ6x0y_rZzd1V6w3D1xNkQGJdowFvlvltlESa61U9pszT_rl3alL9b2oe9t_9APWCfYRODw",
+    "body": {
+      "receipt_id": "00000000-0000-4000-8000-000000000301",
+      "previous_run_id": "00000000-0000-4000-8000-000000000200",
+      "new_generation_marker_digest": "f0fc31a41915b8a585be43212580c7e5395a4cbfb034ef2ce8c141e81ca6b265",
+      "start_permit_id": "00000000-0000-4000-8000-000000000501",
+      "taken_over_at": 1794959997000
+    }
+  },
+  "signing_input": "{\"action\":\"receipt_session_takeover\",\"body_digest\":\"b10ddcc6b10fa85539abb4f9f2d3b5fd801eb9b9bf33350843a8b08641694597\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000000b\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000900b\",\"run_generation\":4,\"sender\":\"executor/session/olive-session-0/st-5e55\",\"stop_generation\":3}"
+}

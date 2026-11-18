@@ -1,0 +1,49 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/receipt-cleaned",
+  "description": "정리 영수증",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "recipient": "supervisor",
+      "action": "receipt_cleaned",
+      "request_id": "00000000-0000-4000-8000-00000000900a",
+      "stop_generation": 3,
+      "run_generation": 2,
+      "body_digest": "25d1bbc100c62d9c8e42babc44623771be9cb8162b04732d3a52c71a50b1a0df",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "0000000000000000000000000000000a"
+    },
+    "signature": "q5vY-jkOU7aOUNnVBjoZLMbcoaZW3SO4rvtYr9iJtLS-OGofI19NjV172q967d6KU6txnAZ17tSFsP_gVBBLBQ",
+    "body": {
+      "receipt_id": "00000000-0000-4000-8000-000000000404",
+      "run_id": "00000000-0000-4000-8000-000000000101",
+      "instruction_request_id": "00000000-0000-4000-8000-000000009006",
+      "cleaned_at": 1794959998000
+    }
+  },
+  "signing_input": "{\"action\":\"receipt_cleaned\",\"body_digest\":\"25d1bbc100c62d9c8e42babc44623771be9cb8162b04732d3a52c71a50b1a0df\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000000a\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000900a\",\"run_generation\":2,\"sender\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"stop_generation\":3}"
+}

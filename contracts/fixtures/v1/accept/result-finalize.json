@@ -1,0 +1,49 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/result-finalize",
+  "description": "결과 확정: 저장한 결과의 digest",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "result_finalize",
+      "request_id": "00000000-0000-4000-8000-000000009006",
+      "stop_generation": 3,
+      "run_generation": 2,
+      "body_digest": "5f51bf2e0998c04d6597bab3041617e4a522c092b0caa08325a3478fb520bdb0",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000006"
+    },
+    "signature": "t85GZUWGfKXJsAeyBMQpXq1_kyFy0pkzlowzbJ_9IKBGtTi25NFqW_mEzaQz9WFrUTB_S8VzB3yuxkDwxqQPCw",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000101",
+      "outcome": "succeeded",
+      "result_digest": "f6a214f7a5fcda0c2cee9660b7fc29f5649e3c68aad48e20e950137c98913a68",
+      "stored_at": 1794959995000
+    }
+  },
+  "signing_input": "{\"action\":\"result_finalize\",\"body_digest\":\"5f51bf2e0998c04d6597bab3041617e4a522c092b0caa08325a3478fb520bdb0\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000006\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009006\",\"run_generation\":2,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

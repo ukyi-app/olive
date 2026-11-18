@@ -1,0 +1,69 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/result-with-transcript",
+  "description": "결과에 원문 기록 칸",
+  "base": "accept/report-result",
+  "changed": [
+    "message.body.result.transcript"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "forbidden_field"
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "recipient": "supervisor",
+      "action": "report_result",
+      "request_id": "00000000-0000-4000-8000-00000000900f",
+      "stop_generation": 3,
+      "run_generation": 2,
+      "body_digest": "908dba6265fc450edeee80c606a89aa70f59908a16c9de765ae5361d3553a893",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "0000000000000000000000000000000f"
+    },
+    "signature": "FqhMfrXGTfgrXJ0KRP5oMU43f7OHUZJYU7Mv3lw-vrgNOPa_Dsru4bfd_Ne5ww8dUtcRYddFG2xIXgF9VUhmCg",
+    "body": {
+      "report_id": "00000000-0000-4000-8000-000000000603",
+      "run_id": "00000000-0000-4000-8000-000000000101",
+      "result": {
+        "role": "diagnosis",
+        "outcome": "completed",
+        "summary": "인증서 갱신이 DNS 응답 지연으로 실패했다.",
+        "items": [
+          {
+            "kind": "finding",
+            "text": "갱신 시도 3회가 모두 시간 초과였다."
+          }
+        ],
+        "refs": [
+          {
+            "kind": "path",
+            "ref": "platform/cert-manager/values.yaml",
+            "digest": null
+          }
+        ],
+        "transcript": "..."
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"report_result\",\"body_digest\":\"908dba6265fc450edeee80c606a89aa70f59908a16c9de765ae5361d3553a893\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000000f\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000900f\",\"run_generation\":2,\"sender\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"stop_generation\":3}"
+}

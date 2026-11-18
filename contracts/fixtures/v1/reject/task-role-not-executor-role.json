@@ -1,0 +1,62 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/task-role-not-executor-role",
+  "description": "진단 실행기에 코드 작성 작업",
+  "base": "accept/task-start",
+  "changed": [
+    "message.body.role"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "role_mismatch"
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "task_start",
+      "request_id": "00000000-0000-4000-8000-000000009003",
+      "stop_generation": 3,
+      "run_generation": 1,
+      "body_digest": "fb78b73b3074ce1dd6fae46727241756ec35573291286dc9522c7c65a3a73c6b",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000003"
+    },
+    "signature": "C8xBl7gux7yVTI5i0IuVmVeF8G71LY0_XJA_eYUD0C-onoWoD1JQxDYfcYh39tS-Y3ntu0wR-ql1YyDt2ftvDw",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000102",
+      "role": "code_author",
+      "profile_revision": "diagnosis-r1",
+      "policy_revision": "policy-r1",
+      "snapshot_digest": "16a0eeb0791b6c92451fd284dd9f599e0a7dbe7f6ebea6e2d2d06c7f74aec112",
+      "input_digest": "c96c6d5be8d08a12e7b5cdc1b207fa6b2430974c86803d8891675e76fd992c20",
+      "deadline_at": 1794960600000,
+      "budget_tokens": 200000,
+      "credential": {
+        "account": "main",
+        "method": "subscription",
+        "revision": "cred-7",
+        "digest": "2755ea6e543bc1dd627e7b1cae35d9db76b6da5302f16dafc14305103bbd33cb"
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"task_start\",\"body_digest\":\"fb78b73b3074ce1dd6fae46727241756ec35573291286dc9522c7c65a3a73c6b\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000003\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009003\",\"run_generation\":1,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

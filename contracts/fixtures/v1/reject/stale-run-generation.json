@@ -1,0 +1,50 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/stale-run-generation",
+  "description": "서명은 맞지만 옛 실행 세대",
+  "base": "accept/task-cancel",
+  "changed": [
+    "context.run_generations.00000000-0000-4000-8000-000000000101"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "run_generation_mismatch"
+  },
+  "keys": {
+    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
+    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 3,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "task_cancel",
+      "request_id": "00000000-0000-4000-8000-000000009004",
+      "stop_generation": 3,
+      "run_generation": 2,
+      "body_digest": "d73f8df50e3aca52ab8dff70a146ea6e79e5a665abb514f2e4a9cf7bde657007",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000004"
+    },
+    "signature": "WDLoB9pUxoYINss38Q923rGzys4VgW6QE6ee58GKwYJdHzJQfwZ7LgAIYX14dqR9Xl0DCec1z5SnaZTeXXM1DQ",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000101",
+      "reason": "requested"
+    }
+  },
+  "signing_input": "{\"action\":\"task_cancel\",\"body_digest\":\"d73f8df50e3aca52ab8dff70a146ea6e79e5a665abb514f2e4a9cf7bde657007\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000004\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009004\",\"run_generation\":2,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}
