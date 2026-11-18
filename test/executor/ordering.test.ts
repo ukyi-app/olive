@@ -7,7 +7,7 @@ import { readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { limits, resultDigest } from "../../src/contract/v1/index.ts";
 import type { StoreIo } from "../../src/executor/store.ts";
-import { fromSupervisor, gate, pause, reconnect, rig, type Rig, start, syncReply, until } from "./support.ts";
+import { barrier, type Barrier, cancelReceiptWrite, fromSupervisor, gate, pause, reconnect, rig, type Rig, scriptedIo, start, syncReply, until } from "./support.ts";
 
 const rigs: Rig[] = [];
 async function make(options: Parameters<typeof rig>[0] = {}) {
@@ -36,16 +36,18 @@ const cancel = (r: Rig, runId: string, reason: "requested" | "emergency_stop" = 
 const renew = (r: Rig, runId: string, stop = 0) =>
   fromSupervisor(r.clock, r.worker.name, "run_renew", { run_id: runId, lease_until: r.clock.now() + limits.RUN_LEASE_MAX_MS }, { stop_generation: stop, run_generation: 1 });
 
-// 정지 세대 파일 쓰기만 문 뒤에 세우는 저장 장치.
-function gatedStopWrites(): { io: Partial<StoreIo>; door: ReturnType<typeof gate>; armed: { on: boolean } } {
+// 정지 세대 파일 쓰기만 장벽에 세우는 저장 장치. entered가 풀리면 그 쓰기에 실제로 들어간 것이다.
+function gatedStopWrites(): { io: Partial<StoreIo>; door: ReturnType<typeof gate>; entered: Barrier; armed: { on: boolean } } {
   const door = gate();
+  const entered = barrier();
   const armed = { on: false };
   return {
     door,
+    entered,
     armed,
     io: {
       writeDurable: async (path, data) => {
-        if (armed.on && path.endsWith("stop-generation.json")) await door.wait;
+        if (armed.on && path.endsWith("stop-generation.json")) await Promise.race([door.wait, entered.pass()]);
         const { writeFile } = await import("node:fs/promises");
         await writeFile(path, data);
       },
@@ -83,9 +85,9 @@ test("정지 세대: 높은 세대를 적는 동안 앞서 검증된 옛 세대�
   done.armed.on = true;
   const stop = r.connection.receive(cancel(r, runId, "emergency_stop", 4));
   const old = r.connection.receive(finalize(r, runId, 0));
-  await pause();
+  await done.entered.entered;
   expect(r.store.stopGeneration()).toBe(4);
-  done.door.open();
+  done.entered.open();
   await Promise.all([stop, old]);
   expect(r.space.cleaned).toEqual([]);
   expect(r.transport.of("receipt_cleaned")).toHaveLength(0);
@@ -100,9 +102,9 @@ test("정지 세대: 높은 세대를 적는 동안 앞서 검증된 옛 세대�
   live.armed.on = true;
   const stop2 = s.connection.receive(cancel(s, running.runId, "emergency_stop", 4));
   const old2 = s.connection.receive(renew(s, running.runId, 0));
-  await pause();
+  await live.entered.entered;
   expect(s.store.run(running.runId)!.lease_until).toBe(lease);
-  live.door.open();
+  live.entered.open();
   await Promise.all([stop2, old2]);
   expect(s.store.run(running.runId)!.lease_until).toBe(lease);
 });
@@ -234,17 +236,21 @@ test("정리: 지우는 중인 실행이 슬롯을 쥐어 새 시작이 들어�
   const r = await make();
   const { runId } = await start(r);
   await r.worker.idle();
-  const door = gate();
-  r.space.cleanGate = door.wait;
+  const deleting = barrier();
+  r.space.clean = async (id) => {
+    r.space.cleaned.push(id);
+    await deleting.pass();
+    return true;
+  };
   // 같은 확정의 재전송(같은 request_id, 새 nonce)이 겹친다.
   const requestId = randomUUID();
   const one = r.connection.receive(finalize(r, runId, 0, { request_id: requestId }));
   const two = r.connection.receive(finalize(r, runId, 0, { request_id: requestId }));
-  await pause();
+  await deleting.entered;
   await start(r);
   await r.worker.idle();
   expect(r.launcher.spawned).toBe(1);
-  door.open();
+  deleting.open();
   await Promise.all([one, two]);
   expect(r.space.cleaned).toEqual([runId]);
   const cleaned = r.store.outboxFor(runId).filter((e) => e.action === "receipt_cleaned");
@@ -253,29 +259,20 @@ test("정리: 지우는 중인 실행이 슬롯을 쥐어 새 시작이 들어�
 });
 
 test("취소: 준비 중 취소의 접수 영수증을 쓰는 사이 자격이 와도 띄우지 않는다", async () => {
-  const door = gate();
-  let gated = false;
-  const r = await make({
-    io: {
-      writeDurable: async (path, data) => {
-        if (gated && path.includes("/outbox/")) await door.wait;
-        const { writeFile } = await import("node:fs/promises");
-        await writeFile(path, data);
-      },
-    },
-  });
-  let runId = "";
+  const disk = scriptedIo();
+  const writing = disk.hold(cancelReceiptWrite);
+  const r = await make({ io: disk.io });
+  const runId = randomUUID();
+  // 자격을 돌려주기 전에 취소 영수증의 쓰기에 실제로 들어간다.
   r.credentials.before = async () => {
-    gated = true;
     void r.connection.receive(cancel(r, runId));
-    await pause();
+    await writing.entered;
   };
-  runId = randomUUID();
   const started = start(r, { runId });
+  await writing.entered;
   await until(() => r.credentials.calls.length > 0);
-  await pause(100);
   expect(r.launcher.spawned).toBe(0);
-  door.open();
+  writing.open();
   await started;
   await r.worker.idle();
   expect(r.launcher.spawned).toBe(0);

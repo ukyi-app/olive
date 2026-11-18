@@ -93,12 +93,13 @@ src/main/
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
 src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다. 진입점 조립은 아직 없다)
-├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 기록, 보낸 영수증, 저장 장애와 장부 대조
-├── worker.ts       # 지시 처리, 띄우기 직전 확인, 영수증·결과 보고
+├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 상태와 사건의 전이(commit), 연산별 저장 장애, 장부 대조와 표식
+├── worker.ts       # 지시 처리, 효과 직전 확인, 영수증·결과 보고, 재시작 뒤 대조
 ├── link.ts         # 연결 하나의 수명: 정지 세대 맞춤 → hello → 재전송
 ├── profile.ts      # 역할 프로필, 허용 목록 환경, 자격 digest 대조
 ├── launcher.ts     # 역할 프로그램 띄우기(띄우는 곳은 여기 하나)
-└── containment.ts  # 전용 PID 공간의 남은 프로세스 정리와 세기(kill(-1))
+├── containment.ts  # 실제 전체 신호 능력을 만드는 제품 입구(PidSpace.record 한 자리)
+└── containment-core.ts # PID 공간의 스캔·종료·세기 알고리즘(신호 능력을 스스로 만들지 않는다)
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
 test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성, test/executor/는 실행기 시험과 가짜 역할 프로그램
 ```
@@ -108,8 +109,26 @@ test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/
 `test/executor/containment.test.ts`의 실제 프로세스 사례는 `bwrap --unshare-pid --unshare-user`로 만든 PID namespace 안에서만 돈다. 그 안의 `kill(-1)`은 밖에 닿지 않는다. `bwrap`이나 비특권 user namespace가 없으면(이미지의 `test` 단계가 그렇다) 그 사례를 등록하지 않고 이유를 한 줄 찍는다. 개발 기계에서 반드시 돌리려면 `OLIVE_REQUIRE_BWRAP=1 bun run test`로 없을 때 실패하게 한다. 호스트의 PID 공간에서 정리 코드에 진짜 신호를 주는 시험을 쓰지 않는다.
 
 - harness(`containment-harness.ts`)는 실제 신호를 쓰기 전에 bwrap이 만든 공간 안인지 스스로 확인한다(시험이 넣는 `--setenv` 표식, 자기 번호 1·2, 호스트가 아닌 `uid_map`). 아니면 신호 없이 끝난다.
-- `python3`(`/usr/bin/python3`)가 없으면 `nondumpable`·`zombieleader`·`tighthop` 사례만 등록하지 않고 이유를 찍는다.
-- 일반 실행기 시험(`worker`·`ordering`)이 띄운 역할 프로그램은 그 자식의 핸들(`SpawnedChild`)로만 끝낸다. 끝난 자식의 숫자 PID에 신호를 보내지 않는다(번호가 재사용되면 무관한 프로세스가 맞는다).
+- `python3`(`/usr/bin/python3`)가 없으면 `nondumpable`·`zombieleader`·`tighthop` 사례만 등록하지 않고 이유를 찍는다. `nsenter`(`/usr/bin/nsenter`)가 없으면 `foreign` 사례만 등록하지 않는다.
+- `foreign` 사례는 시험이 bwrap 공간 밖에서 프로세스 하나를 합류시켜, 전체 신호가 나가지 않고 후손이 살아남는 것을 본다. `latespawn`·`nondumpable`은 해당 조건이 실제로 성립했는지 프로세스가 증인 파일에 직접 적는다.
+- 일반 실행기 시험(`worker`·`ordering`·`recovery`·`hardening`)이 띄운 역할 프로그램은 그 자식의 핸들(`SpawnedChild`)로만 끝낸다. 끝난 자식의 숫자 PID에 신호를 보내지 않는다(번호가 재사용되면 무관한 프로세스가 맞는다).
+
+### PID 공간 정리가 증명하는 것과 기대는 것
+
+`kill(-1)`은 호출자의 PID 공간 전체에 간다. 그 공간이 전용인지는 코어가 다 증명할 수 없어 둘을 나눈다.
+
+**코어가 스스로 확인한다(`containment-core.ts`):**
+
+- 기록할 때 자기와 PID 1 밖의 프로세스가 없고, 기준 스캔이 경합하지 않았다.
+- 스캔과 신호마다 PID namespace와 `/proc`이 기록한 그대로다. 다르면 신호를 보내지 않고 남은 수를 `null`로 답한다.
+- 전체 신호 직전의 스캔에 부모가 공간 밖인 프로세스(PPid 0, 공간의 init과 자기 제외)가 보이면 신호를 보내지 않는다. 그 뒤로는 다시 보내지 않고 0도 말하지 않는다.
+
+**호출자의 보증에 기댄다(`dedicated: true`):**
+
+- 이 공간을 전용으로 만들고 독점하는 쪽이 따로 있다. `dedicated: true`는 그 보증이고 코어는 증명하지 못한다.
+- 합류한 프로세스의 부모가 먼저 끝나면 공간의 init 밑으로 옮겨져 PPid 0이 사라진다. 스캔과 신호 사이에 들어온 프로세스도 볼 수 없다.
+
+**조립(U3b)이 지킬 조건:** 전용 PID 공간 안에서만 `PidSpace.record({ dedicated: true })`를 부르고, 그 공간에 다른 작업을 합류시키지 않는다(`exec` 류의 진입 포함). 제품 코드는 `containment-core.ts`를 직접 import하지 않는다(`static.test.ts`가 막는다). 전용 공간을 누가 만들고 독점하는지는 U3b와 배포 쪽이 정한다.
 
 ### 작업자 실행기가 감독 쪽에 기대는 것
 
@@ -117,12 +136,15 @@ v1을 바꾸지 않고 실행기가 정한 동작이다. 감독 작업은 이것
 
 - **첫 임대:** `task_start`에는 임대 칸이 없어 첫 임대는 `issued_at + RUN_LEASE_MAX_MS`(30초)다. 늦게 받아도 도착 때부터 새로 주지 않는다. 그보다 작은 `run_renew`는 임대를 줄이지 않는다(늘리기만 한다). 이미 끝난 임대는 갱신으로 되살리지 않는다.
 - **시작을 받지 않을 때는 답하지 않는다:** 슬롯을 쥔 실행이 있거나, revision이 다르거나, 접수가 닫혔거나, 확정되지 않은 실행이 `STATUS_MAX_RUNS`(8)개에 이르면 영수증 없이 버린다. 감독은 같은 ID를 `status_query`로 다시 묻고, `not_known`을 종료나 새 실행 허가로 해석하지 않는다. 확정(`result_finalize`)이 실행기의 장부를 비운다.
-- **결과 모양 검사:** 역할 프로그램의 결과는 `report_result` 본문 검사로 모양·크기를 본다. 그 실행의 자격 값이 결과의 어느 글에든 들어 있으면 원문 없이 `outcome: "failed"`의 고정 결과를 보낸다.
-- **임대 만료는 `exit: "failed"`다:** 감독은 `failed`만으로 취소·정리·소멸을 추정하지 않는다. 소멸은 `receipt_stopped`(남은 0)로만 안다.
-- **영수증은 요청마다:** 같은 `request_id`의 재전송에는 같은 영수증을, 다른 `request_id`의 후속 취소·확정에는 그 요청의 영수증을 낸다. 이미 끝난 효과(종료, 지우기)는 반복하지 않는다.
-- **성공 확정은 결과 digest를 대조한다:** `result_finalize(outcome=succeeded)`의 `result_digest`가 실행기가 보낸 `report_result`의 결과와 다르면 지우지도 답하지도 않는다.
-- **저장 장애는 로컬에서 가른다:** nonce·영수증·실행 기록을 적지 못하면 그 봉투는 `replayed`로 거절되거나 영수증을 보내지 않고, 실행기는 쓰기가 돌아올 때까지 새 접수를 닫는다. 진행 중인 종료와 재맞춤은 계속한다. wire에 새 거절 사유는 없다(감독에는 응답 없음으로 보인다).
-- **세대가 어긋나면 연결을 닫는다:** 맞춘 연결에서 서명이 맞는 정지 세대 불일치가 오거나 정지 세대를 저장하지 못하면 실행기가 연결을 닫는다. 감독은 새 연결의 맞춤으로 다시 받는다.
+- **결과 모양 검사:** 역할 프로그램의 결과는 `report_result` 본문 검사로 모양·크기를 본다. 그 실행의 자격 값 원문 전체가 결과의 한 글(값이나 이름)에 그대로 들어 있으면 원문 없이 `outcome: "failed"`의 고정 결과를 보낸다. 일부만 쓴 값, base64 같은 변환, 여러 값으로 나눈 조각은 이 대조의 보장 밖이다.
+- **임대 만료는 `exit: "failed"`다:** 감독은 `failed`만으로 취소·정리·소멸을 추정하지 않는다. 소멸은 `receipt_stopped`(남은 0)로만 안다. 제때 끝난 프로그램은 stdout을 읽는 사이 임대 시각이 지나도 끝난 시각으로 판정한다.
+- **영수증은 요청마다:** 같은 `request_id`·같은 본문의 재전송에는 쓰는 중이어도 같은 영수증(재시작 뒤에도 같은 ID)을, 다른 `request_id`의 후속 취소·확정에는 그 요청의 영수증을 낸다. 같은 `request_id`에 본문이 다르면 답하지 않는다. 이미 끝난 효과(종료, 지우기)는 반복하지 않는다.
+- **성공 확정은 결과 digest를 대조한다:** `result_finalize(outcome=succeeded)`의 `result_digest`가 실행기가 보낸 `report_result`의 결과와 다르면 정리 전·중·후 어느 때든 지우지도 답하지도 않는다. 새 요청의 영수증은 지금 세대·지금 연결에서만 낸다.
+- **상태는 사건 뒤에 말한다:** `status_report`·`hello`의 상태와 `last_receipt_id`는 파일에 적힌 것이다. `ready_result`는 종료 영수증과 결과가, `finalized`는 정리 영수증이 파일에 적힌 뒤에만 보인다. 지우는 중인 실행은 `cleanup_pending`으로 보이고 슬롯을 쥔다.
+- **저장 장애는 로컬에서 가른다:** nonce·영수증·실행 기록을 적지 못하면 그 봉투는 `replayed`로 거절되거나 영수증을 보내지 않고, 실행기는 실패한 그 연산이 실제로 회복될 때까지 새 접수를 닫는다. 프로세스 정리와 재맞춤은 저장을 기다리지 않는다. wire에 새 거절 사유는 없다(감독에는 응답 없음으로 보인다).
+- **nonce 기록 장애는 연결을 끊고 실행을 닫는다:** 거절한 봉투가 비상 종료였을 수 있어 그 연결을 닫고, 진행 중인 준비·자격 요청을 거두고, 실행 중인 작업을 `exit: "failed"`로 끝낸다. 거절한 봉투의 세대·요청 ID는 적용하지 않고 답하지도 않는다. 감독은 새 연결의 맞춤 뒤 같은 실행을 `status_query`로 묻는다.
+- **세대가 어긋나면 연결을 닫는다:** 맞춘 연결에서 서명이 맞는 정지 세대 불일치가 오거나 정지 세대를 저장하지 못하면 실행기가 연결을 닫는다. 세대를 디스크에 쓰는 동안에는 그 세대로 서명한 재전송을 내보내지 않는다. 감독은 새 연결의 맞춤으로 다시 받는다.
+- **설명할 수 없는 장부는 쓰지 않는다:** 저장소 ID를 잃었거나(`storage_id_lost`) 점유 상태가 `STATUS_MAX_RUNS`를 넘는(`over_capacity`) 장부는 세대만 맞추고 `hello` 없이 연결을 닫는다. v1의 `hello`는 8건까지만 실으므로 감독은 그 장부의 실행을 끝내 알 수 없고, 운영자가 대조해야 한다. 일부 사건만 설명할 수 없으면(`outbox_body`, `run_missing`, `receipt_mismatch` 등) 그 사건은 보내지도 복구 증거로 쓰지도 않고 접수를 닫는다. 판정은 볼륨의 `ledger-hold` 표식으로 다음 기동에도 남고, 운영자가 장부를 대조한 뒤 이 파일을 지워야 풀린다.
 
 ## 공개 저장소
 

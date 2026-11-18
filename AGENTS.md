@@ -9,8 +9,9 @@
 - 시험은 `bun run test`로 돌린다. `bun test`는 시험이 0개인 파일을 통과시킨다. `bun run test`(`test/run.ts`)가 JUnit 결과에서 파일마다 실행된 시험 수를 확인한다. 시험 파일 이름은 점으로 시작하지 않는 소문자 `*.test.ts`만 쓴다. Bun이 시험으로 읽는 다른 이름(`.x.test.ts`, `x.TEST.ts`, `*.spec.ts` 등)은 실패한다(README "시험").
 - 작업자 실행기(`src/executor/`)는 역할 프로필(프로그램·argv·작업 폴더·환경 이름)로만 띄운다. 지시 본문에서 명령·argv·환경을 읽는 코드, `launcher.ts` 밖의 프로세스 띄우기, `process.env` 읽기를 두지 않는다(`test/executor/static.test.ts`). 종료 확인 영수증은 남은 프로세스 0개를 센 뒤에만 낸다.
 - `kill(-1)`이나 음수 PID로 가는 신호를 호스트의 PID 공간에서 실제로 보내는 시험을 쓰지 않는다. 그 호출은 사용자의 모든 프로세스를 끝낸다. 실제 프로세스 사례는 `bwrap` PID namespace 안에서만 돌린다(README "실행기 시험의 실제 프로세스").
-- 호스트의 시험은 자기가 띄운 자식에게 그 자식의 핸들로만 신호를 보낸다. 끝난 자식의 숫자 PID에 보내지 않는다. 판정 규칙 시험은 `PidSpace.recordWith`에 가짜 `/proc`·번호·신호 기록기를 함께 준다(`PidSpace.record`는 셋을 실제 값으로 고정한다).
-- 실행기에서 권한이 필요한 효과(자격 요청, spawn, 임대 연장, 폴더 지우기)는 검증 뒤의 await를 지난 그 직전에 연결·정지 세대(저장까지)·접수·취소·기한을 다시 본다(`worker.ts`의 `authorized`·`launchBlocked`).
+- 호스트의 시험은 자기가 띄운 자식에게 그 자식의 핸들로만 신호를 보낸다. 끝난 자식의 숫자 PID에 보내지 않는다. 판정 규칙 시험은 `containment-core.ts`의 `PidSweep.establish`에 가짜 `/proc`·번호·신호 기록기를 함께 준다. 실제 전체 신호 능력은 `containment.ts`의 `PidSpace.record` 한 자리에서만 만들고, `src/`에서 `containment-core.ts`를 import하는 곳은 `containment.ts`뿐이다(`test/executor/static.test.ts`).
+- 실행기에서 권한이 필요한 효과는 검증 뒤의 await를 지난 그 직전에 다시 본다. 폴더 준비·자격 요청·spawn은 `launchBlocked`(연결, 정지 세대의 저장, 접수, 취소, 기한, 임대), 임대 연장·폴더 지우기·새 요청의 영수증은 `authorized`(연결, 정지 세대의 저장, 접수)다(`worker.ts`).
+- 실행 상태와 그 사건(영수증·보고)은 `store.commit` 한 자리로만 남긴다. 사건은 순번 차례로 적고 실행 기록은 그 뒤에 적는다. 닫는 쪽 효과(프로세스 정리, 연결 닫기)는 저장을 기다리지 않고, 여는 쪽 효과는 실패한 그 연산이 회복된 뒤에만 열린다.
 - `.github/CODEOWNERS`는 `* @ukkiee` 한 줄만 둔다. 줄을 더하면 homelab의 자동 배포 조건이 멈춘다.
 - `.github/workflows/build.yaml`의 `uses:`는 태그 ref 그대로 둔다(파일 주석).
 

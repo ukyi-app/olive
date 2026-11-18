@@ -11,12 +11,17 @@
 // - 새 연결이 열리면 앞 연결은 끝난다. 앞 연결에서 늦게 끝난 검증·저장의 결과는 버린다.
 //   맞춘 연결마다 다른 수(epoch)를 실행기에 넘겨, 앞 연결에서 받은 지시의 효과가 새 연결 위에서 나지 않게 한다(worker.ts).
 // - 한 challenge에는 유효한 답 하나만 쓴다. 검증에서 돌아온 답이 대기값을 차지하고(adopting), 세대를 적는 동안은 다른 답과
-//   일반 지시를 처리하지 않는다. 검증에서 돌아온 시점에도 대기값·연결·기한을 다시 본다.
+//   일반 지시를 처리하지 않는다. 검증에서 돌아온 시점에도 대기값·연결·기한을 다시 보고, 경과는 0 이상 25초 미만이어야 한다.
+// - 대기값을 차지한 뒤의 만료는 따로 잰다. 세대 저장이 상한 안에 끝나지 않으면 연결을 닫고 저장 장애로 드러내며, 늦은 완료는 연결을 열지 못한다.
 // - 맞춘 세대는 같은 값이어도 파일에 적힌 뒤에만 연결을 연다(앞서 저장에 실패해 메모리만 올라간 세대를 여기서 디스크에 맞춘다).
 // - 맞춘 연결에서 서명이 맞는 세대 불일치가 오면 연결을 닫는다. 다시 맞추는 것은 새 연결에서다.
+// - 장부 전체를 설명할 수 없으면 세대만 적고 hello 없이 닫는다. 완전한 목록인 것처럼 인사하지 않는다.
 import { randomBytes } from "node:crypto";
 import { type Envelope, limits, type PendingStopSync, verifyEnvelope } from "../contract/v1/index.ts";
 import type { Outlet, WorkerExecutor } from "./worker.ts";
+
+// 제때 받은 맞춤 답의 세대 저장을 기다리는 로컬 상한. 답을 받는 경계(25초)와는 다른 운영 값이다.
+const ADOPT_WAIT_MS = limits.STOP_SYNC_WAIT_MS;
 
 // 연결 하나의 보내기와 닫기. 실제 구현(mTLS 위의 바이트 틀)은 뒤 작업이다.
 export interface Transport {
@@ -78,7 +83,11 @@ export class ExecutorLink implements Outlet {
     if (this.current !== null && this.current.epoch === epoch) this.current.close();
   }
 
-  // 진입점이 주기로 부른다(뒤 작업). 맞춤 기한이 된 연결을 닫는다.
+  dropCurrent(): void {
+    this.current?.close();
+  }
+
+  // 진입점이 주기로 부른다(뒤 작업). 맞춤 기한이 된 연결과 세대 저장이 멈춘 연결을 닫는다.
   tick(): void {
     this.current?.expireIfDue();
   }
@@ -88,6 +97,8 @@ export class Connection {
   state: ConnectionState = "syncing";
   private pendingSync: PendingStopSync | null = null;
   private requested = false;
+  // 대기값을 차지한 답의 세대 저장을 시작한 시각.
+  private adoptingSince: number | null = null;
 
   constructor(
     private readonly link: ExecutorLink,
@@ -127,6 +138,11 @@ export class Connection {
 
   expireIfDue(): void {
     if (this.pendingSync !== null && this.now() - this.pendingSync.sentAt >= limits.STOP_SYNC_WAIT_MS) this.close();
+    if (this.state !== "adopting" || this.adoptingSince === null) return;
+    const elapsed = this.now() - this.adoptingSince;
+    if (elapsed >= 0 && elapsed < ADOPT_WAIT_MS) return;
+    this.link.worker.adoptionStalled();
+    this.close();
   }
 
   // 상대가 끊었거나 새 연결이 열렸다. 기다리던 challenge를 버린다.
@@ -134,6 +150,7 @@ export class Connection {
     if (this.state === "closed") return;
     this.state = "closed";
     this.pendingSync = null;
+    this.adoptingSince = null;
     try {
       this.transport.close();
     } catch {
@@ -153,14 +170,17 @@ export class Connection {
       const result = await verifyEnvelope(raw, worker.verifyContext(pending));
       // 검증(nonce I/O)에서 돌아온 시점에 다시 본다: 이 연결이 지금 연결이고, 같은 대기값을 아직 아무 답도 차지하지 않았고, 기한 안이다.
       if (!this.link.isCurrent(this) || this.state !== "syncing" || this.pendingSync !== pending) return;
-      if (this.now() - pending.sentAt >= limits.STOP_SYNC_WAIT_MS) return this.close();
+      const waited = this.now() - pending.sentAt;
+      if (waited < 0 || waited >= limits.STOP_SYNC_WAIT_MS) return this.close();
       if (!result.ok || result.action !== "stop_sync_reply") return;
       this.pendingSync = null;
       this.state = "adopting";
+      this.adoptingSince = this.now();
       const saved = await worker.syncTo(result.header.stop_generation);
-      if (!this.link.isCurrent(this)) return;
+      if (!this.link.isCurrent(this) || this.state !== "adopting") return;
+      this.adoptingSince = null;
       // 적지 못했으면 이 연결로는 일하지 않는다. 다시 맞추는 것은 새 연결에서다.
-      if (!saved) return this.close();
+      if (!saved || worker.helloWithheld()) return this.close();
       this.state = "synced";
       this.transmit(worker.hello());
       worker.resendUnacked();

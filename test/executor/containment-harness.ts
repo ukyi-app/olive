@@ -2,7 +2,7 @@
 // 그 안의 kill(-1)은 그 namespace 밖에 닿지 않는다.
 // 실제 신호 함수를 쓰는 PidSpace.record를 부르기 전에 bwrap이 만든 공간 안인지 스스로 확인한다. 밖에서 직접 띄우면 신호 없이 끝난다.
 import { readdir, readFile, stat } from "node:fs/promises";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ const ENV = { PATH: "/usr/bin:/bin", WITNESS };
 const sh = (script: string): LaunchPlan => ({ program: "/bin/sh", argv: ["-c", script], cwd: "/", env: ENV });
 const role = (mode: string): LaunchPlan => ({ program: process.execPath, argv: [FAKE_ROLE, mode], cwd: "/", env: ENV });
 
-export const SCENARIOS: Readonly<Record<string, { plan: LaunchPlan; hang?: boolean; witness?: boolean }>> = {
+export const SCENARIOS: Readonly<Record<string, { plan: LaunchPlan; hang?: boolean; witness?: boolean; attest?: boolean }>> = {
   clean: { plan: sh("exit 0") },
   background: { plan: sh("sleep 300 >/dev/null 2>&1 & sleep 0.1") },
   setsid: { plan: sh("setsid sleep 300 >/dev/null 2>&1 & sleep 0.1") },
@@ -31,11 +31,17 @@ export const SCENARIOS: Readonly<Record<string, { plan: LaunchPlan; hang?: boole
   // 부모가 끝나도 stdout을 쥐고 있는 자식.
   stdoutholder: { plan: sh("sleep 300 & sleep 0.1") },
   forkrace: { plan: sh(`setsid sh -c 'while :; do sleep 0.05 & sleep 0.01; done' >/dev/null 2>&1 & sleep 0.1`) },
-  // TERM을 받으면 정리 도중에 새 세션 자식을 띄운다.
-  latespawn: { plan: sh(`setsid sh -c 'trap "setsid sleep 300 >/dev/null 2>&1 &" TERM; while :; do sleep 0.02; done' >/dev/null 2>&1 & sleep 0.1`) },
-  // ptrace 검사로 environ을 읽을 수 없는 자식. 세는 쪽은 status를 읽는다.
+  // TERM을 받으면 정리 도중에 새 세션 자식을 띄운다. 띄운 순간을 증인 파일에 적는다.
+  latespawn: {
+    plan: sh(`setsid sh -c 'trap "setsid sleep 300 >/dev/null 2>&1 & echo spawned >> \\"\\$WITNESS\\"" TERM; while :; do sleep 0.02; done' >/dev/null 2>&1 & sleep 0.1`),
+    attest: true,
+  },
+  // ptrace 검사로 environ을 읽을 수 없는 자식. 세는 쪽은 status를 읽는다. 속성 설정이 실제로 성공했을 때만 증인 파일에 적는다.
   nondumpable: {
-    plan: sh(`setsid env -i ${PYTHON} -c 'import ctypes,time; ctypes.CDLL(None).prctl(4,0,0,0,0); time.sleep(300)' >/dev/null 2>&1 & sleep 0.6`),
+    plan: sh(
+      `setsid env -i ${PYTHON} -c 'import ctypes,time; libc=ctypes.CDLL(None); ok=libc.prctl(4,0,0,0,0)==0 and libc.prctl(3,0,0,0,0)==0; open("${WITNESS}","w").write("nondumpable" if ok else "dumpable"); time.sleep(300)' >/dev/null 2>&1 & sleep 0.6`,
+    ),
+    attest: true,
   },
   // 리더 스레드만 끝내 좀비처럼 보이면서 다른 스레드가 계속 돈다.
   zombieleader: {
@@ -116,6 +122,18 @@ async function growing(path: string): Promise<boolean> {
   await sleep(150);
   return (await sizeOf(path)) > before;
 }
+const attestation = (path: string) => readFile(path, "utf8").catch(() => "");
+
+// 이 공간의 init과 자기 말고 부모가 공간 밖인(PPid 0) 살아 있는 프로세스. 정리 코드와 따로 읽는다.
+async function joinedFromOutside(self: number): Promise<number[]> {
+  const found: number[] = [];
+  for (const name of await readdir("/proc")) {
+    if (!/^\d+$/.test(name) || name === "1" || Number(name) === self) continue;
+    const status = await readFile(`/proc/${name}/status`, "utf8").catch(() => "");
+    if (/^PPid:\s+0$/m.test(status) && !/^State:\s+[ZXx]/m.test(status)) found.push(Number(name));
+  }
+  return found;
+}
 
 async function main() {
   const name = process.argv[2]!;
@@ -157,6 +175,25 @@ async function main() {
     return;
   }
 
+  // 시험이 이 공간 밖에서 프로세스 하나를 합류시킨다. 그것이 보이면 전체 신호를 보내지 않아 함께 있던 후손이 살아남아야 한다.
+  if (name === "foreign") {
+    await bunLauncher.run(sh("setsid sleep 300 >/dev/null 2>&1 & sleep 0.1"), new AbortController().signal, hooks);
+    // 기준을 기록하고 후손을 띄운 뒤에 합류시키게 알린다(먼저 합류하면 이 프로세스의 번호가 밀린다).
+    writeFileSync(process.env.OLIVE_FOREIGN_READY!, "ready");
+    const until = Date.now() + 10_000;
+    let joined = await joinedFromOutside(process.pid);
+    while (joined.length === 0 && Date.now() < until) {
+      await sleep(20);
+      joined = await joinedFromOutside(process.pid);
+    }
+    const before = await independentCount(process.pid);
+    await space.terminate();
+    const survivors = await space.survivors();
+    const after = await independentCount(process.pid);
+    process.stdout.write(`${JSON.stringify({ name, joined: joined.length, before, after, survivors })}\n`);
+    return;
+  }
+
   const scenario = SCENARIOS[name];
   if (!scenario) throw new Error("unknown_scenario");
   const controller = new AbortController();
@@ -168,6 +205,7 @@ async function main() {
   const outcome = await running;
   const before = await independentCount(process.pid);
   const witnessBefore = scenario.witness ? await growing(WITNESS) : null;
+  const attestBefore = scenario.attest ? await attestation(WITNESS) : null;
   const started = Date.now();
   const sweeping = space.terminate();
   // 정리가 도는 동안의 늦은 띄우기는 거부된다.
@@ -180,8 +218,9 @@ async function main() {
   const survivors = await space.survivors();
   const after = await independentCount(process.pid);
   const witnessAfter = scenario.witness ? await growing(WITNESS) : null;
+  const attestAfter = scenario.attest ? await attestation(WITNESS) : null;
   process.stdout.write(
-    `${JSON.stringify({ name, pid: process.pid, exit: outcome.exit, stdoutBytes: outcome.stdout.byteLength, before, after, survivors, late, elapsedMs, graceMs: GRACE_MS, witnessBefore, witnessAfter })}\n`,
+    `${JSON.stringify({ name, pid: process.pid, exit: outcome.exit, stdoutBytes: outcome.stdout.byteLength, before, after, survivors, late, elapsedMs, graceMs: GRACE_MS, witnessBefore, witnessAfter, attestBefore, attestAfter })}\n`,
   );
 }
 

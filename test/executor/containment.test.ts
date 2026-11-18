@@ -5,70 +5,16 @@
 //   bwrap이나 user namespace를 쓸 수 없으면 그 사례를 등록하지 않고 이유를 찍는다(이미지의 test 단계에는 bwrap이 없다).
 //   OLIVE_REQUIRE_BWRAP=1이면 쓸 수 없을 때 실패한다.
 import { expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ContainmentUnavailable, PidSpace, type ProcReader, procFsReader, type Signal } from "../../src/executor/containment.ts";
+import { PidSweep } from "../../src/executor/containment-core.ts";
+import { checkRecordOptions, ContainmentUnavailable, PidSpace, procFsReader, type Signal } from "../../src/executor/containment.ts";
+import { FakeProc, type FakeProcess, SELF } from "./fake-proc.ts";
 
-interface FakeProcess {
-  state?: string;
-  nspid?: number[];
-  threads?: Record<number, string>;
-  survivesTerm?: boolean;
-  survivesKill?: boolean;
-  statusError?: string;
-  threadsError?: string;
-}
-const SELF = 7;
-class FakeProc implements ProcReader {
-  processes = new Map<number, FakeProcess>();
-  listError: string | undefined;
-  signals: { pid: number; signal: Signal; targets: number }[] = [];
-  killError: string | undefined;
-  namespaceId = "pid:[4026531836]";
-  onSignal: ((signal: Signal) => void) | undefined;
-  constructor(extra: Record<number, FakeProcess> = {}) {
-    this.processes.set(1, {});
-    this.processes.set(SELF, {});
-    for (const [pid, entry] of Object.entries(extra)) this.processes.set(Number(pid), entry);
-  }
-  async pids() {
-    if (this.listError) throw Object.assign(new Error("list"), { code: this.listError });
-    return [...this.processes.keys()];
-  }
-  async status(pid: number) {
-    const entry = this.processes.get(pid);
-    if (!entry) throw Object.assign(new Error("gone"), { code: "ENOENT" });
-    if (entry.statusError) throw Object.assign(new Error("read"), { code: entry.statusError });
-    return `Name:\tx\nState:\t${entry.state ?? "S"} (x)\nNSpid:\t${(entry.nspid ?? [pid]).join("\t")}\n`;
-  }
-  async threads(pid: number) {
-    const error = this.processes.get(pid)?.threadsError;
-    if (error) throw Object.assign(new Error("task"), { code: error });
-    return Object.keys(this.processes.get(pid)?.threads ?? { [pid]: "Z" }).map(Number);
-  }
-  async threadStatus(pid: number, thread: number) {
-    return `State:\t${this.processes.get(pid)?.threads?.[thread] ?? "Z"} (x)\n`;
-  }
-  namespaceError: string | undefined;
-  async namespace() {
-    if (this.namespaceError) throw Object.assign(new Error("ns"), { code: this.namespaceError });
-    return this.namespaceId;
-  }
-  async selfPid() {
-    return SELF;
-  }
-  kill = (pid: number, signal: Signal) => {
-    this.signals.push({ pid, signal, targets: [...this.processes.keys()].filter((t) => t !== 1 && t !== SELF).length });
-    if (this.killError) throw Object.assign(new Error("kill"), { code: this.killError });
-    this.onSignal?.(signal);
-    for (const [target, entry] of this.processes) {
-      if (target === 1 || target === SELF) continue;
-      if (signal === "SIGTERM" ? !entry.survivesTerm && !entry.survivesKill : !entry.survivesKill) this.processes.delete(target);
-    }
-  };
-}
-const space = (proc: FakeProc) => PidSpace.recordWith({ dedicated: true, self: SELF, reader: proc, kill: proc.kill, graceMs: 20, killMs: 40, pollMs: 1 });
+const space = (proc: FakeProc) => PidSweep.establish({ self: SELF, reader: proc, kill: proc.kill }, { graceMs: 20, killMs: 40, pollMs: 1 });
 async function recorded(extra: Record<number, FakeProcess>, proc = new FakeProc()) {
   const pod = await space(proc);
   for (const [pid, entry] of Object.entries(extra)) proc.processes.set(Number(pid), entry);
@@ -82,13 +28,12 @@ const refusal = (promise: Promise<unknown>) =>
 
 test("격리: 명시 옵션이 없거나, 실제 경로에 가짜 /proc·번호·신호를 섞거나, 기준 밖 프로세스가 보이면 기록을 거부해 kill(-1)이 나갈 수 없다", async () => {
   const fake = new FakeProc();
-  expect(await refusal(PidSpace.recordWith({ dedicated: false as unknown as true, self: SELF, reader: fake, kill: fake.kill }))).toBe("not_dedicated");
   // 실제 경로는 자기 번호·/proc·신호 함수를 받지 않는다(가짜 관측과 실제 신호의 짝, 실제 /proc과 가짜 신호의 짝 모두).
   for (const mixed of [{ self: SELF }, { reader: fake }, { kill: fake.kill }, { reader: fake, kill: fake.kill }]) {
     expect(await refusal(PidSpace.record({ dedicated: true, ...mixed } as never))).toBe("not_dedicated");
   }
   // 시험 경로는 셋을 함께 받아야 한다.
-  expect(await refusal(PidSpace.recordWith({ dedicated: true, self: SELF, reader: fake } as never))).toBe("not_dedicated");
+  expect(await refusal(PidSweep.establish({ self: SELF, reader: fake } as never))).toBe("not_dedicated");
   // 커널이 가리키는 자기 번호(/proc/self)가 준 번호와 다르면 거부한다.
   const liar = new FakeProc();
   liar.selfPid = async () => SELF + 1;
@@ -104,13 +49,31 @@ test("격리: 명시 옵션이 없거나, 실제 경로에 가짜 /proc·번호�
   expect(await refusal(space(foreign))).toBe("foreign_proc");
 });
 
+test("격리: 제품 옵션의 필수 조건은 실제 신호 능력을 만들지 않고 따로 본다(dedicated가 true가 아니면 그것만으로 거절)", () => {
+  const refused = (options: unknown) => {
+    try {
+      checkRecordOptions(options as never);
+      return "passed";
+    } catch (error) {
+      return error instanceof ContainmentUnavailable ? error.code : "other";
+    }
+  };
+  expect(refused({ dedicated: true })).toBe("passed");
+  expect(refused({ dedicated: true, graceMs: 10 })).toBe("passed");
+  // 주입 칸이 없는 입력에서 dedicated만 틀렸다.
+  for (const dedicated of [false, undefined, 1, "true"]) expect(refused({ dedicated }), String(dedicated)).toBe("not_dedicated");
+  expect(refused({})).toBe("not_dedicated");
+  // dedicated가 맞아도 주입 칸이 하나라도 있으면 거절한다.
+  for (const key of ["self", "reader", "kill"]) expect(refused({ dedicated: true, [key]: undefined }), key).toBe("not_dedicated");
+});
+
 test("격리(호스트): 이 머신의 PID 공간에서는 기준 상태 확인이 거부하고 신호를 보내지 않는다", async () => {
   const others = readdirSync("/proc").filter((name) => /^\d+$/.test(name) && name !== "1" && Number(name) !== process.pid);
   expect(others.length).toBeGreaterThan(0);
   const sent: { pid: number; signal: Signal }[] = [];
   // 실제 /proc을 읽되 신호는 기록기다(시험 경로). 실제 경로(record)는 같은 확인으로 거부되며, 이 시험에서는 부르지 않는다.
-  const probe = { dedicated: true as const, self: process.pid, reader: procFsReader(), kill: (pid: number, signal: Signal) => void sent.push({ pid, signal }) };
-  expect(await refusal(PidSpace.recordWith(probe))).toBe("baseline_not_clean");
+  const probe = { self: process.pid, reader: procFsReader(), kill: (pid: number, signal: Signal) => void sent.push({ pid, signal }) };
+  expect(await refusal(PidSweep.establish(probe))).toBe("baseline_not_clean");
   expect(sent).toEqual([]);
 });
 
@@ -224,6 +187,7 @@ test("격리: fork 경쟁(신호 직후 새 프로세스)에도 연속으로 깨
 
 const HARNESS = fileURLToPath(new URL("./containment-harness.ts", import.meta.url));
 const BWRAP = "/usr/bin/bwrap";
+const NSENTER = "/usr/bin/nsenter";
 const wrap = (...command: string[]) => [
   BWRAP,
   "--unshare-pid",
@@ -264,6 +228,8 @@ interface HarnessResult {
   graceMs: number;
   witnessBefore: boolean | null;
   witnessAfter: boolean | null;
+  attestBefore: string | null;
+  attestAfter: string | null;
 }
 // harness는 이 표식(--setenv)이 있고 bwrap의 공간 안일 때만 실제 신호를 쓴다.
 const MARK = ["--setenv", "OLIVE_CONTAINMENT_HARNESS", "1"];
@@ -322,7 +288,45 @@ if (problem !== null) {
       if (name === "termignore") expect(result.elapsedMs).toBeGreaterThanOrEqual(result.graceMs);
       // 독립 계수기가 리더만 끝나고 스레드가 도는 프로세스를 실제로 보았다.
       if (name === "zombieleader") expect(result.before.zombieLeaders, "리더만 끝난 상태를 만들지 못했다").toBeGreaterThan(0);
+      // TERM을 받은 뒤에 새 후손이 실제로 생겼고(증인 파일), 그래서 유예를 다 쓰고 KILL로 끝났다.
+      if (name === "latespawn") {
+        expect(result.attestBefore, "TERM 전에는 새 후손이 없어야 한다").toBe("");
+        expect(result.attestAfter, "TERM 처리 중 새 후손을 띄우지 못했다").toContain("spawned");
+        expect(result.elapsedMs).toBeGreaterThanOrEqual(result.graceMs);
+      }
+      // 프로세스 자신이 prctl의 성공과 읽어 본 값을 증인 파일에 적었다.
+      if (name === "nondumpable") expect(result.attestBefore, "non-dumpable 속성을 설정하지 못했다").toBe("nondumpable");
     });
+  }
+
+  const HAS_NSENTER = existsSync(NSENTER);
+  if (!HAS_NSENTER) console.warn(`nsenter 없음(${NSENTER}): foreign 사례를 돌리지 않았다`);
+  if (HAS_NSENTER) {
+    test("실제 프로세스 foreign: 공간 밖에서 합류한 프로세스가 보이면 전체 신호를 보내지 않아 후손이 살아남고 0도 말하지 않는다", async () => {
+      const ready = join(mkdtempSync(join(tmpdir(), "olive-foreign-")), "ready");
+      const command = wrap(process.execPath, HARNESS, "foreign");
+      command.splice(1, 0, ...MARK, "--setenv", "OLIVE_FOREIGN_READY", ready);
+      const sandbox = spawn(command[0]!, command.slice(1), { stdio: ["ignore", "pipe", "inherit"] });
+      let stdout = "";
+      sandbox.stdout!.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
+      const finished = new Promise<number | null>((resolve) => sandbox.once("close", resolve));
+      // harness가 기준을 기록한 뒤에 합류시킨다. 밖의 bwrap이 띄운 자식이 그 공간의 init이다.
+      const limit = Date.now() + 10_000;
+      while (!existsSync(ready) && Date.now() < limit) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(existsSync(ready), `harness가 준비되지 않았다: ${stdout}`).toBe(true);
+      const childPid = Number(readFileSync(`/proc/${sandbox.pid}/task/${sandbox.pid}/children`, "utf8").trim().split(/\s+/)[0]);
+      expect(childPid).toBeGreaterThan(0);
+      // 합류한 프로세스는 공간의 init이 끝나면 커널이 함께 끝낸다. 여기서는 신호를 보내지 않는다.
+      const joiner = spawn(NSENTER, ["-t", String(childPid), "-U", "-p", "--preserve-credentials", "--", "/usr/bin/sleep", "20"], { stdio: "ignore" });
+      const code = await finished;
+      await new Promise((resolve) => joiner.once("close", resolve));
+      expect(code, stdout).toBe(0);
+      const result = JSON.parse(stdout) as { joined: number; before: Counted; after: Counted; survivors: number | null };
+      expect(result.joined, "합류한 프로세스를 보지 못했다").toBeGreaterThan(0);
+      expect(result.survivors).toBeNull();
+      expect(result.before.alive).toBeGreaterThanOrEqual(2);
+      expect(result.after.alive).toBe(result.before.alive);
+    }, 30_000);
   }
 
   // 번호를 옮겨 다니는 자식은 /proc 검사로 셀 수 없어 살아 있음을 파일로 본다. 정리 전에 늘다가 정리 뒤 멈춰야 한다.

@@ -1,7 +1,8 @@
 // 실행기 시험이 함께 쓰는 도구: 시험 중에 만드는 키, 감독 쪽 봉투, 가짜 연결·정리·폴더·자격, 시계.
 // 키와 자격 값은 시험이 돌 때마다 새로 만든다(저장소에 두지 않는다).
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -151,6 +152,84 @@ export function gate(): { wait: Promise<void>; open: () => void } {
 }
 
 export const pause = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// 고정 장벽: 들어왔음을 entered로 알리고 open까지 세운다. 순서를 시간이 아니라 실제 진입으로 만든다.
+export interface Barrier {
+  entered: Promise<void>;
+  open: () => void;
+  pass: () => Promise<void>;
+}
+export function barrier(): Barrier {
+  let enter!: () => void;
+  const entered = new Promise<void>((resolve) => (enter = resolve));
+  const door = gate();
+  return {
+    entered,
+    open: door.open,
+    pass: async () => {
+      enter();
+      await door.wait;
+    },
+  };
+}
+
+type WriteMatch = (path: string, data: string) => boolean;
+// 어느 파일 쓰기인지 고르는 조건.
+export const outboxWrite = (action: string): WriteMatch => (path, data) => path.includes("/outbox/") && (JSON.parse(data) as { action?: string }).action === action;
+export const runWrite = (...states: string[]): WriteMatch => (path, data) => path.includes("/runs/") && (states.length === 0 || states.includes((JSON.parse(data) as { state?: string }).state ?? ""));
+export const stopWrite: WriteMatch = (path) => path.endsWith("stop-generation.json");
+export const cancelReceiptWrite: WriteMatch = (path, data) => path.includes("/outbox/") && (JSON.parse(data) as { body?: { instruction?: string } }).body?.instruction === "task_cancel";
+
+// 실제 파일에 쓰되, 고른 쓰기만 실패시키거나 장벽에 세우는 저장 장치.
+export function scriptedIo() {
+  const failing = new Set<WriteMatch>();
+  const onceFailing = new Set<WriteMatch>();
+  const holds = new Map<WriteMatch, Barrier>();
+  const markers = { failing: false, gate: undefined as Barrier | undefined };
+  const io: Partial<StoreIo> = {
+    writeDurable: async (path, data) => {
+      for (const [match, hold] of holds) if (match(path, data)) await hold.pass();
+      for (const match of failing) if (match(path, data)) throw Object.assign(new Error("disk"), { code: "EIO" });
+      for (const match of onceFailing) {
+        if (!match(path, data)) continue;
+        onceFailing.delete(match);
+        throw Object.assign(new Error("disk"), { code: "EIO" });
+      }
+      await writeFile(path, data);
+    },
+    createMarker: async (path) => {
+      await markers.gate?.pass();
+      if (markers.failing) throw Object.assign(new Error("disk"), { code: "ENOSPC" });
+      await writeFile(path, "", { flag: "wx" });
+    },
+  };
+  return {
+    io,
+    markers,
+    fail: (match: WriteMatch) => {
+      failing.add(match);
+      return () => void failing.delete(match);
+    },
+    // 고른 쓰기를 처음 한 번만 실패시킨다.
+    failOnce: (match: WriteMatch) => void onceFailing.add(match),
+    hold: (match: WriteMatch) => {
+      const hold = barrier();
+      holds.set(match, hold);
+      return hold;
+    },
+  };
+}
+
+// 파일에 실제로 적힌 실행 기록과 사건(다시 열기 전에 디스크를 그대로 본다).
+export function onDiskRun(dir: string, runId: string): { state: string; last_receipt_id: string | null } {
+  return JSON.parse(readFileSync(join(dir, "runs", `${runId}.json`), "utf8")) as { state: string; last_receipt_id: string | null };
+}
+export function onDiskEvents(dir: string, runId: string): { id: string; action: string; body: Record<string, unknown> }[] {
+  return readdirSync(join(dir, "outbox"))
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => JSON.parse(readFileSync(join(dir, "outbox", name), "utf8")) as { id: string; action: string; run_id: string; body: Record<string, unknown> })
+    .filter((entry) => entry.run_id === runId);
+}
 
 // bunLauncher를 감싸 띄운 자식의 핸들을 정리 가짜에 알리고, 끝나면 등록에서 뺀다.
 export function recordingLauncher(cleanup: FakeCleanup): Launcher & { spawned: number; onSpawned: (() => void) | undefined } {

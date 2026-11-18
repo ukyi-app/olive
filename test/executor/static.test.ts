@@ -76,6 +76,34 @@ test("정적: 띄우는 곳은 launcher.ts 하나이고, 그 계획은 프로필
   expect(calls).toEqual(["this.profile"]);
 });
 
+test("정적: 실제 전체 신호는 containment.ts의 한 자리에서만 만들고, 신호를 주입하는 알고리즘은 제품 코드가 부를 수 없다", async () => {
+  const sources = await list("src/**/*.ts");
+  expect(sources).toContain("src/executor/containment-core.ts");
+  const signalling: string[] = [];
+  const importers: string[] = [];
+  for (const file of sources) {
+    const source = await code(file);
+    signalling.push(...[...source.matchAll(/\bprocess\.kill\b/g)].map(() => file));
+    if (/containment-core\.ts/.test(source) && file !== "src/executor/containment-core.ts") importers.push(file);
+    expect(/\brecordWith\b/.test(source), file).toBe(false);
+  }
+  expect(signalling).toEqual(["src/executor/containment.ts"]);
+  expect(importers).toEqual(["src/executor/containment.ts"]);
+  // 코어는 신호를 스스로 만들지 않는다.
+  expect(/\bprocess\./.test(await code("src/executor/containment-core.ts"))).toBe(false);
+});
+
+test("정적: 새 종료 확인 영수증을 만드는 곳은 남은 수 0을 본 뒤의 한 곳이고, 실행 기록과 사건은 전이 한 자리로만 남긴다", async () => {
+  const worker = await code("src/executor/worker.ts");
+  expect([...worker.matchAll(/this\.event\("receipt_stopped"/g)]).toHaveLength(1);
+  const count = worker.indexOf("const survivors = await bounded(cleanup.survivors()");
+  const issue = worker.indexOf('this.event("receipt_stopped"');
+  expect(count).toBeGreaterThan(0);
+  expect(worker.slice(count, issue)).toContain("if (survivors !== 0)");
+  // worker는 저장소의 낮은 쓰기 함수를 직접 부르지 않는다.
+  expect(/\bstore\.(noteRun|addOutbox)\(/.test(worker)).toBe(false);
+});
+
 test("정적: 실행기 코드는 소켓·듣는 API를 쓰지 않는다(U3a는 실제 연결 없이 돈다)", async () => {
   const banned = /\bBun\.(serve|listen|connect|udpSocket)\b|\bcreateServer\b|\.listen\(|node:(net|tls|http|https|http2|dgram)\b|\bfetch\(/;
   for (const file of files) expect(banned.test(await code(file)), file).toBe(false);
