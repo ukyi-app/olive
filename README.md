@@ -92,6 +92,7 @@ src/main/
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
+src/ledger/         # 감독 장부(SQLite)와 재시작 복원, 요약은 src/ledger/ledger.md
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
 test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성
 ```
