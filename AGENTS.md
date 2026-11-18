@@ -7,6 +7,8 @@
 - 이미지에는 hc와 `/etc/claude-code`가 없다(D-37). Dockerfile의 `image-check` 단계가 빌드마다 확인한다. 실행기는 감독에 먼저 붙는 쪽이고 포트를 열고 듣지 않는다.
 - 버전은 정확히 고정한다: Bun은 `.bun-version`·Dockerfile 두 FROM·`@types/bun`이 같은 값, npm 패키지는 정확한 버전, 기반 이미지는 digest. 최신 안정판보다 낮게 두면 그 이유를 고정한 자리 옆에 적는다.
 - 시험은 `bun run test`로 돌린다. `bun test`는 시험이 0개인 파일을 통과시킨다. `bun run test`(`test/run.ts`)가 JUnit 결과에서 파일마다 실행된 시험 수를 확인한다. 시험 파일 이름은 점으로 시작하지 않는 소문자 `*.test.ts`만 쓴다. Bun이 시험으로 읽는 다른 이름(`.x.test.ts`, `x.TEST.ts`, `*.spec.ts` 등)은 실패한다(README "시험").
+- 작업자 실행기(`src/executor/`)는 역할 프로필(프로그램·argv·작업 폴더·환경 이름)로만 띄운다. 지시 본문에서 명령·argv·환경을 읽는 코드, `launcher.ts` 밖의 프로세스 띄우기, `process.env` 읽기를 두지 않는다(`test/executor/static.test.ts`). 종료 확인 영수증은 남은 프로세스 0개를 센 뒤에만 낸다.
+- `kill(-1)`이나 음수 PID로 가는 신호를 호스트의 PID 공간에서 실제로 보내는 시험을 쓰지 않는다. 그 호출은 사용자의 모든 프로세스를 끝낸다. 실제 프로세스 사례는 `bwrap` PID namespace 안에서만 돌린다(README "실행기 시험의 실제 프로세스").
 - `.github/CODEOWNERS`는 `* @ukkiee` 한 줄만 둔다. 줄을 더하면 homelab의 자동 배포 조건이 멈춘다.
 - `.github/workflows/build.yaml`의 `uses:`는 태그 ref 그대로 둔다(파일 주석).
 

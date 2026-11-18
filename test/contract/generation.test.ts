@@ -418,20 +418,25 @@ test("정지 세대 맞춤: 세 상한 미만의 가장 느린 왕복은 맞추�
     expect(reply.header.expires_at).toBeGreaterThan(arrived);
     return worker.receive(reply, arrived);
   };
+  // 전달·처리 상한은 운영 기본값이라 바뀔 수 있다. 그래서 기본값으로는 합의 부등식(앞 시험)과 상한 직전의 정상 왕복만 본다.
   expect(await roundTrip(DELIVERY_MAX_MS - 1, STOP_SYNC_ANSWER_MAX_MS - 1, DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
-  // 두 전달과 처리가 모두 상한 정각이면 왕복은 STOP_SYNC_WAIT_MS 정각이고, 상한("미만")을 넘은 것이라 거절한다.
-  expect(DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS + DELIVERY_MAX_MS).toBe(STOP_SYNC_WAIT_MS);
-  expect(await roundTrip(DELIVERY_MAX_MS, STOP_SYNC_ANSWER_MAX_MS, DELIVERY_MAX_MS)).toEqual({ ok: false, reason: "challenge_mismatch" });
   // 셋 중 하나만 정각이어도 왕복은 기한 안이다(남은 둘이 상한 미만이므로).
   expect(await roundTrip(DELIVERY_MAX_MS, STOP_SYNC_ANSWER_MAX_MS - 1, DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
+  // 받는 쪽 경계(25초)의 정각 거절은 숫자를 직접 적어 고정한다. 기본값을 낮춰도 이 사례는 25초 정각의 왕복이다.
+  expect(await roundTrip(10_000, 5_000, 10_000)).toEqual({ ok: false, reason: "challenge_mismatch" });
 
   // 같은 규칙이 일반 봉투에도 있다: maySend가 싣게 하는 마지막 순간(남은 수명 = 전달 상한)에 실은 봉투는
   // 전달이 상한 미만이면 받고, 상한 정각이면 expires_at 정각이라 expired다.
+  // 전제: 보내는 쪽과 받는 쪽의 시계가 같다. CLOCK_SKEW_MS는 미래 발급에만 쓰이고 expires_at에는 더해지지 않으므로,
+  // 받는 쪽 시계가 앞서면 상한 미만의 전달도 expired가 될 수 있다(아래 대조군).
   const request = executor(DIAGNOSIS, 3, {}).requestSync(CHALLENGE, sent);
   const lastSend = request.header.expires_at - DELIVERY_MAX_MS;
   expect(maySend(request.header, lastSend)).toEqual({ ok: true });
   expect(await supervisor(4).receive(request, lastSend + DELIVERY_MAX_MS - 1)).toMatchObject({ ok: true });
   expect(await supervisor(4).receive(request, lastSend + DELIVERY_MAX_MS)).toEqual({ ok: false, reason: "expired" });
+  // 대조군: 전달은 같은 상한 미만(보내는 쪽 시계로 9,999ms)인데 받는 쪽 시계가 1ms 빠르면 받는 시각이 expires_at 정각이다.
+  const receiverAhead = 1;
+  expect(await supervisor(4).receive(request, lastSend + DELIVERY_MAX_MS - 1 + receiverAhead)).toEqual({ ok: false, reason: "expired" });
 });
 
 test("정지 세대 맞춤: 기다리는 요청의 sentAt이 없거나 정수가 아니거나 미래이거나 아주 옛 시각이면 challenge_mismatch이고 세대는 그대로다", async () => {
@@ -459,7 +464,8 @@ test("정지 세대 맞춤: 기다리는 요청의 sentAt이 없거나 정수가
   expect(await withPending({ challenge: CHALLENGE, sent_at: 0 })).toEqual(rejected);
   expect(await withPending({ challenge: CHALLENGE, sent_at: Number.MIN_SAFE_INTEGER })).toEqual(rejected);
   // 정수가 아닌 값: 소수, NaN, 무한, 안전 정수 밖, 숫자가 아닌 값.
-  for (const sentAt of [now - 1_000.5, Number.NaN, Number.NEGATIVE_INFINITY, -(2 ** 53), String(now - 1_000), null]) {
+  // bigint는 뺄셈이 예외를 던지는 값이라, 예외가 아니라 거절 사유로 끝나는지 본다.
+  for (const sentAt of [now - 1_000.5, Number.NaN, Number.NEGATIVE_INFINITY, -(2 ** 53), String(now - 1_000), null, BigInt(now - 1_000)]) {
     expect(await withPending({ challenge: CHALLENGE, sent_at: sentAt }), String(sentAt)).toEqual(rejected);
   }
 });

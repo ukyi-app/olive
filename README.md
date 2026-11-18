@@ -54,7 +54,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드에 듣는 API가 없다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드에 듣는 API가 없다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -92,9 +92,20 @@ src/main/
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
+src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다. 진입점 조립은 아직 없다)
+├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 기록, 보낸 영수증
+├── worker.ts       # 지시 처리, 띄우기 직전 확인, 영수증·결과 보고
+├── link.ts         # 연결 하나의 수명: 정지 세대 맞춤 → hello → 재전송
+├── profile.ts      # 역할 프로필, 허용 목록 환경, 자격 digest 대조
+├── launcher.ts     # 역할 프로그램 띄우기(띄우는 곳은 여기 하나)
+└── containment.ts  # 전용 PID 공간의 남은 프로세스 정리와 세기(kill(-1))
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
-test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성
+test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성, test/executor/는 실행기 시험과 가짜 역할 프로그램
 ```
+
+### 실행기 시험의 실제 프로세스
+
+`test/executor/containment.test.ts`의 실제 프로세스 사례는 `bwrap --unshare-pid --unshare-user`로 만든 PID namespace 안에서만 돈다. 그 안의 `kill(-1)`은 밖에 닿지 않는다. `bwrap`이나 비특권 user namespace가 없으면(이미지의 `test` 단계가 그렇다) 그 사례를 등록하지 않고 이유를 한 줄 찍는다. 개발 기계에서 반드시 돌리려면 `OLIVE_REQUIRE_BWRAP=1 bun run test`로 없을 때 실패하게 한다. 호스트의 PID 공간에서 정리 코드에 진짜 신호를 주는 시험을 쓰지 않는다.
 
 ## 공개 저장소
 
