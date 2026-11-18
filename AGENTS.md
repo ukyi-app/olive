@@ -11,7 +11,7 @@
 - `kill(-1)`이나 음수 PID로 가는 신호를 호스트의 PID 공간에서 실제로 보내는 시험을 쓰지 않는다. 그 호출은 사용자의 모든 프로세스를 끝낸다. 실제 프로세스 사례는 `bwrap` PID namespace 안에서만 돌린다(README "실행기 시험의 실제 프로세스").
 - 호스트의 시험은 자기가 띄운 자식에게 그 자식의 핸들로만 신호를 보낸다. 끝난 자식의 숫자 PID에 보내지 않는다. 판정 규칙 시험은 `containment-core.ts`의 `PidSweep.establish`에 가짜 `/proc`·번호·신호 기록기를 함께 준다. 실제 전체 신호 능력은 `containment.ts`의 `PidSpace.record` 한 자리에서만 만들고, `src/`에서 `containment-core.ts`를 import하는 곳은 `containment.ts`뿐이다(`test/executor/static.test.ts`).
 - 실행기에서 권한이 필요한 효과는 검증 뒤의 await를 지난 그 직전에 다시 본다. 폴더 준비·자격 요청·spawn은 `launchBlocked`(연결, 정지 세대의 저장, 접수, 취소, 기한, 임대), 임대 연장·폴더 지우기·새 요청의 영수증은 `authorized`(연결, 정지 세대의 저장, 접수)다(`worker.ts`).
-- 실행 상태와 그 사건(영수증·보고)은 `store.commit` 한 자리로만 남긴다. 사건은 순번 차례로 적고 실행 기록은 그 뒤에 적는다. 닫는 쪽 효과(프로세스 정리, 연결 닫기)는 저장을 기다리지 않고, 여는 쪽 효과는 실패한 그 연산이 회복된 뒤에만 열린다.
+- 실행 상태와 그 사건(영수증·보고)은 `store.commit` 한 자리로만 남긴다. 사건은 순번 차례로 적고 실행 기록은 그 뒤에 적는다. 사건을 판단에 쓰는 자리는 `store.validEvents` 하나다(`test/executor/static.test.ts`). 닫는 쪽 효과(프로세스 정리, 연결 닫기)는 저장을 기다리지 않고, 여는 쪽 효과는 실패한 그 연산이 회복된 뒤에만 열린다.
 - `.github/CODEOWNERS`는 `* @ukkiee` 한 줄만 둔다. 줄을 더하면 homelab의 자동 배포 조건이 멈춘다.
 - `.github/workflows/build.yaml`의 `uses:`는 태그 ref 그대로 둔다(파일 주석).
 

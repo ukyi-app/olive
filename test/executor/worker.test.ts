@@ -508,7 +508,8 @@ test("정리: result_finalize는 프로세스 0개를 확인한 실행만 지우
   r.space.cleanResult = false;
   const finalize = (id: string, requestId?: string) =>
     fromSupervisor(r.clock, r.worker.name, "result_finalize", { run_id: id, outcome: "failed", result_digest: null, stored_at: r.clock.now() }, { stop_generation: 0, run_generation: 1, request_id: requestId });
-  await r.connection.receive(finalize(runId));
+  const owner = randomUUID();
+  await r.connection.receive(finalize(runId, owner));
   expect(stateOf(r, runId)).toBe("cleanup_pending");
   expect(r.transport.of("receipt_cleaned")).toHaveLength(0);
   await start(r);
@@ -518,11 +519,12 @@ test("정리: result_finalize는 프로세스 0개를 확인한 실행만 지우
   const requestId = randomUUID();
   await r.connection.receive(finalize(runId, requestId));
   expect(stateOf(r, runId)).toBe("finalized");
+  // 끝나지 않은 정리 의도의 주인은 처음 요청이다. 이어서 지우게 한 요청은 그 사실로 자기 영수증을 따로 받는다.
   const cleaned = r.transport.of("receipt_cleaned");
-  expect(cleaned).toHaveLength(1);
+  expect(cleaned.map((e) => e.body.instruction_request_id)).toEqual([owner, requestId]);
   // 같은 확정(같은 request_id)이 새 봉투로 다시 오면 같은 정리 영수증이다.
   await r.connection.receive(finalize(runId, requestId));
-  expect(r.transport.of("receipt_cleaned").map((e) => e.body)).toEqual([cleaned[0]!.body, cleaned[0]!.body]);
+  expect(r.transport.of("receipt_cleaned").map((e) => e.body)).toEqual([cleaned[0]!.body, cleaned[1]!.body, cleaned[1]!.body]);
   // 다른 요청의 확정은 그 요청의 영수증을 받되, 지우기는 반복하지 않고 정리 시각은 처음의 사실이다.
   const other = randomUUID();
   await r.connection.receive(finalize(runId, other));

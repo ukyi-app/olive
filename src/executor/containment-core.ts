@@ -3,7 +3,7 @@
 // src/ 안에서 이 파일을 import하는 곳은 containment.ts 하나다(test/executor/static.test.ts). 시험은 가짜 /proc과 신호 기록기를 넘겨 판정 규칙을 본다.
 //
 // 코어가 스스로 증명하는 것: 신호와 스캔마다 기록한 공간이 그대로인지, 기준 상태가 자기와 PID 1뿐이었는지,
-// 전체 신호 직전 스캔에 밖에서 합류한 프로세스가 보이지 않는지.
+// 전체 신호 직전 스캔의 확인이 완전하고 밖에서 합류한 프로세스가 보이지 않는지.
 // 호출자의 보증에 기대는 것: 이 공간을 만들고 독점하는 쪽이 따로 있고, 스캔과 신호 사이에 들어온 프로세스는 없다는 것.
 // 합류한 프로세스의 부모가 먼저 끝나 공간의 init 밑으로 옮겨지면 PPid 0이 사라지므로 이 검사로는 보이지 않는다.
 //
@@ -78,9 +78,11 @@ export interface PidScan {
   nested: number[];
   // 부모가 이 공간 밖인 프로세스(이 공간의 init과 자기 말고). 밖에서 합류한 것이다.
   foreign: number[];
-  // 읽지 못한 항목이 하나라도 있으면 false다. 그때는 0개라고 말할 수 없다.
+  // 공간 동일성, 목록, 상태, 합류 여부 가운데 확인하지 못한 것이 하나라도 있으면 false다.
+  // 그때는 0개라고 말할 수 없고 전체 신호도 보내지 않는다.
   complete: boolean;
   // 목록에 있었는데 읽을 때 사라졌다. fork와 exit를 빠르게 되풀이하는 프로세스는 언제나 이렇게 보이므로 끝났다는 증거가 아니다.
+  // 확인 실패와 달리 전체 신호를 막지 않는다(그런 프로세스를 끝낼 수단이 그 신호다).
   raced: boolean;
 }
 
@@ -179,7 +181,10 @@ export class PidSweep implements ProcessCleanup {
       else if (alive === "raced") result.raced = true;
       else if (alive) {
         (namespaces.length > 1 ? result.nested : result.sameNamespace).push(pid);
-        if (await this.joinedFromOutside(pid, status)) result.foreign.push(pid);
+        const joined = await this.joinedFromOutside(pid, status);
+        if (joined === null) result.complete = false;
+        else if (joined === "raced") result.raced = true;
+        else if (joined) result.foreign.push(pid);
       }
     }
     if (!(await this.sameSpace())) result.complete = false;
@@ -188,15 +193,20 @@ export class PidSweep implements ProcessCleanup {
 
   // 부모가 이 공간에 없으면 커널은 PPid를 0으로 보여 준다. 이 공간의 init 말고 그런 프로세스는 밖에서 합류한 것이다.
   // 끝나는 중인 프로세스도 잠깐 0으로 보일 수 있어 한 번 더 읽어 같을 때만 친다.
-  private async joinedFromOutside(pid: number, status: string): Promise<boolean> {
+  // 다시 읽지 못하면 합류가 아니라고 말할 수 없다(null). 사라졌으면 경합이고, 리더가 Z여도 산 스레드가 있으면 살아 있다.
+  private async joinedFromOutside(pid: number, status: string): Promise<boolean | null | "raced"> {
     if (parentOf(status) !== "0") return false;
+    let again: string;
     try {
-      const again = await this.reader.status(pid);
-      const state = stateOf(again);
-      return parentOf(again) === "0" && state !== "Z" && state !== "X" && state !== "x";
-    } catch {
-      return false;
+      again = await this.reader.status(pid);
+    } catch (error) {
+      return VANISHED.has(errorCode(error)) ? "raced" : null;
     }
+    const state = stateOf(again);
+    const parent = parentOf(again);
+    if (state === null || parent === null) return null;
+    if (parent !== "0") return false;
+    return this.alive(pid, state);
   }
 
   // 좀비는 도는 코드가 없어 세지 않는다(실행기가 PID 1이면 고아 좀비를 회수하지 않아 남을 수 있다).
@@ -225,16 +235,15 @@ export class PidSweep implements ProcessCleanup {
     return raced ? "raced" : false;
   }
 
-  // 신호마다 공간이 기록한 그대로인지 먼저 본다. namespace가 바뀌었거나 /proc이 자기 것이 아니면 보내지 않는다.
-  // 밖에서 합류한 프로세스가 보이면 그 공간은 전용이 아니므로 보내지 않고, 다시는 보내지 않는다. 스캔이 불완전한 것만으로는 막지 않는다
-  // (fork 연쇄는 언제나 경합으로 보이는데, 그것을 끝낼 수단이 이 신호다).
+  // 전체 신호는 바로 앞 스캔의 확인이 완전할 때만 보낸다. 공간 동일성·목록·상태·합류 여부를 확인하지 못했거나 합류자가 보이면 보내지 않는다.
+  // 단순한 PID 소멸 경합(raced)은 막지 않는다(fork 연쇄는 언제나 경합으로 보이는데, 그것을 끝낼 수단이 이 신호다).
+  // 스캔을 기다리는 사이 다른 계수가 세운 래치도 여기서 함께 본다. 이 판정과 신호 사이에 await가 없다.
   // 대상이 없을 때의 ESRCH는 정상이다. 권한 오류 등은 삼키고 결론은 뒤의 검사가 낸다(닿지 않은 프로세스는 검사에 남는다).
   private async signal(signal: Signal): Promise<boolean> {
-    if (this.shared || !(await this.sameSpace())) return false;
-    if ((await this.scan()).foreign.length > 0) {
-      this.shared = true;
-      return false;
-    }
+    if (this.shared) return false;
+    const scan = await this.scan();
+    if (scan.foreign.length > 0) this.shared = true;
+    if (this.shared || !scan.complete) return false;
     try {
       this.kill(-1, signal);
     } catch {

@@ -11,6 +11,7 @@ import {
   cancelReceiptWrite,
   FakeTransport,
   fromSupervisor,
+  gate,
   onDiskEvents,
   onDiskRun,
   outboxWrite,
@@ -61,6 +62,19 @@ function fakeLauncher(r: Rig, script: (hooks: LaunchHooks) => Promise<Uint8Array
 }
 const goodResult = new TextEncoder().encode(JSON.stringify({ role: "diagnosis", outcome: "completed", summary: "끝", items: [], refs: [] }));
 
+// 검증을 지난 봉투가 실행기의 처리에 들어가 첫 await까지 간 횟수를 센다. count번째 처리가 그 자리에 닿으면 풀린다.
+function handled(r: Rig, count: number): Promise<void> {
+  const reached = gate();
+  const handle = r.worker.handle.bind(r.worker);
+  let seen = 0;
+  r.worker.handle = (verified, epoch) => {
+    const work = handle(verified, epoch);
+    if (++seen === count) reached.open();
+    return work;
+  };
+  return reached.wait;
+}
+
 // ---- R07 ----
 
 test("R07 같은 요청의 취소 둘이 겹쳐도 영수증 ID는 하나이고, 쓰는 동안에는 보내지 않는다", async () => {
@@ -69,10 +83,13 @@ test("R07 같은 요청의 취소 둘이 겹쳐도 영수증 ID는 하나이고,
   const { runId } = await start(r);
   await until(() => r.store.run(runId)?.state === "running");
   const writing = disk.hold(cancelReceiptWrite);
+  const bothLookedUp = handled(r, 2);
   const requestId = randomUUID();
   const first = r.connection.receive(cancel(r, runId, requestId));
   const second = r.connection.receive(cancel(r, runId, requestId));
   await writing.entered;
+  // 둘째 요청의 조회가 첫 영수증의 쓰기 안에서 끝난 뒤에 쓰기를 푼다.
+  await bothLookedUp;
   expect(cancelReceipts(r, runId)).toHaveLength(1);
   expect(r.transport.of("receipt_accepted").filter((e) => e.body.instruction === "task_cancel")).toHaveLength(0);
   writing.open();
@@ -151,7 +168,11 @@ test("R09 다른 digest의 성공 확정은 첫 정리 전·중·후 모두 새 
   };
   const right = r.connection.receive(finalize(r, runId));
   await deleting.entered;
+  const wrongHandled = handled(r, 1);
   const during = r.connection.receive(finalize(r, runId, wrong));
+  // 틀린 확정이 지우는 중에 처리에 들어간 뒤에 지우기를 끝낸다.
+  await wrongHandled;
+  expect(r.store.run(runId)?.state).toBe("cleanup_pending");
   deleting.open();
   await Promise.all([right, during]);
   expect(cleanedReceipts(r, runId)).toHaveLength(1);
@@ -209,7 +230,11 @@ test("R09 지우는 중에 같은 요청 ID로 본문이 다른 확정이 합류
   const first = r.connection.receive(finalize(r, runId, { requestId }));
   await deleting.entered;
   const digest = resultDigest(r.transport.of("report_result")[0]!.body.result);
+  const otherHandled = handled(r, 1);
   const other = r.connection.receive(finalize(r, runId, { requestId, outcome: "succeeded", digest }));
+  // 다른 본문의 확정이 지우는 중에 처리에 들어간 뒤에 지우기를 끝낸다.
+  await otherHandled;
+  expect(r.store.run(runId)?.state).toBe("cleanup_pending");
   deleting.open();
   await Promise.all([first, other]);
   const cleaned = cleanedReceipts(r, runId);

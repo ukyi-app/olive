@@ -48,3 +48,88 @@ test("R06 공유 공간: 부모가 이 공간 안이거나, 끝나는 중에 잠
   expect(zombie.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
   expect(await zombie.pod.survivors()).toBe(0);
 });
+
+// 신호 직전 스캔의 마지막 관측. 첫 공간 확인은 통과하고 그 뒤의 스캔에서만 확인이 실패하게 만든다.
+
+test("F01 불완전한 마지막 관측: 상태를 읽지 못한 항목이 있으면 전체 신호를 보내지 않는다", async () => {
+  const { pod, proc } = await recorded({ 330: { statusError: "EIO" } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+  expect(await pod.survivors()).toBeNull();
+});
+
+test("F01 불완전한 마지막 관측: 목록을 읽지 못하면 전체 신호를 보내지 않는다", async () => {
+  const { pod, proc } = await recorded({ 331: {} });
+  proc.listError = "EIO";
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+});
+
+test("F01 불완전한 마지막 관측: 스캔이 끝날 때의 공간 확인이 실패하면 전체 신호를 보내지 않는다", async () => {
+  const { pod, proc } = await recorded({ 332: {} });
+  const namespace = proc.namespace.bind(proc);
+  let reads = 0;
+  // 스캔 시작의 확인까지는 통과하고, 목록을 다 읽은 뒤의 확인에서 실패한다.
+  proc.pids = async () => {
+    reads++;
+    proc.namespace = async () => {
+      throw Object.assign(new Error("ns"), { code: "EACCES" });
+    };
+    return [...proc.processes.keys()];
+  };
+  await pod.terminate();
+  proc.namespace = namespace;
+  expect(reads).toBeGreaterThan(0);
+  expect(proc.signals).toEqual([]);
+});
+
+test("F01 불완전한 마지막 관측: 리더가 Z인 항목의 스레드를 읽지 못하면 전체 신호를 보내지 않는다", async () => {
+  const { pod, proc } = await recorded({ 333: { state: "Z", threadsError: "EIO" } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+});
+
+test("F01 합류 의심: PPid 0을 다시 읽지 못한 것을 합류 아님으로 바꾸지 않는다", async () => {
+  const { pod, proc } = await recorded({ 334: { ppid: 0, statusReads: [null, "EIO"] } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+});
+
+test("F01 합류 의심: 리더가 Z여도 산 스레드가 있는 합류자는 합류자다", async () => {
+  const { pod, proc } = await recorded({ 335: { state: "Z", ppid: 0, threads: { 335: "Z", 336: "S" } } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+  expect(await pod.survivors()).toBeNull();
+});
+
+test("F01 래치: 신호 직전 스캔을 기다리는 사이 다른 계수가 합류자를 봤으면 전체 신호를 보내지 않는다", async () => {
+  const { pod, proc } = await recorded({ 337: {} });
+  const list = proc.pids.bind(proc);
+  let first = true;
+  proc.pids = async () => {
+    if (first) {
+      first = false;
+      // 신호 직전 스캔이 목록을 읽는 사이 다른 계수가 합류자를 보고 래치를 세운다. 합류자는 그 뒤 사라져 이 스캔에는 보이지 않는다.
+      proc.processes.set(338, { ppid: 0 });
+      expect(await pod.survivors()).toBeNull();
+      proc.processes.delete(338);
+    }
+    return list();
+  };
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+});
+
+test("F01 대조군: 단순한 PID 소멸 경합은 전체 신호를 막지 않는다", async () => {
+  const vanished = await recorded({ 340: { statusError: "ESRCH" } });
+  await vanished.pod.terminate();
+  expect(vanished.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+  // PPid 0으로 보였다가 다시 읽을 때 사라졌다.
+  const exited = await recorded({ 341: { ppid: 0, statusReads: [null, "ENOENT"] } });
+  await exited.pod.terminate();
+  expect(exited.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+  // 리더가 Z인 항목의 스레드 목록이 읽는 사이 사라졌다.
+  const leader = await recorded({ 342: { state: "Z", threadsError: "ENOENT" } });
+  await leader.pod.terminate();
+  expect(leader.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+});

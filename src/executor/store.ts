@@ -6,7 +6,7 @@
 //   outbox/<id>.json      보낸 영수증·보고의 본문과 그 사건의 최초 순번. 같은 id와 같은 본문으로 다시 보낸다
 //   nonces/<hash>         쓴 nonce 하나가 빈 파일 하나다
 //   ledger-hold           설명할 수 없는 장부의 표식. 운영자가 장부를 대조하고 이 파일을 지울 때까지 접수를 열지 않는다
-//   runs/probe, nonces/probe-*  실패했던 연산이 회복됐는지 그 연산으로 다시 해 보는 빈 기록
+//   nonces/probe-*        nonce 배타 생성이 회복됐는지 그 연산으로 다시 해 보는 빈 기록
 //
 // 쓰기는 한 줄로 차례로 한다(아래 serial). 상태 파일은 임시 파일에 쓰고 fsync한 뒤 rename하고 폴더도 fsync한다.
 // nonce 기록의 보장 범위는 "프로세스·파드 재시작 뒤에도 재사용 거부"까지다. fsync하지 않는다. 페이지 캐시를 잃는 노드 정전은
@@ -21,6 +21,12 @@
 // 저장 장애: 파일에 적지 못한 사실은 메모리에 두고 flush가 같은 순서로 다시 적는다. 장애는 실패한 연산별로 기억하고,
 // 그 연산을 실제로 다시 해 본 뒤에만 푼다(루트의 다른 파일이 써진다고 nonce 배타 생성이 회복된 것은 아니다).
 // nonce 기록의 실패(이미 있음 밖의 오류)도 장애다. 그 봉투는 replayed로 거절되지만(계약의 반환은 참·거짓뿐이다) 실행기는 장애로 안다.
+//
+// 보류 판정: 장부를 설명하지 못한다는 판정은 파일(ledger-hold)에 남긴 다음에만 장부를 바꾼다. 원인을 지울 수 있는 쓰기(정지 세대, 상태 보정)가
+// 판정보다 먼저 디스크에 닿으면 다음 기동이 멀쩡한 장부로 보기 때문이다. 판정을 적지 못하면 열기를 실패시키거나, 실행 중이면 쓰기를 멈춘다.
+//
+// 유효한 상태: 실행의 상태는 같은 실행·세대의 본문까지 검증된 사건이 그 상태의 전제(REQUIRED_EVENTS)를 모두 설명할 때만 인정한다.
+// 설명하지 못하는 실행은 상태·사건·정리 승인을 함께 보류한다. 사건을 읽는 쪽은 모두 validEvents 한 자리만 본다.
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, mkdir, open, readdir, readFile, rename, rm, utimes } from "node:fs/promises";
@@ -67,6 +73,20 @@ export interface RunRecord {
 export type OutboxAction = "receipt_accepted" | "receipt_started" | "receipt_stopped" | "receipt_cleaned" | "report_result";
 const OUTBOX_ACTIONS: readonly OutboxAction[] = ["receipt_accepted", "receipt_started", "receipt_stopped", "receipt_cleaned", "report_result"];
 const RECEIPT_ACTIONS: readonly OutboxAction[] = ["receipt_accepted", "receipt_started", "receipt_stopped", "receipt_cleaned"];
+
+// 상태마다 그 상태가 전제하는 사건. 끝을 맺지 않은 상태는 아무 사실도 말하지 않으므로 전제가 없다.
+const REQUIRED_EVENTS: Readonly<Record<StoredRunState, readonly OutboxAction[]>> = {
+  preparing: [],
+  running: [],
+  stopping: [],
+  checking: [],
+  unknown_running: [],
+  not_started: ["receipt_stopped"],
+  failed_stopped: ["receipt_stopped"],
+  cleanup_pending: ["receipt_stopped"],
+  ready_result: ["receipt_stopped", "report_result"],
+  finalized: ["receipt_stopped", "receipt_cleaned"],
+};
 
 export interface OutboxEntry {
   // receipt_id 또는 report_id
@@ -282,8 +302,12 @@ export class ExecutorStore implements NonceStore {
   // 사건이나 실행 기록을 적지 못한 실행. flush가 다시 적는다.
   private readonly pendingRuns = new Set<string>();
   private readonly faults = new Set<StoreFault>();
+  // 적지 못한 최초 실행 기록(경로 → 내용). 그 경로에 그 내용을 실제로 다시 써 본 뒤에야 "runs" 장애가 풀린다.
+  private readonly failedBegins = new Map<string, string>();
   private nonceFaultListener: (() => void) | undefined;
   private inconsistent: StoreInconsistency | null = null;
+  // 파일에 적힌 보류 사유. inconsistent와 다르면 아직 지속되지 않은 판정이 있다.
+  private holdOnDisk: StoreInconsistency | null = null;
   // 설명하지 못해 보내지도, 복구 증거로 쓰지도 않는 사건과 실행.
   private readonly suspectEvents = new Set<string>();
   private readonly suspectRuns = new Set<string>();
@@ -398,7 +422,15 @@ export class ExecutorStore implements NonceStore {
       store.inconsistent = "over_capacity";
     }
     if (store.ledgerHeld()) for (const id of store.events.keys()) store.suspectEvents.add(id);
-    if (store.inconsistent !== null && held === null) await ExecutorStore.writeHold(dir, io, store.inconsistent).catch(() => {});
+    // 첫 판정과 더 강한 사유로의 승격은 지속시킨 뒤에만 연다. 적지 못하면 진단 자료를 그대로 두고 열기를 실패시킨다.
+    if (store.inconsistent !== null && store.inconsistent !== held) {
+      try {
+        await ExecutorStore.writeHold(dir, io, store.inconsistent);
+      } catch {
+        throw new StoreError("store_unavailable");
+      }
+    }
+    store.holdOnDisk = store.inconsistent;
     return store;
   }
 
@@ -475,21 +507,57 @@ export class ExecutorStore implements NonceStore {
     return this.inconsistent !== null && WHOLE_LEDGER.includes(this.inconsistent);
   }
 
-  // 실행기가 열 때 outbox 본문의 계약 모양을 대조하고 맞지 않으면 알린다. 그 사건은 보내지 않고, 판정은 다음 기동에도 남긴다.
+  // 실행기가 outbox 본문의 계약 모양을 대조하고 맞지 않으면 알린다. 그 사건의 실행은 함께 보류하고, 판정은 다음 기동에도 남긴다.
   markInconsistent(reason: StoreInconsistency, eventId?: string): void {
-    if (eventId !== undefined) this.suspectEvents.add(eventId);
+    if (eventId !== undefined) {
+      this.suspectEvents.add(eventId);
+      const runId = this.events.get(eventId)?.entry.run_id;
+      if (runId !== undefined) this.suspectRuns.add(runId);
+    }
     if (this.inconsistent !== null) return;
     this.inconsistent = reason;
-    void this.serial(() => ExecutorStore.writeHold(this.dir, this.io, reason)).catch(() => {});
+    void this.serial(() => this.persistHold());
   }
 
+  // 판정을 파일에 남긴다. 적지 못하면 false이고, 부르는 쪽은 장부를 바꾸지 않는다(다음 flush가 다시 적어 본다).
+  private async persistHold(): Promise<boolean> {
+    const reason = this.inconsistent;
+    if (reason === null || reason === this.holdOnDisk) return true;
+    try {
+      await ExecutorStore.writeHold(this.dir, this.io, reason);
+    } catch {
+      return false;
+    }
+    this.holdOnDisk = reason;
+    return true;
+  }
+
+  // 실행마다 상태의 전제를 검증된 사건으로 대조해, 설명하지 못하는 실행을 보류한다. 실행기가 본문 대조를 마친 뒤 한 번 부른다.
+  auditRuns(): void {
+    for (const record of this.runMap.values()) {
+      if (this.explains(record)) continue;
+      this.suspectRuns.add(record.run_id);
+      this.markInconsistent("receipt_missing");
+    }
+  }
+
+  // 그 실행의 사건이 모두 검증됐고, 상태가 전제한 사건이 있고, 마지막 영수증 포인터가 그 사건 가운데 하나를 가리키는지.
+  private explains(record: RunRecord): boolean {
+    const own = [...this.events.values()].map((event) => event.entry).filter((entry) => entry.run_id === record.run_id);
+    if (own.some((entry) => this.suspectEvents.has(entry.id) || entry.run_generation !== record.run_generation)) return false;
+    if (!REQUIRED_EVENTS[record.state].every((action) => own.some((entry) => entry.action === action))) return false;
+    const last = record.last_receipt_id;
+    return last === null || own.some((entry) => entry.id === last && RECEIPT_ACTIONS.includes(entry.action));
+  }
+
+  // 장부가 설명하지 못해 상태·사건·정리 승인을 함께 보류한 실행.
   suspectRun(runId: string): boolean {
     return this.suspectRuns.has(runId);
   }
 
   // 적지 못한 것이 남았거나 실패한 연산이 아직 회복되지 않았으면 false다. 적는 중인 사건은 장애가 아니다.
   healthy(): boolean {
-    return this.faults.size === 0 && this.pendingRuns.size === 0;
+    return this.faults.size === 0 && this.pendingRuns.size === 0 && this.inconsistent === this.holdOnDisk;
   }
 
   // nonce 기록이 로컬에서 실패한 순간 알린다(거절된 봉투의 내용은 넘기지 않는다).
@@ -501,6 +569,7 @@ export class ExecutorStore implements NonceStore {
   // 새로 적은 사건을 순번 차례로 돌려준다(부르는 쪽이 받아서 보낸다).
   flush(): Promise<OutboxEntry[]> {
     return this.serial(async () => {
+      if (!(await this.persistHold())) return [];
       const written: StoredEvent[] = [];
       for (const runId of new Set([...this.pendingRuns, ...[...this.unsaved.values()].map((event) => event.entry.run_id)])) {
         for (const entry of (await this.drain(runId)).written) written.push(this.events.get(entry.id)!);
@@ -517,7 +586,12 @@ export class ExecutorStore implements NonceStore {
         await this.io.createMarker(path);
         await rm(path, { force: true }).catch(() => {});
       } else {
-        await this.io.writeDurable(join(this.dir, "runs", "probe"), "");
+        // 실패한 그 경로에 그 내용을 다시 써 본다. 접수하지 않은 실행의 기록이 남지 않게 바로 지운다.
+        for (const [path, data] of this.failedBegins) {
+          await this.io.writeDurable(path, data);
+          await rm(path, { force: true });
+          this.failedBegins.delete(path);
+        }
       }
       return true;
     } catch {
@@ -546,6 +620,7 @@ export class ExecutorStore implements NonceStore {
     return this.serial(async () => {
       const onFile = this.durable;
       if (onFile !== null && onFile >= generation) return { saved: true, current: this.fence ?? onFile };
+      if (!(await this.persistHold())) return { saved: false, current: this.fence ?? generation };
       try {
         await this.io.writeDurable(join(this.dir, "stop-generation.json"), JSON.stringify({ stop_generation: generation }));
       } catch {
@@ -637,9 +712,12 @@ export class ExecutorStore implements NonceStore {
   beginRun(record: RunRecord): Promise<boolean> {
     return this.serial(async () => {
       if (this.runMap.has(record.run_id)) return false;
+      const path = join(this.dir, "runs", `${record.run_id}.json`);
+      const data = JSON.stringify(record);
       try {
-        await this.io.writeDurable(join(this.dir, "runs", `${record.run_id}.json`), JSON.stringify(record));
+        await this.io.writeDurable(path, data);
       } catch {
+        this.failedBegins.set(path, data);
         this.faults.add("runs");
         return false;
       }
@@ -669,6 +747,10 @@ export class ExecutorStore implements NonceStore {
   // 앞 사건부터 차례로 적는다. 하나라도 실패하면 뒤 사건과 실행 기록을 적지 않고 flush에 맡긴다.
   private async drain(runId: string): Promise<Committed> {
     const written: OutboxEntry[] = [];
+    if (!(await this.persistHold())) {
+      this.pendingRuns.add(runId);
+      return { saved: false, written };
+    }
     try {
       for (;;) {
         const next = [...this.unsaved.values()].filter((event) => event.entry.run_id === runId).sort((a, b) => a.seq - b.seq)[0];
@@ -700,7 +782,18 @@ export class ExecutorStore implements NonceStore {
 
   // ---- 보낸 영수증·보고 ----
 
-  // 아래 셋은 적지 못한 항목도 돌려준다(같은 사실의 영수증을 새로 만들지 않으려고 대조할 때 쓴다). 보낼지는 sendable로 가른다.
+  // 실행 하나의 유효한 사건(순번 차례): 보류하지 않은 실행의, 같은 세대의, 본문까지 검증된 사건이다. 쓰는 중인 사건도 들어 있다
+  // (같은 사실의 영수증을 새로 만들지 않으려고 대조한다). 복원, 재계수 뒤의 중복 검사, 재전송, 정리 승인이 모두 이 목록만 읽는다.
+  validEvents(runId: string): OutboxEntry[] {
+    const generation = this.runMap.get(runId)?.run_generation;
+    if (generation === undefined || this.suspectRuns.has(runId)) return [];
+    return [...this.events.values(), ...this.unsaved.values()]
+      .filter((event) => event.entry.run_id === runId && event.entry.run_generation === generation && !this.suspectEvents.has(event.entry.id))
+      .sort((a, b) => a.seq - b.seq)
+      .map((event) => structuredClone(event.entry));
+  }
+
+  // 아래 셋은 걸러 내지 않은 원본이다. 저장소의 대조와 시험만 쓴다(실행기의 판단은 validEvents로 한다).
   outbox(id: string): OutboxEntry | undefined {
     const event = this.events.get(id) ?? this.unsaved.get(id);
     return event === undefined ? undefined : structuredClone(event.entry);
@@ -726,20 +819,15 @@ export class ExecutorStore implements NonceStore {
     return this.events.has(id);
   }
 
-  // 보내도 되는 사건: 파일에 적혔고 장부가 설명하는 것.
+  // 보내도 되는 사건: 파일에 적혔고 장부가 설명하는 것. 보류한 실행의 사건은 보내지 않는다.
   sendable(id: string): boolean {
-    return this.events.has(id) && !this.suspectEvents.has(id);
+    const event = this.events.get(id);
+    return event !== undefined && !this.suspectEvents.has(id) && !this.suspectRuns.has(event.entry.run_id);
   }
 
-  // 복구의 증거로 쓸 수 있는 사건: 파일에 적혔고, 장부가 설명하며, 그 실행·세대의 것.
-  evidence(runId: string, runGeneration: number): OutboxEntry[] {
-    if (this.suspectRuns.has(runId)) return [];
-    return this.outboxAll().filter((entry) => entry.run_id === runId && entry.run_generation === runGeneration && !this.suspectEvents.has(entry.id));
-  }
-
-  // 다시 보낼 것: 파일에 적혔고, 장부가 설명하며, 받음 확인이 없는 것(순번 차례).
+  // 다시 보낼 것: 보내도 되는 사건 가운데 받음 확인이 없는 것(순번 차례).
   unacked(): OutboxEntry[] {
-    return this.outboxAll().filter((entry) => !entry.acked && !this.suspectEvents.has(entry.id));
+    return this.outboxAll().filter((entry) => !entry.acked && this.sendable(entry.id));
   }
 
   // 사건 하나만 적고 마지막 영수증 포인터는 움직이지 않는다. 적지 못하면 false이고 flush가 다시 적는다.
@@ -754,6 +842,7 @@ export class ExecutorStore implements NonceStore {
     const changed = ids.map((id) => this.events.get(id)).filter((event): event is StoredEvent => event !== undefined && !event.entry.acked);
     for (const event of changed) event.entry.acked = true;
     return this.serial(async () => {
+      if (!(await this.persistHold())) return false;
       let ok = true;
       for (const event of changed) {
         try {

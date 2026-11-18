@@ -102,6 +102,9 @@ test("정적: 새 종료 확인 영수증을 만드는 곳은 남은 수 0을 �
   expect(worker.slice(count, issue)).toContain("if (survivors !== 0)");
   // worker는 저장소의 낮은 쓰기 함수를 직접 부르지 않는다.
   expect(/\bstore\.(noteRun|addOutbox)\(/.test(worker)).toBe(false);
+  // 사건을 판단에 쓰는 자리는 validEvents 하나다. 걸러 낸 사건을 다시 읽는 원본 조회를 쓰지 않는다.
+  expect(/\bstore\.(outboxFor|outbox)\(/.test(worker)).toBe(false);
+  expect(worker).toContain("store.validEvents(");
 });
 
 test("정적: 실행기 코드는 소켓·듣는 API를 쓰지 않는다(U3a는 실제 연결 없이 돈다)", async () => {

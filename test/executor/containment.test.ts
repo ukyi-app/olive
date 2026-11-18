@@ -288,10 +288,10 @@ if (problem !== null) {
       if (name === "termignore") expect(result.elapsedMs).toBeGreaterThanOrEqual(result.graceMs);
       // 독립 계수기가 리더만 끝나고 스레드가 도는 프로세스를 실제로 보았다.
       if (name === "zombieleader") expect(result.before.zombieLeaders, "리더만 끝난 상태를 만들지 못했다").toBeGreaterThan(0);
-      // TERM을 받은 뒤에 새 후손이 실제로 생겼고(증인 파일), 그래서 유예를 다 쓰고 KILL로 끝났다.
+      // TERM을 받은 뒤에 새 후손이 실제로 돌기 시작했고(그 후손이 직접 적은 증인 파일), 그래서 유예를 다 쓰고 KILL로 끝났다.
       if (name === "latespawn") {
         expect(result.attestBefore, "TERM 전에는 새 후손이 없어야 한다").toBe("");
-        expect(result.attestAfter, "TERM 처리 중 새 후손을 띄우지 못했다").toContain("spawned");
+        expect(result.attestAfter, "TERM 처리 중 새 후손이 실행되지 않았다").toContain("spawned");
         expect(result.elapsedMs).toBeGreaterThanOrEqual(result.graceMs);
       }
       // 프로세스 자신이 prctl의 성공과 읽어 본 값을 증인 파일에 적었다.
@@ -318,8 +318,10 @@ if (problem !== null) {
       expect(childPid).toBeGreaterThan(0);
       // 합류한 프로세스는 공간의 init이 끝나면 커널이 함께 끝낸다. 여기서는 신호를 보내지 않는다.
       const joiner = spawn(NSENTER, ["-t", String(childPid), "-U", "-p", "--preserve-credentials", "--", "/usr/bin/sleep", "20"], { stdio: "ignore" });
+      // 공간이 끝나면 두 자식이 비슷한 때에 닫힌다. 지나간 이벤트를 기다리지 않게 띄운 직후에 받아 둔다.
+      const joinerClosed = new Promise((resolve) => joiner.once("close", resolve));
       const code = await finished;
-      await new Promise((resolve) => joiner.once("close", resolve));
+      await joinerClosed;
       expect(code, stdout).toBe(0);
       const result = JSON.parse(stdout) as { joined: number; before: Counted; after: Counted; survivors: number | null };
       expect(result.joined, "합류한 프로세스를 보지 못했다").toBeGreaterThan(0);

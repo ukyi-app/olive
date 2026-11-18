@@ -12,6 +12,8 @@ export interface FakeProcess {
   survivesTerm?: boolean;
   survivesKill?: boolean;
   statusError?: string;
+  // status를 읽을 때마다 앞에서 하나씩 꺼내 쓴다. 오류 코드면 그 읽기가 실패하고, null이면 정상으로 읽는다.
+  statusReads?: (string | null)[];
   threadsError?: string;
 }
 
@@ -36,6 +38,8 @@ export class FakeProc implements ProcReader {
   async status(pid: number) {
     const entry = this.processes.get(pid);
     if (!entry) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    const scripted = entry.statusReads?.shift();
+    if (scripted) throw Object.assign(new Error("read"), { code: scripted });
     if (entry.statusError) throw Object.assign(new Error("read"), { code: entry.statusError });
     const ppid = entry.ppidReads?.shift() ?? entry.ppid ?? 1;
     return `Name:\tx\nState:\t${entry.state ?? "S"} (x)\nPPid:\t${ppid}\nNSpid:\t${(entry.nspid ?? [pid]).join("\t")}\n`;

@@ -130,6 +130,8 @@ test("R02 재시작: 지우는 중에 꺼져도 디스크가 슬롯을 쥐어 �
   void r.connection.receive(envelope);
   await deleting.entered;
   expect(onDiskRun(r.dir, runId).state).toBe("cleanup_pending");
+  // 첫 기동이 정한 예약 ID. 재시작 뒤의 영수증은 이 값과 같아야 한다.
+  const reserved = (onDiskRun(r.dir, runId) as unknown as { cleanup: { receipt_id: string } }).cleanup.receipt_id;
 
   const again = await make({ dir: r.dir, clock: r.clock });
   await again.worker.recover();
@@ -142,7 +144,8 @@ test("R02 재시작: 지우는 중에 꺼져도 디스크가 슬롯을 쥐어 �
   expect(again.space.cleaned).toEqual([runId]);
   expect(again.store.run(runId)?.state).toBe("finalized");
   const intent = (onDiskRun(again.dir, runId) as unknown as { cleanup: { receipt_id: string } }).cleanup;
-  expect(idsOf(again, runId, "receipt_cleaned")).toEqual([intent.receipt_id]);
+  expect(intent.receipt_id).toBe(reserved);
+  expect(idsOf(again, runId, "receipt_cleaned")).toEqual([reserved]);
 });
 
 test("R02 재시작: 정리 영수증을 적은 뒤 finalized를 적기 전에 꺼지면 다시 지우지 않고 같은 ID로 맺는다", async () => {
@@ -334,9 +337,11 @@ test("R05 ID 유실: 같은 폴더를 두 번 열어도 접수가 닫혀 있고,
   expect(second.launcher.spawned).toBe(0);
 });
 
-test("R05 서명 불가 항목: 다시 서명할 수 없는 사건 하나를 빼고 뒤의 정상 사건은 첫 연결에서 다시 보낸다", async () => {
+test("R05 서명 불가 항목: 그 사건의 실행은 통째로 보류하고, 다른 실행의 정상 사건은 첫 연결에서 다시 보낸다", async () => {
   const r = await make();
   const { runId } = await start(r);
+  await r.worker.idle();
+  await start(r);
   await r.worker.idle();
   const stopped = onDiskEvents(r.dir, runId).find((e) => e.action === "receipt_stopped")!;
   const path = join(r.dir, "outbox", `${stopped.id}.json`);
@@ -349,7 +354,8 @@ test("R05 서명 불가 항목: 다시 서명할 수 없는 사건 하나를 빼
   const sent = again.transport.sent.filter((e) => e.header.action.startsWith("receipt_") || e.header.action === "report_result");
   const sentIds = sent.map((e) => (e.body as { receipt_id?: string; report_id?: string }).receipt_id ?? (e.body as { report_id: string }).report_id);
   expect(sentIds).not.toContain(stopped.id);
-  expect(sent.map((e) => e.header.action)).toEqual(["receipt_accepted", "receipt_started", "report_result"]);
+  expect(sent.filter((e) => (e.body as { run_id?: string }).run_id === runId)).toEqual([]);
+  expect(sent.map((e) => e.header.action)).toEqual(["receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
   expect(again.transport.of("hello")[0]!.body.unacked_ids).not.toContain(stopped.id);
 });
 

@@ -12,7 +12,8 @@
 //   맞춘 연결마다 다른 수(epoch)를 실행기에 넘겨, 앞 연결에서 받은 지시의 효과가 새 연결 위에서 나지 않게 한다(worker.ts).
 // - 한 challenge에는 유효한 답 하나만 쓴다. 검증에서 돌아온 답이 대기값을 차지하고(adopting), 세대를 적는 동안은 다른 답과
 //   일반 지시를 처리하지 않는다. 검증에서 돌아온 시점에도 대기값·연결·기한을 다시 보고, 경과는 0 이상 25초 미만이어야 한다.
-// - 대기값을 차지한 뒤의 만료는 따로 잰다. 세대 저장이 상한 안에 끝나지 않으면 연결을 닫고 저장 장애로 드러내며, 늦은 완료는 연결을 열지 못한다.
+// - 대기값을 차지한 뒤의 만료는 따로 잰다. 세대 저장이 상한 안에 끝나지 않으면 연결을 닫고 저장 장애로 드러내며, 상한을 넘겨 끝난 저장은
+//   그 완료 시점에 tick과 무관하게 닫는다(늦은 완료는 연결을 열지 못한다).
 // - 맞춘 세대는 같은 값이어도 파일에 적힌 뒤에만 연결을 연다(앞서 저장에 실패해 메모리만 올라간 세대를 여기서 디스크에 맞춘다).
 // - 맞춘 연결에서 서명이 맞는 세대 불일치가 오면 연결을 닫는다. 다시 맞추는 것은 새 연결에서다.
 // - 장부 전체를 설명할 수 없으면 세대만 적고 hello 없이 닫는다. 완전한 목록인 것처럼 인사하지 않는다.
@@ -178,6 +179,9 @@ export class Connection {
       this.adoptingSince = this.now();
       const saved = await worker.syncTo(result.header.stop_generation);
       if (!this.link.isCurrent(this) || this.state !== "adopting") return;
+      // 저장이 상한을 넘겨 끝났으면 tick이 보기 전이어도 그 사실만으로 닫는다.
+      this.expireIfDue();
+      if (this.state !== "adopting") return;
       this.adoptingSince = null;
       // 적지 못했으면 이 연결로는 일하지 않는다. 다시 맞추는 것은 새 연결에서다.
       if (!saved || worker.helloWithheld()) return this.close();

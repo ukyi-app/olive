@@ -15,7 +15,9 @@ const PYTHON = "/usr/bin/python3";
 const GRACE_MS = 300;
 // 번호를 옮겨 다니는 자식은 /proc 검사로 셀 수 없다. 자식이 이 파일을 늘리는지로 살아 있음을 따로 본다.
 const WITNESS = join(mkdtempSync(join(tmpdir(), "olive-witness-")), "witness");
-const ENV = { PATH: "/usr/bin:/bin", WITNESS };
+// latespawn의 새 후손이 실행할 명령. 부모가 아니라 새 후손 자신이 증인 파일에 적어 실제로 돌기 시작했음을 증언한다.
+const LATE_CHILD = 'echo spawned >> "$WITNESS"; exec sleep 300';
+const ENV = { PATH: "/usr/bin:/bin", WITNESS, LATE_CHILD };
 const sh = (script: string): LaunchPlan => ({ program: "/bin/sh", argv: ["-c", script], cwd: "/", env: ENV });
 const role = (mode: string): LaunchPlan => ({ program: process.execPath, argv: [FAKE_ROLE, mode], cwd: "/", env: ENV });
 
@@ -31,9 +33,9 @@ export const SCENARIOS: Readonly<Record<string, { plan: LaunchPlan; hang?: boole
   // 부모가 끝나도 stdout을 쥐고 있는 자식.
   stdoutholder: { plan: sh("sleep 300 & sleep 0.1") },
   forkrace: { plan: sh(`setsid sh -c 'while :; do sleep 0.05 & sleep 0.01; done' >/dev/null 2>&1 & sleep 0.1`) },
-  // TERM을 받으면 정리 도중에 새 세션 자식을 띄운다. 띄운 순간을 증인 파일에 적는다.
+  // TERM을 받으면 정리 도중에 새 세션 자식을 띄운다. 새 자식이 시작한 뒤 스스로 증인 파일에 적는다.
   latespawn: {
-    plan: sh(`setsid sh -c 'trap "setsid sleep 300 >/dev/null 2>&1 & echo spawned >> \\"\\$WITNESS\\"" TERM; while :; do sleep 0.02; done' >/dev/null 2>&1 & sleep 0.1`),
+    plan: sh(`setsid sh -c 'trap "setsid sh -c \\"\\$LATE_CHILD\\" >/dev/null 2>&1 &" TERM; while :; do sleep 0.02; done' >/dev/null 2>&1 & sleep 0.1`),
     attest: true,
   },
   // ptrace 검사로 environ을 읽을 수 없는 자식. 세는 쪽은 status를 읽는다. 속성 설정이 실제로 성공했을 때만 증인 파일에 적는다.

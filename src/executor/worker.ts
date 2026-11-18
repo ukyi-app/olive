@@ -6,12 +6,15 @@
 // - 권한이 필요한 효과(폴더 준비, 자격 요청, spawn, 임대 연장, 폴더 지우기, 새 요청에 내는 영수증)는 그 직전에 다시 본다.
 //   무엇을 다시 보는지는 효과마다 다르다: launchBlocked(준비·자격·spawn), authorized(임대 연장, 지우기, 새 요청의 영수증).
 // - 띄우기 직전 확인과 spawn 사이에 await가 없다.
-// - 닫는 쪽 효과(프로세스 정리, 연결 닫기)는 저장을 기다리지 않는다. 여는 쪽 효과(접수, 자격, spawn, 임대 연장, 일반 송신)는
-//   실제로 실패한 그 연산이 회복된 뒤에만 열린다.
+// - 닫는 쪽 효과(프로세스 정리, 연결 닫기)는 저장을 기다리지 않는다. 검증된 취소와 복원이 정리를 요구하면 기록보다 먼저 시작한다.
+//   여는 쪽 효과(접수, 자격, spawn, 임대 연장, 일반 송신)는 실제로 실패한 그 연산이 회복된 뒤에만 열린다.
+// - 장부가 설명하지 못하는 실행(store.validEvents가 비어 있는 실행)은 슬롯을 쥔 채 상태·사건·정리 승인을 함께 보류한다.
+//   프로세스를 끝내고 세는 일은 계속하되 그 결과로 아무 사실도 새로 맺지 않는다.
 // - 자격은 받은 바이트의 SHA-256이 지시의 digest와 같을 때만 프로필의 이름 하나에 넣는다. 결과에 그 값이 그대로 있으면 결과를 버린다.
 // - 종료 확인 영수증(receipt_stopped)은 남은 프로세스 0개를 확인한 뒤에만 낸다. 아니면 unknown_running으로 두고 슬롯을 놓지 않는다.
 // - 상태와 사건은 store.commit 한 자리로만 남긴다. 적은 사건만 보낸다. 접수 영수증이 남기 전에는 자격을 받지도 띄우지도 않는다.
-// - 아는 실행 ID의 시작 지시는 새 실행을 열지 않고 같은 영수증을 다시 보낸다. 결과가 없다는 이유로 다시 띄우지 않는다.
+// - 아는 실행 ID의 시작 지시는 새 실행을 열지 않는다. 처음 접수한 지시와 본문이 같을 때만 같은 영수증을 다시 보낸다.
+//   결과가 없다는 이유로 다시 띄우지 않는다.
 import { type KeyObject, randomBytes, randomUUID } from "node:crypto";
 import {
   type Action,
@@ -153,6 +156,8 @@ export class WorkerExecutor {
   private heldSends = false;
   // 지우는 중인 실행. 첫 await 전에 넣어 슬롯을 쥐고, 같은 실행의 확정은 진행 중인 작업에 합류한다.
   private readonly cleaning = new Map<string, Promise<void>>();
+  // 끝을 확인하지 못해 다시 끝내고 세는 중인 실행. 같은 실행의 정리가 겹치지 않는다.
+  private readonly reclaiming = new Map<string, Promise<void>>();
   private readonly lastSent = new Map<string, number>();
   private readonly now: () => number;
   private readonly launcher: Launcher;
@@ -171,6 +176,8 @@ export class WorkerExecutor {
         options.store.markInconsistent("outbox_body", entry.id);
       }
     }
+    // 본문까지 검증된 사건으로 실행마다 상태의 전제를 대조한다.
+    options.store.auditRuns();
     options.store.onNonceFault(() => this.onNonceFault());
   }
 
@@ -240,11 +247,12 @@ export class WorkerExecutor {
 
   // nonce 기록의 로컬 장애. 거절된 봉투의 내용은 모른다. 그것이 비상 종료였을 수 있으므로 이 연결의 새 권한을 끊고,
   // 진행 중인 준비·자격 요청을 거두고, 실행 중인 작업의 안전한 종료를 시작한다(갱신도 nonce를 못 써 어차피 임대로 끝날 실행이다).
+  // 이미 끝난 것을 본 프로그램의 종료와 결과는 그대로 둔다. 끝내는 것은 아직 도는 작업뿐이다.
   private onNonceFault(): void {
     this.outlet.dropCurrent();
     const active = this.active;
     if (active === undefined) return;
-    active.cause ??= "failed";
+    if (active.exitedAt === null) active.cause ??= "failed";
     active.controller.abort();
   }
 
@@ -268,7 +276,7 @@ export class WorkerExecutor {
         this.stopUnsaved = true;
         this.outlet.drop(epoch);
       }
-      if (verified.action === "task_cancel") return this.onCancel(verified.header, verified.body);
+      if (verified.action === "task_cancel") return this.onCancel(verified.header, verified.body, epoch);
       return;
     }
     switch (verified.action) {
@@ -276,7 +284,7 @@ export class WorkerExecutor {
         return this.onStart(verified.header, verified.body, epoch);
       case "task_cancel":
         // 멈추는 효과는 세대가 지난 지시여도 막지 않는다(더 높은 세대의 비상 종료와 같은 쪽의 효과다).
-        return this.onCancel(verified.header, verified.body);
+        return this.onCancel(verified.header, verified.body, epoch);
       case "run_renew":
         return this.onRenew(verified.header, verified.body, epoch);
       case "result_finalize":
@@ -306,7 +314,7 @@ export class WorkerExecutor {
   private async onStart(header: Header, body: Bodies["task_start"], epoch: number): Promise<void> {
     const runId = body.run_id;
     if (this.store.run(runId) !== undefined) {
-      this.resendFor(runId);
+      this.resendFor(runId, header.body_digest);
       return;
     }
     if (this.refusesStart(header, body, epoch)) return;
@@ -433,7 +441,7 @@ export class WorkerExecutor {
     // 다른 실행이 정리 중이거나 정리를 남겼다(정리 실패가 접수 뒤에 일어난 경우).
     if (this.cleaning.size > 0 || this.store.runs().some((run) => run.run_id !== runId && HOLDS_SLOT.includes(run.state))) return "failed";
     // 첫 영수증(접수)이 파일에 남았다.
-    if (!this.store.outboxFor(runId).some((entry) => entry.action === "receipt_accepted" && this.store.persisted(entry.id))) return "failed";
+    if (!this.store.validEvents(runId).some((entry) => entry.action === "receipt_accepted" && this.store.persisted(entry.id))) return "failed";
     return null;
   }
 
@@ -450,20 +458,24 @@ export class WorkerExecutor {
   // 정리는 저장을 기다리지 않는다: 상태 기록은 줄에 넣어 두고 정리를 먼저 시작하며, 확인한 사실의 기록과 전송은 그 뒤에 온다.
   // 세는 쪽이 끝나지 않으면 상한에서 unknown_running으로 둔다(0을 만들어 내지 않는다).
   // 종료 확인 영수증·결과 보고·최종 상태는 전이 하나로 남긴다. 이미 있는 사건은 새로 만들지 않고 같은 ID로 다시 보낸다.
+  // 장부가 설명하지 못하는 실행은 끝내고 세기만 한다. 끝을 맺지 못한 상태는 슬롯을 쥔 미확인으로 두고, 영수증과 완료 상태를 내지 않는다.
   private async confirmStopped(runId: string, exit: ExitKind, launched: boolean, stdout: Uint8Array | null, credential: string | null): Promise<void> {
     const cleanup = this.options.cleanup;
     if (launched) {
-      void this.transition(runId, { state: "stopping", exit });
+      if (!this.store.suspectRun(runId)) void this.transition(runId, { state: "stopping", exit });
       await bounded(cleanup.terminate(), this.exitWaitMs(), undefined);
     }
     const survivors = await bounded(cleanup.survivors(), this.exitWaitMs(), null);
+    if (this.store.suspectRun(runId)) {
+      if (IN_FLIGHT.includes(this.store.run(runId)!.state)) await this.transition(runId, { state: "unknown_running", exit });
+      return;
+    }
     if (survivors !== 0) {
       await this.transition(runId, { state: "unknown_running", exit });
       return;
     }
     void this.transition(runId, { state: "checking", exit });
-    const generation = this.store.run(runId)?.run_generation;
-    const prior = (action: OutboxAction) => this.store.outboxFor(runId).find((entry) => entry.action === action && entry.run_generation === generation);
+    const prior = (action: OutboxAction) => this.store.validEvents(runId).find((entry) => entry.action === action);
     const stopped = prior("receipt_stopped");
     const report = prior("report_result");
     const events: NewEvent[] = [];
@@ -476,6 +488,16 @@ export class WorkerExecutor {
     }
     await this.transition(runId, { state, exit }, events);
     for (const entry of [stopped, report]) if (entry !== undefined) this.transmit(entry);
+  }
+
+  // 끝을 확인하지 못한 실행을 다시 끝내고 센다. 부르는 즉시 정리를 시작하고, 같은 실행의 정리는 하나만 돈다.
+  private reclaim(runId: string, exit: ExitKind): Promise<void> {
+    let work = this.reclaiming.get(runId);
+    if (work === undefined) {
+      work = this.confirmStopped(runId, exit, true, null, null).finally(() => this.reclaiming.delete(runId));
+      this.reclaiming.set(runId, work);
+    }
+    return work;
   }
 
   private exitWaitMs(): number {
@@ -498,32 +520,41 @@ export class WorkerExecutor {
     }
   }
 
-  private async onCancel(header: Header, body: Bodies["task_cancel"]): Promise<void> {
+  private async onCancel(header: Header, body: Bodies["task_cancel"], epoch: number): Promise<void> {
     const runId = body.run_id;
     const record = this.store.run(runId);
     if (record === undefined) return;
     const cause: ExitKind = body.reason === "deadline" ? "deadline" : "cancelled";
-    // 첫 I/O 전에 그 실행의 자격 요청과 spawn을 막는다(접수 영수증을 쓰는 동안 준비가 끝나도 띄우지 않는다).
+    // 닫는 효과는 접수 영수증의 저장과 무관하게 첫 await 전에 시작한다. 진행 중인 실행의 자격 요청과 spawn도 여기서 막힌다.
     const active = this.active?.runId === runId ? this.active : undefined;
     if (active !== undefined) {
       active.cause ??= cause;
       active.controller.abort();
     }
-    // 같은 요청·같은 본문의 재전송이면 같은 영수증, 다른 요청이면 그 요청의 영수증을 새로 낸다(멈추는 효과는 반복해도 같다).
-    // 쓰는 중인 영수증도 조회에 보이므로 같은 요청에 새 ID를 만들지 않는다. 같은 요청 ID에 다른 본문이면 답하지 않는다.
-    const answer = () =>
-      this.store
-        .outboxFor(runId)
-        .find((entry) => entry.action === "receipt_accepted" && entry.body.instruction === "task_cancel" && entry.body.instruction_request_id === header.request_id);
-    const prior = answer();
-    if (prior === undefined) await this.emit("receipt_accepted", runId, { run_id: runId, instruction_request_id: header.request_id, instruction: "task_cancel" }, header.body_digest);
-    else if (this.store.instructionDigest(prior.id) === header.body_digest) this.transmit(prior);
-    if (active !== undefined) return;
     // 끝났다고 확인하지 못한 실행은 다시 끝내고 센다. 0이면 그때 종료 확인 영수증을 낸다.
-    const latest = this.store.run(runId)!;
-    if (latest.state === "unknown_running" && this.active === undefined) return this.confirmStopped(runId, latest.exit ?? cause, true, null, null);
-    const answered = answer();
-    this.resendLatest(runId, answered === undefined ? [] : [answered]);
+    const uncertain = this.active === undefined && (record.state === "unknown_running" || this.store.suspectRun(runId));
+    const reclaiming = uncertain ? this.reclaim(runId, record.exit ?? cause) : undefined;
+    const answered = await this.answerCancel(header, runId, epoch);
+    if (reclaiming !== undefined) return reclaiming;
+    if (active === undefined && answered !== undefined) this.resendLatest(runId, [answered]);
+  }
+
+  // 같은 요청·같은 본문의 재전송이면 같은 영수증을 다시 보내고, 새 요청이면 지금 세대·지금 연결일 때만 그 요청의 영수증을 낸다.
+  // 쓰는 중인 영수증도 조회에 보이므로 같은 요청에 새 ID를 만들지 않는다. 같은 요청 ID에 다른 본문이면 답하지 않는다.
+  private async answerCancel(header: Header, runId: string, epoch: number): Promise<OutboxEntry | undefined> {
+    const find = () =>
+      this.store
+        .validEvents(runId)
+        .find((entry) => entry.action === "receipt_accepted" && entry.body.instruction === "task_cancel" && entry.body.instruction_request_id === header.request_id);
+    const prior = find();
+    if (prior !== undefined) {
+      if (this.store.instructionDigest(prior.id) !== header.body_digest) return undefined;
+      this.transmit(prior);
+      return prior;
+    }
+    if (!this.authorized(header.stop_generation, epoch)) return undefined;
+    await this.emit("receipt_accepted", runId, { run_id: runId, instruction_request_id: header.request_id, instruction: "task_cancel" }, header.body_digest);
+    return find();
   }
 
   // 기한·임대가 이미 지났으면 지금 닫는다. 감시 주기(tick)보다 갱신이 먼저 와도 지난 임대를 늘리지 않는다.
@@ -549,10 +580,10 @@ export class WorkerExecutor {
     if (body.lease_until > record.lease_until) await this.transition(body.run_id, { lease_until: body.lease_until });
   }
 
-  // 새 요청에 답하거나 지우기 전의 확인: 지금 세대·지금 연결이고, 성공 확정이면 digest가 실행기가 보낸 결과와 같다.
+  // 새 요청에 답하거나 지우기 전의 확인: 장부가 설명하는 실행이고, 지금 세대·지금 연결이고, 성공 확정이면 digest가 실행기가 보낸 결과와 같다.
   private mayFinalize(header: Header, body: Bodies["result_finalize"], epoch: number): boolean {
     const record = this.store.run(body.run_id);
-    if (record === undefined || !this.authorized(header.stop_generation, epoch)) return false;
+    if (record === undefined || this.store.suspectRun(body.run_id) || !this.authorized(header.stop_generation, epoch)) return false;
     return body.outcome !== "succeeded" || this.resultMatches(record, body.result_digest);
   }
 
@@ -581,14 +612,16 @@ export class WorkerExecutor {
     } finally {
       this.cleaning.delete(runId);
     }
+    // 먼저 남은 정리 의도의 요청이 이 정리를 맡았으면, 그 사실이 확정된 뒤 이 요청에 따로 답한다.
+    const finished = this.store.run(runId);
+    if (finished?.state === "finalized" && finished.cleanup?.request_id !== header.request_id && this.mayFinalize(header, body, epoch)) await this.answerCleaned(runId, header);
   }
 
   // 정리 의도를 먼저 지속한 뒤 지운다. 디스크에서도 슬롯을 쥐고(cleanup_pending), 재시작하면 정해 둔 영수증 ID로 잇는다.
+  // 끝나지 않은 의도의 요청은 바꾸지 않는다. 후속 요청이 지우기를 이어도 영수증은 처음 요청의 ID로 남는다.
   // 지우기가 끝나지 않으면 슬롯을 쥔 채로 둔다. 삭제의 소유를 확인할 수 없으므로 시간 초과로 놓지 않는다.
   private async clean(runId: string, header: Header, epoch: number): Promise<void> {
-    const prior = this.store.run(runId)?.cleanup;
-    const intent =
-      prior?.request_id === header.request_id ? prior : { request_id: header.request_id, instruction_digest: header.body_digest, receipt_id: randomUUID() };
+    const intent = this.store.run(runId)?.cleanup ?? { request_id: header.request_id, instruction_digest: header.body_digest, receipt_id: randomUUID() };
     const saved = await this.transition(runId, { state: "cleanup_pending", cleanup: intent });
     // 의도를 적는 사이 바뀌었을 수 있다. 여기서 지우기 호출까지 await가 없다.
     if (!saved || !this.authorized(header.stop_generation, epoch)) return;
@@ -606,21 +639,21 @@ export class WorkerExecutor {
 
   // 이미 낸 같은 요청의 정리 영수증이 있으면 true다. 본문까지 같을 때만 같은 사실을 다시 보내고, 같은 요청 ID에 다른 본문이면 답하지 않는다.
   private resendCleaned(runId: string, header: Header): boolean {
-    const answered = this.store.outboxFor(runId).find((entry) => entry.action === "receipt_cleaned" && entry.body.instruction_request_id === header.request_id);
+    const answered = this.store.validEvents(runId).find((entry) => entry.action === "receipt_cleaned" && entry.body.instruction_request_id === header.request_id);
     if (answered === undefined) return false;
     if (this.store.instructionDigest(answered.id) === header.body_digest) this.transmit(answered);
     return true;
   }
 
   private resultMatches(record: RunRecord, digest: string | null): boolean {
-    const report = this.store.evidence(record.run_id, record.run_generation).find((entry) => entry.action === "report_result");
+    const report = this.store.validEvents(record.run_id).find((entry) => entry.action === "report_result" && this.store.persisted(entry.id));
     return report !== undefined && digest !== null && resultDigest(report.body.result as Result) === digest;
   }
 
   // 이미 지운 실행의 새 요청. 같은 정리 사실(cleaned_at)로 그 요청의 영수증을 낸다.
   private async answerCleaned(runId: string, header: Header): Promise<void> {
     if (this.resendCleaned(runId, header)) return;
-    const first = this.store.outboxFor(runId).find((entry) => entry.action === "receipt_cleaned");
+    const first = this.store.validEvents(runId).find((entry) => entry.action === "receipt_cleaned");
     if (first === undefined) return;
     await this.emit("receipt_cleaned", runId, { run_id: runId, instruction_request_id: header.request_id, cleaned_at: first.body.cleaned_at }, header.body_digest);
   }
@@ -659,7 +692,12 @@ export class WorkerExecutor {
   flush(): Promise<boolean> {
     this.flushing ??= (async () => {
       try {
-        this.deliver(await this.store.flush());
+        const written = await this.store.flush();
+        // 장애 중에 보류한 송신이 있으면 회복한 뒤 저장된 차례대로 모두 다시 보낸다(이번에 적은 사건도 그 안에 있다).
+        if (this.heldSends && this.store.healthy()) {
+          this.heldSends = false;
+          this.resendUnacked();
+        } else this.deliver(written);
         return this.store.healthy();
       } finally {
         this.flushing = undefined;
@@ -670,24 +708,32 @@ export class WorkerExecutor {
 
   // ---- 기동 뒤 복원 ----
 
-  // 다시 뜬 뒤, 연결하기 전에 한 번 부른다. 끝을 맺지 못한 모든 상태를 같은 방식으로 대조한다:
-  // 같은 실행·세대의 지속된 사건이 있으면 그 사건으로 최종 상태를 맺고(같은 ID, 같은 본문), 없으면 남은 수를 센다.
-  // 다시 띄우지 않는다(결과가 없어도 새 실행으로 바꾸지 않는다). 장부가 설명하지 못하는 사건은 증거로 쓰지 않는다.
+  // 다시 뜬 뒤, 연결하기 전에 한 번 부른다. 실행마다 대조를 동시에 시작한다: 한 실행의 보정 쓰기가 멈춰도 다른 실행의 정리는 시작된다.
   async recover(): Promise<void> {
     if (this.store.ledgerHeld()) return;
-    for (const record of this.store.runs()) {
-      if (this.store.suspectRun(record.run_id)) continue;
-      const entries = this.store.evidence(record.run_id, record.run_generation);
-      const has = (action: OutboxAction) => entries.some((entry) => entry.action === action);
-      if (has("receipt_cleaned")) {
-        if (record.state !== "finalized") await this.transition(record.run_id, { state: "finalized" });
-      } else if (has("receipt_stopped") && (IN_FLIGHT.includes(record.state) || record.state === "unknown_running")) {
-        const state: StoredRunState = has("report_result") ? "ready_result" : has("receipt_started") ? "failed_stopped" : "not_started";
-        await this.transition(record.run_id, { state });
-      } else if (IN_FLIGHT.includes(record.state)) {
-        await this.confirmStopped(record.run_id, record.exit ?? "failed", true, null, null);
-      }
+    await Promise.all(this.store.runs().map((record) => this.reconcile(record)));
+  }
+
+  // 끝을 맺지 못한 모든 상태를 같은 방식으로 대조한다: 유효한 사건이 있으면 그 사건으로 최종 상태와 마지막 영수증을 맺고(같은 ID, 같은 본문),
+  // 없으면 남은 수를 센다. 다시 띄우지 않는다(결과가 없어도 새 실행으로 바꾸지 않는다).
+  // 시작 영수증이 없어도 띄우지 않았다는 증거는 아니므로, 종료만 확인된 실행은 not_started가 아니라 failed_stopped로 맺는다.
+  private reconcile(record: RunRecord): Promise<unknown> {
+    const runId = record.run_id;
+    const unfinished = IN_FLIGHT.includes(record.state);
+    if (this.store.suspectRun(runId)) return unfinished ? this.reclaim(runId, record.exit ?? "failed") : Promise.resolve();
+    const entries = this.store.validEvents(runId);
+    const has = (action: OutboxAction) => entries.some((entry) => entry.action === action);
+    const patch: Partial<RunRecord> = {};
+    if (has("receipt_cleaned")) {
+      if (record.state !== "finalized") patch.state = "finalized";
+    } else if (has("receipt_stopped") && (unfinished || record.state === "unknown_running")) {
+      patch.state = has("report_result") ? "ready_result" : "failed_stopped";
+    } else if (unfinished) {
+      return this.reclaim(runId, record.exit ?? "failed");
     }
+    const latest = entries.findLast((entry) => entry.action !== "report_result")?.id ?? null;
+    if (latest !== record.last_receipt_id) patch.last_receipt_id = latest;
+    return Object.keys(patch).length > 0 ? this.transition(runId, patch) : Promise.resolve();
   }
 
   // ---- 영수증·보고 ----
@@ -724,10 +770,11 @@ export class WorkerExecutor {
   }
 
   // 같은 본문을 새 봉투에 담아 보낸다(같은 id, 같은 body_digest). 파일에 적었고 장부가 설명하는 것만, 연결이 맞춰져 있을 때만 보낸다.
+  // 세대가 파일과 어긋나거나 저장 장애가 남은 동안은 보류하고, 회복한 뒤 저장된 같은 본문을 보낸다.
   // 다시 서명할 수 없는 항목은 그 항목만 빼고 넘어간다(뒤의 정상 항목의 재전송을 막지 않는다).
   private transmit(entry: OutboxEntry): void {
     if (this.outlet.epoch() === null || this.store.stopGeneration() === null || !this.store.sendable(entry.id)) return;
-    if (!this.generationSettled()) {
+    if (!this.generationSettled() || !this.store.healthy()) {
       this.heldSends = true;
       return;
     }
@@ -742,18 +789,19 @@ export class WorkerExecutor {
     this.lastSent.set(entry.id, this.now());
   }
 
-  // 아는 실행의 시작 지시가 다시 왔다. 그 실행의 접수 영수증과 마지막 영수증을 같은 id·같은 본문으로 다시 보낸다(새 실행은 열지 않는다).
-  private resendFor(runId: string): void {
-    const wanted = this.store.outboxFor(runId).filter((entry) => entry.action === "receipt_accepted" && entry.body.instruction === "task_start");
-    for (const entry of wanted) this.transmit(entry);
-    this.resendLatest(runId, wanted);
+  // 아는 실행의 시작 지시가 다시 왔다. 처음 접수한 지시와 본문이 같을 때만 접수 영수증과 마지막 영수증을 같은 id·같은 본문으로 다시 보낸다.
+  // 본문이 다르면 답하지 않는다. 새 실행은 어느 쪽이든 열지 않는다.
+  private resendFor(runId: string, bodyDigest: string): void {
+    const accepted = this.store.validEvents(runId).find((entry) => entry.action === "receipt_accepted" && entry.body.instruction === "task_start");
+    if (accepted === undefined || this.store.instructionDigest(accepted.id) !== bodyDigest) return;
+    this.transmit(accepted);
+    this.resendLatest(runId, [accepted]);
   }
 
-  private resendLatest(runId: string, already: readonly OutboxEntry[] = []): void {
-    if (this.store.suspectRun(runId)) return;
+  private resendLatest(runId: string, already: readonly OutboxEntry[]): void {
     const last = this.store.run(runId)?.last_receipt_id;
     if (last === null || last === undefined || already.some((entry) => entry.id === last)) return;
-    const entry = this.store.outbox(last);
+    const entry = this.store.validEvents(runId).find((candidate) => candidate.id === last);
     if (entry !== undefined) this.transmit(entry);
   }
 
@@ -789,10 +837,11 @@ export class WorkerExecutor {
   // 끝을 모르는 실행, 슬롯을 쥔 실행, 나머지 차례로 싣는다. 확정되지 않은 실행은 refusesStart가 STATUS_MAX_RUNS개 안으로 묶고,
   // 점유가 상한을 넘는 기존 장부는 store가 열 때 잡아 helloWithheld로 인사를 막는다.
   hello(): Envelope {
-    const rank = (run: RunRecord) => (run.state === "unknown_running" ? 0 : HOLDS_SLOT.includes(run.state) ? 1 : 2);
+    const uncertain = (run: RunRecord) => run.state === "unknown_running" || this.store.suspectRun(run.run_id);
+    const rank = (run: RunRecord) => (uncertain(run) ? 0 : HOLDS_SLOT.includes(run.state) ? 1 : 2);
     const runs = this.store
       .durableRunList()
-      .filter((run) => run.state !== "finalized")
+      .filter((run) => run.state !== "finalized" || this.store.suspectRun(run.run_id))
       .sort((a, b) => rank(a) - rank(b))
       .slice(0, limits.STATUS_MAX_RUNS)
       .map((run) => this.statusOf(run.run_id));
