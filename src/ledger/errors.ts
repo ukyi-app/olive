@@ -7,6 +7,8 @@ export const UNAVAILABLE_REASONS = [
   "too_new", // 장부의 판이 코드보다 높다
   "migration_mismatch", // 적용 기록이 코드의 마이그레이션 폴더와 다르다
   "migration_failed", // 마이그레이션 도중 실패(그 판 전체를 되돌렸다)
+  "not_initialized", // 재개방인데 파일이 없거나 첫 설치 기록이 없다(빈 볼륨, 빈 대체 파일)
+  "already_initialized", // 첫 설치로 열었는데 이미 만들어진 장부다
   "closed", // 닫은 장부
   "db_error", // 그 밖의 DB 오류
 ] as const;

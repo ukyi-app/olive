@@ -3,7 +3,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { Restorer } from "../../src/ledger/index.ts";
+import { openLedger, Restorer } from "../../src/ledger/index.ts";
 import { clock, NOW, open, tempPath } from "./helpers.ts";
 
 async function crashAt(path: string, scenario: string): Promise<Record<string, string>> {
@@ -26,6 +26,9 @@ async function crashAt(path: string, scenario: string): Promise<Record<string, s
   return JSON.parse(text.slice("READY ".length).trim());
 }
 
+const OPTS = { requiredPeers: ["front-door"] };
+const FROM = { sender: "executor/diagnosis/0/store-a", runGeneration: 1 };
+
 const ports = {
   stopAuthority: { latestStop: async () => null },
   peers: { contracts: async () => [] },
@@ -39,16 +42,16 @@ test("끊김: 기록과 영수증 사이에서 끊겨도 다시 열면 일관된
   const ledger = open(path);
   // 실행 줄과 지시는 남고 영수증은 없다. 복원은 같은 실행을 묻기만 하고 다시 실행하지 않는다.
   expect(ledger.getRun(runId)).toMatchObject({ known: true, value: { state: "preparing", acceptedReceiptId: null } });
-  const restorer = new Restorer(ledger, ports, clock);
+  const restorer = new Restorer(ledger, ports, clock, OPTS);
   await restorer.step1();
   await restorer.step2();
   const s3 = await restorer.step3();
   expect(s3.statusQueries).toEqual([{ executorId: "executor/diagnosis/0/store-a", runIds: [runId] }]);
   expect(ledger.getRun(runId)).toMatchObject({ value: { state: "unknown_running" } });
   // 실행기가 다시 보낸 같은 영수증은 한 번 반영된다.
-  const again = { action: "receipt_accepted" as const, receiptId, runId, instructionRequestId: requestId, bodyDigest: "c".repeat(64), now: NOW };
-  expect(ledger.applyReceipt(again)).toMatchObject({ ok: true, delivery: "new" });
-  expect(ledger.applyReceipt(again)).toMatchObject({ ok: true, delivery: "duplicate" });
+  const again = { action: "receipt_accepted" as const, receiptId, runId, instructionRequestId: requestId, instruction: "task_start" as const, bodyDigest: "c".repeat(64), now: NOW };
+  expect(ledger.applyReceipt(again, FROM)).toMatchObject({ ok: true, delivery: "new" });
+  expect(ledger.applyReceipt(again, FROM)).toMatchObject({ ok: true, delivery: "duplicate" });
 });
 
 test("끊김: 영수증과 상태 전이 사이에서 끊기면 둘 다 없다", async () => {
@@ -57,7 +60,7 @@ test("끊김: 영수증과 상태 전이 사이에서 끊기면 둘 다 없다",
   const ledger = open(path);
   expect(ledger.getRun(runId)).toMatchObject({ value: { state: "stopping", stopReceiptId: null } });
   const stoppedReceipt = { action: "receipt_stopped" as const, receiptId, runId, exit: "completed" as const, bodyDigest: "d".repeat(64), now: NOW };
-  expect(ledger.applyReceipt(stoppedReceipt)).toMatchObject({ ok: true, delivery: "new" });
+  expect(ledger.applyReceipt(stoppedReceipt, FROM)).toMatchObject({ ok: true, delivery: "new" });
   expect(ledger.getRun(runId)).toMatchObject({ value: { state: "checking", stopReceiptId: receiptId } });
 });
 
@@ -67,7 +70,9 @@ test("끊김: 마이그레이션 도중에 끊기면 그 판이 없고, 다시 �
   const raw = new Database(path);
   expect(raw.query("SELECT name FROM sqlite_master WHERE type = 'table'").all()).toEqual([]);
   raw.close();
-  const ledger = open(path);
+  // 첫 설치가 끝나지 않았으므로 재개방은 열지 않고, 첫 설치를 다시 하면 처음부터 적용한다.
+  expect(openLedger(path, { clock, mode: "reopen" })).toMatchObject({ ok: false, reason: "not_initialized" });
+  const ledger = open(path, { mode: "create" });
   expect(ledger.readStop()).toEqual({ known: true, value: null });
 });
 
@@ -76,6 +81,6 @@ test("끊김: 정지 세대 저장 도중에 끊기면 앞 세대가 그대로 �
   await crashAt(path, "stop");
   const ledger = open(path);
   expect(ledger.readStop()).toMatchObject({ known: true, value: { generation: 3, stopped: true } });
-  const restorer = new Restorer(ledger, ports, clock);
+  const restorer = new Restorer(ledger, ports, clock, OPTS);
   expect(await restorer.step1()).toEqual({ stopGeneration: 3, stopped: true, source: "ledger" });
 });

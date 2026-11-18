@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import * as contractSchema from "../../src/contract/v1/schema.ts";
+import { ACCOUNT, AUTH_METHODS, REVISION, SHA256, UUID } from "../../src/ledger/input.ts";
 import { list, readText } from "../files.ts";
 import { open, tempPath } from "./helpers.ts";
 
@@ -60,20 +62,43 @@ test("정적: 장부 스키마에 원문·자격 값 칸이 없다", () => {
   expect(bad).toEqual([]);
 });
 
-test("정적: 쓰기 함수의 입력 타입에 원문·자격 값 칸이 없다", async () => {
-  // src/ledger의 타입·인터페이스 선언 안의 칸 이름(이름?: 또는 이름:)을 모은다.
+// 쓰기 함수가 받는 칸을 모은다. 세 곳을 본다:
+// 1. exact(값, [칸들], …)의 칸 목록: 쓰기 함수는 모두 이것으로 입력을 거르므로 런타임에 실제로 받는 칸이다.
+// 2. 메서드 인자 자리의 인라인 객체 타입(예: markResult(input: { … })).
+// 3. 이름 있는 입력 타입(…Input, EnvelopeFrom, InputRecord)과 그 안의 한 줄짜리 공용체 갈래.
+async function writeInputFields(): Promise<Set<string>> {
   const names = new Set<string>();
+  const add = (body: string) => {
+    for (const field of body.matchAll(/(?:^|[\s{;,(])(?:readonly\s+)?(\w+)\??:/g)) names.add(field[1]);
+  };
   for (const file of await list("src/ledger/*.ts")) {
     const source = await readText(file);
-    for (const block of source.matchAll(/(?:interface\s+\w+[^{]*|type\s+\w+\s*=[^{;]*)\{([\s\S]*?)\n\}/g)) {
-      for (const field of block[1].matchAll(/^\s*(?:readonly\s+)?(\w+)\??:/gm)) names.add(field[1]);
-    }
+    for (const call of source.matchAll(/\bexact\(\s*[^,]+,\s*\[([^\]]*)\]/g)) for (const key of call[1].matchAll(/"(\w+)"/g)) names.add(key[1]);
+    for (const param of source.matchAll(/^ {2}\w+\(\s*\w+\??:\s*\{([^}]*)\}/gm)) add(param[1]);
+    for (const block of source.matchAll(/(?:interface\s+(\w*Input|EnvelopeFrom|InputRecord)\b[^{]*|type\s+(\w*Input)\s*=)([\s\S]*?)\n(?:\}|\s*;)/g)) add(block[3]);
   }
-  expect(names.size).toBeGreaterThan(30);
+  return names;
+}
+
+test("정적: 쓰기 함수의 입력 타입에 원문·자격 값 칸이 없다", async () => {
+  const names = await writeInputFields();
+  // 훑기가 인라인 타입, 한 줄 공용체 갈래, exact 목록, 선택 칸까지 닿는지 확인한다.
+  for (const reached of ["reportId", "instruction", "storedRef", "previousRunId", "sender", "runGeneration", "phase", "executorId"]) {
+    expect(names.has(reached), reached).toBe(true);
+  }
+  expect(names.size).toBeGreaterThan(40);
   expect([...names].filter((name) => !allowed(name))).toEqual([]);
   // 자격 묶음은 네 칸뿐이다.
   const input = await readText("src/ledger/input.ts");
   expect(/interface CredentialRef \{\s*account: string;\s*method: string;\s*revision: string;\s*digest: string;\s*\}/.test(input)).toBe(true);
+});
+
+test("정적: 장부 입력 확인의 UUID·SHA256·REVISION·계정·방식은 계약과 같은 꼴이다", async () => {
+  expect([UUID.source, SHA256.source, REVISION.source]).toEqual([contractSchema.UUID.source, contractSchema.SHA256.source, contractSchema.REVISION.source]);
+  expect([UUID.flags, SHA256.flags, REVISION.flags]).toEqual([contractSchema.UUID.flags, contractSchema.SHA256.flags, contractSchema.REVISION.flags]);
+  const instruction = await readText("src/contract/v1/instruction.ts");
+  expect(instruction).toContain(`account: pattern(/${ACCOUNT.source}/)`);
+  expect(instruction).toContain(`method: oneOf(${JSON.stringify(AUTH_METHODS).replaceAll(",", ", ")})`);
 });
 
 test("정적: 이름 검사가 원문·자격 이름을 실제로 잡는다", () => {

@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { writeSync } from "node:fs";
 import { openLedger } from "../../src/ledger/index.ts";
+import { RESTORE_KEY } from "../../src/ledger/ledger.ts";
 
 const [path, scenario] = process.argv.slice(2);
 const NOW = 1_800_000_000_000;
@@ -18,12 +19,17 @@ const faults = {
 };
 
 if (scenario === "migration") target = "migration:1";
-const opened = openLedger(path, { clock: () => NOW, faults });
+const opened = openLedger(path, { clock: () => NOW, mode: "create", faults });
 if (!opened.ok) throw new Error(opened.reason);
 const ledger = opened.ledger;
 
+const EXECUTOR = "executor/diagnosis/0/store-a";
+const from = { sender: EXECUTOR, runGeneration: 1 };
+
+// 복원을 다 거친 장부처럼 접수를 연다(이 자식은 쓰기 사이의 끊김만 본다).
 function startWorker() {
   ledger.applyStop({ generation: 0, stopped: false, now: NOW });
+  ledger.openIntake(RESTORE_KEY);
   const runId = randomUUID();
   const admitted = ledger.admitRun({
     kind: "worker",
@@ -32,10 +38,10 @@ function startWorker() {
     inputRequestId: null,
     role: "diagnosis",
     snapshotDigest: sha("a"),
-    inputDigest: null,
+    inputDigest: sha("e"),
     profileRevision: "p1",
     policyRevision: "q1",
-    executorId: "executor/diagnosis/0/store-a",
+    executorId: EXECUTOR,
     credential: { account: "acct", method: "subscription", revision: "r1", digest: sha("b") },
     deadlineAt: NOW + 600_000,
     budgetLeft: 1000,
@@ -53,13 +59,13 @@ if (scenario === "receipt_gap") {
   const { runId, requestId } = startWorker();
   info.receiptId = randomUUID();
   target = "receipt:before_commit";
-  ledger.applyReceipt({ action: "receipt_accepted", receiptId: info.receiptId, runId, instructionRequestId: requestId, bodyDigest: sha("c"), now: NOW });
+  ledger.applyReceipt({ action: "receipt_accepted", receiptId: info.receiptId, runId, instructionRequestId: requestId, instruction: "task_start", bodyDigest: sha("c"), now: NOW }, from);
 } else if (scenario === "receipt_transition") {
   const { runId } = startWorker();
   ledger.recordStopInstruction({ runId, requestId: randomUUID(), action: "task_cancel", stopGeneration: 0, now: NOW });
   info.receiptId = randomUUID();
   target = "receipt:after_insert";
-  ledger.applyReceipt({ action: "receipt_stopped", receiptId: info.receiptId, runId, exit: "completed", bodyDigest: sha("d"), now: NOW });
+  ledger.applyReceipt({ action: "receipt_stopped", receiptId: info.receiptId, runId, exit: "completed", bodyDigest: sha("d"), now: NOW }, from);
 } else if (scenario === "stop") {
   ledger.applyStop({ generation: 3, stopped: true, now: NOW });
   target = "stop:before_commit";
