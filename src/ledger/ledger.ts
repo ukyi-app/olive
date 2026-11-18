@@ -4,16 +4,20 @@
 // - locking_mode=EXCLUSIVE: 첫 쓰기 트랜잭션에서 파일 잠금을 잡고 닫을 때까지 놓지 않는다. 같은 파일을 다른 연결이나
 //   다른 프로세스가 열면 첫 접근에서 SQLITE_BUSY다(busy_timeout 0으로 기다리지 않는다). 프로세스가 죽으면 운영체제가 잠금을 푼다.
 //   별도 잠금 파일을 두지 않는 이유: SQLite가 이미 쥐는 잠금이라 장부와 잠금이 어긋날 수 없다.
+//   함정: POSIX 잠금은 같은 프로세스가 같은 파일의 다른 FD를 닫기만 해도 풀린다. 그래서 있는 장부 파일은 SQLite 연결로만 읽는다.
 // - journal_mode=WAL + synchronous=FULL: 커밋마다 WAL을 fsync한다. 그래서 커밋을 돌려준 쓰기(실행 줄, 영수증)는 전원이 나가도
 //   남고, 실행 줄의 커밋이 끝난 뒤에만 지시를 내므로 접수 기록이 영수증보다 먼저 남는다. NORMAL은 마지막 커밋을 잃을 수 있다.
 //   EXCLUSIVE와 함께 쓰면 공유 메모리(-shm) 파일 없이 동작한다. 로컬 볼륨 전제다(네트워크 파일시스템이 아님).
+//   첫 설치는 저널 모드로 끝내고 첫 설치 기록을 커밋한 뒤에 WAL로 바꾼다. 끊긴 첫 설치의 내용이 본체 파일에만 있어야
+//   WAL을 복구하지 않고(파일을 바꾸지 않고) 이어 받아도 되는지 가를 수 있다.
 // - foreign_keys=ON: 지시·세션·게시·영수증이 없는 실행을 가리키지 못한다. 연결마다 켜야 하는 설정이다.
 // - quick_check: 깨진 파일은 열 때 SQLITE_NOTADB·SQLITE_CORRUPT로 걸러 "쓸 수 없음"으로 연다(열지 않는다).
 //
 // 새 업무(접수·실행 줄·시작·자격·게시·갱신)의 공통 전제는 #write의 "start" 한 자리에 있다: 장부가 건강하고, 트랜잭션 안에서
 // 읽은 지금의 정지 기록이 있고 정지가 아니며, 지금의 복원 시도가 바로 그 정지 상태에서 낸 접수 허가(#grant)가 살아 있다.
-import { Database } from "bun:sqlite";
-import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import { constants as sqliteOpen, Database } from "bun:sqlite";
+import { type BigIntStats, closeSync, constants as fileOpen, lstatSync, openSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import {
   HOOK_EVENTS,
   type InstructionAction,
@@ -48,7 +52,7 @@ import {
   time,
   UUID,
 } from "./input.ts";
-import { loadMigrations, migrate, type Migration, validateMigrations } from "./migrate.ts";
+import { applyMigration, loadMigrations, migrate, type Migration, validateMigrations } from "./migrate.ts";
 import { type LedgerRunState, mayTransition, type RunKind, SLOT_FREE, TERMINAL } from "./states.ts";
 
 // ---- 결과의 모양 ----
@@ -80,6 +84,7 @@ export const REFUSALS = [
   "publication_conflict",
   "reference_mismatch",
   "permit_used",
+  "session_start_closed",
   "invariant_violation",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
@@ -202,8 +207,8 @@ function toRun(row: RunRow): Run {
   };
 }
 
-// 재시작 복원이 실행기의 점유와 장부가 맞지 않아 남긴 관측. 줄이 있으면 그 실행 ID는 시작하지 않는다.
-// holdsSlot이 true면 그 종류의 슬롯도 사용 중이다(끝났다고 보고한 관측은 실행 ID만 막는다).
+// 재시작 복원이 실행기의 점유와 장부가 맞지 않아 남긴 관측. 줄은 지워지지 않고, 줄이 있는 실행 ID는 영영 시작하지 않는다.
+// holdsSlot이 true면 그 종류의 슬롯도 사용 중이다(끝났다고 보고한 관측과 해제한 관측은 실행 ID만 막는다).
 export interface SlotHoldObservation {
   executorId: string;
   runId: string;
@@ -218,7 +223,7 @@ export interface SlotHold extends SlotHoldObservation {
   observation: number;
 }
 
-// 대기 실행을 지금 시작하면 안 되는 이유. 5단계의 후보 목록과 두 시작 트랜잭션이 같은 판정을 읽는다.
+// 이 대기 실행 자체를 시작하면 안 되는 이유. 5단계의 후보 목록과 시작 트랜잭션이 같은 판정을 읽는다(접수·슬롯·예산은 시작 트랜잭션만 본다).
 export type StartBar = "run_generation_stale" | "run_blocked" | "input_cancelled" | "input_expired" | "deadline_passed";
 
 // 복원 시도 하나의 표식. 장부만 만들고(beginRestore) 같은 값이 다시 나오지 않는다.
@@ -250,6 +255,7 @@ export interface StartRunInput {
   requestId: string;
   // 내려는 지시의 머리에 실을 정지 세대. 장부의 세대와 같아야 한다.
   stopGeneration: number;
+  // 호출자가 본 시각. 꼴만 확인한다. 기한 판정과 발행 시각은 장부의 시계 한 번으로 정한다.
   now: number;
 }
 
@@ -345,6 +351,40 @@ export interface PendingReport {
   signal?: ReportSignal;
 }
 
+// 받아 적은 세션 증거. 이 PR은 적고 읽기까지만 하고, 세션 시작의 근거로 소비하지 않는다(ledger.md "세션 증거").
+export interface TakeoverEvidence {
+  receiptId: string;
+  previousRunId: string;
+  sender: string;
+  newGenerationMarkerDigest: string;
+  startPermitId: string;
+  takenOverAt: number;
+}
+
+export interface RuleCheckEvidence {
+  reportId: string;
+  sender: string;
+  outcome: RuleCheckInput["outcome"];
+  firstMarkerDigest: string;
+  restartedMarkerDigest: string | null;
+  startPermitId: string | null;
+  checkedAt: number;
+}
+
+export interface SessionReportEvidence {
+  reportId: string;
+  action: "report_session_broken" | "report_hook_event";
+  runId: string;
+  settled: boolean;
+  signal: ReportSignal | null;
+}
+
+export interface SessionEvidence {
+  takeovers: TakeoverEvidence[];
+  ruleChecks: RuleCheckEvidence[];
+  reports: SessionReportEvidence[];
+}
+
 export interface InputRecord {
   requestId: string;
   source: string;
@@ -381,7 +421,7 @@ export type Delivery = "new" | "duplicate";
 export interface OpenOptions {
   // 장부에 적는 시각, nonce 정리, 시작 직전의 기한 확인에 쓰는 시계(밀리초).
   clock: () => number;
-  // create: 첫 설치(파일이 없거나 0바이트이고 WAL·SHM·저널의 흔적이 없다) 또는 이 설치가 시작했다가 끊긴 첫 설치의 이어 받기.
+  // create: 없는 경로를 새로 예약하는 첫 설치, 또는 내용이 끊긴 첫 설치와 정확히 같은 파일의 이어 받기(ledger.md "파일과 잠금").
   // reopen: 이미 만든 장부를 다시 연다. 운영의 보통 기동은 reopen이다. 장부가 사라진 볼륨을 첫 설치로 착각하지 않게 호출자가 고른다.
   mode: "create" | "reopen";
   migrations?: readonly Migration[];
@@ -412,47 +452,134 @@ function hasIdentity(db: Database): boolean {
   return table !== null && db.query("SELECT 1 AS x FROM ledger_identity WHERE id = 1").get() !== null;
 }
 
-// 이 설치가 만든 파일의 표식(SQLite 머리의 application_id, "OLV1"). WAL로 바꾸기 전에 적어 본체 파일의 머리에 남긴다.
-// 그래서 SQLite로 열지 않고 파일의 앞 100바이트만 읽어 이 설치의 파일인지 가를 수 있다.
+// 이 설치가 만든 파일의 표식(SQLite 머리의 application_id, "OLV1"). 첫 쓰기로 적어 본체 파일의 머리에 남긴다.
 const APPLICATION_ID = 0x4f4c5631;
-const SQLITE_HEADER = "SQLite format 3\0";
+const SIDECARS = ["-wal", "-shm", "-journal"] as const;
 
-// SQLite가 파일이나 WAL을 건드리기 전에 디스크의 모양만 읽어 가른다. 여는 순간 WAL 복구와 저널 변경이 일어나므로 연 뒤에는 늦다.
-// fresh: 아무 저장도 없다. resumable: 이 설치가 만든 파일이다. 그 밖의 모양은 던진다.
-function inspectFiles(path: string, mode: "create" | "reopen"): "fresh" | "resumable" {
-  const empty = !existsSync(path) || statSync(path).size === 0;
-  if (empty) {
-    if (mode === "reopen") throw new LedgerUnavailableError("not_initialized", "장부 파일이 없거나 비었다");
-    const leftover = ["-wal", "-shm", "-journal"].filter((suffix) => existsSync(`${path}${suffix}`));
-    if (leftover.length > 0) throw new LedgerUnavailableError("foreign_data", `본체 없이 남은 파일: ${leftover.join(", ")}`);
-    return "fresh";
-  }
-  const header = Buffer.alloc(100);
-  let read: number;
+type OpenMode = "create" | "reopen";
+
+function notOurs(mode: OpenMode, detail: string): LedgerUnavailableError {
+  return new LedgerUnavailableError(mode === "create" ? "foreign_data" : "not_initialized", detail);
+}
+
+// 폴더의 경로에 링크가 없을 때만 받는다. SQLite는 링크를 풀어 WAL·저널의 이름을 정하므로, 링크가 있으면 검사한 이름과 실제 이름이 갈라진다.
+function ledgerPath(path: string, mode: OpenMode): string {
+  const full = resolve(path);
+  let real: string;
   try {
-    const fd = openSync(path, "r");
-    try {
-      read = readSync(fd, header, 0, 100, 0);
-    } finally {
-      closeSync(fd);
+    real = realpathSync(dirname(full));
+  } catch (error) {
+    throw new LedgerUnavailableError("io", `장부 폴더를 읽지 못함: ${describe(error)}`);
+  }
+  if (real !== dirname(full)) throw notOurs(mode, "장부 폴더의 경로에 심볼릭 링크가 있다");
+  return full;
+}
+
+// 이름과 종류만 본다(링크를 따라가지 않고 FD를 열지 않는다). 없으면 null, 이름이 하나뿐인 정규 파일이 아니면 던진다.
+function fileEntry(path: string, mode: OpenMode): BigIntStats | null {
+  let stats: BigIntStats | undefined;
+  try {
+    stats = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  } catch (error) {
+    throw new LedgerUnavailableError("io", `장부 파일을 확인하지 못함: ${describe(error)}`);
+  }
+  if (stats === undefined) return null;
+  if (!stats.isFile() || stats.nlink !== 1n) throw notOurs(mode, "장부 자리에 이름이 하나인 정규 파일이 아닌 것이 있다");
+  return stats;
+}
+
+// 없는 경로를 이 호출의 것으로 예약한다. 방금 만든 파일이라 이 FD를 닫아도 풀릴 잠금이 없다.
+function reserveFile(path: string): BigIntStats {
+  try {
+    closeSync(openSync(path, fileOpen.O_CREAT | fileOpen.O_EXCL | fileOpen.O_WRONLY | fileOpen.O_NOFOLLOW, 0o600));
+  } catch (error) {
+    if ((error as { code?: string }).code === "EEXIST") throw new LedgerUnavailableError("foreign_data", "예약하는 사이에 다른 파일이 생겼다");
+    throw new LedgerUnavailableError("io", `장부 파일을 만들지 못함: ${describe(error)}`);
+  }
+  const reserved = fileEntry(path, "create");
+  if (reserved === null) throw new LedgerUnavailableError("foreign_data", "예약한 파일이 사라졌다");
+  return reserved;
+}
+
+// 판정과 실제로 쥔 파일이 같은 개체인지 본다. 판정 뒤에 경로가 다른 파일로 바뀌었으면 그 파일을 쓰지 않는다.
+function requireSameFile(path: string, judged: BigIntStats, mode: OpenMode): void {
+  const now = fileEntry(path, mode);
+  if (now === null || now.dev !== judged.dev || now.ino !== judged.ino) throw notOurs(mode, "판정한 뒤에 장부 경로의 파일이 바뀌었다");
+}
+
+// 본체 파일만 읽는 연결(immutable): 잠금을 잡지 않고 WAL·저널을 보지 않아 파일을 바꾸지 않는다. 닫을 때 다른 연결의 잠금은 SQLite가 지킨다.
+function readOnlyView(path: string): Database {
+  const uri = `file:${path.split("/").map(encodeURIComponent).join("/")}?immutable=1`;
+  return new Database(uri, sqliteOpen.SQLITE_OPEN_READONLY | sqliteOpen.SQLITE_OPEN_URI);
+}
+
+function schemaOf(db: Database): string {
+  return JSON.stringify(db.query("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name").all());
+}
+
+function rowsOf(db: Database, table: string): string {
+  // 적용 시각은 설치마다 다르다.
+  const columns = table === "ledger_migrations" ? "version, name" : "*";
+  return JSON.stringify((db.query(`SELECT ${columns} FROM "${table}"`).all() as unknown[]).map((row) => JSON.stringify(row)).sort());
+}
+
+function sameContents(db: Database, expected: Database): boolean {
+  if (schemaOf(db) !== schemaOf(expected)) return false;
+  if (JSON.stringify(db.query("PRAGMA user_version").get()) !== JSON.stringify(expected.query("PRAGMA user_version").get())) return false;
+  const tables = expected.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+  return tables.every(({ name }) => rowsOf(db, name) === rowsOf(expected, name));
+}
+
+// 끊긴 첫 설치의 증거: 파일의 스키마와 모든 행이 이 코드의 첫 설치가 어느 판까지 적용했을 때 남기는 내용과 정확히 같다.
+// 업무 기록이 한 줄이라도 있거나 판 기록만 흉내 낸 파일은 여기서 걸린다. 내용이 같으면 이어 받아도 잃을 것이 없다.
+function requireInterruptedInstall(db: Database, migrations: readonly Migration[]): void {
+  const expected = new Database(":memory:");
+  try {
+    if (sameContents(db, expected)) return;
+    for (const migration of migrations) {
+      applyMigration(expected, migration, 1);
+      if (sameContents(db, expected)) return;
     }
   } catch (error) {
-    throw new LedgerUnavailableError("io", `장부 파일의 머리를 읽지 못함: ${describe(error)}`);
+    throw new LedgerUnavailableError("foreign_data", `끊긴 첫 설치와 대조하지 못함: ${describe(error)}`);
+  } finally {
+    expected.close();
   }
-  if (read < 100 || header.toString("latin1", 0, 16) !== SQLITE_HEADER) throw new LedgerUnavailableError("corrupt", "SQLite 장부의 머리가 아니다");
-  if (header.readUInt32BE(68) !== APPLICATION_ID) {
-    throw new LedgerUnavailableError(mode === "create" ? "foreign_data" : "not_initialized", "이 설치가 만든 장부가 아니다");
-  }
-  return "resumable";
+  throw new LedgerUnavailableError("foreign_data", "끊긴 첫 설치의 내용과 다르다");
 }
 
-// 첫 설치가 끝나지 않은 파일을 이어 받기 전의 확인: 표식이 있어도 판 기록 없이 표가 있으면 이 설치의 중단으로 볼 근거가 없다.
-function requireInterruptedInstall(db: Database): void {
-  const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[]).map((row) => row.name);
-  if (tables.length > 0 && !tables.includes("ledger_migrations")) throw new LedgerUnavailableError("foreign_data", "판 기록 없이 표가 있다");
+// SQLite가 파일이나 저널을 건드리기 전의 판정. fresh: 이 호출이 새로 예약했다. 그 밖의 받지 않는 모양은 던진다.
+function inspectFile(path: string, mode: OpenMode, migrations: readonly Migration[]): { fresh: boolean; file: BigIntStats } {
+  const main = fileEntry(path, mode);
+  const leftover = SIDECARS.filter((suffix) => fileEntry(`${path}${suffix}`, mode) !== null);
+  if (main === null || main.size === 0n) {
+    if (mode === "reopen") throw new LedgerUnavailableError("not_initialized", "장부 파일이 없거나 비었다");
+    if (leftover.length > 0) throw new LedgerUnavailableError("foreign_data", `본체 없이 남은 파일: ${leftover.join(", ")}`);
+    if (main !== null) throw new LedgerUnavailableError("foreign_data", "이미 있는 빈 파일은 이 설치가 예약했다는 증거가 없다");
+    return { fresh: true, file: reserveFile(path) };
+  }
+  if (main.size < 100n) throw new LedgerUnavailableError("corrupt", "SQLite 장부의 머리가 아니다");
+  const view = readOnlyView(path);
+  try {
+    const stored = view.query("PRAGMA application_id").get() as { application_id: number };
+    if (stored.application_id !== APPLICATION_ID) throw notOurs(mode, "이 설치가 만든 장부가 아니다");
+    if (mode === "create") {
+      if (hasIdentity(view)) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
+      if (leftover.some((suffix) => suffix !== "-journal")) throw new LedgerUnavailableError("foreign_data", "끊긴 첫 설치에는 WAL이 남지 않는다");
+      requireInterruptedInstall(view, migrations);
+    }
+  } finally {
+    view.close();
+  }
+  return { fresh: false, file: main };
 }
 
-// 여는 순서: 입력 확인 → 파일의 모양 → 설정 → 잠금 → 검사 → 첫 설치 기록 확인 → 마이그레이션. 하나라도 실패하면 연결을 닫고 이유를 돌려준다.
+function useWal(db: Database): void {
+  const journal = (db.query("PRAGMA journal_mode = WAL").get() as { journal_mode: string }).journal_mode;
+  if (journal !== "wal") throw new LedgerUnavailableError("db_error", `journal_mode ${journal}`);
+}
+
+// 여는 순서: 입력 확인 → 파일 판정 → 설정 → 잠금 → 같은 파일인지 → 검사 → 첫 설치 기록 확인 → 마이그레이션. 하나라도 실패하면 연결을 닫고 이유를 돌려준다.
 export function openLedger(path: string, options: OpenOptions): OpenResult {
   const mode = oneOf(options.mode, ["create", "reopen"] as const, "openLedger.mode");
   let db: Database | undefined;
@@ -466,26 +593,31 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
     // 적용 시각은 커밋된 뒤에는 고칠 수 없으므로 파일을 건드리기 전에 확인한다.
     const openedAt = options.clock();
     if (!Number.isSafeInteger(openedAt) || openedAt <= 0) throw new LedgerUnavailableError("db_error", "시계의 값이 안전한 시각이 아니다");
-    const shape = inspectFiles(path, mode);
-    db = new Database(path, { create: mode === "create", readwrite: true, strict: true });
+    const faults = options.faults ?? NO_FAULTS;
+    const target = ledgerPath(path, mode);
+    const { fresh, file } = inspectFile(target, mode, migrations);
+    faults.at("open:inspected");
+    db = new Database(target, { readwrite: true, strict: true });
+    // 연결이 파일을 처음 읽기 전에 본다(synchronous가 첫 읽기이고, 끊긴 트랜잭션의 저널은 그때 되돌려진다).
+    requireSameFile(target, file, mode);
     db.run("PRAGMA busy_timeout = 0");
     db.run("PRAGMA locking_mode = EXCLUSIVE");
-    if (shape === "fresh") db.run(`PRAGMA application_id = ${APPLICATION_ID}`);
-    const journal = (db.query("PRAGMA journal_mode = WAL").get() as { journal_mode: string }).journal_mode;
-    if (journal !== "wal") throw new LedgerUnavailableError("db_error", `journal_mode ${journal}`);
     db.run("PRAGMA synchronous = FULL");
     db.run("PRAGMA foreign_keys = ON");
+    if (fresh) db.run(`PRAGMA application_id = ${APPLICATION_ID}`);
     // 빈 쓰기 트랜잭션으로 지금 잠금을 잡는다. EXCLUSIVE라 커밋 뒤에도 놓지 않는다.
-    db.run("BEGIN IMMEDIATE");
+    db.run("BEGIN EXCLUSIVE");
     db.run("COMMIT");
+    requireSameFile(target, file, mode);
     const check = db.query("PRAGMA quick_check").all() as { quick_check: string }[];
     if (check.length !== 1 || check[0].quick_check !== "ok") throw new LedgerUnavailableError("corrupt", `quick_check: ${check.map((r) => r.quick_check).join("; ")}`);
     // 마이그레이션 전에 본다: 재개방에 빈 파일이 오면 표를 만들지 않고 닫는다.
     const identified = hasIdentity(db);
     if (mode === "reopen" && !identified) throw new LedgerUnavailableError("not_initialized", "첫 설치 기록이 없다(빈 파일이거나 다른 파일)");
     if (mode === "create" && identified) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
-    if (mode === "create") requireInterruptedInstall(db);
-    const faults = options.faults ?? NO_FAULTS;
+    // 잠금을 쥔 뒤의 내용으로 다시 판정한다. 잠금 전의 판정은 파일을 바꾸지 않고 거절하려는 것이고, 쓰기의 근거는 이쪽이다.
+    if (mode === "create") requireInterruptedInstall(db, migrations);
+    if (mode === "reopen") useWal(db);
     const migrated = migrate(db, migrations, openedAt, faults);
     if (mode === "create") {
       const conn = db;
@@ -495,6 +627,7 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
           conn.query("INSERT INTO ledger_identity (id, ledger_id, created_at) VALUES (1, ?, ?)").run(crypto.randomUUID(), openedAt);
         })
         .immediate();
+      useWal(conn);
     }
     options.faults?.onOpen?.(db);
     return { ok: true, ledger: new Ledger(OPENED, db, options.clock, faults), migrated };
@@ -664,12 +797,16 @@ export class Ledger {
     return this.#db.query("SELECT 1 AS x FROM slot_holds WHERE kind = ? AND holds_slot = 1 LIMIT 1").get(kind) !== null;
   }
 
-  // 대기 실행을 지금 시작하면 안 되는 이유. 슬롯과 달리 이 실행 자체의 사실만 본다. 기한은 호출자가 넘긴 값이 아니라 장부의 시계로 잰다.
-  #startBar(row: RunRow): StartBar | null {
+  // 판정 하나에 쓰는 장부의 시각. 시계를 믿을 수 없으면 모든 기한이 지난 것으로 본다.
+  #ledgerNow(): number {
+    const now = this.#clock();
+    return Number.isSafeInteger(now) && now > 0 ? now : Number.MAX_SAFE_INTEGER;
+  }
+
+  // 대기 실행을 지금 시작하면 안 되는 이유. 슬롯과 달리 이 실행 자체의 사실만 본다. now는 호출자가 넘긴 값이 아니라 #ledgerNow의 값이다.
+  #startBar(row: RunRow, now: number): StartBar | null {
     if (row.run_generation !== this.#epoch()) return "run_generation_stale";
     if (this.#db.query("SELECT 1 AS x FROM slot_holds WHERE run_id = ? LIMIT 1").get(row.run_id) !== null) return "run_blocked";
-    const now = this.#clock();
-    if (!Number.isSafeInteger(now) || now <= 0) return "deadline_passed";
     if (row.input_request_id !== null) {
       const input = this.#db.query("SELECT cancelled_at, source_expires_at FROM inputs WHERE request_id = ?").get(row.input_request_id) as {
         cancelled_at: number | null;
@@ -682,11 +819,11 @@ export class Ledger {
   }
 
   // 시작으로 옮기기 전 공통 확인: 대기인지, 지금 실행 세대의 줄인지, 슬롯 차단이 없는지, 이 실행을 시작해도 되는지.
-  #requireStartable(row: RunRow | null, kind: RunKind): RunRow {
+  #requireStartable(row: RunRow | null, kind: RunKind, now: number): RunRow {
     if (row === null) throw new Refuse("unknown_run");
     if (row.kind !== kind) throw new Refuse("invariant_violation");
     if (row.state !== "queued") throw new Refuse("transition_denied");
-    const bar = this.#startBar(row);
+    const bar = this.#startBar(row, now);
     if (bar === "run_generation_stale") throw new Refuse(bar);
     if (this.#slotHeld(kind)) throw new Refuse("slot_busy");
     if (bar !== null) throw new Refuse(bar);
@@ -854,21 +991,18 @@ export class Ledger {
   }
 
   // 재시작 뒤 새 세션이 이어받을 입력. 처리 위치 뒤의 입력을 순번대로 내고, 취소·만료는 따로 낸다(전하지 않는다).
-  pendingInputs(now: number): Read<PendingInputs> {
-    const when = time(now, "now");
-    return this.#read(() => {
-      const processedSeq = safe((this.#db.query("SELECT COALESCE(MAX(processed_seq), 0) AS n FROM sessions").get() as { n: number }).n, "processed_seq");
-      const rows = this.#db
-        .query("SELECT request_id, seq, source_ref, source_expires_at, cancelled_at FROM inputs WHERE seq > ? ORDER BY seq")
-        .all(processedSeq) as { request_id: string; seq: number; source_ref: string; source_expires_at: number; cancelled_at: number | null }[];
-      const out: PendingInputs = { processedSeq, pending: [], cancelled: [], expired: [] };
-      for (const row of rows) {
-        if (row.cancelled_at !== null) out.cancelled.push(row.request_id);
-        else if (row.source_expires_at <= when) out.expired.push(row.request_id);
-        else out.pending.push({ requestId: row.request_id, seq: row.seq, sourceRef: { ref: row.source_ref, expiresAt: row.source_expires_at } });
-      }
-      return out;
-    });
+  #pendingInputs(now: number): PendingInputs {
+    const processedSeq = safe((this.#db.query("SELECT COALESCE(MAX(processed_seq), 0) AS n FROM sessions").get() as { n: number }).n, "processed_seq");
+    const rows = this.#db
+      .query("SELECT request_id, seq, source_ref, source_expires_at, cancelled_at FROM inputs WHERE seq > ? ORDER BY seq")
+      .all(processedSeq) as { request_id: string; seq: number; source_ref: string; source_expires_at: number; cancelled_at: number | null }[];
+    const out: PendingInputs = { processedSeq, pending: [], cancelled: [], expired: [] };
+    for (const row of rows) {
+      if (row.cancelled_at !== null) out.cancelled.push(row.request_id);
+      else if (row.source_expires_at <= now) out.expired.push(row.request_id);
+      else out.pending.push({ requestId: row.request_id, seq: row.seq, sourceRef: { ref: row.source_ref, expiresAt: row.source_expires_at } });
+    }
+    return out;
   }
 
   // ---- 실행 ----
@@ -945,10 +1079,11 @@ export class Ledger {
     const runId = str(v.runId, UUID, "runId");
     const requestId = str(v.requestId, UUID, "requestId");
     const stopGeneration = count(v.stopGeneration, "stopGeneration");
-    const now = time(v.now, "now");
+    time(v.now, "now");
     return this.#write("start", "start", () => {
       this.#requireStopGeneration(stopGeneration);
-      const row = this.#requireStartable(this.#runRow(runId), "worker");
+      const now = this.#ledgerNow();
+      const row = this.#requireStartable(this.#runRow(runId), "worker", now);
       // v1 task_start로 만들 수 있는 실행만 자리를 잡는다(입력 digest, 1 이상의 예산, 역할과 지정 실행기).
       const principal = parsePrincipal(row.executor_id);
       if (row.input_digest === null || row.budget_left < 1 || principal?.kind !== "worker_executor" || principal.role !== row.role) throw new Refuse("not_startable");
@@ -959,81 +1094,28 @@ export class Ledger {
     });
   }
 
-  // 세션 시작: 규칙 확인 기록(D-51)과 인수 영수증(D-50)을 장부와 대조하고, 시작 허가를 한 번 쓴다. 모두 한 트랜잭션이다.
-  // 규칙 확인과 인수는 이 실행에 지정된 실행기가 낸 것이어야 한다. 직전 세션은 시작 커밋의 순번으로 찾는다.
-  startSession(input: StartSessionInput): { ok: true; run: Run; credential: CredentialRef } | Refused {
+  // 세션 시작은 닫혀 있다. v1의 인수와 규칙 확인에는 다음 실행 ID가 없어, 어느 대기 실행의 시작 근거인지 장부가 정할 수 없다.
+  // 세션 계약 작업이 앞 실행·유일하게 예약한 다음 실행·실행기·표식·허가·규칙 확인·영수증을 한 기록에 함께 커밋한 뒤에 연다(ledger.md "세션 증거").
+  // 입력의 꼴과 새 업무의 공통 전제는 지금도 확인한다. 어떤 입력에도 시작 지시와 자격 참조를 내지 않는다.
+  startSession(input: StartSessionInput): Refused {
     const v = exact(
       input,
       ["runId", "requestId", "stopGeneration", "now", "sessionId", "generationMarkerDigest", "takeoverReceiptId", "ruleCheckId", "handoffRef", "handoffDigest"],
       "startSession",
     );
-    const runId = str(v.runId, UUID, "runId");
-    const requestId = str(v.requestId, UUID, "requestId");
-    const stopGeneration = count(v.stopGeneration, "stopGeneration");
-    const now = time(v.now, "now");
-    const sessionId = str(v.sessionId, UUID, "sessionId");
-    const marker = str(v.generationMarkerDigest, SHA256, "generationMarkerDigest");
-    const takeoverId = strOrNull(v.takeoverReceiptId, UUID, "takeoverReceiptId");
-    const ruleCheckId = str(v.ruleCheckId, UUID, "ruleCheckId");
+    str(v.runId, UUID, "runId");
+    str(v.requestId, UUID, "requestId");
+    count(v.stopGeneration, "stopGeneration");
+    time(v.now, "now");
+    str(v.sessionId, UUID, "sessionId");
+    str(v.generationMarkerDigest, SHA256, "generationMarkerDigest");
+    strOrNull(v.takeoverReceiptId, UUID, "takeoverReceiptId");
+    str(v.ruleCheckId, UUID, "ruleCheckId");
     const handoffRef = strOrNull(v.handoffRef, HANDOFF_REF, "handoffRef");
     const handoffDigest = strOrNull(v.handoffDigest, SHA256, "handoffDigest");
     if ((handoffRef === null) !== (handoffDigest === null)) throw new LedgerInputError("startSession: 인계 참조와 digest는 함께 있거나 함께 없다");
-    return this.#write("start_session", "start", () => {
-      this.#requireStopGeneration(stopGeneration);
-      const row = this.#requireStartable(this.#runRow(runId), "session");
-      const check = this.#db.query("SELECT sender, outcome, restarted_marker_digest, start_permit_id FROM rule_checks WHERE report_id = ?").get(ruleCheckId) as {
-        sender: string;
-        outcome: string;
-        restarted_marker_digest: string | null;
-        start_permit_id: string | null;
-      } | null;
-      if (check === null || check.sender !== row.executor_id || check.outcome !== "rule_present" || check.restarted_marker_digest !== marker || check.start_permit_id === null) {
-        throw new Refuse("reference_mismatch");
-      }
-      // 마지막으로 시작한 세션. 인수는 그 세션의 교체를 끝낸 것이어야 한다.
-      const previous = this.#db.query("SELECT run_id FROM sessions ORDER BY start_seq DESC LIMIT 1").get() as { run_id: string } | null;
-      if (takeoverId === null) {
-        // 첫 세션만 인수 영수증 없이 연다. 앞 세션이 한 번이라도 있었으면 인수가 있어야 한다.
-        if (previous !== null) throw new Refuse("reference_mismatch");
-      } else {
-        const takeover = this.#db
-          .query("SELECT previous_run_id, sender, new_generation_marker_digest, start_permit_id, confirmed_at, rule_check_id, next_run_id FROM session_takeovers WHERE receipt_id = ?")
-          .get(takeoverId) as {
-          previous_run_id: string;
-          sender: string;
-          new_generation_marker_digest: string;
-          start_permit_id: string;
-          confirmed_at: number | null;
-          rule_check_id: string | null;
-          next_run_id: string | null;
-        } | null;
-        if (
-          takeover === null ||
-          takeover.confirmed_at === null ||
-          previous === null ||
-          takeover.previous_run_id !== previous.run_id ||
-          takeover.sender !== row.executor_id ||
-          takeover.rule_check_id !== ruleCheckId ||
-          takeover.next_run_id !== null ||
-          takeover.new_generation_marker_digest !== marker ||
-          takeover.start_permit_id !== check.start_permit_id
-        ) {
-          throw new Refuse("reference_mismatch");
-        }
-        this.#db.query("UPDATE session_takeovers SET next_run_id = ? WHERE receipt_id = ?").run(runId, takeoverId);
-      }
-      if (this.#db.query("SELECT 1 AS x FROM start_permit_uses WHERE start_permit_id = ?").get(check.start_permit_id)) throw new Refuse("permit_used");
-      this.#setState(row, "preparing", now);
-      this.#db.query("INSERT INTO start_permit_uses (start_permit_id, run_id, used_at) VALUES (?, ?, ?)").run(check.start_permit_id, runId, now);
-      const startSeq = (this.#db.query("SELECT COALESCE(MAX(start_seq), 0) + 1 AS seq FROM sessions").get() as { seq: number }).seq;
-      this.#db
-        .query(
-          "INSERT INTO sessions (session_id, run_id, start_seq, generation_marker_digest, takeover_receipt_id, rule_check_id, handoff_ref, handoff_digest) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .run(sessionId, runId, startSeq, marker, takeoverId, ruleCheckId, handoffRef, handoffDigest);
-      this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'session_start', ?, ?)").run(requestId, runId, stopGeneration, now);
-      const after = toRun(this.#runRow(runId) as RunRow);
-      return { ok: true as const, run: after, credential: after.credential };
+    return this.#write<never>("start_session", "start", () => {
+      throw new Refuse("session_start_closed");
     });
   }
 
@@ -1126,9 +1208,7 @@ export class Ledger {
       this.#setState(row, digest === null ? "failed_stopped" : "ready_result", now, { result_digest: digest });
       const open = this.#db.query("SELECT id, result_digest FROM deliveries WHERE run_id = ? AND action = 'report_result' AND applied_at IS NULL").all(runId) as { id: string; result_digest: string }[];
       for (const report of open) {
-        if (digest !== null && report.result_digest !== digest) {
-          this.#db.query("INSERT INTO receipt_conflicts (id, first_digest, other_digest, received_at) VALUES (?, ?, ?, ?)").run(report.id, digest, report.result_digest, now);
-        }
+        if (digest !== null && report.result_digest !== digest) this.#recordConflict(report.id, digest, report.result_digest, now);
         this.#db.query("UPDATE deliveries SET applied_at = ? WHERE id = ?").run(now, report.id);
       }
       return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow) };
@@ -1210,6 +1290,7 @@ export class Ledger {
 
   // 재시작 복원 2단계가 적는다. (실행기, 실행, 세대)마다 한 줄이고, 같은 관측을 다시 보면 새 번호를 받는다.
   // 다시 본 관측은 슬롯 차단을 낮추지 않는다(끝났다는 보고만으로 슬롯을 풀지 않는다). 돌려준 번호가 지금의 관측이다.
+  // 줄을 지우는 곳은 같은 관측을 새 번호로 바꿔 적는 여기뿐이다. 그래서 한 번 적힌 실행 ID는 계속 시작하지 못한다.
   holdSlots(key: symbol, observations: readonly SlotHoldObservation[], now: number): { ok: true; holds: SlotHold[] } | Refused {
     if (key !== RESTORE_KEY) throw new TypeError("점유 차단은 재시작 복원만 적는다");
     const when = time(now, "now");
@@ -1230,10 +1311,11 @@ export class Ledger {
     });
   }
 
+  // 지금 슬롯을 막고 있는 관측. 해제할 수 있는 것만 낸다(실행 ID만 막는 줄은 해제할 것이 없다).
   slotHolds(): Read<SlotHold[]> {
     return this.#read(() =>
       (
-        this.#db.query("SELECT observation, executor_id, run_id, kind, run_generation, holds_slot, why FROM slot_holds ORDER BY observation").all() as {
+        this.#db.query("SELECT observation, executor_id, run_id, kind, run_generation, holds_slot, why FROM slot_holds WHERE holds_slot = 1 ORDER BY observation").all() as {
           observation: number;
           executor_id: string;
           run_id: string;
@@ -1254,8 +1336,9 @@ export class Ledger {
     );
   }
 
-  // 그 실행기가 그 세대의 그 실행을 더는 쥐지 않는다고 재대조했거나 종료를 증명했을 때 부른다. 확인한 관측의 세대와 번호가 지금의 줄과 같을 때만 지운다.
+  // 그 실행기가 그 세대의 그 실행을 더는 쥐지 않는다고 재대조했거나 종료를 증명했을 때 부른다. 확인한 관측의 세대와 번호가 지금의 줄과 같을 때만 슬롯을 돌려준다.
   // 옛 세대의 종료 확인이나 다시 관측되기 전의 확인은 지금의 차단을 풀지 못한다. 무엇을 증명으로 볼지는 실제 연결 작업이 정한다.
+  // 줄은 남긴다: 끝났다는 증명은 그 실행 ID가 이미 쓰였다는 증명이기도 하다. 다시 할 일은 새 실행 ID를 받는다.
   clearSlotHold(input: { executorId: string; runId: string; runGeneration: number; observation: number }): { ok: true } | Refused {
     const v = exact(input, ["executorId", "runId", "runGeneration", "observation"], "clearSlotHold");
     const executorId = str(v.executorId, REF, "executorId");
@@ -1263,7 +1346,7 @@ export class Ledger {
     const runGeneration = count(v.runGeneration, "runGeneration");
     const observation = count(v.observation, "observation");
     return this.#write("slot_release", "continue", () => {
-      const changed = this.#db.query("DELETE FROM slot_holds WHERE executor_id = ? AND run_id = ? AND run_generation = ? AND observation = ?").run(executorId, runId, runGeneration, observation).changes;
+      const changed = this.#db.query("UPDATE slot_holds SET holds_slot = 0 WHERE executor_id = ? AND run_id = ? AND run_generation = ? AND observation = ?").run(executorId, runId, runGeneration, observation).changes;
       if (changed > 0) return { ok: true as const };
       const held = this.#db.query("SELECT 1 AS x FROM slot_holds WHERE executor_id = ? AND run_id = ? LIMIT 1").get(executorId, runId);
       throw new Refuse(held === null ? "unknown_run" : "reference_mismatch");
@@ -1278,8 +1361,13 @@ export class Ledger {
     const before = this.#db.query("SELECT body_digest FROM deliveries WHERE id = ?").get(id) as { body_digest: string } | null;
     if (before === null) return null;
     if (before.body_digest === digest) return "duplicate";
-    this.#db.query("INSERT INTO receipt_conflicts (id, first_digest, other_digest, received_at) VALUES (?, ?, ?, ?)").run(id, before.body_digest, digest, now);
+    this.#recordConflict(id, before.body_digest, digest, now);
     return { ok: false, reason: "receipt_conflict" };
+  }
+
+  // 같은 충돌은 한 줄이다. 거절한 보고는 ack가 없어 실행기가 같은 내용을 계속 다시 보낸다.
+  #recordConflict(id: string, first: string, other: string, now: number): void {
+    this.#db.query("INSERT INTO receipt_conflicts (id, first_digest, other_digest, received_at) VALUES (?, ?, ?, ?) ON CONFLICT (id, first_digest, other_digest) DO NOTHING").run(id, first, other, now);
   }
 
   #insertDelivery(
@@ -1366,41 +1454,13 @@ export class Ledger {
         return;
       case "receipt_session_takeover": {
         if (row.kind !== "session") throw new Refuse("invariant_violation");
-        // 인수 대상: 장부가 종료(교체)를 지시한 앞 세션이어야 한다.
-        if (!["stopping", "unknown_running"].includes(row.state)) throw new Refuse("transition_denied");
-        if (this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'session_stop'").get(row.run_id) === null) throw new Refuse("reference_mismatch");
-        // 새 세대 표식은 앞 세션의 표식과 달라야 하고, 새 허가는 아직 쓰이지 않았어야 한다.
-        const previous = this.#db.query("SELECT generation_marker_digest FROM sessions WHERE run_id = ?").get(row.run_id) as { generation_marker_digest: string } | null;
-        if (previous === null || previous.generation_marker_digest === r.newGenerationMarkerDigest) throw new Refuse("reference_mismatch");
-        if (this.#db.query("SELECT 1 AS x FROM start_permit_uses WHERE start_permit_id = ?").get(r.startPermitId)) throw new Refuse("permit_used");
+        // 증거로만 적는다. 앞 세션의 상태·종료 지시·표식의 대조와 앞 세션을 끝내는 일은 이 기록을 소비하는 세션 계약 작업이 한다.
         if (this.#db.query("SELECT 1 AS x FROM session_takeovers WHERE start_permit_id = ?").get(r.startPermitId)) throw new Refuse("permit_used");
         this.#db
           .query("INSERT INTO session_takeovers (receipt_id, previous_run_id, sender, new_generation_marker_digest, start_permit_id, taken_over_at) VALUES (?, ?, ?, ?, ?, ?)")
           .run(r.receiptId, row.run_id, from.sender, r.newGenerationMarkerDigest, r.startPermitId, r.takenOverAt);
-        // 같은 발신자·표식·허가의 규칙 확인이 이미 있으면 지금 확정한다. 없으면 인수 대기로 두고 앞 세션의 슬롯을 쥔 채 기다린다.
-        this.#confirmTakeovers(r.now);
         return;
       }
-    }
-  }
-
-  // 같은 실행기가 낸 규칙 확인(rule_present)과 표식·허가가 같은 인수 대기를 확정하고 앞 세션을 끝낸다.
-  // 같은 앞 세션에 인수가 둘이면 먼저 확정한 쪽이 교체이고 나머지는 대기로 남는다(그 인수로는 시작하지 못한다).
-  #confirmTakeovers(now: number): void {
-    const ready = this.#db
-      .query(
-        `SELECT t.receipt_id, t.previous_run_id, t.taken_over_at, c.report_id FROM session_takeovers t
-         JOIN rule_checks c ON c.outcome = 'rule_present' AND c.sender = t.sender
-           AND c.restarted_marker_digest = t.new_generation_marker_digest AND c.start_permit_id = t.start_permit_id
-         WHERE t.confirmed_at IS NULL ORDER BY t.taken_over_at, t.receipt_id, c.report_id`,
-      )
-      .all() as { receipt_id: string; previous_run_id: string; taken_over_at: number; report_id: string }[];
-    for (const takeover of ready) {
-      const previous = this.#runRow(takeover.previous_run_id) as RunRow;
-      if (previous.stop_receipt_id !== null) continue;
-      this.#setState(previous, "finalized", now, { stop_receipt_id: takeover.receipt_id });
-      this.#db.query("UPDATE session_takeovers SET confirmed_at = ?, rule_check_id = ? WHERE receipt_id = ?").run(now, takeover.report_id, takeover.receipt_id);
-      this.#db.query("UPDATE sessions SET rotated_at = COALESCE(rotated_at, ?) WHERE run_id = ?").run(takeover.taken_over_at, takeover.previous_run_id);
     }
   }
 
@@ -1428,7 +1488,6 @@ export class Ledger {
       this.#db
         .query("INSERT INTO rule_checks (report_id, sender, outcome, first_marker_digest, restarted_marker_digest, start_permit_id, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .run(reportId, sender, outcome, first, restarted, permit, checkedAt);
-      this.#confirmTakeovers(now);
       return { ok: true as const, delivery: "new" as const, ack: reportId };
     });
   }
@@ -1441,7 +1500,7 @@ export class Ledger {
     if (!["ready_result", "failed_stopped", "cleanup_pending", "finalized"].includes(row.state)) return "pending";
     if (row.result_digest === null) throw new Refuse("transition_denied");
     if (row.result_digest === resultDigest) return "settled";
-    this.#db.query("INSERT INTO receipt_conflicts (id, first_digest, other_digest, received_at) VALUES (?, ?, ?, ?)").run(reportId, row.result_digest, resultDigest, now);
+    this.#recordConflict(reportId, row.result_digest, resultDigest, now);
     return { ok: false, reason: "receipt_conflict" };
   }
 
@@ -1524,6 +1583,66 @@ export class Ledger {
   }
 
   // ---- 세션 ----
+
+  // 받아 적은 세션 증거를 실행기 기준으로 읽는다. previousRunId를 주면 인수와 보고를 그 실행의 것으로 좁힌다(규칙 확인은 실행에 속하지 않는다).
+  // ack를 낸 뒤 재시작해도 여기서 다시 읽는다. 읽었다고 시작의 근거가 되지는 않는다.
+  sessionEvidence(query: { executorId: string; previousRunId: string | null }): Read<SessionEvidence> {
+    const v = exact(query, ["executorId", "previousRunId"], "sessionEvidence");
+    const executorId = str(v.executorId, REF, "executorId");
+    const previousRunId = strOrNull(v.previousRunId, UUID, "previousRunId");
+    return this.#read(() => {
+      const takeovers = this.#db
+        .query(
+          `SELECT receipt_id, previous_run_id, sender, new_generation_marker_digest, start_permit_id, taken_over_at FROM session_takeovers
+           WHERE sender = ?1 AND (?2 IS NULL OR previous_run_id = ?2) ORDER BY taken_over_at, receipt_id`,
+        )
+        .all(executorId, previousRunId) as { receipt_id: string; previous_run_id: string; sender: string; new_generation_marker_digest: string; start_permit_id: string; taken_over_at: number }[];
+      const ruleChecks = this.#db
+        .query("SELECT report_id, sender, outcome, first_marker_digest, restarted_marker_digest, start_permit_id, checked_at FROM rule_checks WHERE sender = ? ORDER BY checked_at, report_id")
+        .all(executorId) as {
+        report_id: string;
+        sender: string;
+        outcome: RuleCheckInput["outcome"];
+        first_marker_digest: string;
+        restarted_marker_digest: string | null;
+        start_permit_id: string | null;
+        checked_at: number;
+      }[];
+      const reports = this.#db
+        .query(
+          `SELECT d.id, d.action, d.run_id, d.stored_ref, d.result_digest, d.applied_at, s.hook_event, s.session_id, s.turn_id, s.stop_failure, s.broken_cause, s.marker_digest, s.observed_at
+           FROM deliveries d JOIN runs r ON r.run_id = d.run_id LEFT JOIN report_signals s ON s.report_id = d.id
+           WHERE r.executor_id = ?1 AND (?2 IS NULL OR d.run_id = ?2) AND d.action IN ('report_session_broken', 'report_hook_event') ORDER BY d.received_at, d.id`,
+        )
+        .all(executorId, previousRunId) as (PendingReportRow & { applied_at: number | null })[];
+      return {
+        takeovers: takeovers.map((row) => ({
+          receiptId: row.receipt_id,
+          previousRunId: row.previous_run_id,
+          sender: row.sender,
+          newGenerationMarkerDigest: row.new_generation_marker_digest,
+          startPermitId: row.start_permit_id,
+          takenOverAt: row.taken_over_at,
+        })),
+        ruleChecks: ruleChecks.map((row) => ({
+          reportId: row.report_id,
+          sender: row.sender,
+          outcome: row.outcome,
+          firstMarkerDigest: row.first_marker_digest,
+          restartedMarkerDigest: row.restarted_marker_digest,
+          startPermitId: row.start_permit_id,
+          checkedAt: row.checked_at,
+        })),
+        reports: reports.map((row) => ({
+          reportId: row.id,
+          action: row.action as SessionReportEvidence["action"],
+          runId: row.run_id,
+          settled: row.applied_at !== null,
+          signal: toSignal(row),
+        })),
+      };
+    });
+  }
 
   setProcessedSeq(input: { sessionId: string; processedSeq: number }): { ok: true } | Refused {
     const v = exact(input, ["sessionId", "processedSeq"], "setProcessedSeq");
@@ -1623,14 +1742,24 @@ export class Ledger {
     };
   }
 
-  // 재시작 복원이 쓰는 읽기 묶음. 끝난 실행은 빼고 돌려준다. 대기 실행에는 지금 시작하면 안 되는 이유(시작 트랜잭션과 같은 판정)를 함께 준다.
+  #openRuns(now: number): (Run & { startBar: StartBar | null })[] {
+    return (this.#db.query(`SELECT * FROM runs WHERE state NOT IN (${TERMINAL.map(() => "?").join(", ")}) ORDER BY queue_seq`).all(...TERMINAL) as RunRow[]).map((row) => ({
+      ...toRun(row),
+      startBar: row.state === "queued" ? this.#startBar(row, now) : null,
+    }));
+  }
+
+  // 재시작 복원이 쓰는 읽기 묶음. 끝난 실행은 빼고 돌려준다. 대기 실행에는 이 실행 자체를 시작하면 안 되는 이유를 함께 준다.
   openRuns(): Read<(Run & { startBar: StartBar | null })[]> {
-    return this.#read(() =>
-      (this.#db.query(`SELECT * FROM runs WHERE state NOT IN (${TERMINAL.map(() => "?").join(", ")}) ORDER BY queue_seq`).all(...TERMINAL) as RunRow[]).map((row) => ({
-        ...toRun(row),
-        startBar: row.state === "queued" ? this.#startBar(row) : null,
-      })),
-    );
+    return this.#read(() => this.#openRuns(this.#ledgerNow()));
+  }
+
+  // 복원 5단계의 대기 실행과 입력. 장부의 시각 하나로 함께 판정해 만료된 실행의 입력이 전달 대기로 나오지 않게 한다.
+  queueView(): Read<{ runs: (Run & { startBar: StartBar | null })[]; inputs: PendingInputs }> {
+    return this.#read(() => {
+      const now = this.#ledgerNow();
+      return { runs: this.#openRuns(now), inputs: this.#pendingInputs(now) };
+    });
   }
 }
 

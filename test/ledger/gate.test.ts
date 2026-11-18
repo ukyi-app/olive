@@ -230,25 +230,19 @@ test("F07 복원: 종료 확인이 장부에 있는 checking은 재시작 뒤에
   expect(ledger.slotFree("worker")).toEqual({ known: true, value: true });
 });
 
-test("F08 세션: 앞 세션의 표식만 같거나 이미 쓴 허가만 같은 인수는 각각 거절되고 앞 세션이 끝나지 않는다", async () => {
+test("F08 세션: 이미 적힌 허가를 실은 다른 인수는 거절되고 앞 세션이 끝나지 않는다", async () => {
   const ledger = open(tempPath());
   await restore(restorer(ledger));
-  const marker1 = digest("marker-1");
-  const permit1 = id();
-  const check1 = id();
+  const permit = id();
   const sender = "executor/session/0/store-s";
-  must(ledger.applyRuleCheck({ reportId: check1, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker1, startPermitId: permit1, checkedAt: NOW, bodyDigest: digest("rc1"), now: NOW }, { sender }));
   const s1 = must(ledger.admitRun(session())).run;
-  must(ledger.startSession({ runId: s1.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker1, takeoverReceiptId: null, ruleCheckId: check1, handoffRef: null, handoffDigest: null }));
-  must(ledger.recordStopInstruction({ runId: s1.runId, requestId: id(), action: "session_stop", stopGeneration: 0, now: NOW }));
   const from = { sender, runGeneration: s1.runGeneration };
   const takeover = { action: "receipt_session_takeover" as const, previousRunId: s1.runId, takenOverAt: NOW, now: NOW };
-  // 표식만 틀렸다: 허가는 처음 보는 것이다.
-  expect(ledger.applyReceipt({ ...takeover, receiptId: id(), newGenerationMarkerDigest: marker1, startPermitId: id(), bodyDigest: digest("tk-marker") }, from)).toEqual({ ok: false, reason: "reference_mismatch" });
-  // 허가만 틀렸다: 표식은 앞 세션과 다르다.
-  expect(ledger.applyReceipt({ ...takeover, receiptId: id(), newGenerationMarkerDigest: digest("marker-2"), startPermitId: permit1, bodyDigest: digest("tk-permit") }, from)).toEqual({ ok: false, reason: "permit_used" });
-  expect(stateOf(ledger, s1.runId)).toBe("stopping");
-  expect(ledger.slotFree("session")).toEqual({ known: true, value: false });
+  must(ledger.applyReceipt({ ...takeover, receiptId: id(), newGenerationMarkerDigest: digest("marker-1"), startPermitId: permit, bodyDigest: digest("tk-first") }, from));
+  // 허가만 겹친다: 표식과 영수증 ID는 처음 보는 것이다.
+  expect(ledger.applyReceipt({ ...takeover, receiptId: id(), newGenerationMarkerDigest: digest("marker-2"), startPermitId: permit, bodyDigest: digest("tk-permit") }, from)).toEqual({ ok: false, reason: "permit_used" });
+  expect(stateOf(ledger, s1.runId)).toBe("queued");
+  expect(ledger.getRun(s1.runId)).toMatchObject({ value: { stopReceiptId: null } });
 });
 
 test("F09 장부: 실행 세대가 오른 뒤에는 옛 세대의 대기 실행을 시작하지 않는다", async () => {

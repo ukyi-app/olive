@@ -155,14 +155,25 @@ WHEN (NEW.stop_receipt_id IS NOT OLD.stop_receipt_id AND (OLD.stop_receipt_id IS
   OR (NEW.started_receipt_id IS NOT OLD.started_receipt_id AND (OLD.started_receipt_id IS NOT NULL OR NOT EXISTS (
         SELECT 1 FROM deliveries d WHERE d.id = NEW.started_receipt_id AND d.run_id = NEW.run_id AND d.action = 'receipt_started')))
   OR NEW.run_id IS NOT OLD.run_id OR NEW.kind IS NOT OLD.kind OR NEW.run_generation IS NOT OLD.run_generation OR NEW.executor_id IS NOT OLD.executor_id
+  OR NEW.queue_seq IS NOT OLD.queue_seq OR NEW.dedupe_key IS NOT OLD.dedupe_key
 BEGIN
   SELECT RAISE(ABORT, 'run_evidence_mismatch');
 END;
 
+-- 슬롯의 유일 인덱스는 UPDATE OR REPLACE면 먼저 자리를 쥔 실행 줄을 지운다(REPLACE가 지우는 줄에는 DELETE 트리거가 걸리지 않는다).
+-- 인덱스보다 먼저 여기서 막는다. 코드의 거절 분류(slot_busy)가 보는 이름을 그대로 낸다.
+CREATE TRIGGER runs_slot_no_replace BEFORE UPDATE OF state ON runs
+WHEN NEW.state NOT IN ('queued', 'finalized', 'not_started')
+  AND EXISTS (SELECT 1 FROM runs WHERE kind = NEW.kind AND run_id <> NEW.run_id AND state NOT IN ('queued', 'finalized', 'not_started'))
+BEGIN
+  SELECT RAISE(ABORT, 'UNIQUE constraint failed: runs.kind');
+END;
+
 -- 실행기의 점유가 장부와 맞지 않은 관측(재시작 복원 2단계). 장부 밖 실행은 실행 줄로 올리지 않고 여기에만 남는다.
 -- 줄 하나가 사실 둘을 따로 말한다: 이 실행 ID는 다시 시작하면 안 되고(줄이 있으면 항상), holds_slot이 1이면 그 종류의 슬롯도 사용 중이다.
--- 관측은 (실행기, 실행, 세대)마다 한 줄이다. 같은 관측을 다시 보면 새 번호를 받으므로, 앞선 번호로 늦게 온 해제는 지금의 관측을 지우지 못한다.
--- AUTOINCREMENT: 지운 번호를 다시 쓰면 옛 해제가 새 관측에 맞아 버린다. 재대조·종료 증명으로 줄을 지우는 쪽은 실제 연결 작업이다.
+-- 관측은 (실행기, 실행, 세대)마다 한 줄이다. 같은 관측을 다시 보면 새 번호를 받으므로, 앞선 번호로 늦게 온 해제는 지금의 관측을 풀지 못한다.
+-- 해제는 holds_slot만 0으로 내린다. 줄은 남아 그 실행 ID가 이미 쓰였다는 사실을 계속 말한다.
+-- AUTOINCREMENT: 바꿔 적으며 지운 번호를 다시 쓰면 옛 해제가 새 관측에 맞아 버린다.
 CREATE TABLE slot_holds (
   observation INTEGER PRIMARY KEY AUTOINCREMENT CHECK (observation BETWEEN 1 AND 9007199254740991),
   executor_id TEXT NOT NULL,
@@ -314,7 +325,9 @@ CREATE TABLE receipt_conflicts (
   id TEXT NOT NULL,
   first_digest TEXT NOT NULL,
   other_digest TEXT NOT NULL,
-  received_at INTEGER NOT NULL CHECK (received_at BETWEEN 1 AND 9007199254740991)
+  received_at INTEGER NOT NULL CHECK (received_at BETWEEN 1 AND 9007199254740991),
+  -- 같은 충돌은 한 줄이다. 거절한 보고는 ack가 없어 같은 내용으로 계속 다시 온다.
+  UNIQUE (id, first_digest, other_digest)
 ) STRICT;
 
 -- 훅 보고·세션 깨짐 보고를 ack한 뒤에도 어떤 사건이었는지 이어 가는 데 필요한 칸만 둔다(v1이 허용한 값만, 원문 없음).
@@ -382,7 +395,7 @@ BEGIN
 END;
 
 -- 교체 기록 하나: 앞 실행, 인수를 낸 교체 실행기(sender), 새 세대 표식, 시작 허가, 확정한 규칙 확인, 그 인수로 시작한 다음 실행.
--- confirmed_at이 NULL이면 아직 대조하지 못해 앞 세션을 끝내지 않은 인수 대기다(그 규칙 확인이 늦게 올 수 있다).
+-- 지금은 받은 인수를 적기만 한다. confirmed_at·rule_check_id·next_run_id는 세션 계약 작업이 채우는 칸이고 아직 비어 있다.
 CREATE TABLE session_takeovers (
   receipt_id TEXT PRIMARY KEY REFERENCES deliveries (id),
   previous_run_id TEXT NOT NULL REFERENCES runs (run_id),
@@ -408,6 +421,10 @@ WHEN NEW.receipt_id IS NOT OLD.receipt_id OR NEW.previous_run_id IS NOT OLD.prev
   OR (OLD.confirmed_at IS NOT NULL AND NEW.confirmed_at IS NOT OLD.confirmed_at)
   OR (OLD.rule_check_id IS NOT NULL AND NEW.rule_check_id IS NOT OLD.rule_check_id)
   OR (OLD.next_run_id IS NOT NULL AND NEW.next_run_id IS NOT OLD.next_run_id)
+  -- 보조 고유 키가 부딪히면 UPDATE OR REPLACE가 다른 교체 기록을 지운다.
+  OR (NEW.confirmed_at IS NOT NULL AND EXISTS (SELECT 1 FROM session_takeovers
+        WHERE previous_run_id = NEW.previous_run_id AND confirmed_at IS NOT NULL AND receipt_id <> NEW.receipt_id))
+  OR (NEW.next_run_id IS NOT NULL AND EXISTS (SELECT 1 FROM session_takeovers WHERE next_run_id = NEW.next_run_id AND receipt_id <> NEW.receipt_id))
 BEGIN
   SELECT RAISE(ABORT, 'takeover_fixed');
 END;
@@ -418,7 +435,8 @@ BEGIN
 END;
 
 CREATE TRIGGER session_takeovers_no_replace BEFORE INSERT ON session_takeovers
-WHEN EXISTS (SELECT 1 FROM session_takeovers WHERE receipt_id = NEW.receipt_id OR start_permit_id = NEW.start_permit_id)
+WHEN EXISTS (SELECT 1 FROM session_takeovers WHERE receipt_id = NEW.receipt_id OR start_permit_id = NEW.start_permit_id OR next_run_id = NEW.next_run_id
+    OR (NEW.confirmed_at IS NOT NULL AND previous_run_id = NEW.previous_run_id AND confirmed_at IS NOT NULL))
 BEGIN
   SELECT RAISE(ABORT, 'takeover_fixed');
 END;

@@ -113,7 +113,8 @@ export interface Step5 {
   intakeMayOpen: boolean;
   closedBecause: ClosedBecause[];
   diagnosisPausedUntil: number | null;
-  // 시작해도 되는 대기 실행: 시작 트랜잭션과 같은 판정을 지난 줄이다.
+  // 시작 후보: 이 실행 자체를 막는 사유(옛 세대, 점유 관측, 입력 취소·만료, 기한)가 없는 대기 실행이다.
+  // 시작을 보장하지 않는다. 접수 허가, 슬롯, 예산·입력 digest(not_startable)는 시작 트랜잭션이 다시 본다.
   queued: string[];
   // 옛 실행 세대의 대기 실행. 시작하지 않는다(닫는 기록만).
   staleQueued: string[];
@@ -243,7 +244,8 @@ export class Restorer {
   }
 
   // 2. 계약 판을 맞추고 장부의 실행과 실행기의 점유를 실행 ID·세대·지정 실행기·양쪽 상태로 대조한다.
-  // 장부 밖 실행은 종료 대상이고 장부에 실행으로 올리지 않는다. 맞지 않는 관측은 그 실행 ID의 시작을 막고, 활동 중이면 그 종류의 슬롯도 막는다.
+  // 장부 밖 실행은 종료 대상이고 장부에 실행으로 올리지 않는다. 남긴 관측은 그 실행 ID의 시작을 영영 막고, 활동 중이면 그 종류의 슬롯도 막는다.
+  // 관측으로 남기지 않는 불일치: 이미 시작한 실행 줄이 슬롯을 쥔 채 끝났다고 답한 경우와 끝난 상태끼리 이름만 다른 경우다(장부의 줄이 이미 막는다).
   step2(): Promise<Step2> {
     return this.#step(
       2,
@@ -307,7 +309,9 @@ export class Restorer {
             };
             if (known === undefined) {
               out.terminate.push({ executorId, runId: status.run_id, runGeneration: generation, why: "outside_ledger" });
-              if (active) observe("outside_ledger");
+              // 끝났다는 답도 이 ID가 이미 쓰였다는 사실이다. 어느 슬롯인지 몰라 적지 못하면 접수를 보류한다.
+              if (kind === undefined && !out.unresolvedExecutors.includes(executorId)) out.unresolvedExecutors.push(executorId);
+              observe("outside_ledger");
               continue;
             }
             // 대기 줄은 아직 지시를 내지 않은 실행이다. 어느 실행기든 이 ID를 안다고 답하면 끝났다는 답이어도 다시 시작 후보가 되지 않는다.
@@ -418,12 +422,10 @@ export class Restorer {
   step5(): Promise<Step5> {
     return this.#step(5, () => {
       const attempt = this.#requireCurrent(5);
-      const now = this.clock();
       const stop = this.ledger.readStop();
       const pause = this.ledger.readPause();
-      const open = this.ledger.openRuns();
-      const inputs = this.ledger.pendingInputs(now);
-      if (!stop.known || !pause.known || !open.known || !inputs.known) throw new RestoreStepError(5, "장부를 읽지 못함");
+      const view = this.ledger.queueView();
+      if (!stop.known || !pause.known || !view.known) throw new RestoreStepError(5, "장부를 읽지 못함");
       const step2 = this.#step2;
       if (step2 === null) throw new RestoreStepError(5, "2단계의 판정이 없음");
       const closedBecause: ClosedBecause[] = [];
@@ -437,7 +439,7 @@ export class Restorer {
       // 1단계 뒤에 정지가 바뀌었다 풀렸으면 앞서 모은 대조로는 열지 않는다. 새 시도가 처음부터 다시 대조한다.
       const granted = closedBecause.length === 0 && this.ledger.grantIntake(RESTORE_KEY, attempt);
       if (closedBecause.length === 0 && !granted) closedBecause.push(this.ledger.health().writable ? "stop_changed" : "ledger_unwritable");
-      const queued = open.value.filter((run) => run.state === "queued");
+      const queued = view.value.runs.filter((run) => run.state === "queued");
       const barred = (...bars: (typeof queued)[number]["startBar"][]) => queued.filter((run) => bars.includes(run.startBar)).map((run) => run.runId);
       return {
         intakeMayOpen: granted,
@@ -448,8 +450,8 @@ export class Restorer {
         cancelledQueued: barred("input_cancelled"),
         expiredQueued: barred("input_expired", "deadline_passed"),
         blockedQueued: barred("run_blocked"),
-        inputs: inputs.value,
-        budgets: open.value.map((run) => ({ runId: run.runId, budgetLeft: run.budgetLeft })),
+        inputs: view.value.inputs,
+        budgets: view.value.runs.map((run) => ({ runId: run.runId, budgetLeft: run.budgetLeft })),
       };
     });
   }

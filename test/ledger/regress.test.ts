@@ -269,7 +269,7 @@ test("R06 점유: 옛 세대의 종료 확인과 다시 관측되기 전의 확�
   expect(ledger.slotFree("worker")).toEqual({ known: true, value: true });
 });
 
-// 세션 교체 시험의 공통 조각.
+// 세션 증거 시험의 공통 조각.
 const base = { stopGeneration: 0, now: NOW, handoffRef: null, handoffDigest: null };
 function ruleCheck(marker: string, permit: string) {
   const reportId = id();
@@ -279,70 +279,63 @@ function takeoverOf(previous: Run, marker: string, permit: string) {
   const receiptId = id();
   return { action: "receipt_session_takeover" as const, receiptId, previousRunId: previous.runId, newGenerationMarkerDigest: marker, startPermitId: permit, takenOverAt: NOW, bodyDigest: digest(`tk:${receiptId}`), now: NOW };
 }
-function startFirst(ledger: Ledger, run: Run, sender: string) {
-  const marker = digest(`marker:${run.runId}`);
-  const check = ruleCheck(marker, id());
-  must(ledger.applyRuleCheck(check, { sender }));
-  must(ledger.startSession({ ...base, runId: run.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check.reportId }));
-}
-const stopSession = (ledger: Ledger, run: Run) => must(ledger.recordStopInstruction({ runId: run.runId, requestId: id(), action: "session_stop", stopGeneration: 0, now: NOW }));
 const stateOf = (ledger: Ledger, runId: string) => (ledger.getRun(runId) as { value: { state: string } }).value.state;
 
-test("R07 세션: B의 인수와 규칙 확인으로 C를 시작하지 못하고 B만 시작한다", () => {
+test("R07 세션: B의 인수와 규칙 확인이 있어도 B와 C 어느 쪽도 시작하지 못한다", () => {
   const ledger = ready(open(tempPath()));
   const a = must(ledger.admitRun(session({ executorId: SESSION_A }))).run;
   const b = must(ledger.admitRun(session({ executorId: SESSION_B }))).run;
   const c = must(ledger.admitRun(session({ executorId: SESSION_C }))).run;
-  startFirst(ledger, a, SESSION_A);
-  stopSession(ledger, a);
   const marker = digest("marker-b");
   const permit = id();
   const takeover = takeoverOf(a, marker, permit);
   const check = ruleCheck(marker, permit);
   must(ledger.applyReceipt(takeover, { sender: SESSION_B, runGeneration: a.runGeneration }));
   must(ledger.applyRuleCheck(check, { sender: SESSION_B }));
-  expect(stateOf(ledger, a.runId)).toBe("finalized");
+  expect(stateOf(ledger, a.runId)).toBe("queued");
   const opening = { ...base, requestId: id(), sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: takeover.receiptId, ruleCheckId: check.reportId };
-  expect(ledger.startSession({ ...opening, runId: c.runId })).toEqual({ ok: false, reason: "reference_mismatch" });
+  expect(ledger.startSession({ ...opening, runId: c.runId })).toEqual({ ok: false, reason: "session_start_closed" });
   expect(stateOf(ledger, c.runId)).toBe("queued");
-  expect(ledger.startSession({ ...opening, runId: b.runId })).toMatchObject({ ok: true });
+  expect(ledger.startSession({ ...opening, runId: b.runId })).toEqual({ ok: false, reason: "session_start_closed" });
+  expect(stateOf(ledger, b.runId)).toBe("queued");
 });
 
-test("R07 세션: 첫 세션도 자기 실행기가 낸 규칙 확인으로만 시작한다", () => {
+test("R07 세션: 첫 세션은 자기 실행기가 낸 규칙 확인이 있어도 시작하지 않는다", () => {
   const ledger = ready(open(tempPath()));
   const c = must(ledger.admitRun(session({ executorId: SESSION_C }))).run;
   const marker = digest("marker-c");
   const foreign = ruleCheck(marker, id());
   must(ledger.applyRuleCheck(foreign, { sender: SESSION_B }));
   const opening = { ...base, runId: c.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null };
-  expect(ledger.startSession({ ...opening, ruleCheckId: foreign.reportId })).toEqual({ ok: false, reason: "reference_mismatch" });
+  expect(ledger.startSession({ ...opening, ruleCheckId: foreign.reportId })).toEqual({ ok: false, reason: "session_start_closed" });
   const own = ruleCheck(marker, id());
   must(ledger.applyRuleCheck(own, { sender: SESSION_C }));
-  expect(ledger.startSession({ ...opening, ruleCheckId: own.reportId })).toMatchObject({ ok: true });
+  expect(ledger.startSession({ ...opening, ruleCheckId: own.reportId })).toEqual({ ok: false, reason: "session_start_closed" });
+  expect(stateOf(ledger, c.runId)).toBe("queued");
 });
 
-test("R07 세션: 다른 실행기의 규칙 확인은 인수를 확정하지 못한다", () => {
+test("R07 세션: 인수와 규칙 확인은 낸 실행기별로 따로 읽히고 다른 실행기의 확인과 섞이지 않는다", () => {
   const ledger = ready(open(tempPath()));
   const a = must(ledger.admitRun(session({ executorId: SESSION_A }))).run;
   must(ledger.admitRun(session({ executorId: SESSION_B })));
   must(ledger.admitRun(session({ executorId: SESSION_C })));
-  startFirst(ledger, a, SESSION_A);
-  stopSession(ledger, a);
   const marker = digest("marker-b");
   const permit = id();
-  must(ledger.applyReceipt(takeoverOf(a, marker, permit), { sender: SESSION_B, runGeneration: a.runGeneration }));
-  must(ledger.applyRuleCheck(ruleCheck(marker, permit), { sender: SESSION_C }));
-  expect(stateOf(ledger, a.runId)).toBe("stopping");
-  expect(ledger.slotFree("session")).toEqual({ known: true, value: false });
+  const takeover = takeoverOf(a, marker, permit);
+  const check = ruleCheck(marker, permit);
+  must(ledger.applyReceipt(takeover, { sender: SESSION_B, runGeneration: a.runGeneration }));
+  must(ledger.applyRuleCheck(check, { sender: SESSION_C }));
+  expect(ledger.sessionEvidence({ executorId: SESSION_B, previousRunId: a.runId })).toMatchObject({ known: true, value: { takeovers: [{ receiptId: takeover.receiptId, sender: SESSION_B }], ruleChecks: [] } });
+  expect(ledger.sessionEvidence({ executorId: SESSION_C, previousRunId: a.runId })).toMatchObject({ known: true, value: { takeovers: [], ruleChecks: [{ reportId: check.reportId, sender: SESSION_C }] } });
+  expect(stateOf(ledger, a.runId)).toBe("queued");
+  expect(ledger.slotFree("session")).toEqual({ known: true, value: true });
 });
 
-test("R07 세션: 같은 앞 세션에 인수가 둘 먼저 와도 먼저 확정한 교체만 남고 늦은 확인이 되돌려지지 않는다", () => {
+test("R07 세션: 같은 앞 세션에 인수가 둘 와도 둘 다 증거로 남고 앞 세션을 끝내지 않으며, 재전송은 처음 낸 쪽만 ack를 받는다", () => {
   const ledger = ready(open(tempPath()));
   const a = must(ledger.admitRun(session({ executorId: SESSION_A }))).run;
   const b = must(ledger.admitRun(session({ executorId: SESSION_B }))).run;
   const c = must(ledger.admitRun(session({ executorId: SESSION_C }))).run;
-  startFirst(ledger, a, SESSION_A);
-  stopSession(ledger, a);
   const [markerB, markerC] = [digest("marker-b"), digest("marker-c")];
   const [permitB, permitC] = [id(), id()];
   const takeoverB = takeoverOf(a, markerB, permitB);
@@ -352,37 +345,21 @@ test("R07 세션: 같은 앞 세션에 인수가 둘 먼저 와도 먼저 확정
   const checkB = ruleCheck(markerB, permitB);
   const checkC = ruleCheck(markerC, permitC);
   must(ledger.applyRuleCheck(checkB, { sender: SESSION_B }));
-  expect(stateOf(ledger, a.runId)).toBe("finalized");
   expect(ledger.applyRuleCheck(checkC, { sender: SESSION_C })).toMatchObject({ ok: true, delivery: "new" });
-  expect((ledger.getRun(a.runId) as { value: { stopReceiptId: string } }).value.stopReceiptId).toBe(takeoverB.receiptId);
+  expect(stateOf(ledger, a.runId)).toBe("queued");
+  expect((ledger.getRun(a.runId) as { value: { stopReceiptId: string | null } }).value.stopReceiptId).toBeNull();
   expect(ledger.startSession({ ...base, runId: c.runId, requestId: id(), sessionId: id(), generationMarkerDigest: markerC, takeoverReceiptId: takeoverC.receiptId, ruleCheckId: checkC.reportId })).toEqual({
     ok: false,
-    reason: "reference_mismatch",
+    reason: "session_start_closed",
   });
-  must(ledger.startSession({ ...base, runId: b.runId, requestId: id(), sessionId: id(), generationMarkerDigest: markerB, takeoverReceiptId: takeoverB.receiptId, ruleCheckId: checkB.reportId }));
-  // 재전송은 처음 낸 쪽만 다시 ack를 받는다. 그 쪽의 대기 줄이 이미 시작했어도 같다.
+  expect(ledger.startSession({ ...base, runId: b.runId, requestId: id(), sessionId: id(), generationMarkerDigest: markerB, takeoverReceiptId: takeoverB.receiptId, ruleCheckId: checkB.reportId })).toEqual({
+    ok: false,
+    reason: "session_start_closed",
+  });
+  // 재전송은 처음 낸 쪽만 다시 ack를 받는다.
   expect(ledger.applyReceipt(takeoverB, { sender: SESSION_B, runGeneration: a.runGeneration })).toMatchObject({ ok: true, delivery: "duplicate" });
   expect(ledger.applyReceipt(takeoverB, { sender: SESSION_C, runGeneration: a.runGeneration })).toEqual({ ok: false, reason: "sender_mismatch" });
   expect(ledger.applyRuleCheck(checkB, { sender: SESSION_C })).toEqual({ ok: false, reason: "sender_mismatch" });
-});
-
-test("R08 세션: 접수 순서와 다르게 시작해도 직전 세션은 시작 순서로 찾고 교체가 이어진다", () => {
-  const ledger = ready(open(tempPath()));
-  const [s1, s2, s3] = [must(ledger.admitRun(session())).run, must(ledger.admitRun(session())).run, must(ledger.admitRun(session())).run];
-  startFirst(ledger, s2, SESSION_A);
-  const rotate = (previous: Run, next: Run) => {
-    stopSession(ledger, previous);
-    const marker = digest(`marker:${next.runId}`);
-    const permit = id();
-    const takeover = takeoverOf(previous, marker, permit);
-    const check = ruleCheck(marker, permit);
-    must(ledger.applyReceipt(takeover, { sender: SESSION_A, runGeneration: previous.runGeneration }));
-    must(ledger.applyRuleCheck(check, { sender: SESSION_A }));
-    expect(stateOf(ledger, previous.runId)).toBe("finalized");
-    return ledger.startSession({ ...base, runId: next.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: takeover.receiptId, ruleCheckId: check.reportId });
-  };
-  expect(rotate(s2, s1)).toMatchObject({ ok: true });
-  expect(rotate(s1, s3)).toMatchObject({ ok: true });
 });
 
 test("R09 열기: 비어 있지 않은 낯선 DB는 첫 설치로 받지 않고 건드리지 않는다", () => {
@@ -428,17 +405,17 @@ test("R09 열기: 본체 없이 남은 WAL·SHM과 빈 본체 옆의 WAL은 첫 
   expect(openLedger(empty, { clock, mode: "create" })).toMatchObject({ ok: false, reason: "foreign_data" });
 });
 
-test("R09 열기: 새 경로와 빈 파일은 첫 설치로 받고 다시 연 장부는 표식을 유지한다", () => {
-  for (const prepare of [() => {}, (path: string) => writeFileSync(path, "")]) {
-    const path = tempPath();
-    prepare(path);
-    const created = openLedger(path, { clock, mode: "create" });
-    expect(created).toMatchObject({ ok: true });
-    if (created.ok) created.ledger.close();
-    const again = openLedger(path, { clock, mode: "reopen" });
-    expect(again).toMatchObject({ ok: true });
-    if (again.ok) again.ledger.close();
-  }
+test("R09 열기: 새 경로는 첫 설치로 받고 다시 연 장부는 표식을 유지하며, 이미 있는 빈 파일은 받지 않는다", () => {
+  const path = tempPath();
+  const created = openLedger(path, { clock, mode: "create" });
+  expect(created).toMatchObject({ ok: true });
+  if (created.ok) created.ledger.close();
+  const again = openLedger(path, { clock, mode: "reopen" });
+  expect(again).toMatchObject({ ok: true });
+  if (again.ok) again.ledger.close();
+  const empty = tempPath();
+  writeFileSync(empty, "");
+  expect(openLedger(empty, { clock, mode: "create" })).toMatchObject({ ok: false, reason: "foreign_data" });
 });
 
 test("R10 시작: 목록을 낸 뒤 취소된 입력의 대기 실행은 자격을 받지 않는다", async () => {

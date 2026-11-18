@@ -54,6 +54,13 @@ function applied(db: Database): { version: number; name: string }[] {
   return db.query("SELECT version, name FROM ledger_migrations ORDER BY version").all() as { version: number; name: string }[];
 }
 
+// 판 하나를 적는다. 트랜잭션은 부르는 쪽이 정한다.
+export function applyMigration(db: Database, migration: Migration, now: number): void {
+  db.run(BOOTSTRAP);
+  db.run(migration.sql);
+  db.query("INSERT INTO ledger_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(migration.version, migration.name, now);
+}
+
 // migrations는 validateMigrations를 지난 목록이다(openLedger가 파일을 열기 전에 확인한다).
 export function migrate(db: Database, migrations: readonly Migration[], now: number, faults: Faults): { from: number; to: number } {
   const done = applied(db);
@@ -70,9 +77,7 @@ export function migrate(db: Database, migrations: readonly Migration[], now: num
   for (const migration of migrations.slice(done.length)) {
     try {
       db.transaction(() => {
-        db.run(BOOTSTRAP);
-        db.run(migration.sql);
-        db.query("INSERT INTO ledger_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(migration.version, migration.name, now);
+        applyMigration(db, migration, now);
         faults.at(`migration:${migration.version}`);
       }).immediate();
     } catch (error) {

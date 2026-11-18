@@ -119,6 +119,18 @@ test("정적: 이름 검사가 원문·자격 이름을 실제로 잡는다", ()
   for (const name of ["credential_digest", "credential_revision", "source_ref", "dedupe_key", "budget_left", "body_digest"]) expect(allowed(name), name).toBe(true);
 });
 
+test("정적: 장부 파일을 SQLite 밖에서 여는 곳은 새 파일의 예약 한 곳뿐이다", async () => {
+  // 같은 프로세스가 장부 파일의 다른 FD를 닫으면 작성자의 POSIX 잠금이 풀린다.
+  const files = await list("src/ledger/**/*.ts");
+  const opened = [];
+  for (const file of files) {
+    const source = (await readText(file)).split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+    for (const call of source.matchAll(/\b(openSync|readSync|createReadStream|createWriteStream|Bun\.file|fsyncSync|ftruncateSync|truncateSync)\s*\(([^\n]*)/g)) opened.push(`${file}: ${call[1]}(${call[2]}`);
+  }
+  expect(opened).toHaveLength(1);
+  expect(opened[0]).toContain("O_EXCL");
+});
+
 const transpiler = new Bun.Transpiler({ loader: "ts" });
 
 test("정적: src/contract/가 src/ledger/를 import하지 않는다", async () => {

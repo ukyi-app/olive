@@ -76,6 +76,20 @@ test("끊김: 마이그레이션 도중에 끊기면 그 판이 없고, 다시 �
   expect(ledger.readStop()).toEqual({ known: true, value: null });
 });
 
+test("끊김: 첫 설치가 트랜잭션 도중에 끊긴 파일은 남은 저널과 함께 create가 바로 이어 받고 끝나면 WAL로 동작한다", async () => {
+  const path = tempPath();
+  await crashAt(path, "migration");
+  const resumed = openLedger(path, { clock, mode: "create" });
+  expect(resumed).toMatchObject({ ok: true, migrated: { from: 0, to: 1 } });
+  if (!resumed.ok) return;
+  expect(resumed.ledger.readStop()).toEqual({ known: true, value: null });
+  resumed.ledger.close();
+  const raw = new Database(path);
+  expect(raw.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+  raw.close();
+  expect(openLedger(path, { clock, mode: "create" })).toMatchObject({ ok: false, reason: "already_initialized" });
+});
+
 test("끊김: 정지 세대 저장 도중에 끊기면 앞 세대가 그대로 남는다(정지 상태 유지)", async () => {
   const path = tempPath();
   await crashAt(path, "stop");

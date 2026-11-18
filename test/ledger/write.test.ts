@@ -81,22 +81,11 @@ test("쓰기: 접수 영수증은 v1의 여섯 지시를 원래 이름과 함께
   expect(ledger.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 1, now: NOW })).toEqual({ ok: false, reason: "stopped" });
 });
 
-test("쓰기: 세션 시작·종료와 결과 확정 지시의 접수 영수증도 원래 이름으로 반영한다", () => {
+test("쓰기: 결과 확정 지시의 접수 영수증은 원래 이름으로 반영하고, 시작 지시가 없는 세션의 접수 영수증은 받지 않는다", () => {
   const ledger = ready(open(tempPath()));
   const run = must(ledger.admitRun(session())).run;
-  const marker = digest("marker");
-  const check = id();
-  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: id(), checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, S));
-  const sessionStart = id();
-  must(ledger.startSession({ runId: run.runId, requestId: sessionStart, stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check, handoffRef: null, handoffDigest: null }));
-  const sender = from(run);
-  expect(ledger.applyReceipt(accepted(run.runId, sessionStart, "session_stop"), sender)).toEqual({ ok: false, reason: "unknown_instruction" });
-  const startedReceipt = accepted(run.runId, sessionStart, "session_start");
-  expect(ledger.applyReceipt(startedReceipt, sender)).toMatchObject({ ok: true, delivery: "new" });
-  expect(ledger.getRun(run.runId)).toMatchObject({ value: { acceptedReceiptId: startedReceipt.receiptId } });
-  const sessionStop = id();
-  must(ledger.recordStopInstruction({ runId: run.runId, requestId: sessionStop, action: "session_stop", stopGeneration: 0, now: NOW }));
-  expect(ledger.applyReceipt(accepted(run.runId, sessionStop, "session_stop"), sender)).toMatchObject({ ok: true, delivery: "new" });
+  expect(ledger.applyReceipt(accepted(run.runId, id(), "session_start"), from(run))).toEqual({ ok: false, reason: "unknown_instruction" });
+  expect(ledger.getRun(run.runId)).toMatchObject({ value: { acceptedReceiptId: null } });
 
   const { runId, requestId: taskStart } = startedWorker(ledger);
   must(ledger.applyReceipt(stopped(runId), W));
@@ -130,14 +119,12 @@ test("R15 증거: 영수증이 가리키는 지시와 쓴 허가는 저장 뒤 �
   const { runId, requestId } = startedWorker(ledger);
   must(ledger.applyReceipt(accepted(runId, requestId), W));
   const run = must(ledger.admitRun(session())).run;
-  const marker = digest("marker");
-  const check = id();
   const permit = id();
-  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: permit, checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, S));
-  must(ledger.startSession({ runId: run.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check, handoffRef: null, handoffDigest: null }));
   ledger.close();
   const raw = new Database(path);
   raw.run("PRAGMA foreign_keys = ON");
+  // 세션 시작이 닫혀 있어 쓴 허가의 줄은 장부에 바로 적어 보호를 확인한다.
+  raw.query("INSERT INTO start_permit_uses (start_permit_id, run_id, used_at) VALUES (?, ?, 1)").run(permit, run.runId);
   for (const change of ["action = 'task_cancel'", `run_id = '${run.runId}'`, `request_id = '${id()}'`]) {
     expect(() => raw.query(`UPDATE instructions SET ${change} WHERE request_id = ?`).run(requestId), change).toThrow("instruction_fixed");
   }
@@ -165,7 +152,9 @@ test("R16 세션: 인계 참조는 저장소가 낸 불투명 ID만 받고 diges
   expect(() => ledger.startSession({ ...input, handoffRef: `handoffs/${id()}`, handoffDigest: null })).toThrow(LedgerInputError);
   expect(() => ledger.startSession({ ...input, handoffRef: null, handoffDigest: digest("handoff") })).toThrow(LedgerInputError);
   expect(ledger.getRun(run.runId)).toMatchObject({ value: { state: "queued" } });
-  expect(ledger.startSession({ ...input, handoffRef: `handoffs/${id()}`, handoffDigest: digest("handoff") })).toMatchObject({ ok: true });
+  // 꼴이 맞는 입력도 세션 시작이 닫혀 있어 시작하지 않는다.
+  expect(ledger.startSession({ ...input, handoffRef: `handoffs/${id()}`, handoffDigest: digest("handoff") })).toEqual({ ok: false, reason: "session_start_closed" });
+  expect(ledger.getRun(run.runId)).toMatchObject({ value: { state: "queued" } });
 });
 
 test("쓰기: 허용되지 않은 상태 전이는 거절(코드와 장부의 트리거 둘 다)", () => {
@@ -431,43 +420,30 @@ test("쓰기: 장부의 정수는 안전 정수다(쓰기 함수와 STRICT 열)"
   raw.close();
 });
 
-test("세션: 규칙 확인과 확정된 인수를 대조하고 시작 허가는 한 번만 쓴다", () => {
+test("세션: 인수와 규칙 확인은 어느 순서로 와도 적기만 하고, 앞 세션을 끝내거나 다음 세션을 시작하지 않으며 같은 허가의 다른 인수는 받지 않는다", () => {
   const ledger = ready(open(tempPath()));
-  const marker1 = digest("marker-1");
-  const permit1 = id();
-  const check1 = id();
-  must(ledger.applyRuleCheck({ reportId: check1, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker1, startPermitId: permit1, checkedAt: NOW, bodyDigest: digest("rc1"), now: NOW }, S));
   const s1 = must(ledger.admitRun(session())).run;
-  const base = { stopGeneration: 0, now: NOW, handoffRef: null, handoffDigest: null };
-  expect(ledger.startSession({ ...base, runId: s1.runId, requestId: id(), sessionId: id(), generationMarkerDigest: digest("other"), takeoverReceiptId: null, ruleCheckId: check1 })).toEqual({ ok: false, reason: "reference_mismatch" });
-  must(ledger.startSession({ ...base, runId: s1.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker1, takeoverReceiptId: null, ruleCheckId: check1 }));
   const s2 = must(ledger.admitRun(session())).run;
-  must(ledger.recordStopInstruction({ runId: s1.runId, requestId: id(), action: "session_stop", stopGeneration: 0, now: NOW }));
-  // 새 세대: 인수 영수증이 규칙 확인보다 먼저 와도 인수 대기로 두고 앞 세션의 자리를 쥔다.
-  const marker2 = digest("marker-2");
-  const permit2 = id();
-  const takeover = { action: "receipt_session_takeover" as const, receiptId: id(), previousRunId: s1.runId, newGenerationMarkerDigest: marker2, startPermitId: permit2, takenOverAt: NOW, bodyDigest: digest("tk"), now: NOW };
+  const base = { stopGeneration: 0, now: NOW, handoffRef: null, handoffDigest: null };
+  const marker = digest("marker-2");
+  const permit = id();
+  const check = id();
+  const takeover = { action: "receipt_session_takeover" as const, receiptId: id(), previousRunId: s1.runId, newGenerationMarkerDigest: marker, startPermitId: permit, takenOverAt: NOW, bodyDigest: digest("tk"), now: NOW };
+  // 규칙 확인이 먼저 온 인수와 인수가 먼저 온 규칙 확인 모두 받아 적는다.
+  const early = id();
+  must(ledger.applyRuleCheck({ reportId: early, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: digest("marker-early"), startPermitId: id(), checkedAt: NOW, bodyDigest: digest("rc-early"), now: NOW }, S));
   must(ledger.applyReceipt(takeover, from(s1)));
-  expect(state(ledger, s1.runId)).toBe("stopping");
-  expect(ledger.slotFree("session")).toEqual({ known: true, value: false });
-  // 확정되지 않은 인수로는 다음 세션을 열지 않는다.
-  const check2 = id();
-  // 규칙 확인이 오면 같은 표식·허가의 인수를 확정하고 앞 세션을 끝낸다.
-  must(ledger.applyRuleCheck({ reportId: check2, outcome: "rule_present", firstMarkerDigest: digest("m1"), restartedMarkerDigest: marker2, startPermitId: permit2, checkedAt: NOW, bodyDigest: digest("rc2"), now: NOW }, S));
-  expect(state(ledger, s1.runId)).toBe("finalized");
-  // 앞 세션의 허가(이미 쓴 것)로는 열지 않는다.
-  expect(ledger.startSession({ ...base, runId: s2.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker1, takeoverReceiptId: takeover.receiptId, ruleCheckId: check1 })).toEqual({ ok: false, reason: "reference_mismatch" });
-  // 앞 세션이 있었으면 인수 영수증 없이 열지 않는다.
-  expect(ledger.startSession({ ...base, runId: s2.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker2, takeoverReceiptId: null, ruleCheckId: check2 })).toEqual({ ok: false, reason: "reference_mismatch" });
-  must(ledger.startSession({ ...base, runId: s2.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker2, takeoverReceiptId: takeover.receiptId, ruleCheckId: check2 }));
-  // 같은 인수·허가로 세 번째 세션을 열지 않는다.
-  const s3 = must(ledger.admitRun(session())).run;
-  must(ledger.recordStopInstruction({ runId: s2.runId, requestId: id(), action: "session_stop", stopGeneration: 0, now: NOW }));
-  expect(ledger.startSession({ ...base, runId: s3.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker2, takeoverReceiptId: takeover.receiptId, ruleCheckId: check2 })).toEqual({ ok: false, reason: "reference_mismatch" });
-  // 이미 쓴 허가를 실은 인수 영수증은 받지 않는다.
+  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m1"), restartedMarkerDigest: marker, startPermitId: permit, checkedAt: NOW, bodyDigest: digest("rc2"), now: NOW }, S));
+  expect(ledger.sessionEvidence({ executorId: SESSION_EXECUTOR, previousRunId: s1.runId })).toMatchObject({ known: true, value: { takeovers: [{ receiptId: takeover.receiptId }] } });
+  expect(state(ledger, s1.runId)).toBe("queued");
+  expect(ledger.slotFree("session")).toEqual({ known: true, value: true });
+  // 표식·허가·규칙 확인이 모두 맞아도 다음 세션은 시작하지 않는다.
+  expect(ledger.startSession({ ...base, runId: s2.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: takeover.receiptId, ruleCheckId: check })).toEqual({ ok: false, reason: "session_start_closed" });
+  expect(state(ledger, s2.runId)).toBe("queued");
+  // 이미 적힌 허가를 실은 다른 인수 영수증은 받지 않는다.
   const reused = { ...takeover, receiptId: id(), previousRunId: s2.runId, newGenerationMarkerDigest: digest("marker-3"), bodyDigest: digest("tk3") };
   expect(ledger.applyReceipt(reused, from(s2))).toEqual({ ok: false, reason: "permit_used" });
-  expect(state(ledger, s2.runId)).toBe("stopping");
+  expect(state(ledger, s2.runId)).toBe("queued");
 });
 
 test("넣지 않는 것: 쓰기 함수는 원문·자격 값 칸과 원문 꼴의 값을 받지 않는다", () => {

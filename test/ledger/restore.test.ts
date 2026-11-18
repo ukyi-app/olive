@@ -314,10 +314,7 @@ test("R12 보고: 훅과 세션 깨짐 보고는 ack 뒤 재시작해도 어떤 
   let ledger = ready(open(path));
   const run = must(ledger.admitRun(session())).run;
   const marker = digest("marker");
-  const check = id();
   const sender = run.executorId;
-  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: id(), checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, { sender }));
-  must(ledger.startSession({ runId: run.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check, handoffRef: null, handoffDigest: null }));
   const from = { sender, runGeneration: run.runGeneration };
   const hookSignal = { kind: "hook" as const, event: "StopFailure" as const, sessionId: id(), turnId: id(), stopFailure: "rate_limit" as const, observedAt: NOW };
   const brokenSignal = { kind: "session_broken" as const, cause: "relay_lost" as const, markerDigest: marker, observedAt: NOW };

@@ -1,7 +1,7 @@
 // 장부 시험의 공용 도구. 장부 파일은 시험마다 임시 폴더에 만들고 지운다(저장소에 남기지 않는다).
 import { afterEach } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AdmitRunInput, type EnvelopeFrom, type Ledger, openLedger, type OpenOptions } from "../../src/ledger/index.ts";
@@ -15,7 +15,8 @@ afterEach(() => {
 });
 
 export function tempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "olive-ledger-"));
+  // 장부는 폴더 경로에 링크가 있으면 열지 않는다. 임시 폴더가 링크인 환경에서도 실제 경로를 쓴다.
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), "olive-ledger-"));
   dirs.push(dir);
   return dir;
 }
