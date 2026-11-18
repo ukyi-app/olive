@@ -9,6 +9,11 @@
 // - 맞춤 전이거나 연결이 없으면 live()가 false다. 실행기는 그때 새 실행을 띄우지 않고 자격을 받지 않는다.
 // - 맞춤 성공·hello는 시작이나 자격의 근거가 아니다. 시작은 따로 서명된 task_start로만 열린다.
 // - 새 연결이 열리면 앞 연결은 끝난다. 앞 연결에서 늦게 끝난 검증·저장의 결과는 버린다.
+//   맞춘 연결마다 다른 수(epoch)를 실행기에 넘겨, 앞 연결에서 받은 지시의 효과가 새 연결 위에서 나지 않게 한다(worker.ts).
+// - 한 challenge에는 유효한 답 하나만 쓴다. 검증에서 돌아온 답이 대기값을 차지하고(adopting), 세대를 적는 동안은 다른 답과
+//   일반 지시를 처리하지 않는다. 검증에서 돌아온 시점에도 대기값·연결·기한을 다시 본다.
+// - 맞춘 세대는 같은 값이어도 파일에 적힌 뒤에만 연결을 연다(앞서 저장에 실패해 메모리만 올라간 세대를 여기서 디스크에 맞춘다).
+// - 맞춘 연결에서 서명이 맞는 세대 불일치가 오면 연결을 닫는다. 다시 맞추는 것은 새 연결에서다.
 import { randomBytes } from "node:crypto";
 import { type Envelope, limits, type PendingStopSync, verifyEnvelope } from "../contract/v1/index.ts";
 import type { Outlet, WorkerExecutor } from "./worker.ts";
@@ -25,12 +30,13 @@ export interface LinkOptions {
   challenge?: () => string;
 }
 
-export type ConnectionState = "syncing" | "synced" | "closed";
+export type ConnectionState = "syncing" | "adopting" | "synced" | "closed";
 
 const actionOf = (raw: unknown): unknown => (raw as { header?: { action?: unknown } } | null)?.header?.action;
 
 export class ExecutorLink implements Outlet {
   private current: Connection | null = null;
+  private opened = 0;
   private readonly now: () => number;
   private readonly challenge: () => string;
 
@@ -46,7 +52,7 @@ export class ExecutorLink implements Outlet {
   // 인증된 연결이 새로 열렸을 때 부른다. 앞 연결의 대기값은 여기서 버린다.
   open(transport: Transport): Connection {
     this.current?.close();
-    const connection = new Connection(this, transport, this.now);
+    const connection = new Connection(this, transport, this.now, ++this.opened);
     this.current = connection;
     connection.begin(this.challenge());
     return connection;
@@ -56,12 +62,20 @@ export class ExecutorLink implements Outlet {
     return this.current === connection && connection.state !== "closed";
   }
 
+  epoch(): number | null {
+    return this.current !== null && this.current.state === "synced" ? this.current.epoch : null;
+  }
+
   live(): boolean {
-    return this.current !== null && this.current.state === "synced";
+    return this.epoch() !== null;
   }
 
   send(envelope: Envelope): void {
     if (this.live()) this.current!.transmit(envelope);
+  }
+
+  drop(epoch: number): void {
+    if (this.current !== null && this.current.epoch === epoch) this.current.close();
   }
 
   // 진입점이 주기로 부른다(뒤 작업). 맞춤 기한이 된 연결을 닫는다.
@@ -79,6 +93,7 @@ export class Connection {
     private readonly link: ExecutorLink,
     private readonly transport: Transport,
     private readonly now: () => number,
+    readonly epoch: number,
   ) {}
 
   pending(): PendingStopSync | null {
@@ -130,18 +145,22 @@ export class Connection {
     this.expireIfDue();
     if (!this.link.isCurrent(this)) return;
     const worker = this.link.worker;
+    // 맞춘 세대를 적는 동안은 아무것도 처리하지 않는다(다른 답도, 일반 지시도).
+    if (this.state === "adopting") return;
     if (this.state === "syncing") {
-      if (actionOf(raw) !== "stop_sync_reply" || this.pendingSync === null) return;
-      const result = await verifyEnvelope(raw, worker.verifyContext(this.pendingSync));
-      if (!this.link.isCurrent(this) || this.state !== "syncing") return;
+      const pending = this.pendingSync;
+      if (actionOf(raw) !== "stop_sync_reply" || pending === null) return;
+      const result = await verifyEnvelope(raw, worker.verifyContext(pending));
+      // 검증(nonce I/O)에서 돌아온 시점에 다시 본다: 이 연결이 지금 연결이고, 같은 대기값을 아직 아무 답도 차지하지 않았고, 기한 안이다.
+      if (!this.link.isCurrent(this) || this.state !== "syncing" || this.pendingSync !== pending) return;
+      if (this.now() - pending.sentAt >= limits.STOP_SYNC_WAIT_MS) return this.close();
       if (!result.ok || result.action !== "stop_sync_reply") return;
       this.pendingSync = null;
-      if (result.adoptedStopGeneration !== null) {
-        const saved = await worker.adopt(result.adoptedStopGeneration);
-        if (!this.link.isCurrent(this)) return;
-        // 적지 못했으면 이 연결로는 일하지 않는다. 다시 맞추는 것은 새 연결에서다.
-        if (!saved) return this.close();
-      }
+      this.state = "adopting";
+      const saved = await worker.syncTo(result.header.stop_generation);
+      if (!this.link.isCurrent(this)) return;
+      // 적지 못했으면 이 연결로는 일하지 않는다. 다시 맞추는 것은 새 연결에서다.
+      if (!saved) return this.close();
       this.state = "synced";
       this.transmit(worker.hello());
       worker.resendUnacked();
@@ -149,7 +168,11 @@ export class Connection {
     }
     if (actionOf(raw) === "stop_sync_reply") return;
     const result = await verifyEnvelope(raw, worker.verifyContext(null));
-    if (!this.link.isCurrent(this) || !result.ok) return;
-    await worker.handle(result);
+    if (!this.link.isCurrent(this) || this.state !== "synced") return;
+    if (!result.ok) {
+      if (result.reason === "stop_generation_mismatch") this.close();
+      return;
+    }
+    await worker.handle(result, this.epoch);
   }
 }

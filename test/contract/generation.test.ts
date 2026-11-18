@@ -422,8 +422,18 @@ test("정지 세대 맞춤: 세 상한 미만의 가장 느린 왕복은 맞추�
   expect(await roundTrip(DELIVERY_MAX_MS - 1, STOP_SYNC_ANSWER_MAX_MS - 1, DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
   // 셋 중 하나만 정각이어도 왕복은 기한 안이다(남은 둘이 상한 미만이므로).
   expect(await roundTrip(DELIVERY_MAX_MS, STOP_SYNC_ANSWER_MAX_MS - 1, DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
-  // 받는 쪽 경계(25초)의 정각 거절은 숫자를 직접 적어 고정한다. 기본값을 낮춰도 이 사례는 25초 정각의 왕복이다.
-  expect(await roundTrip(10_000, 5_000, 10_000)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  // 받는 쪽 경계(25초)의 정각 거절은 숫자를 직접 적어 고정한다. 내는 쪽 기본값(전달·처리 상한, 맞춤 봉투의 수명)과 무관하도록
+  // 요청은 감독에 보내지 않고, 답은 수명을 15,000ms(v1의 상한)로 고정해 다시 서명한 유효한 봉투를 쓴다. 답은 도착 때도 신선하다.
+  const fixedReply = (issued: number) => forge(syncReply(DIAGNOSIS, 4, CHALLENGE, issued), { header: { expires_at: issued + 15_000 } }, SUPERVISOR);
+  const boundary = async (arrived: number) => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    worker.requestSync(CHALLENGE, sent);
+    const reply = fixedReply(sent + 15_000);
+    expect(reply.header.expires_at).toBeGreaterThan(arrived);
+    return worker.receive(reply, arrived);
+  };
+  expect(await boundary(sent + 24_999)).toEqual({ ok: true, adopted: 4 });
+  expect(await boundary(sent + 25_000)).toEqual({ ok: false, reason: "challenge_mismatch" });
 
   // 같은 규칙이 일반 봉투에도 있다: maySend가 싣게 하는 마지막 순간(남은 수명 = 전달 상한)에 실은 봉투는
   // 전달이 상한 미만이면 받고, 상한 정각이면 expires_at 정각이라 expired다.

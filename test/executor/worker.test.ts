@@ -66,11 +66,13 @@ test("시작: 결과가 계약의 모양이 아니면 실패 결과로 보고하
 
 test("지시: 서명이 맞아도 옛 정지 세대·옛 실행 세대면 실행 0", async () => {
   const r = await make({ syncTo: 3 });
-  // 옛 정지 세대(2)의 시작.
+  // 옛 정지 세대(2)의 시작. 서명이 맞는 세대 불일치라 그 연결도 닫는다(새 연결에서 다시 맞춘다).
   await start(r, { stop: 2 });
   await r.worker.idle();
   expect(r.launcher.spawned).toBe(0);
   expect(receipts(r)).toHaveLength(0);
+  expect(r.transport.closed).toBe(true);
+  await reconnect(r, 3);
   // 실행 세대 2로 연 실행에 옛 실행 세대(1)의 시작·취소가 와도 아무 일도 없다.
   const runId = randomUUID();
   const value = credentialValue();
@@ -403,13 +405,25 @@ test("정지 세대: 저장에 실패하면 종료는 계속하되 새 지시를
   await r.worker.idle();
   expect(r.worker.intakeClosed()).toBe("stop_generation_unsaved");
   expect(r.store.durableStopGeneration()).toBe(0);
-  // 종료는 끝까지 갔다.
-  expect(r.transport.of("receipt_stopped")[0]!.body.exit).toBe("cancelled");
+  // 그 연결은 닫는다(다시 맞추는 것은 새 연결에서).
+  expect(r.transport.closed).toBe(true);
+  // 종료는 끝까지 갔다. 영수증은 적어 두었다가 다시 맞춘 연결에서 보낸다.
+  expect(r.store.outboxFor(runId).find((e) => e.action === "receipt_stopped")?.body.exit).toBe("cancelled");
   // 새 세대(4)로 온 시작도 받지 않는다.
+  await reconnect(r, 4);
+  expect(r.link.live()).toBe(false);
   await start(r, { stop: 4 });
   await r.worker.idle();
   expect(r.launcher.spawned).toBe(1);
   expect(r.store.runs()).toHaveLength(1);
+  // 저장이 돌아온 뒤 같은 세대로 다시 맞추면 그 세대를 파일에 적고서야 연결을 열고 접수를 회복한다.
+  fail = false;
+  await reconnect(r, 4);
+  expect(r.store.durableStopGeneration()).toBe(4);
+  expect(r.worker.intakeClosed()).toBeNull();
+  expect(r.transport.of("receipt_stopped")[0]!.body.exit).toBe("cancelled");
+  await start(r, { stop: 4 });
+  await until(() => r.launcher.spawned === 2);
 });
 
 test("멱등: 같은 지시를 다시 받으면 같은 영수증(같은 id, 같은 본문)이고 새로 띄우지 않는다", async () => {
@@ -492,8 +506,8 @@ test("정리: result_finalize는 프로세스 0개를 확인한 실행만 지우
   const { runId } = await start(r);
   await r.worker.idle();
   r.space.cleanResult = false;
-  const finalize = (id: string) =>
-    fromSupervisor(r.clock, r.worker.name, "result_finalize", { run_id: id, outcome: "failed", result_digest: null, stored_at: r.clock.now() }, { stop_generation: 0, run_generation: 1 });
+  const finalize = (id: string, requestId?: string) =>
+    fromSupervisor(r.clock, r.worker.name, "result_finalize", { run_id: id, outcome: "failed", result_digest: null, stored_at: r.clock.now() }, { stop_generation: 0, run_generation: 1, request_id: requestId });
   await r.connection.receive(finalize(runId));
   expect(stateOf(r, runId)).toBe("cleanup_pending");
   expect(r.transport.of("receipt_cleaned")).toHaveLength(0);
@@ -501,13 +515,22 @@ test("정리: result_finalize는 프로세스 0개를 확인한 실행만 지우
   await r.worker.idle();
   expect(r.launcher.spawned).toBe(1);
   r.space.cleanResult = true;
-  await r.connection.receive(finalize(runId));
+  const requestId = randomUUID();
+  await r.connection.receive(finalize(runId, requestId));
   expect(stateOf(r, runId)).toBe("finalized");
   const cleaned = r.transport.of("receipt_cleaned");
   expect(cleaned).toHaveLength(1);
-  // 같은 확정이 다시 오면 같은 정리 영수증이다.
-  await r.connection.receive(finalize(runId));
+  // 같은 확정(같은 request_id)이 새 봉투로 다시 오면 같은 정리 영수증이다.
+  await r.connection.receive(finalize(runId, requestId));
   expect(r.transport.of("receipt_cleaned").map((e) => e.body)).toEqual([cleaned[0]!.body, cleaned[0]!.body]);
+  // 다른 요청의 확정은 그 요청의 영수증을 받되, 지우기는 반복하지 않고 정리 시각은 처음의 사실이다.
+  const other = randomUUID();
+  await r.connection.receive(finalize(runId, other));
+  const last = r.transport.of("receipt_cleaned").at(-1)!.body;
+  expect(last.instruction_request_id).toBe(other);
+  expect(last.receipt_id).not.toBe(cleaned[0]!.body.receipt_id);
+  expect(last.cleaned_at).toBe(cleaned[0]!.body.cleaned_at);
+  expect(r.space.cleaned).toEqual([runId, runId]);
 });
 
 test("저장소: 초기화되면 저장소 ID가 바뀌어 옛 지시가 거절된다", async () => {

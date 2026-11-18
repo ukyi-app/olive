@@ -42,6 +42,20 @@ switch (mode) {
     descendant("inherit");
     done();
     break;
+  case "echo-credential": {
+    // 받은 자격을 결과의 모든 글 칸에 되쓴다(결과로 자격이 새는 길의 시험용).
+    const value = process.env.OLIVE_CREDENTIAL ?? "";
+    process.stdout.write(
+      JSON.stringify({
+        role,
+        outcome: "completed",
+        summary: `요약 ${value}`,
+        items: [{ kind: "finding", text: `항목 ${value}` }],
+        refs: [{ kind: "path", ref: value, digest: null }],
+      }),
+    );
+    break;
+  }
   case "print-env":
     // 받은 환경을 그대로 작업 폴더에 적는다(허용 목록 확인용).
     writeFileSync(join(process.cwd(), "received-env.json"), JSON.stringify(process.env));

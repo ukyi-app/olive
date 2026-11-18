@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Action, type Bodies, type Envelope, sealEnvelope, type SealInput } from "../../src/contract/v1/index.ts";
 import type { ProcessCleanup } from "../../src/executor/containment.ts";
-import { bunLauncher, type Launcher } from "../../src/executor/launcher.ts";
+import { bunLauncher, type Launcher, type SpawnedChild } from "../../src/executor/launcher.ts";
 import { type Connection, ExecutorLink, type Transport } from "../../src/executor/link.ts";
 import type { CredentialSource, RoleProfile } from "../../src/executor/profile.ts";
 import { ExecutorStore, type StoreIo } from "../../src/executor/store.ts";
@@ -72,24 +72,36 @@ export class FakeTransport implements Transport {
   }
 }
 
-// 가짜 정리. survivors가 돌려줄 값을 시험이 정한다. terminate는 시험이 띄운 프로세스를 그 pid로만 끝낸다.
+// 가짜 정리. survivors가 돌려줄 값을 시험이 정한다. terminate는 시험이 띄운 자식을 그 자식의 핸들로만 끝낸다.
+// 숫자 PID로 보내지 않는다: 끝나 회수된 자식의 번호는 이 머신의 무관한 프로세스가 다시 받을 수 있다.
+// 끝난 자식은 등록에서 빠지고(recordingLauncher), 핸들도 끝난 자식에는 보내지 않는다(launcher.ts).
 export class FakeCleanup implements ProcessCleanup {
   remaining: number | null = 0;
+  // survivors가 던지게 하는 자리(세는 쪽의 실패).
+  survivorsError: Error | null = null;
   terminations = 0;
   survivorChecks = 0;
-  readonly pids = new Set<number>();
+  // 살아 있다고 아는 자식과 끝나서 등록에서 뺀 자식.
+  readonly children = new Set<SpawnedChild>();
+  readonly exitedChildren = new Set<SpawnedChild>();
+  // 신호를 보낸 자식(끝난 자식이 여기 있으면 안 된다).
+  readonly signalled: SpawnedChild[] = [];
+  // 정리가 걸린 경우: 신호가 닿지 않고(inert) terminate가 돌아오지 않는다(hold).
+  inert = false;
+  hold: Promise<void> | undefined;
   async terminate() {
     this.terminations++;
-    for (const pid of this.pids) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // 이미 끝남
+    if (!this.inert) {
+      for (const child of this.children) {
+        this.signalled.push(child);
+        child.signal("SIGKILL");
       }
     }
+    await this.hold;
   }
   async survivors() {
     this.survivorChecks++;
+    if (this.survivorsError !== null) throw this.survivorsError;
     return this.remaining;
   }
   busy() {
@@ -102,12 +114,17 @@ export class FakeSpace implements RunSpace {
   cleaned: string[] = [];
   cleanResult = true;
   before: (() => void | Promise<void>) | undefined;
-  async prepare(runId: string) {
+  // 지우기가 돌아오기 전에 시험이 끼어드는 자리(정리 중 경합).
+  cleanGate: Promise<void> | undefined;
+  signals: AbortSignal[] = [];
+  async prepare(runId: string, signal?: AbortSignal) {
     this.prepared.push(runId);
+    if (signal) this.signals.push(signal);
     await this.before?.();
   }
   async clean(runId: string) {
     this.cleaned.push(runId);
+    await this.cleanGate;
     return this.cleanResult;
   }
 }
@@ -115,29 +132,48 @@ export class FakeSpace implements RunSpace {
 export class FakeCredentials implements CredentialSource {
   values = new Map<string, Uint8Array>();
   calls: { runId: string; digest: string }[] = [];
+  signals: AbortSignal[] = [];
   // 값을 내어 주기 전에 시험이 끼어드는 자리(준비 중 경합).
   before: (() => void | Promise<void>) | undefined;
-  async take(runId: string, digest: string) {
+  async take(runId: string, digest: string, signal?: AbortSignal) {
     this.calls.push({ runId, digest });
+    if (signal) this.signals.push(signal);
     await this.before?.();
     return this.values.get(runId) ?? null;
   }
 }
 
-// bunLauncher를 감싸 띄운 pid를 정리 가짜에 알린다.
-export function recordingLauncher(cleanup: FakeCleanup): Launcher & { spawned: number } {
+// 시험이 여닫는 문. open 전까지 기다리게 한다.
+export function gate(): { wait: Promise<void>; open: () => void } {
+  let open!: () => void;
+  const wait = new Promise<void>((resolve) => (open = resolve));
+  return { wait, open };
+}
+
+export const pause = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// bunLauncher를 감싸 띄운 자식의 핸들을 정리 가짜에 알리고, 끝나면 등록에서 뺀다.
+export function recordingLauncher(cleanup: FakeCleanup): Launcher & { spawned: number; onSpawned: (() => void) | undefined } {
   const launcher = {
     spawned: 0,
+    // 자식이 생긴 직후 시험이 끼어드는 자리(예: 시계를 임대 뒤로 옮긴다).
+    onSpawned: undefined as (() => void) | undefined,
+    // 자식이 실제로 끝났을 때만 등록에서 뺀다(끝을 기다리다 포기한 자식은 계속 핸들로 끝낼 수 있어야 한다).
     run: (plan, signal, hooks) =>
       bunLauncher.run(plan, signal, {
         ...hooks,
-        spawned: (pid) => {
+        spawned: (child) => {
           launcher.spawned++;
-          cleanup.pids.add(pid);
-          hooks.spawned(pid);
+          cleanup.children.add(child);
+          void child.exited.then(() => {
+            cleanup.children.delete(child);
+            cleanup.exitedChildren.add(child);
+          });
+          hooks.spawned(child);
+          launcher.onSpawned?.();
         },
       }),
-  } satisfies Launcher & { spawned: number };
+  } satisfies Launcher & { spawned: number; onSpawned: (() => void) | undefined };
   return launcher;
 }
 
@@ -163,7 +199,7 @@ export interface Rig {
   cleanup: FakeCleanup;
   space: FakeSpace;
   credentials: FakeCredentials;
-  launcher: Launcher & { spawned: number };
+  launcher: Launcher & { spawned: number; onSpawned: (() => void) | undefined };
   transport: FakeTransport;
   connection: Connection;
   challenge: string;
@@ -178,6 +214,7 @@ export interface RigOptions {
   // 맞춤 답의 정지 세대. null이면 맞추지 않는다(연결만 연다).
   syncTo?: number | null;
   extraEnv?: Record<string, string>;
+  exitWaitMs?: number;
 }
 
 export async function rig(options: RigOptions = {}): Promise<Rig> {
@@ -202,6 +239,7 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
     launcher,
     now: clock.now,
     drainMs: 100,
+    exitWaitMs: options.exitWaitMs,
   });
   let n = 0;
   const challenges: string[] = [];

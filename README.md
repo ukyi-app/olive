@@ -93,7 +93,7 @@ src/main/
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
 src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다. 진입점 조립은 아직 없다)
-├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 기록, 보낸 영수증
+├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 기록, 보낸 영수증, 저장 장애와 장부 대조
 ├── worker.ts       # 지시 처리, 띄우기 직전 확인, 영수증·결과 보고
 ├── link.ts         # 연결 하나의 수명: 정지 세대 맞춤 → hello → 재전송
 ├── profile.ts      # 역할 프로필, 허용 목록 환경, 자격 digest 대조
@@ -106,6 +106,23 @@ test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/
 ### 실행기 시험의 실제 프로세스
 
 `test/executor/containment.test.ts`의 실제 프로세스 사례는 `bwrap --unshare-pid --unshare-user`로 만든 PID namespace 안에서만 돈다. 그 안의 `kill(-1)`은 밖에 닿지 않는다. `bwrap`이나 비특권 user namespace가 없으면(이미지의 `test` 단계가 그렇다) 그 사례를 등록하지 않고 이유를 한 줄 찍는다. 개발 기계에서 반드시 돌리려면 `OLIVE_REQUIRE_BWRAP=1 bun run test`로 없을 때 실패하게 한다. 호스트의 PID 공간에서 정리 코드에 진짜 신호를 주는 시험을 쓰지 않는다.
+
+- harness(`containment-harness.ts`)는 실제 신호를 쓰기 전에 bwrap이 만든 공간 안인지 스스로 확인한다(시험이 넣는 `--setenv` 표식, 자기 번호 1·2, 호스트가 아닌 `uid_map`). 아니면 신호 없이 끝난다.
+- `python3`(`/usr/bin/python3`)가 없으면 `nondumpable`·`zombieleader`·`tighthop` 사례만 등록하지 않고 이유를 찍는다.
+- 일반 실행기 시험(`worker`·`ordering`)이 띄운 역할 프로그램은 그 자식의 핸들(`SpawnedChild`)로만 끝낸다. 끝난 자식의 숫자 PID에 신호를 보내지 않는다(번호가 재사용되면 무관한 프로세스가 맞는다).
+
+### 작업자 실행기가 감독 쪽에 기대는 것
+
+v1을 바꾸지 않고 실행기가 정한 동작이다. 감독 작업은 이것을 전제로 한다.
+
+- **첫 임대:** `task_start`에는 임대 칸이 없어 첫 임대는 `issued_at + RUN_LEASE_MAX_MS`(30초)다. 늦게 받아도 도착 때부터 새로 주지 않는다. 그보다 작은 `run_renew`는 임대를 줄이지 않는다(늘리기만 한다). 이미 끝난 임대는 갱신으로 되살리지 않는다.
+- **시작을 받지 않을 때는 답하지 않는다:** 슬롯을 쥔 실행이 있거나, revision이 다르거나, 접수가 닫혔거나, 확정되지 않은 실행이 `STATUS_MAX_RUNS`(8)개에 이르면 영수증 없이 버린다. 감독은 같은 ID를 `status_query`로 다시 묻고, `not_known`을 종료나 새 실행 허가로 해석하지 않는다. 확정(`result_finalize`)이 실행기의 장부를 비운다.
+- **결과 모양 검사:** 역할 프로그램의 결과는 `report_result` 본문 검사로 모양·크기를 본다. 그 실행의 자격 값이 결과의 어느 글에든 들어 있으면 원문 없이 `outcome: "failed"`의 고정 결과를 보낸다.
+- **임대 만료는 `exit: "failed"`다:** 감독은 `failed`만으로 취소·정리·소멸을 추정하지 않는다. 소멸은 `receipt_stopped`(남은 0)로만 안다.
+- **영수증은 요청마다:** 같은 `request_id`의 재전송에는 같은 영수증을, 다른 `request_id`의 후속 취소·확정에는 그 요청의 영수증을 낸다. 이미 끝난 효과(종료, 지우기)는 반복하지 않는다.
+- **성공 확정은 결과 digest를 대조한다:** `result_finalize(outcome=succeeded)`의 `result_digest`가 실행기가 보낸 `report_result`의 결과와 다르면 지우지도 답하지도 않는다.
+- **저장 장애는 로컬에서 가른다:** nonce·영수증·실행 기록을 적지 못하면 그 봉투는 `replayed`로 거절되거나 영수증을 보내지 않고, 실행기는 쓰기가 돌아올 때까지 새 접수를 닫는다. 진행 중인 종료와 재맞춤은 계속한다. wire에 새 거절 사유는 없다(감독에는 응답 없음으로 보인다).
+- **세대가 어긋나면 연결을 닫는다:** 맞춘 연결에서 서명이 맞는 정지 세대 불일치가 오거나 정지 세대를 저장하지 못하면 실행기가 연결을 닫는다. 감독은 새 연결의 맞춤으로 다시 받는다.
 
 ## 공개 저장소
 

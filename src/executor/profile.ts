@@ -60,7 +60,8 @@ export function fixProfile(profile: RoleProfile): RoleProfile {
 // 실행기는 받은 바이트의 SHA-256이 지시의 credential.digest와 같을 때만 쓴다.
 export interface CredentialSource {
   // 없으면 null. 돌려준 바이트를 그대로 대조하고 쓴다(인코딩·줄바꿈을 바꾸지 않는다).
-  take(runId: string, digest: string): Promise<Uint8Array | null>;
+  // signal이 중단되면 요청을 거둔다. 실행기는 중단 뒤 늦게 온 값을 쓰지 않는다.
+  take(runId: string, digest: string, signal: AbortSignal): Promise<Uint8Array | null>;
 }
 
 // 정확한 바이트로 digest를 대조한다. digest 칸은 계약이 소문자 16진 64자로 묶는다.

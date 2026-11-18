@@ -10,8 +10,28 @@ const code = async (file: string) =>
     .filter((line) => !line.trimStart().startsWith("//"))
     .join("\n");
 
-// 실행기가 읽는 본문 칸. 지시(task_start·task_cancel·run_renew·result_finalize·status_query·ack)와 자기가 낸 영수증의 칸뿐이다.
-const READABLE = new Set(["run_id", "profile_revision", "policy_revision", "deadline_at", "credential", "reason", "lease_until", "run_ids", "ids", "instruction"]);
+// 실행기가 읽는 본문 칸. 지시(task_start·task_cancel·run_renew·result_finalize·status_query·ack)와 자기가 낸 영수증·보고의 칸뿐이다.
+const READABLE = new Set([
+  // 지시의 칸
+  "run_id",
+  "profile_revision",
+  "policy_revision",
+  "deadline_at",
+  "credential",
+  "reason",
+  "lease_until",
+  "run_ids",
+  "ids",
+  "outcome",
+  "result_digest",
+  // 자기가 낸 영수증·보고의 칸(재전송 대조, 정리 사실, 성공 확정의 결과 대조)
+  "instruction",
+  "receipt_id",
+  "report_id",
+  "instruction_request_id",
+  "cleaned_at",
+  "result",
+]);
 
 function bodyReads(source: string): string[] {
   const found: string[] = [];
