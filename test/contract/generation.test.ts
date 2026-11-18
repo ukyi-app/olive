@@ -350,7 +350,7 @@ test("정지 세대 맞춤: 다른 연결의 답, 이미 쓴 답, 기다리지 �
   expect(worker.state.stopGeneration).toBe(4);
 });
 
-test("정지 세대 맞춤: 답의 수명은 15초다(직전 통과, 정각 expired, 30초 수명은 lifetime_invalid)", async () => {
+test("정지 세대 맞춤: 답의 수명은 15초다(직전 통과, 정각 expired, 받는 쪽 상한 + 1ms 수명은 lifetime_invalid)", async () => {
   expect(STOP_SYNC_TTL_MS).toBeLessThan(MESSAGE_TTL_MS);
   // 보내는 쪽이 maySend로 실을 수 있어야 한다.
   expect(STOP_SYNC_TTL_MS).toBeGreaterThan(DELIVERY_MAX_MS + CLOCK_SKEW_MS);
@@ -363,14 +363,21 @@ test("정지 세대 맞춤: 답의 수명은 15초다(직전 통과, 정각 expi
   };
   expect(await at(ISSUED + STOP_SYNC_TTL_MS - 1)).toEqual({ ok: true, adopted: 4 });
   expect(await at(ISSUED + STOP_SYNC_TTL_MS)).toEqual({ ok: false, reason: "expired" });
-  const long = forge(reply, { header: { expires_at: ISSUED + MESSAGE_TTL_MS } }, SUPERVISOR);
-  const worker = executor(DIAGNOSIS, 3, {});
-  worker.requestSync(CHALLENGE);
-  expect(await worker.receive(long)).toEqual({ ok: false, reason: "lifetime_invalid" });
+  // 거절 사례는 받는 쪽 상한으로 만든다. 발급 기본값(STOP_SYNC_TTL_MS)을 낮춰도 이 봉투는 상한을 넘는다.
+  const listen = () => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    worker.requestSync(CHALLENGE);
+    return worker;
+  };
+  const atMax = forge(reply, { header: { expires_at: ISSUED + STOP_SYNC_TTL_MAX_MS } }, SUPERVISOR);
+  expect(await listen().receive(atMax)).toEqual({ ok: true, adopted: 4 });
+  const long = forge(reply, { header: { expires_at: ISSUED + STOP_SYNC_TTL_MAX_MS + 1 } }, SUPERVISOR);
+  expect(await listen().receive(long)).toEqual({ ok: false, reason: "lifetime_invalid" });
 });
 
 test("정지 세대 맞춤: 기다리는 기한은 요청 전달 + 감독 처리 + 답 전달을 덮고, 수명 상한은 내는 쪽 기본값보다 작지 않다", () => {
-  // 전달은 DELIVERY_MAX_MS 미만(maySend의 경계)이고 감독은 받은 뒤 STOP_SYNC_ANSWER_MAX_MS 안에 답을 싣는다.
+  // 시한은 모두 정각부터 거절하므로 전달 상한과 처리 상한은 "그 값 미만"이다. 그러면 왕복은 2 * 전달 + 처리 미만이다.
+  // 받는 쪽은 실제 전달 지연을 재지 않는다. maySend는 싣는 순간 남은 수명만 보므로, 전달 상한은 운영의 가정이다.
   expect(STOP_SYNC_WAIT_MS).toBeGreaterThanOrEqual(2 * DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS);
   expect(STOP_SYNC_WAIT_MS).toBe(25_000);
   expect(STOP_SYNC_TTL_MAX_MS).toBe(15_000);
@@ -393,14 +400,68 @@ test("정지 세대 맞춤: 요청 8초, 답 8초가 걸린 왕복은 맞춘다(
   expect(maySend(reply.header, sent + 8_000)).toEqual({ ok: true });
   expect(await worker.receive(reply, sent + 16_000)).toEqual({ ok: true, adopted: 4 });
   expect(worker.state.challenge).toBeNull();
+});
 
-  // 지원하는 가장 느린 왕복: 전달 상한 직전 두 번과 감독 처리 상한.
-  const slow = executor(DIAGNOSIS, 3, {});
-  const slowRequest = slow.requestSync(CHALLENGE, sent);
-  const arrived = sent + DELIVERY_MAX_MS - 1;
-  expect(await supervisor(4).receive(slowRequest, arrived)).toMatchObject({ ok: true });
-  const answered = arrived + STOP_SYNC_ANSWER_MAX_MS;
-  expect(await slow.receive(syncReply(DIAGNOSIS, 4, CHALLENGE, answered), answered + DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
+test("정지 세대 맞춤: 세 상한 미만의 가장 느린 왕복은 맞추고, 세 상한에 정각으로 걸린 왕복(10초 + 5초 + 10초)은 계약상 거절이다", async () => {
+  const sent = ISSUED;
+  // 요청 전달 d1, 감독 처리 a, 답 전달 d2를 거친 왕복. 감독이 받는 것과 maySend가 싣게 하는 것도 함께 확인한다.
+  const roundTrip = async (d1: number, a: number, d2: number) => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    const request = worker.requestSync(CHALLENGE, sent);
+    expect(maySend(request.header, sent)).toEqual({ ok: true });
+    expect(await supervisor(4).receive(request, sent + d1)).toMatchObject({ ok: true, adopted: null });
+    const answered = sent + d1 + a;
+    const reply = syncReply(DIAGNOSIS, 4, CHALLENGE, answered);
+    expect(maySend(reply.header, answered)).toEqual({ ok: true });
+    const arrived = answered + d2;
+    // 거절이 답의 신선도 때문이 아니라 기다리는 기한 때문임을 보이려고, 답 봉투의 수명이 남아 있음을 확인한다.
+    expect(reply.header.expires_at).toBeGreaterThan(arrived);
+    return worker.receive(reply, arrived);
+  };
+  expect(await roundTrip(DELIVERY_MAX_MS - 1, STOP_SYNC_ANSWER_MAX_MS - 1, DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
+  // 두 전달과 처리가 모두 상한 정각이면 왕복은 STOP_SYNC_WAIT_MS 정각이고, 상한("미만")을 넘은 것이라 거절한다.
+  expect(DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS + DELIVERY_MAX_MS).toBe(STOP_SYNC_WAIT_MS);
+  expect(await roundTrip(DELIVERY_MAX_MS, STOP_SYNC_ANSWER_MAX_MS, DELIVERY_MAX_MS)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  // 셋 중 하나만 정각이어도 왕복은 기한 안이다(남은 둘이 상한 미만이므로).
+  expect(await roundTrip(DELIVERY_MAX_MS, STOP_SYNC_ANSWER_MAX_MS - 1, DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
+
+  // 같은 규칙이 일반 봉투에도 있다: maySend가 싣게 하는 마지막 순간(남은 수명 = 전달 상한)에 실은 봉투는
+  // 전달이 상한 미만이면 받고, 상한 정각이면 expires_at 정각이라 expired다.
+  const request = executor(DIAGNOSIS, 3, {}).requestSync(CHALLENGE, sent);
+  const lastSend = request.header.expires_at - DELIVERY_MAX_MS;
+  expect(maySend(request.header, lastSend)).toEqual({ ok: true });
+  expect(await supervisor(4).receive(request, lastSend + DELIVERY_MAX_MS - 1)).toMatchObject({ ok: true });
+  expect(await supervisor(4).receive(request, lastSend + DELIVERY_MAX_MS)).toEqual({ ok: false, reason: "expired" });
+});
+
+test("정지 세대 맞춤: 기다리는 요청의 sentAt이 없거나 정수가 아니거나 미래이거나 아주 옛 시각이면 challenge_mismatch이고 세대는 그대로다", async () => {
+  // 나머지(감독 서명, 받는 쪽, 답의 신선도, challenge, nonce)는 모두 맞는 답이다. sentAt만 바꾼다.
+  const now = NOW;
+  const reply = syncReply(DIAGNOSIS, 4, CHALLENGE, now - 1_000);
+  const withPending = async (pending: unknown) => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    worker.requestSync(CHALLENGE, now - 1_000);
+    worker.state.challenge = pending as typeof worker.state.challenge;
+    const result = await worker.receive(reply, now);
+    return { result, stopGeneration: worker.state.stopGeneration };
+  };
+  const rejected = { result: { ok: false, reason: "challenge_mismatch" }, stopGeneration: 3 } as const;
+  // 대조군: 같은 답이 올바른 sentAt이면 받는다(경과 0도 받는다).
+  expect(await withPending({ challenge: CHALLENGE, sent_at: now - 1_000 })).toEqual({ result: { ok: true, adopted: 4 }, stopGeneration: 4 });
+  expect(await withPending({ challenge: CHALLENGE, sent_at: now })).toEqual({ result: { ok: true, adopted: 4 }, stopGeneration: 4 });
+  // 대기 객체 전체 없음.
+  expect(await withPending(null)).toEqual(rejected);
+  // sentAt 없음(덧셈이면 NaN이 되어 기한 비교가 거짓이 되는 자리).
+  expect(await withPending({ challenge: CHALLENGE })).toEqual(rejected);
+  // 미래 시각(로컬 시계가 뒤로 감), 1ms 앞.
+  expect(await withPending({ challenge: CHALLENGE, sent_at: now + 1 })).toEqual(rejected);
+  // 아주 옛 시각.
+  expect(await withPending({ challenge: CHALLENGE, sent_at: 0 })).toEqual(rejected);
+  expect(await withPending({ challenge: CHALLENGE, sent_at: Number.MIN_SAFE_INTEGER })).toEqual(rejected);
+  // 정수가 아닌 값: 소수, NaN, 무한, 안전 정수 밖, 숫자가 아닌 값.
+  for (const sentAt of [now - 1_000.5, Number.NaN, Number.NEGATIVE_INFINITY, -(2 ** 53), String(now - 1_000), null]) {
+    expect(await withPending({ challenge: CHALLENGE, sent_at: sentAt }), String(sentAt)).toEqual(rejected);
+  }
 });
 
 test("정지 세대 맞춤: 기다리는 기한 직전은 받고 정각은 challenge_mismatch, 답의 15초 신선도는 따로 expired다", async () => {

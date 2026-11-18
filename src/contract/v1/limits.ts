@@ -1,9 +1,12 @@
-// olive-control/v1의 한도와 시간 상수는 모두 이 파일에 있다. 숫자는 두 종류다.
-// - 받는 쪽 경계(이름에 MAX가 들거나 "v1에 고정"이라고 적은 것): 받는 쪽이 이 값을 넘는 봉투·본문을 거절한다. 판에 고정이다.
-//   바꾸면 이미 배포된 v1 수신기가 새 값으로 낸 메시지를 거절하므로 판을 올린다(v2).
-// - 내는 쪽 기본값과 운영 숫자: 보내는 쪽이 고르는 값, 연결·실행 감시의 시간. 받는 쪽 경계 안에서만 같은 판에서 바꾼다
-//   (경계와의 관계는 시험이 지킨다). "기본값(관리자 미확정)"은 이 종류에만 붙는다. supervisor.md §11의 기본값이거나
-//   이 계약이 고른 출발점이고, 재 본 값이 아니다.
+// olive-control/v1의 한도와 시간 상수는 모두 이 파일에 있다. 숫자는 두 종류이고, 종류는 상수마다 붙은 표시로 가른다(이름으로 가르지 않는다).
+// - 받는 쪽 경계("v1에 고정"이라고 적은 것): 받는 쪽 검증(verifyEnvelope와 본문 해석기)이 이 값으로 봉투·본문을 거절한다.
+//   판에 고정이다. 바꾸면 이미 배포된 v1 수신기가 새 값으로 낸 메시지를 거절하므로 판을 올린다(v2).
+// - 내는 쪽 기본값과 운영 숫자("기본값(관리자 미확정)"이라고 적은 것): 보내는 쪽이 고르는 값, 전달·처리·준비의 상한,
+//   연결·실행 감시의 시간. 이름에 MAX가 들어도(DELIVERY_MAX_MS, STOP_SYNC_ANSWER_MAX_MS, PREPARE_MAX_MS) 받는 쪽 검증이
+//   강제하지 않으므로 이 종류다. 받는 쪽 경계 안에서만 같은 판에서 바꾼다(경계와의 관계는 시험이 지킨다).
+//   supervisor.md §11의 기본값이거나 이 계약이 고른 출발점이고, 재 본 값이 아니다.
+// 시한은 모두 정각부터 거절한다: 봉투는 expires_at 정각에 expired, 맞춤 대기는 sentAt + STOP_SYNC_WAIT_MS 정각에
+// challenge_mismatch. 그래서 전달·처리의 상한은 "그 값 미만"이다(정각까지 걸리면 상한을 넘은 것이다).
 
 export const CONTRACT = "olive-control/v1";
 
@@ -23,18 +26,23 @@ export const STOP_SYNC_TTL_MAX_MS = 15_000;
 // 커야 보내는 쪽이 실을 수 있다(시험이 지킨다).
 export const STOP_SYNC_TTL_MS = 15_000;
 // 실행기가 stop_sync_request를 연결에 실은 때부터 그 challenge의 답을 받아들이는 기한. v1에 고정(실행기가 거절하는 경계).
-// 답 봉투의 신선도(발급부터 STOP_SYNC_TTL_MAX_MS)와 따로 잰다. 요청의 전달, 감독의 처리, 답의 전달을 합친 왕복을 덮어야 하므로
-// STOP_SYNC_WAIT_MS >= 2 * DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS 이다(시험이 지킨다). 지금 값은 등호(2 * 10초 + 5초).
+// 답 봉투의 신선도(발급부터 STOP_SYNC_TTL_MAX_MS)와 따로 잰다. 경과 시간이 0 이상 이 값 미만일 때만 받는다(정각부터 거절).
+// 요청의 전달 < DELIVERY_MAX_MS, 감독의 처리 < STOP_SYNC_ANSWER_MAX_MS, 답의 전달 < DELIVERY_MAX_MS이면 왕복은
+// 2 * DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS 미만이므로 STOP_SYNC_WAIT_MS >= 2 * DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS이면
+// 덮는다(시험이 지킨다). 지금 값은 등호(2 * 10초 + 5초)라, 세 상한에 정각으로 걸린 왕복(25초)은 상한을 넘은 것이고 거절된다.
 // 기한을 늘려도 받아들이는 답은 이 연결에서 기다리는 challenge를 담은 답뿐이다.
 export const STOP_SYNC_WAIT_MS = 25_000;
-// 감독이 맞춤 요청을 받은 때부터 답을 연결에 싣기까지의 상한. 기본값(관리자 미확정). 넘기면 답하지 않는다(실행기가 이미 버렸다).
+// 감독이 맞춤 요청을 받은 때부터 답을 연결에 싣기까지의 상한. 기본값(관리자 미확정). 이 값 미만에 실어야 한다.
+// 받은 때부터 이 값이 되면(정각 포함) 답하지 않는다. 그 답은 실행기의 기한 안에 닿는다고 보장할 수 없다.
 export const STOP_SYNC_ANSWER_MAX_MS = 5_000;
 
-// 전달 지연의 상한. 기본값(관리자 미확정). 보내는 쪽은 남은 시한이 이보다 짧은 봉투를 연결에 싣지 않는다.
+// 전달 지연의 상한. 기본값(관리자 미확정). 연결 위 한 번의 전달은 이 값 미만이라고 본다(받는 쪽이 재지 않는다).
+// 보내는 쪽은 남은 시한이 이보다 짧은 봉투를 연결에 싣지 않는다(maySend, 싣는 순간에만 본다). 남은 시한이 정확히 이 값일 때 실은
+// 봉투는 전달이 이 값 미만이어야 expires_at 전에 닿는다.
 // 이 값과 CLOCK_SKEW_MS의 합은 MESSAGE_TTL_MS·STOP_SYNC_TTL_MS보다 작아야 하고, 맞춤 왕복이 STOP_SYNC_WAIT_MS 안에 들어야 한다(시험이 지킨다).
 export const DELIVERY_MAX_MS = 10_000;
 
-// 실행 감시(S-10). 모두 기본값(관리자 미확정).
+// 실행 감시(S-10). RUN_LEASE_MAX_MS 밖은 모두 기본값(관리자 미확정)이다(PREPARE_MAX_MS도 받는 쪽이 검사하지 않는다).
 export const RENEW_INTERVAL_MS = 10_000;
 // RUN_LEASE_MAX_MS 이상이어야 한다: 감독이 끊김을 판정할 때 실행기는 임대가 끝나 이미 닫혀 있다(시험이 지킨다).
 export const DISCONNECT_JUDGE_MS = 30_000;

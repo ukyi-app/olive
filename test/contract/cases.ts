@@ -8,7 +8,7 @@ import { digestOf, sha256Hex } from "../../src/contract/v1/canonical.ts";
 import { type Envelope, rawPublicKey, signUnchecked } from "../../src/contract/v1/envelope.ts";
 import type { RejectReason } from "../../src/contract/v1/errors.ts";
 import type { Action, Header } from "../../src/contract/v1/header.ts";
-import { CONTRACT, MESSAGE_TTL_MS, STOP_SYNC_TTL_MS, STOP_SYNC_WAIT_MS } from "../../src/contract/v1/limits.ts";
+import { CONTRACT, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS, STOP_SYNC_TTL_MAX_MS, STOP_SYNC_TTL_MS, STOP_SYNC_WAIT_MS } from "../../src/contract/v1/limits.ts";
 import { executorName } from "../../src/contract/v1/principal.ts";
 
 // 2026-11-18T00:00:00Z. fixture는 이 시각을 "지금"으로 검증한다.
@@ -377,7 +377,8 @@ export function buildCases(keys: Keys): ContractCase[] {
     d.context.expected_recipient = DIAGNOSIS_NEW_STORAGE;
   });
   reject("lifetime-over-30s", "task-cancel", "lifetime_invalid", ["message.header.expires_at"], "수명이 30초를 넘음", (d) => {
-    d.header.expires_at = ISSUED + MESSAGE_TTL_MS + 1;
+    // 받는 쪽 상한 + 1ms. 발급 기본값(MESSAGE_TTL_MS)과 무관하게 거절이어야 한다.
+    d.header.expires_at = ISSUED + MESSAGE_TTL_MAX_MS + 1;
   });
   reject("issued-in-future", "task-cancel", "not_yet_valid", ["context.now"], "발급 시각이 시계 오차보다 미래", (d) => {
     d.context.now = ISSUED - 1_001;
@@ -479,8 +480,11 @@ export function buildCases(keys: Keys): ContractCase[] {
   reject("stop-sync-reply-expired", "stop-sync-reply", "expired", ["context.now"], "수명(15초)이 지난 답", (d) => {
     d.context.now = ISSUED + STOP_SYNC_TTL_MS;
   });
-  reject("stop-sync-reply-lifetime-30s", "stop-sync-reply", "lifetime_invalid", ["message.header.expires_at"], "다른 메시지와 같은 30초 수명의 답(맞춤은 15초까지)", (d) => {
-    d.header.expires_at = ISSUED + MESSAGE_TTL_MS;
+  reject("stop-sync-reply-lifetime-over-15s", "stop-sync-reply", "lifetime_invalid", ["message.header.expires_at"], "수명이 맞춤의 받는 쪽 상한(15초)을 1ms 넘는 답", (d) => {
+    d.header.expires_at = ISSUED + STOP_SYNC_TTL_MAX_MS + 1;
+  });
+  reject("stop-sync-reply-sent-at-future", "stop-sync-reply", "challenge_mismatch", ["context.stop_sync_challenge.sent_at"], "요청을 실은 시각이 받는 시각보다 1ms 미래(실행기 시계가 뒤로 감)", (d) => {
+    d.context.stop_sync_challenge!.sent_at = NOW + 1;
   });
   reject("stop-sync-reply-other-executor", "stop-sync-reply", "wrong_recipient", ["context.expected_recipient"], "같은 인스턴스의 다른 저장소 앞으로 낸 답", (d) => {
     d.context.expected_recipient = DIAGNOSIS_NEW_STORAGE;

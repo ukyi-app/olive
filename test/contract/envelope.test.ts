@@ -3,7 +3,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { digestOf } from "../../src/contract/v1/canonical.ts";
 import { rawPublicKey, sealEnvelope, SealError, signUnchecked, verifyEnvelope } from "../../src/contract/v1/envelope.ts";
 import type { Header } from "../../src/contract/v1/header.ts";
-import { CLOCK_SKEW_MS, MESSAGE_TTL_MS } from "../../src/contract/v1/limits.ts";
+import { CLOCK_SKEW_MS, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS } from "../../src/contract/v1/limits.ts";
 import {
   buildCases,
   DIAGNOSIS,
@@ -70,7 +70,10 @@ test("envelope: 시한 30초를 넘으면 거절(연결이 살아 있어도)", a
   expect((await verify(cancel(NOW - MESSAGE_TTL_MS + 1))).ok).toBe(true);
   expect(await verify(cancel(NOW + CLOCK_SKEW_MS + 1))).toEqual({ ok: false, reason: "not_yet_valid" });
   expect((await verify(cancel(NOW + CLOCK_SKEW_MS))).ok).toBe(true);
-  const long = signUnchecked({ ...cancel().header, expires_at: ISSUED + MESSAGE_TTL_MS + 1 }, cancel().body, keys[SUPERVISOR]!.privateKey);
+  // 수명 경계는 받는 쪽 상한으로 잰다. 발급 기본값(MESSAGE_TTL_MS)을 낮춰도 상한 정각은 받고 상한 + 1ms는 거절한다.
+  const atMax = signUnchecked({ ...cancel().header, expires_at: ISSUED + MESSAGE_TTL_MAX_MS }, cancel().body, keys[SUPERVISOR]!.privateKey);
+  expect((await verify(atMax)).ok).toBe(true);
+  const long = signUnchecked({ ...cancel().header, expires_at: ISSUED + MESSAGE_TTL_MAX_MS + 1 }, cancel().body, keys[SUPERVISOR]!.privateKey);
   expect(await verify(long)).toEqual({ ok: false, reason: "lifetime_invalid" });
   const backwards = signUnchecked({ ...cancel().header, expires_at: ISSUED }, cancel().body, keys[SUPERVISOR]!.privateKey);
   expect(await verify(backwards)).toEqual({ ok: false, reason: "lifetime_invalid" });

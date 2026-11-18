@@ -88,7 +88,9 @@ export interface VerifyContext {
   // 정지하지 않았다"는 알려진 세대이고, null은 모른다는 뜻이라 stop_sync_reply 밖의 모든 메시지를 거절한다(맞춤이 먼저다).
   stopGeneration: number | null;
   // 이 연결에서 보내고 아직 답을 기다리는 stop_sync_request의 challenge와 그 요청을 연결에 실은 시각(sentAt, 받는 쪽 시계).
-  // 없으면 null(또는 생략)이고 그때 오는 답은 거절한다. now가 sentAt + STOP_SYNC_WAIT_MS 이상이면 버린 것으로 본다.
+  // 없으면 null(또는 생략)이고 그때 오는 답은 거절한다. sentAt은 now와 같은 시계의 안전 정수 밀리초여야 하고, 경과 시간
+  // now - sentAt이 0 이상 STOP_SYNC_WAIT_MS 미만일 때만 답을 받는다. sentAt이 없거나 정수가 아니거나 미래이거나 기한이 지났으면
+  // challenge_mismatch다. 실제로 요청을 실은 시각을 두고 다시 쓰지 않는 것은 실행기의 책임이다.
   stopSyncChallenge?: PendingStopSync | null;
   // 받는 쪽이 아는 실행의 세대. 모르는 실행이면 undefined.
   runGeneration(runId: string): number | undefined;
@@ -191,10 +193,12 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
   const current = ctx.stopGeneration;
   if (spec.stopSync === "reply") {
     // 기다리는 기한은 답 봉투의 신선도(4)와 따로 잰다. 기한이 지났으면 challenge를 버린 것과 같다.
+    // sentAt은 실행기의 로컬 값이라 상대가 정할 수 없지만, 빠뜨리거나(NaN) 시계가 뒤로 가 미래가 되면 기한 비교가 거짓이 되어
+    // 통과해 버린다. 그래서 안전 정수이고 경과 시간이 0 이상·기한 미만일 때만 받는다(통과 조건을 직접 쓴다).
     const pending = ctx.stopSyncChallenge ?? null;
-    if (pending === null || ctx.now >= pending.sentAt + STOP_SYNC_WAIT_MS || (body as StopSyncReply).challenge !== pending.challenge) {
-      return reject("challenge_mismatch");
-    }
+    const waited = pending === null ? Number.NaN : ctx.now - pending.sentAt;
+    const inWindow = pending !== null && Number.isSafeInteger(pending.sentAt) && waited >= 0 && waited < STOP_SYNC_WAIT_MS;
+    if (!inWindow || (body as StopSyncReply).challenge !== pending.challenge) return reject("challenge_mismatch");
     if (current !== null && header.stop_generation < current) return reject("stop_generation_mismatch");
     if (current === null || header.stop_generation > current) adoptedStopGeneration = header.stop_generation;
   } else if (spec.stopSync === "request") {
