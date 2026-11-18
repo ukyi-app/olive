@@ -1,0 +1,44 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/stop-sync-reply-lost-storage",
+  "description": "저장소를 잃어 세대가 없는(null) 실행기가 새 저장소 ID로 세대 4를 받는다",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": 4
+  },
+  "keys": {
+    "supervisor": "UAJvNBbtmSSSDdI5O3ZAr7HeV6nIO-YpPn9Kcgp72dc",
+    "executor/session/olive-session-0/st-5e55": "SbpEXs-tXx-pxqoJbdyBDwD03aHhhZIcXvtYOxfh9KY",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "aEhRH1viV112z1woCAvo2I1iQp1YC_GDdyPRUAIrfz0"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-0e77",
+    "stop_generation": null,
+    "stop_sync_challenge": "c0ffee00000000000000000000000001",
+    "run_generations": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-0e77",
+      "action": "stop_sync_reply",
+      "request_id": "00000000-0000-4000-8000-00000000901b",
+      "stop_generation": 4,
+      "run_generation": 0,
+      "body_digest": "5aba6f054a240825dbd1515b323237f87a0ee185dd5136e5091115e30c72b3c6",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960014000,
+      "nonce": "0000000000000000000000000000001b"
+    },
+    "signature": "9ZUE8uV00sO5hc9bd2GFcI_iK6nGbdBVclaj8qkZg9Zclih5X-5uhyv0XDzogHz6KenwnSRE2n4v_3aVHeU8BQ",
+    "body": {
+      "challenge": "c0ffee00000000000000000000000001"
+    }
+  },
+  "signing_input": "{\"action\":\"stop_sync_reply\",\"body_digest\":\"5aba6f054a240825dbd1515b323237f87a0ee185dd5136e5091115e30c72b3c6\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960014000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000001b\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-0e77\",\"request_id\":\"00000000-0000-4000-8000-00000000901b\",\"run_generation\":0,\"sender\":\"supervisor\",\"stop_generation\":4}"
+}

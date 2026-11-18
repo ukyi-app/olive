@@ -10,6 +10,9 @@ export const MESSAGE_TTL_MS = 30_000;
 export const CLOCK_SKEW_MS = 1_000;
 // nonce 기록을 지워도 되는 시간: 이보다 오래된 봉투는 시한으로 이미 거절된다(옛 봇 NONCE_RETENTION_MS와 같은 식).
 export const NONCE_RETENTION_MS = 2 * (MESSAGE_TTL_MS + CLOCK_SKEW_MS);
+// 정지 세대 맞춤(stop_sync_request·stop_sync_reply)의 수명. 기본값(관리자 미확정). 다른 메시지보다 짧게 두어, 감독이 서명한
+// "지금의 세대"가 그 뒤 새 정지로 낡을 수 있는 시간을 줄인다. DELIVERY_MAX_MS보다 커야 보내는 쪽이 실을 수 있다(시험이 지킨다).
+export const STOP_SYNC_TTL_MS = 15_000;
 
 // 전달 지연의 상한. 기본값(관리자 미확정). 보내는 쪽은 남은 시한이 이보다 짧은 봉투를 연결에 싣지 않는다.
 // 이 값과 CLOCK_SKEW_MS의 합은 MESSAGE_TTL_MS보다 작아야 한다(시험이 지킨다).

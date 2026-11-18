@@ -28,6 +28,9 @@ export const ACTIONS = [
   "status_query",
   "status_report",
   "ack",
+  // 정지 세대 맞춤(효과 없음): 실행기가 연결의 첫 단계에서 감독이 서명한 지금의 정지 세대를 받는다(transport.ts).
+  "stop_sync_request",
+  "stop_sync_reply",
 ] as const;
 export type Action = (typeof ACTIONS)[number];
 

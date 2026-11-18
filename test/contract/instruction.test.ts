@@ -15,10 +15,11 @@ test("instruction: 지시(감독 → 실행기)는 여섯뿐이다", () => {
   const fromSupervisorWithEffect = ACTIONS.filter((a) => ACTION_SPECS[a].from.includes("supervisor") && ACTION_SPECS[a].class !== "transport");
   expect(fromSupervisorWithEffect.sort()).toEqual([...INSTRUCTIONS].sort());
   for (const action of INSTRUCTIONS) expect(ACTION_SPECS[action]).toMatchObject({ class: "instruction", from: ["supervisor"] });
-  // 감독이 내는 전송 메시지는 읽기(status_query)와 받음 확인(ack)뿐이다. 실행을 열거나 자격을 싣지 않는다.
+  // 감독이 내는 전송 메시지는 읽기(status_query), 받음 확인(ack), 정지 세대 맞춤의 답(stop_sync_reply)뿐이다.
+  // 실행을 열거나 지목하지 않고 자격을 싣지 않는다.
   const transport = ACTIONS.filter((a) => ACTION_SPECS[a].from.includes("supervisor") && ACTION_SPECS[a].class === "transport");
-  expect(transport.sort()).toEqual(["ack", "status_query"]);
-  for (const action of transport) expect(ACTION_SPECS[action].opensRun).toBe(false);
+  expect(transport.sort()).toEqual(["ack", "status_query", "stop_sync_reply"]);
+  for (const action of transport) expect(ACTION_SPECS[action]).toMatchObject({ opensRun: false, runField: null });
 });
 
 test("instruction: 여섯 밖의 종류는 거절한다", async () => {

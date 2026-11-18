@@ -1,13 +1,37 @@
 // 세대와 받는 시각의 순서 시험: 비상 정지의 새 정지 세대, 재접속 상태의 실행 세대, 받을 때 이미 지난 작업 기한.
 import { expect, test } from "bun:test";
-import { rawPublicKey, sealEnvelope, type SealInput, verifyEnvelope } from "../../src/contract/v1/envelope.ts";
-import type { Action } from "../../src/contract/v1/header.ts";
-import { runsOutsideLedger, type RunStatus } from "../../src/contract/v1/transport.ts";
-import { DIAGNOSIS, freshKeys, hash, id, ISSUED, NOW, RUN_NEW_TASK, RUN_TASK, SESSION, SUPERVISOR } from "./cases.ts";
+import { generateKeyPairSync } from "node:crypto";
+import { ACTION_SPECS } from "../../src/contract/v1/actions.ts";
+import { digestOf } from "../../src/contract/v1/canonical.ts";
+import type { RejectReason } from "../../src/contract/v1/errors.ts";
+import { INSTRUCTIONS } from "../../src/contract/v1/instruction.ts";
+import { type Envelope, rawPublicKey, sealEnvelope, type SealInput, signUnchecked, verifyEnvelope } from "../../src/contract/v1/envelope.ts";
+import type { Action, Header } from "../../src/contract/v1/header.ts";
+import { CLOCK_SKEW_MS, DELIVERY_MAX_MS, MESSAGE_TTL_MS, STOP_SYNC_TTL_MS } from "../../src/contract/v1/limits.ts";
+import { runsOutsideLedger, type RunStatus, STARTS_RUN } from "../../src/contract/v1/transport.ts";
+import {
+  CHALLENGE,
+  DIAGNOSIS,
+  DIAGNOSIS_NEW_STORAGE,
+  freshKeys,
+  hash,
+  id,
+  ISSUED,
+  NOW,
+  OTHER_CHALLENGE,
+  RUN_NEW_TASK,
+  RUN_TASK,
+  SESSION,
+  SUPERVISOR,
+} from "./cases.ts";
 import { contextOf, MemoryNonces } from "./support.ts";
 
+const FRONT_DOOR = "front-door";
 const keys = freshKeys();
-const trusted = Object.fromEntries(Object.entries(keys).map(([name, pair]) => [name, rawPublicKey(pair.publicKey)]));
+// 저장소를 잃고 새 저장소 ID로 뜬 실행기와 현관도 각자의 키가 있다.
+keys[DIAGNOSIS_NEW_STORAGE] = generateKeyPairSync("ed25519");
+keys[FRONT_DOOR] = generateKeyPairSync("ed25519");
+const trusted =Object.fromEntries(Object.entries(keys).map(([name, pair]) => [name, rawPublicKey(pair.publicKey)]));
 const credential = { account: "main", method: "subscription", revision: "cred-7", digest: hash("credential value") } as const;
 
 let counter = 0;
@@ -20,16 +44,44 @@ function seal<A extends Action>(input: Omit<SealInput<A>, "request_id" | "nonce"
 }
 
 // 실행기 하나의 상태를 흉내 낸다. 검증 함수는 순수하므로, 받아들인 새 정지 세대를 적용하는 것은 이 쪽(실행기)의 일이다.
-function executor(recipient: string, stopGeneration: number, runs: Record<string, number>) {
-  const state = { stopGeneration, runs: { ...runs } };
+// challenge는 연결마다 하나다. requestSync가 새 연결의 맞춤 요청을 만들고, 답을 받아들이면 그 challenge를 버린다.
+function executor(recipient: string, stopGeneration: number | null, runs: Record<string, number>) {
+  const state = { stopGeneration, runs: { ...runs }, challenge: null as string | null };
   const nonces = new MemoryNonces();
   return {
     state,
+    requestSync(challenge: string) {
+      state.challenge = challenge;
+      return seal({ sender: recipient, recipient: SUPERVISOR, action: "stop_sync_request", stop_generation: 0, run_generation: 0, body: { challenge } });
+    },
     async receive(message: unknown, now = NOW) {
-      const ctx = contextOf(trusted, { now, expected_recipient: recipient, stop_generation: state.stopGeneration, run_generations: state.runs, spent_nonces: [] }, nonces);
+      const ctx = contextOf(
+        trusted,
+        { now, expected_recipient: recipient, stop_generation: state.stopGeneration, stop_sync_challenge: state.challenge, run_generations: state.runs, spent_nonces: [] },
+        nonces,
+      );
       const result = await verifyEnvelope(message, ctx);
+      if (result.ok && result.action === "stop_sync_reply") state.challenge = null;
       if (result.ok && result.adoptedStopGeneration !== null) state.stopGeneration = result.adoptedStopGeneration;
       return result.ok ? { ok: true as const, adopted: result.adoptedStopGeneration } : { ok: false as const, reason: result.reason };
+    },
+  };
+}
+
+// 감독 쪽. 세대는 감독 자신의 정지 기록에서만 온다. 받은 메시지는 이 값을 바꾸지 않는다(시험이 확인한다).
+function supervisor(stopGeneration: number | null) {
+  const state = { stopGeneration };
+  const nonces = new MemoryNonces();
+  return {
+    state,
+    async receive(message: unknown) {
+      const ctx = contextOf(
+        trusted,
+        { now: NOW, expected_recipient: SUPERVISOR, stop_generation: state.stopGeneration, stop_sync_challenge: null, run_generations: {}, spent_nonces: [] },
+        nonces,
+      );
+      const result = await verifyEnvelope(message, ctx);
+      return result.ok ? { ok: true as const, adopted: result.adoptedStopGeneration, body: result.body } : { ok: false as const, reason: result.reason };
     },
   };
 }
@@ -109,7 +161,7 @@ test("정지 세대: 감독 쪽에서는 실행기가 보낸 더 높은 세대�
     run_generation: 0,
     body: { in_reply_to: id(1), runs: [{ run_id: RUN_TASK, state: "running", run_generation: 2, last_receipt_id: null }] },
   });
-  const ctx = contextOf(trusted, { now: NOW, expected_recipient: SUPERVISOR, stop_generation: 3, run_generations: { [RUN_TASK]: 2 }, spent_nonces: [] });
+  const ctx = contextOf(trusted, { now: NOW, expected_recipient: SUPERVISOR, stop_generation: 3, stop_sync_challenge: null, run_generations: { [RUN_TASK]: 2 }, spent_nonces: [] });
   expect(await verifyEnvelope(report, ctx)).toEqual({ ok: false, reason: "stop_generation_mismatch" });
 });
 
@@ -118,7 +170,7 @@ const status = (runs: RunStatus[], action: "status_report" | "hello" = "status_r
     ? seal({ sender: DIAGNOSIS, recipient: SUPERVISOR, action, stop_generation: 3, run_generation: 0, body: { in_reply_to: id(1), runs } })
     : seal({ sender: DIAGNOSIS, recipient: SUPERVISOR, action, stop_generation: 3, run_generation: 0, body: { profile_revision: "p", policy_revision: "q", runs, unacked_ids: [] } });
 const atSupervisor = (runs: Record<string, number>) =>
-  contextOf(trusted, { now: NOW, expected_recipient: SUPERVISOR, stop_generation: 3, run_generations: runs, spent_nonces: [] });
+  contextOf(trusted, { now: NOW, expected_recipient: SUPERVISOR, stop_generation: 3, stop_sync_challenge: null, run_generations: runs, spent_nonces: [] });
 
 test("실행 세대: 감독이 아는 실행의 옛 세대 상태는 hello·status_report 모두 거절한다", async () => {
   for (const action of ["status_report", "hello"] as const) {
@@ -206,4 +258,171 @@ test("작업 기한: 받는 시각 기준 직전은 통과, 정각과 직후는 
   expect(await executor(DIAGNOSIS, 3, {}).receive(after)).toEqual({ ok: false, reason: "deadline_passed" });
   // 발급 시각 이하의 기한은 받을 때도 처음부터 잘못 만든 본문이다.
   expect(() => at(ISSUED)).toThrow("body_malformed");
+});
+
+// ---- 정지 세대 맞춤 ----
+
+const syncReply = (recipient: string, stop: number, challenge: string, issued_at = ISSUED) =>
+  seal({ sender: SUPERVISOR, recipient, action: "stop_sync_reply", stop_generation: stop, run_generation: 0, issued_at, body: { challenge } });
+const helloAt = (stop: number) =>
+  seal({ sender: DIAGNOSIS, recipient: SUPERVISOR, action: "hello", stop_generation: stop, run_generation: 0, body: { profile_revision: "p", policy_revision: "q", runs: [], unacked_ids: [] } });
+// 서명된 봉투의 머리 일부나 본문을 바꾸고 digest를 맞춘 뒤 signer의 키로 다시 서명한다(계약 밖의 봉투를 만드는 시험 전용).
+function forge(envelope: Envelope, change: { header?: Partial<Header>; body?: unknown }, signer: string): Envelope {
+  const body = change.body ?? envelope.body;
+  const header = { ...envelope.header, ...change.header, body_digest: digestOf(body) } as Header;
+  return signUnchecked(header, body, keys[signer]!.privateKey);
+}
+
+test("정지 세대 맞춤: 쥔 실행이 없는 실행기가 정지 3→4 뒤 연결의 첫 단계에서 4를 받고, 그 뒤 세대 3의 효과는 거절한다", async () => {
+  const worker = executor(DIAGNOSIS, 3, {});
+  const sup = supervisor(3);
+  // 정지 전에 서명돼 아직 날아오는 세대 3의 시작·갱신.
+  const oldStart = taskStart(3);
+  const oldRenew = renew(3);
+
+  // 비상 정지: 감독이 4로 올라간다. 실행기는 닫을 실행이 없어 비상 종료로는 4를 받지 못한다.
+  sup.state.stopGeneration = 4;
+  expect(await worker.receive(cancel(4))).toEqual({ ok: false, reason: "unknown_run" });
+  expect(worker.state.stopGeneration).toBe(3);
+
+  // 풀기 뒤 다시 붙은 실행기: 옛 세대의 hello는 감독이, 감독의 세대 4 메시지는 실행기가 거절한다.
+  expect(await sup.receive(helloAt(3))).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  const query = seal({ sender: SUPERVISOR, recipient: DIAGNOSIS, action: "status_query", stop_generation: 4, run_generation: 0, body: { run_ids: [RUN_TASK] } });
+  expect(await worker.receive(query)).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+
+  // 맞춤: 실행기가 이 연결의 challenge로 묻고, 감독은 자기 세대 4로 답한다. 요청은 감독의 세대를 바꾸지 않는다.
+  const request = await sup.receive(worker.requestSync(CHALLENGE));
+  expect(request).toMatchObject({ ok: true, adopted: null, body: { challenge: CHALLENGE } });
+  expect(sup.state.stopGeneration).toBe(4);
+  expect(await worker.receive(syncReply(DIAGNOSIS, sup.state.stopGeneration!, CHALLENGE))).toEqual({ ok: true, adopted: 4 });
+  expect(worker.state.stopGeneration).toBe(4);
+
+  // 맞춘 세대로 hello가 통과한다.
+  expect(await sup.receive(helloAt(4))).toMatchObject({ ok: true, adopted: null });
+
+  // 세대 3의 시작·갱신은 서명과 시한이 맞아도 거절한다.
+  expect(await worker.receive(oldStart)).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  expect(await worker.receive(oldRenew)).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  expect(worker.state.stopGeneration).toBe(4);
+});
+
+test("정지 세대 맞춤: 저장소를 잃은 실행기(세대 없음)는 맞춤 전에 모든 메시지를 거절하고, 답의 값을 0까지 그대로 받는다", async () => {
+  const fresh = executor(DIAGNOSIS_NEW_STORAGE, null, {});
+  const query = seal({ sender: SUPERVISOR, recipient: DIAGNOSIS_NEW_STORAGE, action: "status_query", stop_generation: 4, run_generation: 0, body: { run_ids: [RUN_TASK] } });
+  expect(await fresh.receive(query)).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  fresh.requestSync(CHALLENGE);
+  expect(await fresh.receive(syncReply(DIAGNOSIS_NEW_STORAGE, 4, CHALLENGE))).toEqual({ ok: true, adopted: 4 });
+  expect(fresh.state.stopGeneration).toBe(4);
+
+  // 한 번도 정지하지 않은 감독(0): 세대 없음과 0은 달라서, 0을 받아들였다는 값(0)이 나온다.
+  const never = executor(DIAGNOSIS_NEW_STORAGE, null, {});
+  never.requestSync(CHALLENGE);
+  expect(await never.receive(syncReply(DIAGNOSIS_NEW_STORAGE, 0, CHALLENGE))).toEqual({ ok: true, adopted: 0 });
+  expect(never.state.stopGeneration).toBe(0);
+});
+
+test("정지 세대 맞춤: 다른 연결의 답, 이미 쓴 답, 기다리지 않는 답은 challenge_mismatch다", async () => {
+  const worker = executor(DIAGNOSIS, 3, {});
+  worker.requestSync(CHALLENGE);
+  const first = syncReply(DIAGNOSIS, 4, CHALLENGE);
+  // 앞선 연결에서 OTHER_CHALLENGE로 받은 답이 이 연결에 다시 오면 거절한다.
+  expect(await worker.receive(syncReply(DIAGNOSIS, 4, OTHER_CHALLENGE))).toEqual({ ok: false, reason: "challenge_mismatch" });
+  expect(await worker.receive(first)).toEqual({ ok: true, adopted: 4 });
+  // 받아들인 뒤 challenge를 버렸으므로 같은 답을 다시 보내도 거절한다.
+  expect(await worker.receive(first)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  // 새 연결의 새 challenge 앞에서도 앞 연결의 답은 거절한다.
+  worker.requestSync(OTHER_CHALLENGE.replace(/2$/, "3"));
+  expect(await worker.receive(first)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  expect(worker.state.stopGeneration).toBe(4);
+});
+
+test("정지 세대 맞춤: 답의 수명은 15초다(직전 통과, 정각 expired, 30초 수명은 lifetime_invalid)", async () => {
+  expect(STOP_SYNC_TTL_MS).toBeLessThan(MESSAGE_TTL_MS);
+  // 보내는 쪽이 maySend로 실을 수 있어야 한다.
+  expect(STOP_SYNC_TTL_MS).toBeGreaterThan(DELIVERY_MAX_MS + CLOCK_SKEW_MS);
+  const reply = syncReply(DIAGNOSIS, 4, CHALLENGE);
+  expect(reply.header.expires_at - reply.header.issued_at).toBe(STOP_SYNC_TTL_MS);
+  const at = async (now: number) => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    worker.requestSync(CHALLENGE);
+    return worker.receive(reply, now);
+  };
+  expect(await at(ISSUED + STOP_SYNC_TTL_MS - 1)).toEqual({ ok: true, adopted: 4 });
+  expect(await at(ISSUED + STOP_SYNC_TTL_MS)).toEqual({ ok: false, reason: "expired" });
+  const long = forge(reply, { header: { expires_at: ISSUED + MESSAGE_TTL_MS } }, SUPERVISOR);
+  const worker = executor(DIAGNOSIS, 3, {});
+  worker.requestSync(CHALLENGE);
+  expect(await worker.receive(long)).toEqual({ ok: false, reason: "lifetime_invalid" });
+});
+
+test("정지 세대 맞춤: 다른 실행기에게 준 답과 감독이 아닌 키로 서명한 답은 거절한다", async () => {
+  const listen = () => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    worker.requestSync(CHALLENGE);
+    return worker;
+  };
+  // 같은 인스턴스의 옛(다른) 저장소 앞으로 낸 답, 다른 역할의 실행기 앞으로 낸 답.
+  expect(await listen().receive(syncReply(DIAGNOSIS_NEW_STORAGE, 4, CHALLENGE))).toEqual({ ok: false, reason: "wrong_recipient" });
+  const reply = syncReply(DIAGNOSIS, 4, CHALLENGE);
+  const toSession = forge(reply, { header: { recipient: SESSION } }, SUPERVISOR);
+  expect(await listen().receive(toSession)).toEqual({ ok: false, reason: "wrong_recipient" });
+  // 감독 이름에 실행기 키, 실행기·현관 이름에 그 주체의 키.
+  expect(await listen().receive(forge(reply, {}, DIAGNOSIS))).toEqual({ ok: false, reason: "bad_signature" });
+  expect(await listen().receive(forge(reply, { header: { sender: SESSION } }, SESSION))).toEqual({ ok: false, reason: "wrong_direction" });
+  expect(await listen().receive(forge(reply, { header: { sender: FRONT_DOOR } }, FRONT_DOOR))).toEqual({ ok: false, reason: "wrong_direction" });
+});
+
+test("정지 세대 맞춤: 받는 쪽보다 낮은 답은 거절하고(세대는 내려가지 않음), 같은 답은 그대로 둔다", async () => {
+  const worker = executor(DIAGNOSIS, 5, {});
+  worker.requestSync(CHALLENGE);
+  expect(await worker.receive(syncReply(DIAGNOSIS, 4, CHALLENGE))).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  expect(worker.state.stopGeneration).toBe(5);
+  expect(await worker.receive(syncReply(DIAGNOSIS, 5, CHALLENGE))).toEqual({ ok: true, adopted: null });
+  expect(worker.state.stopGeneration).toBe(5);
+});
+
+test("정지 세대 맞춤: 실행기의 요청은 감독의 세대를 바꾸지 않고, 세대를 실은 요청과 복원 전 감독은 거절한다", async () => {
+  const sup = supervisor(4);
+  const worker = executor(DIAGNOSIS, 3, {});
+  const request = worker.requestSync(CHALLENGE);
+  expect(request.header.stop_generation).toBe(0);
+  expect(await sup.receive(request)).toMatchObject({ ok: true, adopted: null });
+  // 머리에 감독보다 높은 세대를 실은 요청, 본문에 세대를 실은 요청.
+  expect(await sup.receive(forge(request, { header: { stop_generation: 99, nonce: "f".repeat(32) } }, DIAGNOSIS))).toEqual({
+    ok: false,
+    reason: "stop_generation_mismatch",
+  });
+  expect(await sup.receive(forge(request, { header: { nonce: "e".repeat(32) }, body: { challenge: CHALLENGE, stop_generation: 99 } }, DIAGNOSIS))).toEqual({
+    ok: false,
+    reason: "unknown_field",
+  });
+  // 어떤 동작도 실행기에서 감독으로 더 높은 세대를 옮기지 않는다(hello에 99).
+  expect(await sup.receive(helloAt(99))).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  expect(sup.state.stopGeneration).toBe(4);
+  // 정지 기록을 복원하기 전(세대 없음)의 감독은 요청부터 받지 않아 답을 만들 길이 없다.
+  expect(await supervisor(null).receive(worker.requestSync(OTHER_CHALLENGE))).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+});
+
+test("정지 세대 맞춤: 실행을 지목하거나 자격·명령을 싣는 맞춤 메시지는 거절하고, 맞춤은 지시가 아니다", async () => {
+  const reply = syncReply(DIAGNOSIS, 4, CHALLENGE);
+  const cases: [Record<string, unknown>, RejectReason][] = [
+    [{ challenge: CHALLENGE, run_id: RUN_TASK }, "unknown_field"],
+    [{ challenge: CHALLENGE, credential }, "unknown_field"],
+    [{ challenge: CHALLENGE, command: "x" }, "forbidden_field"],
+  ];
+  for (const [body, reason] of cases) {
+    const worker = executor(DIAGNOSIS, 3, { [RUN_TASK]: 2 });
+    worker.requestSync(CHALLENGE);
+    expect(await worker.receive(forge(reply, { body }, SUPERVISOR)), JSON.stringify(body)).toEqual({ ok: false, reason });
+    expect(worker.state.stopGeneration).toBe(3);
+  }
+  // 실행에 묶이지 않는다: 머리의 run_generation은 0이어야 한다.
+  const worker = executor(DIAGNOSIS, 3, { [RUN_TASK]: 2 });
+  worker.requestSync(CHALLENGE);
+  expect(await worker.receive(forge(reply, { header: { run_generation: 2 } }, SUPERVISOR))).toEqual({ ok: false, reason: "run_generation_mismatch" });
+  for (const action of ["stop_sync_request", "stop_sync_reply"] as const) {
+    expect(ACTION_SPECS[action].class).toBe("transport");
+    expect((INSTRUCTIONS as readonly string[]).includes(action)).toBe(false);
+    expect(STARTS_RUN.includes(action)).toBe(false);
+  }
 });

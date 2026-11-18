@@ -19,7 +19,8 @@ import {
   parseReceiptStopped,
 } from "./receipt.ts";
 import { parseHookEvent, parseResultReport, parseRuleCheck, parseSessionBroken } from "./report.ts";
-import { parseAck, parseHello, parseStatusQuery, parseStatusReport } from "./transport.ts";
+import { STOP_SYNC_TTL_MS } from "./limits.ts";
+import { parseAck, parseHello, parseStatusQuery, parseStatusReport, parseStopSyncReply, parseStopSyncRequest } from "./transport.ts";
 
 export type ActionClass = "instruction" | "receipt" | "report" | "transport";
 
@@ -35,6 +36,10 @@ export interface ActionSpec {
   runList?: "runs";
   // 받는 쪽보다 높은 정지 세대를 받아들여도 되는 본문인가(instruction.ts의 advancesStopGeneration). 없으면 정확히 같아야 한다.
   advancesStop?: (body: unknown) => boolean;
+  // 정지 세대 맞춤의 두 메시지(transport.ts). 이 둘은 정확 일치 대신 envelope.ts의 맞춤 규칙으로 세대를 본다.
+  stopSync?: "request" | "reply";
+  // 봉투 수명의 상한. 없으면 MESSAGE_TTL_MS다. sealEnvelope도 이 값으로 expires_at을 정한다.
+  lifetimeMs?: number;
   parse(body: unknown, ctx: BodyContext): unknown;
 }
 
@@ -117,6 +122,26 @@ export const ACTION_SPECS: Readonly<Record<Action, ActionSpec>> = Object.freeze(
   status_query: { class: "transport", from: SUP, to: EXECUTORS, runField: null, opensRun: false, parse: plain(parseStatusQuery) },
   status_report: { class: "transport", from: EXECUTORS, to: SUP, runField: null, opensRun: false, runList: "runs", parse: plain(parseStatusReport) },
   ack: { class: "transport", from: SUP, to: EXECUTORS, runField: null, opensRun: false, parse: plain(parseAck) },
+  stop_sync_request: {
+    class: "transport",
+    from: EXECUTORS,
+    to: SUP,
+    runField: null,
+    opensRun: false,
+    stopSync: "request",
+    lifetimeMs: STOP_SYNC_TTL_MS,
+    parse: plain(parseStopSyncRequest),
+  },
+  stop_sync_reply: {
+    class: "transport",
+    from: SUP,
+    to: EXECUTORS,
+    runField: null,
+    opensRun: false,
+    stopSync: "reply",
+    lifetimeMs: STOP_SYNC_TTL_MS,
+    parse: plain(parseStopSyncReply),
+  },
 } satisfies Record<Action, ActionSpec>);
 
 export function isAction(value: unknown): value is Action {

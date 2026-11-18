@@ -25,6 +25,7 @@ const context = (patch: Partial<Parameters<typeof contextOf>[1]> = {}) => ({
   now: NOW,
   expected_recipient: DIAGNOSIS,
   stop_generation: STOP_GENERATION,
+  stop_sync_challenge: null,
   run_generations: { ...RUN_GENERATIONS },
   spent_nonces: [],
   ...patch,

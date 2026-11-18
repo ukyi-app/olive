@@ -5,16 +5,17 @@
 // 1. 연결 없음(또는 끊김 판정 뒤)에는 감독이 지시를 만들지 않는다. 특히 새 실행(task_start, session_start)과
 //    새 자격을 싣는 지시를 쌓아 두었다가 다시 붙은 뒤 보내는 길이 없다.
 // 2. 끊긴 동안 진행 중이던 실행은 감독 쪽에서 unknown_running이고 슬롯을 놓지 않는다.
-// 3. 다시 붙으면 실행기가 hello로 자기가 쥔 실행의 상태와 아직 받음 확인을 못 받은 영수증 ID를 알린다.
+// 3. 붙으면 실행기는 먼저 정지 세대를 맞추고(stop_sync_request → stop_sync_reply, 아래), 그 세대로
+//    hello를 보내 자기가 쥔 실행의 상태와 아직 받음 확인을 못 받은 영수증 ID를 알린다.
 //    감독은 같은 실행 ID로 status_query만 보낸다. 끊김을 이유로 새 실행 ID를 만드는 재전송 모양은 없다(§3의 4).
 // 4. 영수증·보고는 감독의 ack가 올 때까지 같은 본문을 새 봉투에 담아 다시 보낸다. 감독은 id와 digest로 한 번만 반영한다.
 // 5. 시한이 지난 지시는 연결이 살아 있어도 거절된다(봉투 검증의 expired). 보내는 쪽은 남은 시한이 전달 지연 상한보다
 //    짧은 봉투를 싣지 않는다(too_late_to_send). 그때는 같은 실행의 상태를 묻는다.
 import type { RejectReason } from "./errors.ts";
-import { type Action, BodyReject } from "./header.ts";
+import { type Action, BodyReject, NONCE } from "./header.ts";
 import { INSTRUCTIONS } from "./instruction.ts";
 import { ACK_MAX_IDS, DELIVERY_MAX_MS, DISCONNECT_JUDGE_MS, STATUS_MAX_RUNS } from "./limits.ts";
-import { int, list, nullable, object, oneOf, revision, uuid } from "./schema.ts";
+import { int, list, nullable, object, oneOf, pattern, revision, uuid } from "./schema.ts";
 
 // 실행기가 아는 실행 상태(supervisor.md §3의 이름). queued는 감독에만 있다.
 // not_known은 "실행기에 기록이 없음"이다. 감독은 이것을 "없음"이나 "끝남"으로 바꾸지 않는다.
@@ -92,7 +93,29 @@ export function runsOutsideLedger(
   return out;
 }
 
+// ---- 정지 세대 맞춤 ----
+//
+// 쥔 실행이 없거나, 감독이 없어 비상 종료를 받지 못했거나, 저장소를 잃고 다시 뜬 실행기는 비상 종료로 새 정지 세대를 받을 길이
+// 없다. 그래서 실행기가 연 인증된 연결의 첫 단계에서, hello보다 먼저, 감독이 서명한 지금의 정지 세대를 받는다.
+//
+//   실행기 → 감독  stop_sync_request { challenge }   머리 stop_generation 0, 이 연결에서 처음 만든 무작위 값
+//   감독 → 실행기  stop_sync_reply   { challenge }   머리 stop_generation = 감독의 지금 정지 세대, 받은 challenge 그대로
+//   실행기 → 감독  hello (맞춘 세대로 정확 일치)
+//
+// - 요청은 세대를 싣지 않는다(머리 0, 본문에 칸 없음). 실행기가 보내는 어떤 값도 감독의 세대를 바꾸지 않는다.
+// - 답은 감독 키로 서명되고 받는 쪽 이름(역할·인스턴스·저장소 ID)과 이 연결의 challenge에 묶이며 수명이 짧다(STOP_SYNC_TTL_MS).
+// - 받는 쪽보다 낮은 세대의 답은 거절한다. 같으면 그대로, 높거나 받는 쪽에 세대가 없으면(null) 그 값을 돌려준다.
+// - 실행을 지목하지 않고 실행·자격·명령을 싣지 않는다. 지시 여섯에 들지 않고, 정지 해제나 실행 허가가 아니다.
+export const parseStopSyncRequest = object({
+  challenge: pattern(NONCE),
+});
+export const parseStopSyncReply = object({
+  challenge: pattern(NONCE),
+});
+
 export type Hello = ReturnType<typeof parseHello>;
+export type StopSyncRequest = ReturnType<typeof parseStopSyncRequest>;
+export type StopSyncReply = ReturnType<typeof parseStopSyncReply>;
 export type StatusQuery = ReturnType<typeof parseStatusQuery>;
 export type StatusReport = ReturnType<typeof parseStatusReport>;
 export type Ack = ReturnType<typeof parseAck>;

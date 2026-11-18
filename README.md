@@ -79,7 +79,7 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 
 `contracts/fixtures/v1/accept/`와 `reject/`에 사례 하나가 JSON 파일 하나다. 다른 구현(현관 등)은 우리 코드 없이 이 파일만 읽어 자기 검증기를 시험한다.
 
-- 사례의 칸: `keys`(믿는 공개 키, 주체 이름 → Ed25519 32바이트의 base64url), `context`(`now`, `expected_recipient`, `stop_generation`, `run_generations`, `spent_nonces`), `message`(봉투), `expect`(`{ok: true, adopted_stop_generation}` 또는 `{ok: false, reason}`. `adopted_stop_generation`은 받아들이며 올린 정지 세대, 아니면 `null`), `signing_input`(서명한 바이트의 글).
+- 사례의 칸: `keys`(믿는 공개 키, 주체 이름 → Ed25519 32바이트의 base64url), `context`(`now`, `expected_recipient`, `stop_generation`(`null`은 세대 없음), `stop_sync_challenge`(기다리는 정지 세대 맞춤의 challenge, 없으면 `null`), `run_generations`, `spent_nonces`), `message`(봉투), `expect`(`{ok: true, adopted_stop_generation}` 또는 `{ok: false, reason}`. `adopted_stop_generation`은 받아들이며 올린 정지 세대, 아니면 `null`), `signing_input`(서명한 바이트의 글).
 - 거절 사례는 `base`(통과 사례)에서 `changed`에 적은 곳만 다르다. 시험이 이것을 대조한다.
 - **개인 키는 저장소에 없다.** `bun run fixtures`가 부를 때마다 주체별 키를 새로 만들어 서명하고 공개 키만 파일에 쓴다. 그래서 사례 하나만 고쳐 다시 서명할 수 없고 늘 전부 다시 만든다(모든 파일의 서명과 키가 바뀐다). 사례를 지웠으면 그 파일도 지운다(시험이 남은 파일을 잡는다).
 

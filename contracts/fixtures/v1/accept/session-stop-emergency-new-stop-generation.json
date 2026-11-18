@@ -9,14 +9,15 @@
     "adopted_stop_generation": 4
   },
   "keys": {
-    "supervisor": "GzvXVs3MVjaodZvUHQz-jA7Q8XtySiSV3nWVOGFJtdk",
-    "executor/session/olive-session-0/st-5e55": "c3IbtmbT8xvJbAcFqhOvWpp-kn9L9gRp86igQgDnGCc",
-    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "ttWcWFlHw3zqwY3ZuS3_Lz2-c-ReJt4-PJlPI_FQNCc"
+    "supervisor": "UAJvNBbtmSSSDdI5O3ZAr7HeV6nIO-YpPn9Kcgp72dc",
+    "executor/session/olive-session-0/st-5e55": "SbpEXs-tXx-pxqoJbdyBDwD03aHhhZIcXvtYOxfh9KY",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "aEhRH1viV112z1woCAvo2I1iQp1YC_GDdyPRUAIrfz0"
   },
   "context": {
     "now": 1794960000000,
     "expected_recipient": "executor/session/olive-session-0/st-5e55",
     "stop_generation": 3,
+    "stop_sync_challenge": null,
     "run_generations": {
       "00000000-0000-4000-8000-000000000101": 2,
       "00000000-0000-4000-8000-000000000201": 5,
@@ -38,7 +39,7 @@
       "expires_at": 1794960029000,
       "nonce": "00000000000000000000000000000015"
     },
-    "signature": "nXkenKAKt54DgNtHDQi1hcJvSCdS1szz9UvMYiu0FRG9T4EY-cukuo8I-xp4FTdE__5nbgvnYtZT4vABH6vSDg",
+    "signature": "sdLp4Ek-Ml4itIgTpLPIywpdZ7rTOjDNIfittvVacByIrLV20TwWNCNxB5Kt0bgfDR1qPf4Mnt1PaSSnbK_oAg",
     "body": {
       "run_id": "00000000-0000-4000-8000-000000000201",
       "reason": "emergency_stop"

@@ -3,11 +3,12 @@
 // 시험이 기준과 거절 사례를 칸 단위로 비교해 정말 그곳만 다른지 확인한다(서명과 본문 digest는 다시 계산된 값이라 빼고 본다).
 // 키는 부를 때마다 새로 만든다. 개인 키는 이 프로세스 밖으로 나가지 않는다.
 import { generateKeyPairSync, type KeyObject } from "node:crypto";
+import { ACTION_SPECS } from "../../src/contract/v1/actions.ts";
 import { digestOf, sha256Hex } from "../../src/contract/v1/canonical.ts";
 import { type Envelope, rawPublicKey, signUnchecked } from "../../src/contract/v1/envelope.ts";
 import type { RejectReason } from "../../src/contract/v1/errors.ts";
 import type { Action, Header } from "../../src/contract/v1/header.ts";
-import { CONTRACT, MESSAGE_TTL_MS } from "../../src/contract/v1/limits.ts";
+import { CONTRACT, MESSAGE_TTL_MS, STOP_SYNC_TTL_MS } from "../../src/contract/v1/limits.ts";
 import { executorName } from "../../src/contract/v1/principal.ts";
 
 // 2026-11-18T00:00:00Z. fixture는 이 시각을 "지금"으로 검증한다.
@@ -49,10 +50,17 @@ export function freshKeys(): Keys {
   return keys;
 }
 
+// 정지 세대 맞춤의 challenge(실행기가 이 연결에서 만든 값과 다른 연결의 값).
+export const CHALLENGE = "c0ffee00000000000000000000000001";
+export const OTHER_CHALLENGE = "c0ffee00000000000000000000000002";
+
 export interface CaseContext {
   now: number;
   expected_recipient: string;
-  stop_generation: number;
+  // null: 받는 쪽에 정지 세대가 없다(저장소를 잃은 실행기, 정지 기록 복원 전의 감독).
+  stop_generation: number | null;
+  // 받는 쪽이 이 연결에서 보내고 답을 기다리는 stop_sync_request의 challenge. 없으면 null.
+  stop_sync_challenge: string | null;
   run_generations: Record<string, number>;
   spent_nonces: { sender: string; nonce: string }[];
 }
@@ -89,6 +97,8 @@ export function buildCases(keys: Keys): ContractCase[] {
   const cases: ContractCase[] = [];
 
   // opts.stopGeneration: 머리의 정지 세대(기본은 받는 쪽과 같은 값). opts.runGenerations: 받는 쪽이 아는 실행의 세대.
+  // opts.receiverStopGeneration: 받는 쪽의 정지 세대(기본 STOP_GENERATION, null은 세대 없음).
+  // opts.challenge: 받는 쪽이 기다리는 stop_sync_request의 challenge.
   function base(
     name: string,
     description: string,
@@ -97,10 +107,16 @@ export function buildCases(keys: Keys): ContractCase[] {
     recipient: string,
     runGeneration: number,
     body: unknown,
-    opts: { stopGeneration?: number; runGenerations?: Record<string, number> } = {},
+    opts: {
+      stopGeneration?: number;
+      runGenerations?: Record<string, number>;
+      receiverStopGeneration?: number | null;
+      challenge?: string;
+    } = {},
   ) {
     counter++;
     const stopGeneration = opts.stopGeneration ?? STOP_GENERATION;
+    const receiverStopGeneration = opts.receiverStopGeneration === undefined ? STOP_GENERATION : opts.receiverStopGeneration;
     const header = {
       contract: CONTRACT,
       sender,
@@ -111,19 +127,22 @@ export function buildCases(keys: Keys): ContractCase[] {
       run_generation: runGeneration,
       body_digest: digestOf(body),
       issued_at: ISSUED,
-      expires_at: ISSUED + MESSAGE_TTL_MS,
+      expires_at: ISSUED + (ACTION_SPECS[action].lifetimeMs ?? MESSAGE_TTL_MS),
       nonce: counter.toString(16).padStart(32, "0"),
     };
     const context: CaseContext = {
       now: NOW,
       expected_recipient: recipient,
-      stop_generation: STOP_GENERATION,
+      stop_generation: receiverStopGeneration,
+      stop_sync_challenge: opts.challenge ?? null,
       run_generations: { ...(opts.runGenerations ?? RUN_GENERATIONS) },
       spent_nonces: [],
     };
     const draft: Draft = { context, header, body, signature: sign(header, body, sender), trusted: [...PRINCIPALS] };
     accept.set(name, draft);
-    const adopted = stopGeneration === STOP_GENERATION ? null : stopGeneration;
+    // 정지 세대를 싣지 않는 요청(머리 0)은 받는 쪽 세대를 바꾸지 않는다.
+    const carries = ACTION_SPECS[action].stopSync !== "request";
+    const adopted = carries && stopGeneration !== receiverStopGeneration ? stopGeneration : null;
     cases.push(toCase(`accept/${name}`, description, null, [], { ok: true, adopted_stop_generation: adopted }, draft));
   }
 
@@ -300,6 +319,16 @@ export function buildCases(keys: Keys): ContractCase[] {
     in_reply_to: id(0x9011),
     runs: [{ run_id: RUN_TASK, state: "not_known", run_generation: null, last_receipt_id: null }],
   });
+  // 정지 세대 맞춤: 실행기는 세대를 싣지 않은 요청(머리 0)을 보내고, 감독은 그 challenge를 담아 지금의 세대 4로 답한다.
+  base("stop-sync-request", "정지 세대 맞춤 요청: 세대 없이 이 연결의 challenge만", "stop_sync_request", DIAGNOSIS, SUPERVISOR, 0, {
+    challenge: CHALLENGE,
+  }, { stopGeneration: 0 });
+  base("stop-sync-reply", "정지 세대 맞춤 답: 실행기는 3, 감독의 지금 세대 4를 받아들인다", "stop_sync_reply", SUPERVISOR, DIAGNOSIS, 0, {
+    challenge: CHALLENGE,
+  }, { stopGeneration: STOP_GENERATION + 1, challenge: CHALLENGE });
+  base("stop-sync-reply-lost-storage", "저장소를 잃어 세대가 없는(null) 실행기가 새 저장소 ID로 세대 4를 받는다", "stop_sync_reply", SUPERVISOR, DIAGNOSIS_NEW_STORAGE, 0, {
+    challenge: CHALLENGE,
+  }, { stopGeneration: STOP_GENERATION + 1, challenge: CHALLENGE, receiverStopGeneration: null, runGenerations: {} });
 
   // ---- 거절 사례: 기준에서 한 곳만 바꾼다 ----
   const body = (draft: Draft) => draft.body as Record<string, unknown>;
@@ -423,6 +452,51 @@ export function buildCases(keys: Keys): ContractCase[] {
   });
   reject("replayed-nonce", "task-cancel", "replayed", ["context.spent_nonces[0]"], "이미 쓴 nonce", (d) => {
     d.context.spent_nonces.push({ sender: d.header.sender as string, nonce: d.header.nonce as string });
+  });
+
+  // 정지 세대 맞춤의 거절. 답(stop-sync-reply)과 요청(stop-sync-request)에서 한 곳만 바꾼다.
+  reject("stop-sync-reply-other-connection", "stop-sync-reply", "challenge_mismatch", ["context.stop_sync_challenge"], "다른 연결(앞선 연결)의 challenge를 담은 답", (d) => {
+    d.context.stop_sync_challenge = OTHER_CHALLENGE;
+  });
+  reject("stop-sync-reply-not-awaited", "stop-sync-reply", "challenge_mismatch", ["context.stop_sync_challenge"], "기다리는 요청이 없는데 온 답", (d) => {
+    d.context.stop_sync_challenge = null;
+  });
+  reject("stop-sync-reply-expired", "stop-sync-reply", "expired", ["context.now"], "수명(15초)이 지난 답", (d) => {
+    d.context.now = ISSUED + STOP_SYNC_TTL_MS;
+  });
+  reject("stop-sync-reply-lifetime-30s", "stop-sync-reply", "lifetime_invalid", ["message.header.expires_at"], "다른 메시지와 같은 30초 수명의 답(맞춤은 15초까지)", (d) => {
+    d.header.expires_at = ISSUED + MESSAGE_TTL_MS;
+  });
+  reject("stop-sync-reply-other-executor", "stop-sync-reply", "wrong_recipient", ["context.expected_recipient"], "같은 인스턴스의 다른 저장소 앞으로 낸 답", (d) => {
+    d.context.expected_recipient = DIAGNOSIS_NEW_STORAGE;
+  });
+  reject("stop-sync-reply-signed-by-executor", "stop-sync-reply", "bad_signature", ["message.signature"], "감독 이름의 답을 실행기 키로 서명", () => {}, { sign: DIAGNOSIS });
+  reject("stop-sync-reply-from-executor", "stop-sync-reply", "wrong_direction", ["message.header.sender"], "실행기가 자기 키로 서명한 답", (d) => {
+    d.header.sender = SESSION;
+  });
+  reject("stop-sync-reply-lower", "stop-sync-reply", "stop_generation_mismatch", ["context.stop_generation"], "받는 쪽(5)보다 낮은 세대(4)의 답", (d) => {
+    d.context.stop_generation = STOP_GENERATION + 2;
+  });
+  reject("stop-sync-reply-with-run-id", "stop-sync-reply", "unknown_field", ["message.body.run_id"], "실행을 지목하는 답", (d) => {
+    body(d).run_id = RUN_TASK;
+  });
+  reject("stop-sync-reply-with-credential", "stop-sync-reply", "unknown_field", ["message.body.credential"], "자격을 싣는 답", (d) => {
+    body(d).credential = credential;
+  });
+  reject("stop-sync-reply-with-command", "stop-sync-reply", "forbidden_field", ["message.body.command"], "명령을 싣는 답", (d) => {
+    body(d).command = "x";
+  });
+  reject("stop-sync-request-with-generation", "stop-sync-request", "stop_generation_mismatch", ["message.header.stop_generation"], "세대를 실어 보낸 요청(감독보다 높은 99)", (d) => {
+    d.header.stop_generation = 99;
+  });
+  reject("stop-sync-request-generation-in-body", "stop-sync-request", "unknown_field", ["message.body.stop_generation"], "본문에 세대를 실은 요청", (d) => {
+    body(d).stop_generation = 99;
+  });
+  reject("stop-sync-request-supervisor-not-restored", "stop-sync-request", "stop_generation_mismatch", ["context.stop_generation"], "정지 기록을 복원하기 전(세대 없음)의 감독이 받은 요청", (d) => {
+    d.context.stop_generation = null;
+  });
+  reject("cancel-before-stop-sync", "task-cancel", "stop_generation_mismatch", ["context.stop_generation"], "세대가 없는 실행기는 맞춤 답 밖의 메시지를 받지 않는다", (d) => {
+    d.context.stop_generation = null;
   });
   return cases;
 }

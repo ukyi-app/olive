@@ -24,6 +24,8 @@ export const REJECT_REASONS = [
   // 받는 시각에 이미 작업 종료 기한(task_start.deadline_at)이 지났다. 발급할 때는 맞던 본문이라 body_malformed와 가른다.
   "deadline_passed",
   // 6. 세대
+  // 정지 세대 맞춤의 답이 이 연결에서 보낸 확인값(challenge)을 담지 않았다. 다른 연결·앞선 연결의 답, 기다리는 확인값이 없을 때의 답.
+  "challenge_mismatch",
   "stop_generation_mismatch",
   "unknown_run",
   "run_generation_mismatch",

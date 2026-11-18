@@ -14,7 +14,7 @@ import { type Principal, parsePrincipal } from "./principal.ts";
 import type { ReceiptAccepted, ReceiptCleaned, ReceiptSessionTakeover, ReceiptStarted, ReceiptStopped } from "./receipt.ts";
 import type { HookEvent, ResultReport, RuleCheck, SessionBroken } from "./report.ts";
 import { findForbidden, SchemaError } from "./schema.ts";
-import type { Ack, Hello, RunStatus, StatusQuery, StatusReport } from "./transport.ts";
+import type { Ack, Hello, RunStatus, StatusQuery, StatusReport, StopSyncReply, StopSyncRequest } from "./transport.ts";
 
 export interface Envelope {
   header: Header;
@@ -42,9 +42,12 @@ export interface Bodies {
   status_query: StatusQuery;
   status_report: StatusReport;
   ack: Ack;
+  stop_sync_request: StopSyncRequest;
+  stop_sync_reply: StopSyncReply;
 }
 
-// adoptedStopGeneration: 이 봉투가 받는 쪽의 정지 세대를 올렸으면 그 새 값, 아니면 null(VerifyContext.stopGeneration과 같았다).
+// adoptedStopGeneration: 이 봉투가 받는 쪽의 정지 세대를 올렸으면(받는 쪽에 세대가 없었으면 처음 정했으면) 그 값, 아니면 null.
+// 값을 주는 봉투는 비상 종료 지시 둘과 stop_sync_reply뿐이다.
 // 이 함수는 값을 돌려줄 뿐 적용하지 않는다. 받는 쪽(실행기)은 이 봉투의 효과를 내기 전에, 새 세대를 지속 상태에 적고
 // 그 세대보다 낮은 지시로 새 실행이 열리지 않게 막는 일을 한 번에(원자적으로) 해야 한다. v1.md "구현이 지킬 것" 참고.
 export type Verified = {
@@ -71,9 +74,14 @@ export interface VerifyContext {
   // 받는 쪽 자기 이름. 실행기면 저장소 ID까지 든 이름이다.
   expectedRecipient: string;
   publicKeyFor(sender: string): KeyObject | undefined;
-  // 받는 쪽이 지금 적용한 정지 세대. 봉투의 값과 정확히 같아야 한다. 단 하나의 예외는 비상 종료 지시(task_cancel·session_stop의
-  // reason emergency_stop)가 더 높은 값을 실어 온 경우로, 그때는 받아들이고 그 값을 adoptedStopGeneration으로 돌려준다.
-  stopGeneration: number;
+  // 받는 쪽이 지금 적용한 정지 세대. 봉투의 값과 정확히 같아야 한다. 더 높은 값을 받아들이는 예외는 둘이다.
+  // - 비상 종료 지시(task_cancel·session_stop의 reason emergency_stop): 받는 쪽이 아는 실행을 닫으며 새 세대를 옮긴다.
+  // - stop_sync_reply: 연결의 첫 단계에서 감독이 서명한 지금의 세대. 같거나 높으면 받는다.
+  // null은 "세대 없음"이다(저장소를 잃었거나 처음 뜬 실행기, 정지 기록을 아직 복원하지 못한 감독). 0과 다르다. 0은 "한 번도
+  // 정지하지 않았다"는 알려진 세대이고, null은 모른다는 뜻이라 stop_sync_reply 밖의 모든 메시지를 거절한다(맞춤이 먼저다).
+  stopGeneration: number | null;
+  // 이 연결에서 보내고 아직 답을 기다리는 stop_sync_request의 challenge. 없으면 null(또는 생략)이고 그때 오는 답은 거절한다.
+  stopSyncChallenge?: string | null;
   // 받는 쪽이 아는 실행의 세대. 모르는 실행이면 undefined.
   runGeneration(runId: string): number | undefined;
   nonces: NonceStore;
@@ -103,7 +111,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 //    digest를 모양보다 먼저 보는 이유: 서명한 쪽이 보낸 본문인지부터 확인해야 그 뒤의 거절 사유가 서명한 쪽의 잘못을 가리킨다.
 //    받는 시각에만 보는 관계(이미 지난 작업 기한)도 여기서 본다(deadline_passed).
 // 6. 세대: 정지 세대, 그다음 실행 세대. 서명이 맞아도 옛 세대면 거절한다.
-//    정지 세대는 내려가지 않는다. 더 높은 값은 비상 종료 지시에서만 받아들인다(본문의 reason을 보므로 본문 뒤에 둔다).
+//    정지 세대는 내려가지 않는다. 더 높은 값은 비상 종료 지시와 stop_sync_reply에서만 받아들인다(본문을 보므로 본문 뒤에 둔다).
+//    stop_sync_reply는 challenge를 세대보다 먼저 본다. 이 연결의 답이 아니면 세대를 판단할 근거가 아니다.
+//    stop_sync_request는 세대를 싣지 않는다(머리 0). 받는 쪽(감독)의 세대와 대조하지도, 올리지도 않는다. 다만 감독이 세대를
+//    모르면(null, 정지 기록 복원 전) 요청부터 거절해 답을 만들 길을 닫는다.
 //    hello·status_report는 실행마다 실린 세대를 받는 쪽이 아는 실행의 세대와 대조한다.
 // 7. nonce를 마지막에 쓴다. 다른 이유로 거절될 봉투가 nonce를 태우지 않고, 받아들이는 봉투만 nonce를 쓴다.
 export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<Verified | Rejected> {
@@ -143,7 +154,7 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
 
   // 4. 시한
   const lifetime = header.expires_at - header.issued_at;
-  if (lifetime <= 0 || lifetime > MESSAGE_TTL_MS) return reject("lifetime_invalid");
+  if (lifetime <= 0 || lifetime > (spec.lifetimeMs ?? MESSAGE_TTL_MS)) return reject("lifetime_invalid");
   if (header.issued_at > ctx.now + CLOCK_SKEW_MS) return reject("not_yet_valid");
   if (header.expires_at <= ctx.now) return reject("expired");
 
@@ -169,8 +180,18 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
 
   // 6. 세대
   let adoptedStopGeneration: number | null = null;
-  if (header.stop_generation !== ctx.stopGeneration) {
-    const advances = header.stop_generation > ctx.stopGeneration && spec.advancesStop?.(body) === true;
+  const current = ctx.stopGeneration;
+  if (spec.stopSync === "reply") {
+    const pending = ctx.stopSyncChallenge ?? null;
+    if (pending === null || (body as StopSyncReply).challenge !== pending) return reject("challenge_mismatch");
+    if (current !== null && header.stop_generation < current) return reject("stop_generation_mismatch");
+    if (current === null || header.stop_generation > current) adoptedStopGeneration = header.stop_generation;
+  } else if (spec.stopSync === "request") {
+    if (current === null || header.stop_generation !== 0) return reject("stop_generation_mismatch");
+  } else if (current === null) {
+    return reject("stop_generation_mismatch");
+  } else if (header.stop_generation !== current) {
+    const advances = header.stop_generation > current && spec.advancesStop?.(body) === true;
     if (!advances) return reject("stop_generation_mismatch");
     adoptedStopGeneration = header.stop_generation;
   }
@@ -221,10 +242,11 @@ export class SealError extends Error {
 }
 
 // 계약에 맞는 봉투만 만든다. 받는 쪽이 모양·방향·본문 때문에 거절할 봉투는 서명하기 전에 막는다.
-// 수명은 늘 MESSAGE_TTL_MS다. 세대와 받는 쪽이 맞는지는 서명하는 쪽 장부의 일이라 여기서 보지 않는다.
+// 수명은 동작의 상한(정지 세대 맞춤은 STOP_SYNC_TTL_MS, 나머지는 MESSAGE_TTL_MS)을 꽉 채운다.
+// 세대와 받는 쪽이 맞는지는 서명하는 쪽 장부의 일이라 여기서 보지 않는다.
 export function sealEnvelope<A extends Action>(input: SealInput<A>, privateKey: KeyObject): Envelope {
-  const header = buildHeader(input, input.issued_at + MESSAGE_TTL_MS);
   const spec = ACTION_SPECS[input.action];
+  const header = buildHeader(input, input.issued_at + (spec.lifetimeMs ?? MESSAGE_TTL_MS));
   const sender = parsePrincipal(header.sender);
   const recipient = parsePrincipal(header.recipient);
   if (!sender || !recipient) throw new SealError("malformed");
