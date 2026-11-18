@@ -1,0 +1,46 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/task-cancel-run-outside-ledger",
+  "description": "장부 밖 실행을 보고된 세대로 닫는다",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "GzvXVs3MVjaodZvUHQz-jA7Q8XtySiSV3nWVOGFJtdk",
+    "executor/session/olive-session-0/st-5e55": "c3IbtmbT8xvJbAcFqhOvWpp-kn9L9gRp86igQgDnGCc",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "ttWcWFlHw3zqwY3ZuS3_Lz2-c-ReJt4-PJlPI_FQNCc"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-0000000001f0": 7
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "task_cancel",
+      "request_id": "00000000-0000-4000-8000-000000009017",
+      "stop_generation": 3,
+      "run_generation": 7,
+      "body_digest": "d30eee43a70e103f51a460c67ea57ea8d7d805cf2a704663f27635342a012737",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000017"
+    },
+    "signature": "f7AvVxplj0uIPAXtlOGkY5Astd2tFBc-vOslLGMlp7p3jnCxwKBRgxfNuAB6R73qNFQG3jrzndhgf0rTHtMeDA",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-0000000001f0",
+      "reason": "requested"
+    }
+  },
+  "signing_input": "{\"action\":\"task_cancel\",\"body_digest\":\"d30eee43a70e103f51a460c67ea57ea8d7d805cf2a704663f27635342a012737\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000017\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009017\",\"run_generation\":7,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

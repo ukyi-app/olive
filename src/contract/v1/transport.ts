@@ -11,10 +11,10 @@
 // 5. 시한이 지난 지시는 연결이 살아 있어도 거절된다(봉투 검증의 expired). 보내는 쪽은 남은 시한이 전달 지연 상한보다
 //    짧은 봉투를 싣지 않는다(too_late_to_send). 그때는 같은 실행의 상태를 묻는다.
 import type { RejectReason } from "./errors.ts";
-import type { Action } from "./header.ts";
+import { type Action, BodyReject } from "./header.ts";
 import { INSTRUCTIONS } from "./instruction.ts";
 import { ACK_MAX_IDS, DELIVERY_MAX_MS, DISCONNECT_JUDGE_MS, STATUS_MAX_RUNS } from "./limits.ts";
-import { list, nullable, object, oneOf, revision, uuid } from "./schema.ts";
+import { int, list, nullable, object, oneOf, revision, uuid } from "./schema.ts";
 
 // 실행기가 아는 실행 상태(supervisor.md §3의 이름). queued는 감독에만 있다.
 // not_known은 "실행기에 기록이 없음"이다. 감독은 이것을 "없음"이나 "끝남"으로 바꾸지 않는다.
@@ -33,13 +33,34 @@ export const RUN_STATES = [
 ] as const;
 export type RunState = (typeof RUN_STATES)[number];
 
-const runStatus = object({ run_id: uuid, state: oneOf(RUN_STATES), last_receipt_id: nullable(uuid) });
+// run_generation은 실행기 장부에 적힌 그 실행의 세대다(서명된 본문 안). 받는 쪽(감독)은
+// - 아는 실행이면 지금 세대와 대조한다. 다르면 그 상태는 옛(또는 다른) 세대의 것이라 봉투째 run_generation_mismatch다.
+// - 모르는 실행(장부 밖)이면 이 세대를 재개·결과 반영의 권한으로 쓰지 않는다. 그 실행을 닫는 지시(task_cancel·session_stop)와
+//   status_query의 대조에만 쓴다(supervisor.md §8의 2: 장부에 없는 실행은 종료 대상).
+// not_known(실행기에 기록이 없음)이면 세대도 영수증도 없으므로 run_generation과 last_receipt_id는 null이다.
+const runStatusShape = object({ run_id: uuid, state: oneOf(RUN_STATES), run_generation: nullable(int(1)), last_receipt_id: nullable(uuid) });
+function runStatus(value: unknown, path: string) {
+  const status = runStatusShape(value, path);
+  const unknown = status.state === "not_known";
+  if (unknown !== (status.run_generation === null) || (unknown && status.last_receipt_id !== null)) throw new BodyReject("body_malformed");
+  return status;
+}
+export type RunStatus = ReturnType<typeof runStatus>;
+// 한 메시지 안에서 같은 실행 ID는 한 번만 온다. 두 세대가 함께 오면 어느 쪽이 지금 것인지 가를 수 없다.
+function runList(min: number) {
+  const inner = list(runStatus, min, STATUS_MAX_RUNS);
+  return (value: unknown, path: string) => {
+    const runs = inner(value, path);
+    if (new Set(runs.map((run) => run.run_id)).size !== runs.length) throw new BodyReject("body_malformed");
+    return runs;
+  };
+}
 
 // 연결 뒤 실행기의 첫 메시지. 계약 판은 봉투 머리가, 정책·프로필 revision은 여기서 맞춘다(§9.1 "서로").
 export const parseHello = object({
   profile_revision: revision,
   policy_revision: revision,
-  runs: list(runStatus, 0, STATUS_MAX_RUNS),
+  runs: runList(0),
   unacked_ids: list(uuid, 0, ACK_MAX_IDS, true),
 });
 
@@ -50,13 +71,26 @@ export const parseStatusQuery = object({
 
 export const parseStatusReport = object({
   in_reply_to: uuid,
-  runs: list(runStatus, 1, STATUS_MAX_RUNS),
+  runs: runList(1),
 });
 
 // 감독 → 실행기. 영수증·보고를 반영했다는 확인. 실행기는 이것을 받은 id만 다시 보내기를 멈춘다.
 export const parseAck = object({
   ids: list(uuid, 1, ACK_MAX_IDS, true),
 });
+
+// 검증을 통과한 hello·status_report에서 감독 장부에 없는 실행(종료 대상)을 고른다. 돌려준 세대는 그 실행을 닫는
+// 지시의 run_generation으로만 쓴다. 장부에 실행으로 올리거나 결과를 받아들이는 근거가 아니다.
+export function runsOutsideLedger(
+  runs: readonly RunStatus[],
+  runGeneration: (runId: string) => number | undefined,
+): { run_id: string; run_generation: number }[] {
+  const out: { run_id: string; run_generation: number }[] = [];
+  for (const run of runs) {
+    if (run.run_generation !== null && runGeneration(run.run_id) === undefined) out.push({ run_id: run.run_id, run_generation: run.run_generation });
+  }
+  return out;
+}
 
 export type Hello = ReturnType<typeof parseHello>;
 export type StatusQuery = ReturnType<typeof parseStatusQuery>;

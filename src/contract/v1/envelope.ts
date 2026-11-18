@@ -14,7 +14,7 @@ import { type Principal, parsePrincipal } from "./principal.ts";
 import type { ReceiptAccepted, ReceiptCleaned, ReceiptSessionTakeover, ReceiptStarted, ReceiptStopped } from "./receipt.ts";
 import type { HookEvent, ResultReport, RuleCheck, SessionBroken } from "./report.ts";
 import { findForbidden, SchemaError } from "./schema.ts";
-import type { Ack, Hello, StatusQuery, StatusReport } from "./transport.ts";
+import type { Ack, Hello, RunStatus, StatusQuery, StatusReport } from "./transport.ts";
 
 export interface Envelope {
   header: Header;
@@ -44,8 +44,19 @@ export interface Bodies {
   ack: Ack;
 }
 
+// adoptedStopGeneration: 이 봉투가 받는 쪽의 정지 세대를 올렸으면 그 새 값, 아니면 null(VerifyContext.stopGeneration과 같았다).
+// 이 함수는 값을 돌려줄 뿐 적용하지 않는다. 받는 쪽(실행기)은 이 봉투의 효과를 내기 전에, 새 세대를 지속 상태에 적고
+// 그 세대보다 낮은 지시로 새 실행이 열리지 않게 막는 일을 한 번에(원자적으로) 해야 한다. v1.md "구현이 지킬 것" 참고.
 export type Verified = {
-  [A in Action]: { ok: true; action: A; header: Header; body: Bodies[A]; sender: Principal; recipient: Principal };
+  [A in Action]: {
+    ok: true;
+    action: A;
+    header: Header;
+    body: Bodies[A];
+    sender: Principal;
+    recipient: Principal;
+    adoptedStopGeneration: number | null;
+  };
 }[Action];
 export type Rejected = { ok: false; reason: RejectReason };
 
@@ -60,7 +71,8 @@ export interface VerifyContext {
   // 받는 쪽 자기 이름. 실행기면 저장소 ID까지 든 이름이다.
   expectedRecipient: string;
   publicKeyFor(sender: string): KeyObject | undefined;
-  // 지금의 정지 세대. 봉투의 값과 정확히 같아야 한다.
+  // 받는 쪽이 지금 적용한 정지 세대. 봉투의 값과 정확히 같아야 한다. 단 하나의 예외는 비상 종료 지시(task_cancel·session_stop의
+  // reason emergency_stop)가 더 높은 값을 실어 온 경우로, 그때는 받아들이고 그 값을 adoptedStopGeneration으로 돌려준다.
   stopGeneration: number;
   // 받는 쪽이 아는 실행의 세대. 모르는 실행이면 undefined.
   runGeneration(runId: string): number | undefined;
@@ -89,7 +101,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 //    본문을 해시하기 전에 보아 시한 지난 큰 본문에 일을 쓰지 않는다.
 // 5. 본문: 정규화 → digest → 금지 칸 → 엄격한 모양 → 칸 사이·머리와의 관계(역할, 결과 크기 등).
 //    digest를 모양보다 먼저 보는 이유: 서명한 쪽이 보낸 본문인지부터 확인해야 그 뒤의 거절 사유가 서명한 쪽의 잘못을 가리킨다.
+//    받는 시각에만 보는 관계(이미 지난 작업 기한)도 여기서 본다(deadline_passed).
 // 6. 세대: 정지 세대, 그다음 실행 세대. 서명이 맞아도 옛 세대면 거절한다.
+//    정지 세대는 내려가지 않는다. 더 높은 값은 비상 종료 지시에서만 받아들인다(본문의 reason을 보므로 본문 뒤에 둔다).
+//    hello·status_report는 실행마다 실린 세대를 받는 쪽이 아는 실행의 세대와 대조한다.
 // 7. nonce를 마지막에 쓴다. 다른 이유로 거절될 봉투가 nonce를 태우지 않고, 받아들이는 봉투만 nonce를 쓴다.
 export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<Verified | Rejected> {
   // 1. 모양
@@ -142,7 +157,7 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
   }
   if (bodyDigest !== header.body_digest) return reject("digest_mismatch");
   if (findForbidden(raw.body) !== undefined) return reject("forbidden_field");
-  const bodyContext: BodyContext = { header, sender, recipient };
+  const bodyContext: BodyContext = { header, sender, recipient, receivedAt: ctx.now };
   let body: unknown;
   try {
     body = spec.parse(raw.body, bodyContext);
@@ -153,7 +168,19 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
   }
 
   // 6. 세대
-  if (header.stop_generation !== ctx.stopGeneration) return reject("stop_generation_mismatch");
+  let adoptedStopGeneration: number | null = null;
+  if (header.stop_generation !== ctx.stopGeneration) {
+    const advances = header.stop_generation > ctx.stopGeneration && spec.advancesStop?.(body) === true;
+    if (!advances) return reject("stop_generation_mismatch");
+    adoptedStopGeneration = header.stop_generation;
+  }
+  if (spec.runList !== undefined) {
+    for (const run of (body as Record<string, unknown>)[spec.runList] as RunStatus[]) {
+      if (run.run_generation === null) continue;
+      const known = ctx.runGeneration(run.run_id);
+      if (known !== undefined && known !== run.run_generation) return reject("run_generation_mismatch");
+    }
+  }
   if (spec.runField === null) {
     if (header.run_generation !== 0) return reject("run_generation_mismatch");
   } else {
@@ -170,7 +197,7 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
   // 7. nonce
   if (!(await ctx.nonces.consume(header.sender, header.nonce, header.expires_at))) return reject("replayed");
 
-  return { ok: true, action, header, body, sender, recipient } as Verified;
+  return { ok: true, action, header, body, sender, recipient, adoptedStopGeneration } as Verified;
 }
 
 // ---- 만들기 ----
@@ -204,7 +231,7 @@ export function sealEnvelope<A extends Action>(input: SealInput<A>, privateKey: 
   if (!spec.from.includes(sender.kind) || !spec.to.includes(recipient.kind)) throw new SealError("wrong_direction");
   if (findForbidden(input.body) !== undefined) throw new SealError("forbidden_field");
   try {
-    spec.parse(input.body, { header, sender, recipient });
+    spec.parse(input.body, { header, sender, recipient, receivedAt: null });
   } catch (error) {
     if (error instanceof SealError) throw error;
     if (error instanceof BodyReject) throw new SealError(error.reason);

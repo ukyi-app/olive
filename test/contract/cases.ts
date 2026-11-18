@@ -30,6 +30,9 @@ export const RUN_SESSION = id(0x201);
 export const RUN_NEW_SESSION = id(0x202);
 export const RUN_PREVIOUS_SESSION = id(0x200);
 export const RUN_GENERATIONS: Record<string, number> = { [RUN_TASK]: 2, [RUN_SESSION]: 5, [RUN_PREVIOUS_SESSION]: 4 };
+// 실행기에는 있지만 감독 장부에는 없는 실행(재시작 복원의 종료 대상).
+export const RUN_ORPHAN = id(0x1f0);
+export const RUN_ORPHAN_GENERATION = 7;
 
 export const hash = (label: string) => sha256Hex(label);
 const credential = { account: "main", method: "subscription", revision: "cred-7", digest: hash("credential value") };
@@ -59,7 +62,8 @@ export interface ContractCase {
   description: string;
   base: string | null;
   changed: string[];
-  expect: { ok: true } | { ok: false; reason: RejectReason };
+  // adopted_stop_generation: 받아들이면서 받는 쪽의 정지 세대를 올렸으면 그 값, 아니면 null.
+  expect: { ok: true; adopted_stop_generation: number | null } | { ok: false; reason: RejectReason };
   keys: Record<string, string>;
   context: CaseContext;
   message: Envelope;
@@ -84,15 +88,26 @@ export function buildCases(keys: Keys): ContractCase[] {
   const accept = new Map<string, Draft>();
   const cases: ContractCase[] = [];
 
-  function base(name: string, description: string, action: Action, sender: string, recipient: string, runGeneration: number, body: unknown) {
+  // opts.stopGeneration: 머리의 정지 세대(기본은 받는 쪽과 같은 값). opts.runGenerations: 받는 쪽이 아는 실행의 세대.
+  function base(
+    name: string,
+    description: string,
+    action: Action,
+    sender: string,
+    recipient: string,
+    runGeneration: number,
+    body: unknown,
+    opts: { stopGeneration?: number; runGenerations?: Record<string, number> } = {},
+  ) {
     counter++;
+    const stopGeneration = opts.stopGeneration ?? STOP_GENERATION;
     const header = {
       contract: CONTRACT,
       sender,
       recipient,
       action,
       request_id: id(0x9000 + counter),
-      stop_generation: STOP_GENERATION,
+      stop_generation: stopGeneration,
       run_generation: runGeneration,
       body_digest: digestOf(body),
       issued_at: ISSUED,
@@ -103,12 +118,13 @@ export function buildCases(keys: Keys): ContractCase[] {
       now: NOW,
       expected_recipient: recipient,
       stop_generation: STOP_GENERATION,
-      run_generations: { ...RUN_GENERATIONS },
+      run_generations: { ...(opts.runGenerations ?? RUN_GENERATIONS) },
       spent_nonces: [],
     };
     const draft: Draft = { context, header, body, signature: sign(header, body, sender), trusted: [...PRINCIPALS] };
     accept.set(name, draft);
-    cases.push(toCase(`accept/${name}`, description, null, [], { ok: true }, draft));
+    const adopted = stopGeneration === STOP_GENERATION ? null : stopGeneration;
+    cases.push(toCase(`accept/${name}`, description, null, [], { ok: true, adopted_stop_generation: adopted }, draft));
   }
 
   function toCase(name: string, description: string, from: string | null, changed: string[], expect: ContractCase["expect"], draft: Draft): ContractCase {
@@ -250,15 +266,40 @@ export function buildCases(keys: Keys): ContractCase[] {
   base("hello", "연결 인사: 쥔 실행과 받음 확인 못 받은 영수증", "hello", DIAGNOSIS, SUPERVISOR, 0, {
     profile_revision: "diagnosis-r1",
     policy_revision: "policy-r1",
-    runs: [{ run_id: RUN_TASK, state: "running", last_receipt_id: id(0x402) }],
+    runs: [{ run_id: RUN_TASK, state: "running", run_generation: 2, last_receipt_id: id(0x402) }],
     unacked_ids: [id(0x402)],
   });
   base("status-query", "다시 붙은 뒤 같은 실행 ID의 상태 조회", "status_query", SUPERVISOR, DIAGNOSIS, 0, { run_ids: [RUN_TASK] });
   base("status-report", "상태 조회의 답", "status_report", DIAGNOSIS, SUPERVISOR, 0, {
     in_reply_to: id(0x9011),
-    runs: [{ run_id: RUN_TASK, state: "ready_result", last_receipt_id: id(0x403) }],
+    runs: [{ run_id: RUN_TASK, state: "ready_result", run_generation: 2, last_receipt_id: id(0x403) }],
   });
   base("ack", "영수증 받음 확인", "ack", SUPERVISOR, DIAGNOSIS, 0, { ids: [id(0x401), id(0x402)] });
+  // 비상 정지(§7.3): 감독이 새 정지 세대 4를 적용한 뒤 보내는 종료. 받는 쪽은 아직 3이고, 받아들이며 4를 돌려준다.
+  base("task-cancel-emergency-new-stop-generation", "비상 종료가 새 정지 세대를 싣고 온다(작업)", "task_cancel", SUPERVISOR, DIAGNOSIS, 2, {
+    run_id: RUN_TASK,
+    reason: "emergency_stop",
+  }, { stopGeneration: STOP_GENERATION + 1 });
+  base("session-stop-emergency-new-stop-generation", "비상 종료가 새 정지 세대를 싣고 온다(세션)", "session_stop", SUPERVISOR, SESSION, 5, {
+    run_id: RUN_SESSION,
+    reason: "emergency_stop",
+  }, { stopGeneration: STOP_GENERATION + 1 });
+  // 재시작 복원(§8의 2): 감독 장부에 없는 실행을 실행기가 알린다. 통과하지만 그 세대는 닫는 데만 쓴다.
+  base("hello-run-outside-ledger", "감독 장부에 없는 실행을 쥔 실행기의 인사", "hello", DIAGNOSIS, SUPERVISOR, 0, {
+    profile_revision: "diagnosis-r1",
+    policy_revision: "policy-r1",
+    runs: [{ run_id: RUN_ORPHAN, state: "running", run_generation: RUN_ORPHAN_GENERATION, last_receipt_id: null }],
+    unacked_ids: [],
+  });
+  // 위 인사에서 알게 된 세대로 감독이 낸 종료. 실행기는 그 실행을 자기 장부의 세대로 안다.
+  base("task-cancel-run-outside-ledger", "장부 밖 실행을 보고된 세대로 닫는다", "task_cancel", SUPERVISOR, DIAGNOSIS, RUN_ORPHAN_GENERATION, {
+    run_id: RUN_ORPHAN,
+    reason: "requested",
+  }, { runGenerations: { [RUN_ORPHAN]: RUN_ORPHAN_GENERATION } });
+  base("status-report-not-known", "실행기에 기록이 없는 실행: 세대·영수증 없이 not_known", "status_report", DIAGNOSIS, SUPERVISOR, 0, {
+    in_reply_to: id(0x9011),
+    runs: [{ run_id: RUN_TASK, state: "not_known", run_generation: null, last_receipt_id: null }],
+  });
 
   // ---- 거절 사례: 기준에서 한 곳만 바꾼다 ----
   const body = (draft: Draft) => draft.body as Record<string, unknown>;
@@ -346,6 +387,30 @@ export function buildCases(keys: Keys): ContractCase[] {
   });
   reject("stale-stop-generation", "task-cancel", "stop_generation_mismatch", ["context.stop_generation"], "비상 정지 뒤의 새 정지 세대(지시는 옛 세대)", (d) => {
     d.context.stop_generation = STOP_GENERATION + 1;
+  });
+  reject("start-with-future-stop-generation", "task-start", "stop_generation_mismatch", ["message.header.stop_generation"], "작업 시작이 받는 쪽보다 높은 정지 세대를 실어 옴", (d) => {
+    d.header.stop_generation = STOP_GENERATION + 1;
+  });
+  reject("renew-with-future-stop-generation", "run-renew", "stop_generation_mismatch", ["message.header.stop_generation"], "실행 갱신이 받는 쪽보다 높은 정지 세대를 실어 옴", (d) => {
+    d.header.stop_generation = STOP_GENERATION + 1;
+  });
+  reject("new-stop-generation-plain-cancel", "task-cancel-emergency-new-stop-generation", "stop_generation_mismatch", ["message.body.reason"], "새 정지 세대를 실은 취소가 비상 정지가 아님", (d) => {
+    body(d).reason = "requested";
+  });
+  reject("emergency-cancel-older-stop-generation", "task-cancel-emergency-new-stop-generation", "stop_generation_mismatch", ["context.stop_generation"], "받는 쪽이 이미 더 높은 정지 세대(세대는 내려가지 않음)", (d) => {
+    d.context.stop_generation = STOP_GENERATION + 2;
+  });
+  reject("stale-status-report", "status-report", "run_generation_mismatch", [`context.run_generations.${RUN_TASK}`], "감독이 아는 세대와 다른 세대의 실행 상태", (d) => {
+    d.context.run_generations[RUN_TASK] = 3;
+  });
+  reject("not-known-with-generation", "status-report-not-known", "body_malformed", ["message.body.runs[0].run_generation"], "not_known인데 세대가 있음", (d) => {
+    ((body(d).runs as Record<string, unknown>[])[0]!).run_generation = 2;
+  });
+  reject("task-start-deadline-at-receipt", "task-start", "deadline_passed", ["message.body.deadline_at"], "받는 시각이 작업 종료 기한 정각(봉투는 살아 있음)", (d) => {
+    body(d).deadline_at = NOW;
+  });
+  reject("task-start-deadline-passed", "task-start", "deadline_passed", ["message.body.deadline_at"], "받을 때 작업 종료 기한이 1ms 지남(봉투는 살아 있음)", (d) => {
+    body(d).deadline_at = NOW - 1;
   });
   reject("cancel-unknown-run", "task-cancel", "unknown_run", [`context.run_generations.${RUN_TASK}`], "받는 쪽이 모르는 실행의 취소", (d) => {
     delete d.context.run_generations[RUN_TASK];

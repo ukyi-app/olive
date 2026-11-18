@@ -1,0 +1,50 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/new-stop-generation-plain-cancel",
+  "description": "새 정지 세대를 실은 취소가 비상 정지가 아님",
+  "base": "accept/task-cancel-emergency-new-stop-generation",
+  "changed": [
+    "message.body.reason"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "stop_generation_mismatch"
+  },
+  "keys": {
+    "supervisor": "GzvXVs3MVjaodZvUHQz-jA7Q8XtySiSV3nWVOGFJtdk",
+    "executor/session/olive-session-0/st-5e55": "c3IbtmbT8xvJbAcFqhOvWpp-kn9L9gRp86igQgDnGCc",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "ttWcWFlHw3zqwY3ZuS3_Lz2-c-ReJt4-PJlPI_FQNCc"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "task_cancel",
+      "request_id": "00000000-0000-4000-8000-000000009014",
+      "stop_generation": 4,
+      "run_generation": 2,
+      "body_digest": "d73f8df50e3aca52ab8dff70a146ea6e79e5a665abb514f2e4a9cf7bde657007",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000014"
+    },
+    "signature": "bCtsvktareuY3gMo7hYVfaNyVZN3fNIP-sWGN6AtblZ9P6I-5V5PTmKnuDqTMomGjJavPkdLa5Vla9UtHCMwCw",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000101",
+      "reason": "requested"
+    }
+  },
+  "signing_input": "{\"action\":\"task_cancel\",\"body_digest\":\"d73f8df50e3aca52ab8dff70a146ea6e79e5a665abb514f2e4a9cf7bde657007\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000014\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009014\",\"run_generation\":2,\"sender\":\"supervisor\",\"stop_generation\":4}"
+}

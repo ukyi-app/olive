@@ -56,6 +56,9 @@ export interface BodyContext {
   header: Header;
   sender: Principal;
   recipient: Principal;
+  // 받는 쪽의 지금 시각. 봉투를 만들 때(sealEnvelope)는 null이고, 그때는 발급 시각 기준의 관계만 본다.
+  // 받을 때만 보는 관계(이미 지난 작업 기한 등)는 이 값이 있을 때만 검사한다.
+  receivedAt: number | null;
 }
 
 // 본문의 칸끼리, 또는 머리와 본문 사이가 맞지 않을 때 던진다.

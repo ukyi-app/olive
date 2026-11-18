@@ -27,7 +27,8 @@ test("fixture: 파일 이름과 사례 이름이 같고, accept·reject 두 폴�
 test("fixture: accept는 모두 통과하고 reject는 모두 정해진 사유로 거절된다", async () => {
   for (const fixture of fixtures.values()) {
     const result = await verifyCase(fixture);
-    expect(result.ok ? { ok: true } : { ok: false, reason: result.reason }, fixture.name).toEqual(fixture.expect);
+    const got = result.ok ? { ok: true, adopted_stop_generation: result.adoptedStopGeneration } : { ok: false, reason: result.reason };
+    expect(got, fixture.name).toEqual(fixture.expect);
   }
 });
 
@@ -51,7 +52,7 @@ test("fixture: 거절 사례는 기준 사례(통과)에서 적어 둔 곳만 �
   for (const fixture of fixtures.values()) {
     if (fixture.expect.ok) continue;
     const base = fixtures.get(fixture.base ?? "");
-    expect(base?.expect, `${fixture.name}의 기준`).toEqual({ ok: true });
+    expect(base?.expect.ok, `${fixture.name}의 기준`).toBe(true);
     expect((await verifyCase(base!)).ok).toBe(true);
     const pick = (f: Fixture) => ({ message: f.message, context: f.context, keys: f.keys });
     const diff = leafDiff(pick(base!), pick(fixture)).filter((path) => !derived.includes(path) || fixture.changed.includes(path));

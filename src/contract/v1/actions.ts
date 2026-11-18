@@ -2,6 +2,7 @@
 // 현관(front-door)이 낼 수 있는 동작은 v1에 없다. 감독과 현관의 동작(§9.1)을 더하면 표가 바뀌므로 판을 올린다.
 import { type Action, type BodyContext, BodyReject } from "./header.ts";
 import {
+  advancesStopGeneration,
   parseResultFinalize,
   parseRunRenew,
   parseSessionStart,
@@ -30,6 +31,10 @@ export interface ActionSpec {
   runField: string | null;
   // true면 받는 쪽이 아직 모르는 실행 ID를 받는다(새 실행을 여는 지시). 그때 run_generation은 1 이상이다.
   opensRun: boolean;
+  // 실행별 세대를 담은 상태 목록의 본문 칸(hello, status_report). 받는 쪽이 아는 실행은 그 세대와 대조한다.
+  runList?: "runs";
+  // 받는 쪽보다 높은 정지 세대를 받아들여도 되는 본문인가(instruction.ts의 advancesStopGeneration). 없으면 정확히 같아야 한다.
+  advancesStop?: (body: unknown) => boolean;
   parse(body: unknown, ctx: BodyContext): unknown;
 }
 
@@ -42,7 +47,15 @@ const plain = (parse: (value: unknown, path: string) => unknown) => (body: unkno
 
 export const ACTION_SPECS: Readonly<Record<Action, ActionSpec>> = Object.freeze({
   session_start: { class: "instruction", from: SUP, to: SESSION, runField: "run_id", opensRun: true, parse: plain(parseSessionStart) },
-  session_stop: { class: "instruction", from: SUP, to: SESSION, runField: "run_id", opensRun: false, parse: plain(parseSessionStop) },
+  session_stop: {
+    class: "instruction",
+    from: SUP,
+    to: SESSION,
+    runField: "run_id",
+    opensRun: false,
+    advancesStop: (body) => advancesStopGeneration("session_stop", body),
+    parse: plain(parseSessionStop),
+  },
   task_start: {
     class: "instruction",
     from: SUP,
@@ -51,7 +64,15 @@ export const ACTION_SPECS: Readonly<Record<Action, ActionSpec>> = Object.freeze(
     opensRun: true,
     parse: (body, ctx) => parseTaskStart(body, "body", ctx),
   },
-  task_cancel: { class: "instruction", from: SUP, to: WORKER, runField: "run_id", opensRun: false, parse: plain(parseTaskCancel) },
+  task_cancel: {
+    class: "instruction",
+    from: SUP,
+    to: WORKER,
+    runField: "run_id",
+    opensRun: false,
+    advancesStop: (body) => advancesStopGeneration("task_cancel", body),
+    parse: plain(parseTaskCancel),
+  },
   run_renew: {
     class: "instruction",
     from: SUP,
@@ -92,9 +113,9 @@ export const ACTION_SPECS: Readonly<Record<Action, ActionSpec>> = Object.freeze(
     },
   },
 
-  hello: { class: "transport", from: EXECUTORS, to: SUP, runField: null, opensRun: false, parse: plain(parseHello) },
+  hello: { class: "transport", from: EXECUTORS, to: SUP, runField: null, opensRun: false, runList: "runs", parse: plain(parseHello) },
   status_query: { class: "transport", from: SUP, to: EXECUTORS, runField: null, opensRun: false, parse: plain(parseStatusQuery) },
-  status_report: { class: "transport", from: EXECUTORS, to: SUP, runField: null, opensRun: false, parse: plain(parseStatusReport) },
+  status_report: { class: "transport", from: EXECUTORS, to: SUP, runField: null, opensRun: false, runList: "runs", parse: plain(parseStatusReport) },
   ack: { class: "transport", from: SUP, to: EXECUTORS, runField: null, opensRun: false, parse: plain(parseAck) },
 } satisfies Record<Action, ActionSpec>);
 

@@ -5,12 +5,13 @@
   "base": null,
   "changed": [],
   "expect": {
-    "ok": true
+    "ok": true,
+    "adopted_stop_generation": null
   },
   "keys": {
-    "supervisor": "LKaJ_wXfccyFQ_Gmw6fXZp9BEO2Qv53Y7doATy2Ln-A",
-    "executor/session/olive-session-0/st-5e55": "3Yc3vYovvi_ZVziiX5dSTwj1tXxkOXU-sDwKsORfVWg",
-    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "vfiJXXt8ZSKZi1DeSlFsd14Y2oAzL9uJS1exHufY5Jo"
+    "supervisor": "GzvXVs3MVjaodZvUHQz-jA7Q8XtySiSV3nWVOGFJtdk",
+    "executor/session/olive-session-0/st-5e55": "c3IbtmbT8xvJbAcFqhOvWpp-kn9L9gRp86igQgDnGCc",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "ttWcWFlHw3zqwY3ZuS3_Lz2-c-ReJt4-PJlPI_FQNCc"
   },
   "context": {
     "now": 1794960000000,
@@ -37,7 +38,7 @@
       "expires_at": 1794960029000,
       "nonce": "0000000000000000000000000000000e"
     },
-    "signature": "agkUV8fiiiSGJiYkyBj8pToGWu9c4RFh-Gj41b2XbnP7y9QN0SlI5BzPD6e59Ec75cCE_-xTFG40r8DOIz1KDg",
+    "signature": "VDspL4vYRn3yhenSyaUNqPE6GozYduB0JH6KctTCENPR24S_La99FIfvUnKTexR8-aRvQK5qO4MfqSGj6pkHAQ",
     "body": {
       "report_id": "00000000-0000-4000-8000-000000000602",
       "run_id": "00000000-0000-4000-8000-000000000201",

@@ -18,7 +18,7 @@ export {
 } from "./envelope.ts";
 export { REJECT_REASONS, type RejectReason, TRANSPORT_REASONS } from "./errors.ts";
 export { type Action, ACTIONS, type Header, NONCE } from "./header.ts";
-export { INSTRUCTIONS, type InstructionAction, SESSION_STOP_REASONS, TASK_CANCEL_REASONS } from "./instruction.ts";
+export { advancesStopGeneration, INSTRUCTIONS, type InstructionAction, SESSION_STOP_REASONS, TASK_CANCEL_REASONS } from "./instruction.ts";
 export * as limits from "./limits.ts";
 export { CONTRACT } from "./limits.ts";
 export { executorName, parsePrincipal, type Principal } from "./principal.ts";
@@ -36,6 +36,8 @@ export {
   queriesAfterReconnect,
   RUN_STATES,
   type RunState,
+  type RunStatus,
+  runsOutsideLedger,
   STARTS_RUN,
   stateAfterLoss,
   viewLink,

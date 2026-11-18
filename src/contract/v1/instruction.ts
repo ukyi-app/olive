@@ -53,10 +53,21 @@ export function parseTaskStart(value: unknown, path: string, ctx: BodyContext) {
   // 역할은 실행기 이름에 고정돼 있다. 다른 역할의 작업을 이 실행기에서 띄우지 않는다.
   if (ctx.recipient.kind !== "worker_executor" || ctx.recipient.role !== body.role) throw new BodyReject("role_mismatch");
   if (body.deadline_at <= ctx.header.issued_at) throw new BodyReject("body_malformed");
+  // 시작 허가(봉투 30초)와 작업 기한은 따로다. 전송이 늦어 받을 때 이미 기한이 지났으면 봉투가 살아 있어도 띄우지 않는다.
+  // 정각도 거절한다: 기한 정각에 시작한 작업은 일할 시간이 0이다.
+  if (ctx.receivedAt !== null && body.deadline_at <= ctx.receivedAt) throw new BodyReject("deadline_passed");
   return body;
 }
 
 export const TASK_CANCEL_REASONS = ["requested", "deadline", "budget", "emergency_stop"] as const;
+
+// 받는 쪽보다 높은 정지 세대를 실어 와도 받아들이는 지시: reason이 emergency_stop인 task_cancel과 session_stop뿐이다.
+// 비상 정지(supervisor.md §7.3)는 감독이 새 정지 세대를 적용한 뒤 실행기에 종료를 지시하므로, 그 종료가 새 세대를 실행기에
+// 옮기는 길이다. 실행을 닫기만 하므로 미래 세대를 받아도 새로 열리는 것이 없다. 시작·갱신·확정은 늘 정확히 같아야 한다.
+export function advancesStopGeneration(action: InstructionAction, body: unknown): boolean {
+  if (action !== "task_cancel" && action !== "session_stop") return false;
+  return (body as { reason?: unknown }).reason === "emergency_stop";
+}
 export const parseTaskCancel = object({
   run_id: uuid,
   reason: oneOf(TASK_CANCEL_REASONS),

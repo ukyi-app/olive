@@ -16,7 +16,7 @@ import {
 } from "../../src/contract/v1/transport.ts";
 import { signUnchecked } from "../../src/contract/v1/envelope.ts";
 import { buildCases, freshKeys, id, ISSUED, NOW } from "./cases.ts";
-import { verifyCase } from "./support.ts";
+import { verifyCase, withBody } from "./support.ts";
 
 const connected: Link = { state: "connected", since: NOW - 60_000, last_seen_at: NOW - 1_000 };
 const disconnected: Link = { state: "disconnected", since: NOW - 1_000 };
@@ -68,9 +68,9 @@ test("transport: 재접속 뒤 같은 실행 ID의 상태 조회만 있고 새 �
   const cases = buildCases(keys);
   const query = cases.find((c) => c.name === "accept/status-query")!;
   for (const extra of [{ retry_of: ISSUED }, { resend: true }, { new_run_id: query.message.body }, { instruction: "task_start" }]) {
-    const c = structuredClone(query);
-    Object.assign(c.message.body as object, extra);
-    expect((await verifyCase(c)).ok, JSON.stringify(Object.keys(extra))).toBe(false);
+    // digest와 서명을 다시 맞춘다. 그래야 digest 불일치가 아니라 본문 스키마가 그 칸을 거절하는지를 본다.
+    const c = withBody(cases, keys, "status-query", (body) => Object.assign(body, extra));
+    expect(await verifyCase(c), JSON.stringify(Object.keys(extra))).toEqual({ ok: false, reason: "unknown_field" });
   }
   // 어떤 본문 해석기에도 재전송을 뜻하는 칸이 없다. 새 실행은 task_start·session_start로만 열린다.
   for (const c of cases.filter((x) => x.expect.ok)) {

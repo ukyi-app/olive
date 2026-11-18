@@ -21,6 +21,8 @@ export const REJECT_REASONS = [
   "forbidden_field",
   "role_mismatch",
   "result_too_large",
+  // 받는 시각에 이미 작업 종료 기한(task_start.deadline_at)이 지났다. 발급할 때는 맞던 본문이라 body_malformed와 가른다.
+  "deadline_passed",
   // 6. 세대
   "stop_generation_mismatch",
   "unknown_run",
