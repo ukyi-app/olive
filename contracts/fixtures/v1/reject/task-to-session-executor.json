@@ -1,0 +1,52 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/task-to-session-executor",
+  "description": "작업 취소를 세션 실행기에",
+  "base": "accept/session-stop",
+  "changed": [
+    "message.header.action",
+    "message.body.reason"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "wrong_direction"
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/session/olive-session-0/st-5e55",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/session/olive-session-0/st-5e55",
+      "action": "task_cancel",
+      "request_id": "00000000-0000-4000-8000-000000009002",
+      "stop_generation": 3,
+      "run_generation": 5,
+      "body_digest": "21eb45c49cb0dd765a5fbe54981a6807afc4d74d65e367a3fef04c6a19a3def8",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000002"
+    },
+    "signature": "ni6ui4qgLw2Zh8GVHTGpWp4s9BuqNSGfJpXODWJrGdIPRP-st4Xl6r9oLf5z-kR35VbUjSMC7PsFuW76_jB2DQ",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000201",
+      "reason": "requested"
+    }
+  },
+  "signing_input": "{\"action\":\"task_cancel\",\"body_digest\":\"21eb45c49cb0dd765a5fbe54981a6807afc4d74d65e367a3fef04c6a19a3def8\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000002\",\"recipient\":\"executor/session/olive-session-0/st-5e55\",\"request_id\":\"00000000-0000-4000-8000-000000009002\",\"run_generation\":5,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/stop-sync-reply-from-executor",
+  "description": "실행기가 자기 키로 서명한 답",
+  "base": "accept/stop-sync-reply",
+  "changed": [
+    "message.header.sender"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "wrong_direction"
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "stop_sync_challenge": {
+      "challenge": "c0ffee00000000000000000000000001",
+      "sent_at": 1794959998000
+    },
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/session/olive-session-0/st-5e55",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "stop_sync_reply",
+      "request_id": "00000000-0000-4000-8000-00000000901a",
+      "stop_generation": 4,
+      "run_generation": 0,
+      "body_digest": "5aba6f054a240825dbd1515b323237f87a0ee185dd5136e5091115e30c72b3c6",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960014000,
+      "nonce": "0000000000000000000000000000001a"
+    },
+    "signature": "LORLqGTVaLpC7RoYbvEZwOofqoukJ12ExfbioRGZpnuEYJAhuz47-CNodHtD4DCzggdMBdkXucQH5exgYQAsCw",
+    "body": {
+      "challenge": "c0ffee00000000000000000000000001"
+    }
+  },
+  "signing_input": "{\"action\":\"stop_sync_reply\",\"body_digest\":\"5aba6f054a240825dbd1515b323237f87a0ee185dd5136e5091115e30c72b3c6\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960014000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000001a\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-00000000901a\",\"run_generation\":0,\"sender\":\"executor/session/olive-session-0/st-5e55\",\"stop_generation\":4}"
+}

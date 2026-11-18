@@ -1,0 +1,50 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/status-query",
+  "description": "다시 붙은 뒤 같은 실행 ID의 상태 조회",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "status_query",
+      "request_id": "00000000-0000-4000-8000-000000009011",
+      "stop_generation": 3,
+      "run_generation": 0,
+      "body_digest": "5264273d015d1662259e428d98dc946cb75764b78f95f99b602f482d0eccb12c",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000011"
+    },
+    "signature": "Q3yg4VqDGa3Ndj72CcxkoWbd9Rykogv2VRk1o6d3u8_U8_xuJ1xfrD6l75F-2ayD6mgJG4P2goRr4FGMprFOCw",
+    "body": {
+      "run_ids": [
+        "00000000-0000-4000-8000-000000000101"
+      ]
+    }
+  },
+  "signing_input": "{\"action\":\"status_query\",\"body_digest\":\"5264273d015d1662259e428d98dc946cb75764b78f95f99b602f482d0eccb12c\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000011\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009011\",\"run_generation\":0,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

@@ -54,7 +54,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드에 듣는 API가 없다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드에 듣는 API가 없다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -68,6 +68,21 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 
 `.only`와 `.if(false)`는 시험을 결과에서 아예 빼므로 위 확인으로 잡히지 않는다. 그래서 `test/repo.test.ts`가 `test/`의 소스에서 이 표시들을 막는다. 일부 시험만 돌리려면 `bun test <이름>`을 쓴다(`bun run test`는 인자를 받지 않는다).
 
+## 계약 `olive-control/v1`
+
+감독, 실행기, 현관이 함께 쓰는 계약(서명 봉투, 지시 여섯, 영수증, 보고, 전송 규칙, 거절 사유)이다. 코드는 `src/contract/v1/`이고 다른 코드는 `index.ts`만 import한다. 요약 표는 `src/contract/v1.md`.
+
+- 입출력이 없는 순수 모듈이다. 시계, 키, 세대, nonce 저장소, 무작위 값은 인자로 받는다. `test/contract/static.test.ts`가 import와 API를 막는다.
+- **판 규칙:** main에 병합된 판 안에서 칸, 동작, 받는 쪽 거절 경계(수명 상한, 시계 오차, 맞춤 대기 기한, 임대 상한, 크기·개수 상한, 허용 값, 거절 사유)를 바꾸지 않는다. 바꾸면 `v2`를 새로 만든다. 병합 전의 판은 아직 아무도 고정하지 않았으므로 그 PR 안에서 고친다. `limits.ts`에서 "기본값(관리자 미확정)"으로 적은 것은 내는 쪽 기본값(예: 맞춤 봉투의 발급 수명 `STOP_SYNC_TTL_MS`)과 운영 숫자(전달 상한, 갱신·끊김 시간 등)뿐이다. 이것들은 받는 쪽 경계 안에서만 같은 판에서 바꾼다(예: `STOP_SYNC_TTL_MS`는 `STOP_SYNC_TTL_MAX_MS` 15초 이하). 경계와의 관계는 시험이 지킨다.
+
+### fixture
+
+`contracts/fixtures/v1/accept/`와 `reject/`에 사례 하나가 JSON 파일 하나다. 다른 구현(현관 등)은 우리 코드 없이 이 파일만 읽어 자기 검증기를 시험한다.
+
+- 사례의 칸: `keys`(믿는 공개 키, 주체 이름 → Ed25519 32바이트의 base64url), `context`(`now`, `expected_recipient`, `stop_generation`(`null`은 세대 없음), `stop_sync_challenge`(기다리는 정지 세대 맞춤의 `challenge`와 그 요청을 실은 시각 `sent_at`, 없으면 `null`), `run_generations`, `spent_nonces`), `message`(봉투), `expect`(`{ok: true, adopted_stop_generation}` 또는 `{ok: false, reason}`. `adopted_stop_generation`은 받아들이며 올린 정지 세대, 아니면 `null`), `signing_input`(서명한 바이트의 글).
+- 거절 사례는 `base`(통과 사례)에서 `changed`에 적은 곳만 다르다. 시험이 이것을 대조한다.
+- **개인 키는 저장소에 없다.** `bun run fixtures`가 부를 때마다 주체별 키를 새로 만들어 서명하고 공개 키만 파일에 쓴다. 그래서 사례 하나만 고쳐 다시 서명할 수 없고 늘 전부 다시 만든다(모든 파일의 서명과 키가 바뀐다). 사례를 지웠으면 그 파일도 지운다(시험이 남은 파일을 잡는다).
+
 ## 폴더
 
 ```text
@@ -76,7 +91,9 @@ src/main/
 ├── executor.ts     # 작업자 실행기 진입점(자리)
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
-test/               # 시험(*.test.ts)과 시험 명령(run.ts)
+src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
+contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
+test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성
 ```
 
 ## 공개 저장소

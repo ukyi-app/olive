@@ -1,0 +1,60 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/session-start",
+  "description": "세션 시작: 인수 영수증과 규칙 확인 기록을 가리킨다",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/session/olive-session-0/st-5e55",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/session/olive-session-0/st-5e55",
+      "action": "session_start",
+      "request_id": "00000000-0000-4000-8000-000000009001",
+      "stop_generation": 3,
+      "run_generation": 1,
+      "body_digest": "66b7a06574a14399b9b327f38fcf3db7cc8b25282b4723fc279b979068a818c4",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "Kjw4H80vvDQqEsRbimapTvSEMiDihBOaGyrtBSfz-dTUkHByTD7c2dwrrluDjQJcy9msj8VkplSmHHTKiE0gCw",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000202",
+      "generation_marker_digest": "f0fc31a41915b8a585be43212580c7e5395a4cbfb034ef2ce8c141e81ca6b265",
+      "takeover_receipt_id": "00000000-0000-4000-8000-000000000301",
+      "rule_check_id": "00000000-0000-4000-8000-000000000302",
+      "profile_revision": "session-r1",
+      "policy_revision": "policy-r1",
+      "handoff_digest": "249215fed826e1cff9368c2c7490760a16f7bd49f875d39a9f23eaf1505d076d",
+      "credential": {
+        "account": "main",
+        "method": "subscription",
+        "revision": "cred-7",
+        "digest": "2755ea6e543bc1dd627e7b1cae35d9db76b6da5302f16dafc14305103bbd33cb"
+      }
+    }
+  },
+  "signing_input": "{\"action\":\"session_start\",\"body_digest\":\"66b7a06574a14399b9b327f38fcf3db7cc8b25282b4723fc279b979068a818c4\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"executor/session/olive-session-0/st-5e55\",\"request_id\":\"00000000-0000-4000-8000-000000009001\",\"run_generation\":1,\"sender\":\"supervisor\",\"stop_generation\":3}"
+}

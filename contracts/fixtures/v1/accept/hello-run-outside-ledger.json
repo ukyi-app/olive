@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/hello-run-outside-ledger",
+  "description": "감독 장부에 없는 실행을 쥔 실행기의 인사",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "recipient": "supervisor",
+      "action": "hello",
+      "request_id": "00000000-0000-4000-8000-000000009016",
+      "stop_generation": 3,
+      "run_generation": 0,
+      "body_digest": "febd32deba45920f1305a5a539ac790cf339d1d93de38d40db66a4532778801f",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000016"
+    },
+    "signature": "xbUnHDCc9Gcm0vHe7GiCDp6WXZ4ATwtVdH4lqCIBAsnVwwwPP33BSXvBrpjc_XUGckiBTm0Gs_JJX6CA_d64BQ",
+    "body": {
+      "profile_revision": "diagnosis-r1",
+      "policy_revision": "policy-r1",
+      "runs": [
+        {
+          "run_id": "00000000-0000-4000-8000-0000000001f0",
+          "state": "running",
+          "run_generation": 7,
+          "last_receipt_id": null
+        }
+      ],
+      "unacked_ids": []
+    }
+  },
+  "signing_input": "{\"action\":\"hello\",\"body_digest\":\"febd32deba45920f1305a5a539ac790cf339d1d93de38d40db66a4532778801f\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000016\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000009016\",\"run_generation\":0,\"sender\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"stop_generation\":3}"
+}

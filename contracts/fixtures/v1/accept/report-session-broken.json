@@ -1,0 +1,52 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/report-session-broken",
+  "description": "세션 깨짐 보고(D-52)",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/session/olive-session-0/st-5e55",
+      "recipient": "supervisor",
+      "action": "report_session_broken",
+      "request_id": "00000000-0000-4000-8000-00000000900c",
+      "stop_generation": 3,
+      "run_generation": 5,
+      "body_digest": "b4eaeaafd0aa08631184caf9b419aff7676bd5b26ce536bd91365d6d58c7e106",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "0000000000000000000000000000000c"
+    },
+    "signature": "S-Nq8ydmWLyCPgpuwp1pPgQ1VFki5rCFmoe_swVZNKpiUx1pEJ7TSrsFCbZ5H378RbyLc2OFf3DJc1B3utFZAA",
+    "body": {
+      "report_id": "00000000-0000-4000-8000-000000000601",
+      "run_id": "00000000-0000-4000-8000-000000000201",
+      "cause": "relay_lost",
+      "generation_marker_digest": "d83546ae0f7aaf614a146a17fdbbecd25b4b3335beea5dc3bc78b82640281501",
+      "observed_at": 1794959998000
+    }
+  },
+  "signing_input": "{\"action\":\"report_session_broken\",\"body_digest\":\"b4eaeaafd0aa08631184caf9b419aff7676bd5b26ce536bd91365d6d58c7e106\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000000c\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000900c\",\"run_generation\":5,\"sender\":\"executor/session/olive-session-0/st-5e55\",\"stop_generation\":3}"
+}

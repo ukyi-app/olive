@@ -1,0 +1,49 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/task-cancel-emergency-new-stop-generation",
+  "description": "비상 종료가 새 정지 세대를 싣고 온다(작업)",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": 4
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "supervisor",
+      "recipient": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "action": "task_cancel",
+      "request_id": "00000000-0000-4000-8000-000000009014",
+      "stop_generation": 4,
+      "run_generation": 2,
+      "body_digest": "8251eaae1c4292f9fbe410fb0b8b506730e42e15b9fa56f4dcfec8c1502137cc",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000014"
+    },
+    "signature": "PaEbVucxb0i89R34kZ4Ba5YIhdIvaOnJYhCLLElSwCl_of6cEXJug9JeXIxx2ZBCm8tegCIsk528yJaQmSX9Cw",
+    "body": {
+      "run_id": "00000000-0000-4000-8000-000000000101",
+      "reason": "emergency_stop"
+    }
+  },
+  "signing_input": "{\"action\":\"task_cancel\",\"body_digest\":\"8251eaae1c4292f9fbe410fb0b8b506730e42e15b9fa56f4dcfec8c1502137cc\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000014\",\"recipient\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"request_id\":\"00000000-0000-4000-8000-000000009014\",\"run_generation\":2,\"sender\":\"supervisor\",\"stop_generation\":4}"
+}

@@ -1,0 +1,60 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/hello",
+  "description": "연결 인사: 쥔 실행과 받음 확인 못 받은 영수증",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "recipient": "supervisor",
+      "action": "hello",
+      "request_id": "00000000-0000-4000-8000-000000009010",
+      "stop_generation": 3,
+      "run_generation": 0,
+      "body_digest": "1dc473bc6585f1c4abb8dd6d1f253ce0f2a6846a586af83bc198376fd19fc030",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "00000000000000000000000000000010"
+    },
+    "signature": "ZuRFfJ1dPHXMCMjKaL1LG6cCif5MWVmdDvGDCIMkowEUu--tBHpwcgimOkD8ehhcW4hbzwgmb1lmonl4errKAw",
+    "body": {
+      "profile_revision": "diagnosis-r1",
+      "policy_revision": "policy-r1",
+      "runs": [
+        {
+          "run_id": "00000000-0000-4000-8000-000000000101",
+          "state": "running",
+          "run_generation": 2,
+          "last_receipt_id": "00000000-0000-4000-8000-000000000402"
+        }
+      ],
+      "unacked_ids": [
+        "00000000-0000-4000-8000-000000000402"
+      ]
+    }
+  },
+  "signing_input": "{\"action\":\"hello\",\"body_digest\":\"1dc473bc6585f1c4abb8dd6d1f253ce0f2a6846a586af83bc198376fd19fc030\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000010\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000009010\",\"run_generation\":0,\"sender\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"stop_generation\":3}"
+}

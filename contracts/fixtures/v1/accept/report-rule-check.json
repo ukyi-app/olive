@@ -1,0 +1,53 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "accept/report-rule-check",
+  "description": "규칙 확인 기록(D-51)",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "adopted_stop_generation": null
+  },
+  "keys": {
+    "supervisor": "-jI-qWu_1Hwr_Fbr-5l86fLCJVN2jrSwTf25fAMDxGg",
+    "executor/session/olive-session-0/st-5e55": "b2o25dhrZ2fLfr27d8b1VRGofxwLqRR5iOjECp2tTIU",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Z-pHbFalFF_LRWo3x05a3NJOf7HzDjCq9RTzVyKjfJg"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/session/olive-session-0/st-5e55",
+      "recipient": "supervisor",
+      "action": "report_rule_check",
+      "request_id": "00000000-0000-4000-8000-00000000900d",
+      "stop_generation": 3,
+      "run_generation": 0,
+      "body_digest": "f18d83b94f65b5e67e0d3061ae572b8c93886cc5d4f826cdc6c9a101d7cf2941",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960029000,
+      "nonce": "0000000000000000000000000000000d"
+    },
+    "signature": "jw97ECG99Apw57JNC0W64YyAn4Y8yWW-xiH55mD9-K4FwRk0nl2QMQVd8KLhAIkIYPg_sH3ZWC5tMAbS1Tx0Bw",
+    "body": {
+      "report_id": "00000000-0000-4000-8000-000000000302",
+      "outcome": "rule_present",
+      "first_marker_digest": "25a166195ee1933fc184f96e55dfb500f05a7949a37fc2fc81e1306e07049be5",
+      "restarted_marker_digest": "f0fc31a41915b8a585be43212580c7e5395a4cbfb034ef2ce8c141e81ca6b265",
+      "start_permit_id": "00000000-0000-4000-8000-000000000501",
+      "checked_at": 1794959996000
+    }
+  },
+  "signing_input": "{\"action\":\"report_rule_check\",\"body_digest\":\"f18d83b94f65b5e67e0d3061ae572b8c93886cc5d4f826cdc6c9a101d7cf2941\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960029000,\"issued_at\":1794959999000,\"nonce\":\"0000000000000000000000000000000d\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-00000000900d\",\"run_generation\":0,\"sender\":\"executor/session/olive-session-0/st-5e55\",\"stop_generation\":3}"
+}
