@@ -19,7 +19,7 @@ import {
   parseReceiptStopped,
 } from "./receipt.ts";
 import { parseHookEvent, parseResultReport, parseRuleCheck, parseSessionBroken } from "./report.ts";
-import { STOP_SYNC_TTL_MS } from "./limits.ts";
+import { STOP_SYNC_TTL_MAX_MS, STOP_SYNC_TTL_MS } from "./limits.ts";
 import { parseAck, parseHello, parseStatusQuery, parseStatusReport, parseStopSyncReply, parseStopSyncRequest } from "./transport.ts";
 
 export type ActionClass = "instruction" | "receipt" | "report" | "transport";
@@ -38,7 +38,9 @@ export interface ActionSpec {
   advancesStop?: (body: unknown) => boolean;
   // 정지 세대 맞춤의 두 메시지(transport.ts). 이 둘은 정확 일치 대신 envelope.ts의 맞춤 규칙으로 세대를 본다.
   stopSync?: "request" | "reply";
-  // 봉투 수명의 상한. 없으면 MESSAGE_TTL_MS다. sealEnvelope도 이 값으로 expires_at을 정한다.
+  // 봉투 수명의 받는 쪽 상한(v1에 고정). 없으면 MESSAGE_TTL_MAX_MS다. verifyEnvelope가 넘는 봉투를 lifetime_invalid로 거절한다.
+  maxLifetimeMs?: number;
+  // 내는 쪽 기본 수명. 없으면 MESSAGE_TTL_MS다. sealEnvelope가 이 값으로 expires_at을 정한다. maxLifetimeMs 이하다(시험이 지킨다).
   lifetimeMs?: number;
   parse(body: unknown, ctx: BodyContext): unknown;
 }
@@ -129,6 +131,7 @@ export const ACTION_SPECS: Readonly<Record<Action, ActionSpec>> = Object.freeze(
     runField: null,
     opensRun: false,
     stopSync: "request",
+    maxLifetimeMs: STOP_SYNC_TTL_MAX_MS,
     lifetimeMs: STOP_SYNC_TTL_MS,
     parse: plain(parseStopSyncRequest),
   },
@@ -139,6 +142,7 @@ export const ACTION_SPECS: Readonly<Record<Action, ActionSpec>> = Object.freeze(
     runField: null,
     opensRun: false,
     stopSync: "reply",
+    maxLifetimeMs: STOP_SYNC_TTL_MAX_MS,
     lifetimeMs: STOP_SYNC_TTL_MS,
     parse: plain(parseStopSyncReply),
   },

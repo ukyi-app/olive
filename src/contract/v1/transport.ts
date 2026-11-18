@@ -57,7 +57,8 @@ function runList(min: number) {
   };
 }
 
-// 연결 뒤 실행기의 첫 메시지. 계약 판은 봉투 머리가, 정책·프로필 revision은 여기서 맞춘다(§9.1 "서로").
+// 정지 세대 맞춤(stop_sync_request → stop_sync_reply) 뒤 실행기의 첫 일반 메시지. 연결의 첫 메시지는 맞춤 요청이다.
+// 감독은 hello부터 정지 세대를 정확 일치로 본다(정확 일치의 예외는 v1.md "정지 세대 올리기"). 계약 판은 봉투 머리가, 정책·프로필 revision은 여기서 맞춘다(§9.1 "서로").
 export const parseHello = object({
   profile_revision: revision,
   policy_revision: revision,
@@ -103,7 +104,8 @@ export function runsOutsideLedger(
 //   실행기 → 감독  hello (맞춘 세대로 정확 일치)
 //
 // - 요청은 세대를 싣지 않는다(머리 0, 본문에 칸 없음). 실행기가 보내는 어떤 값도 감독의 세대를 바꾸지 않는다.
-// - 답은 감독 키로 서명되고 받는 쪽 이름(역할·인스턴스·저장소 ID)과 이 연결의 challenge에 묶이며 수명이 짧다(STOP_SYNC_TTL_MS).
+// - 답은 감독 키로 서명되고 받는 쪽 이름(역할·인스턴스·저장소 ID)과 이 연결의 challenge에 묶이며 수명이 짧다(STOP_SYNC_TTL_MAX_MS).
+//   실행기는 요청을 실은 때부터 STOP_SYNC_WAIT_MS 동안만 그 challenge의 답을 받는다(답의 신선도와 따로 잰다).
 // - 받는 쪽보다 낮은 세대의 답은 거절한다. 같으면 그대로, 높거나 받는 쪽에 세대가 없으면(null) 그 값을 돌려준다.
 // - 실행을 지목하지 않고 실행·자격·명령을 싣지 않는다. 지시 여섯에 들지 않고, 정지 해제나 실행 허가가 아니다.
 export const parseStopSyncRequest = object({

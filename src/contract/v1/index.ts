@@ -5,6 +5,7 @@ export {
   type Bodies,
   type Envelope,
   type NonceStore,
+  type PendingStopSync,
   publicKeyFromRaw,
   rawPublicKey,
   type Rejected,

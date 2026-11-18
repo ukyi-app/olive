@@ -8,7 +8,7 @@ import { digestOf, sha256Hex } from "../../src/contract/v1/canonical.ts";
 import { type Envelope, rawPublicKey, signUnchecked } from "../../src/contract/v1/envelope.ts";
 import type { RejectReason } from "../../src/contract/v1/errors.ts";
 import type { Action, Header } from "../../src/contract/v1/header.ts";
-import { CONTRACT, MESSAGE_TTL_MS, STOP_SYNC_TTL_MS } from "../../src/contract/v1/limits.ts";
+import { CONTRACT, MESSAGE_TTL_MS, STOP_SYNC_TTL_MS, STOP_SYNC_WAIT_MS } from "../../src/contract/v1/limits.ts";
 import { executorName } from "../../src/contract/v1/principal.ts";
 
 // 2026-11-18T00:00:00Z. fixture는 이 시각을 "지금"으로 검증한다.
@@ -53,14 +53,16 @@ export function freshKeys(): Keys {
 // 정지 세대 맞춤의 challenge(실행기가 이 연결에서 만든 값과 다른 연결의 값).
 export const CHALLENGE = "c0ffee00000000000000000000000001";
 export const OTHER_CHALLENGE = "c0ffee00000000000000000000000002";
+// 실행기가 맞춤 요청을 실은 시각: 감독이 답을 발급하기(ISSUED) 1초 전.
+export const CHALLENGE_SENT_AT = ISSUED - 1_000;
 
 export interface CaseContext {
   now: number;
   expected_recipient: string;
   // null: 받는 쪽에 정지 세대가 없다(저장소를 잃은 실행기, 정지 기록 복원 전의 감독).
   stop_generation: number | null;
-  // 받는 쪽이 이 연결에서 보내고 답을 기다리는 stop_sync_request의 challenge. 없으면 null.
-  stop_sync_challenge: string | null;
+  // 받는 쪽이 이 연결에서 보내고 답을 기다리는 stop_sync_request의 challenge와 그 요청을 연결에 실은 시각. 없으면 null.
+  stop_sync_challenge: { challenge: string; sent_at: number } | null;
   run_generations: Record<string, number>;
   spent_nonces: { sender: string; nonce: string }[];
 }
@@ -98,7 +100,7 @@ export function buildCases(keys: Keys): ContractCase[] {
 
   // opts.stopGeneration: 머리의 정지 세대(기본은 받는 쪽과 같은 값). opts.runGenerations: 받는 쪽이 아는 실행의 세대.
   // opts.receiverStopGeneration: 받는 쪽의 정지 세대(기본 STOP_GENERATION, null은 세대 없음).
-  // opts.challenge: 받는 쪽이 기다리는 stop_sync_request의 challenge.
+  // opts.challenge: 받는 쪽이 기다리는 stop_sync_request의 challenge. opts.challengeSentAt: 그 요청을 실은 시각(기본 CHALLENGE_SENT_AT).
   function base(
     name: string,
     description: string,
@@ -112,6 +114,7 @@ export function buildCases(keys: Keys): ContractCase[] {
       runGenerations?: Record<string, number>;
       receiverStopGeneration?: number | null;
       challenge?: string;
+      challengeSentAt?: number;
     } = {},
   ) {
     counter++;
@@ -134,7 +137,7 @@ export function buildCases(keys: Keys): ContractCase[] {
       now: NOW,
       expected_recipient: recipient,
       stop_generation: receiverStopGeneration,
-      stop_sync_challenge: opts.challenge ?? null,
+      stop_sync_challenge: opts.challenge === undefined ? null : { challenge: opts.challenge, sent_at: opts.challengeSentAt ?? CHALLENGE_SENT_AT },
       run_generations: { ...(opts.runGenerations ?? RUN_GENERATIONS) },
       spent_nonces: [],
     };
@@ -329,6 +332,9 @@ export function buildCases(keys: Keys): ContractCase[] {
   base("stop-sync-reply-lost-storage", "저장소를 잃어 세대가 없는(null) 실행기가 새 저장소 ID로 세대 4를 받는다", "stop_sync_reply", SUPERVISOR, DIAGNOSIS_NEW_STORAGE, 0, {
     challenge: CHALLENGE,
   }, { stopGeneration: STOP_GENERATION + 1, challenge: CHALLENGE, receiverStopGeneration: null, runGenerations: {} });
+  base("stop-sync-reply-slow-round-trip", "요청을 실은 뒤 기다리는 기한(25초)의 1ms 전에 온 답(답의 15초 신선도는 남아 있음)", "stop_sync_reply", SUPERVISOR, DIAGNOSIS, 0, {
+    challenge: CHALLENGE,
+  }, { stopGeneration: STOP_GENERATION + 1, challenge: CHALLENGE, challengeSentAt: NOW - STOP_SYNC_WAIT_MS + 1 });
 
   // ---- 거절 사례: 기준에서 한 곳만 바꾼다 ----
   const body = (draft: Draft) => draft.body as Record<string, unknown>;
@@ -455,8 +461,17 @@ export function buildCases(keys: Keys): ContractCase[] {
   });
 
   // 정지 세대 맞춤의 거절. 답(stop-sync-reply)과 요청(stop-sync-request)에서 한 곳만 바꾼다.
-  reject("stop-sync-reply-other-connection", "stop-sync-reply", "challenge_mismatch", ["context.stop_sync_challenge"], "다른 연결(앞선 연결)의 challenge를 담은 답", (d) => {
-    d.context.stop_sync_challenge = OTHER_CHALLENGE;
+  reject("stop-sync-reply-other-connection", "stop-sync-reply", "challenge_mismatch", ["context.stop_sync_challenge.challenge"], "다른 연결(앞선 연결)의 challenge를 담은 답", (d) => {
+    d.context.stop_sync_challenge!.challenge = OTHER_CHALLENGE;
+  });
+  reject("stop-sync-reply-wait-elapsed", "stop-sync-reply-slow-round-trip", "challenge_mismatch", ["context.stop_sync_challenge.sent_at"], "요청을 실은 지 기다리는 기한(25초) 정각에 온 답(답의 15초 신선도는 남아 있음)", (d) => {
+    d.context.stop_sync_challenge!.sent_at = NOW - STOP_SYNC_WAIT_MS;
+  });
+  reject("stop-sync-reply-run-generation", "stop-sync-reply", "run_generation_mismatch", ["message.header.run_generation"], "실행 세대를 실은 답(맞춤은 실행에 묶이지 않아 0)", (d) => {
+    d.header.run_generation = 1;
+  });
+  reject("stop-sync-request-run-generation", "stop-sync-request", "run_generation_mismatch", ["message.header.run_generation"], "실행 세대를 실은 요청(맞춤은 실행에 묶이지 않아 0)", (d) => {
+    d.header.run_generation = 1;
   });
   reject("stop-sync-reply-not-awaited", "stop-sync-reply", "challenge_mismatch", ["context.stop_sync_challenge"], "기다리는 요청이 없는데 온 답", (d) => {
     d.context.stop_sync_challenge = null;

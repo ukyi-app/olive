@@ -3,7 +3,7 @@
 // - 공백이 없다. 문자열은 JSON.stringify의 이스케이프(JCS와 같다)를 쓴다.
 // - 숫자는 안전 정수(±(2^53-1))만 받는다. 소수·지수·NaN·무한대가 오면 직렬화하지 않는다. -0은 0으로 쓴다.
 //   소수를 막는 이유: 구현마다 소수의 최단 표기가 달라질 수 있어 같은 뜻이 다른 바이트가 된다.
-// - 짝이 없는 서로게이트가 든 문자열, 빈 칸이 있는 배열, undefined, 평범한 객체가 아닌 값은 받지 않는다.
+// - 짝이 없는 서로게이트가 든 문자열(값이든 객체의 키든), 빈 칸이 있는 배열, undefined, 평범한 객체가 아닌 값은 받지 않는다.
 // 그래서 받는 쪽이 받은 바이트가 아니라 해석한 값에서 이 바이트를 다시 만들어도 보낸 쪽과 같다.
 // 함정: 같은 키가 두 번 든 JSON 글은 해석기마다 고르는 값이 다를 수 있다. 바이트 틀(뒤 작업)이 그런 글을 거절해야 한다.
 import { createHash } from "node:crypto";
@@ -44,6 +44,8 @@ function write(value: unknown, depth: number): string {
       if (proto !== Object.prototype && proto !== null) throw new CanonicalError("not_plain_object");
       const record = value as Record<string, unknown>;
       const keys = Object.keys(record).sort();
+      // 키도 문자열이라 값과 같은 검사를 한다(JCS의 문자열 규칙은 속성 이름에도 적용된다).
+      for (const key of keys) if (!key.isWellFormed()) throw new CanonicalError("lone_surrogate");
       return `{${keys.map((key) => `${JSON.stringify(key)}:${write(record[key], depth + 1)}`).join(",")}}`;
     }
     default:

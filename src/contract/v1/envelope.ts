@@ -9,7 +9,7 @@ import { CanonicalError, canonicalJson, digestOf, utf8Bytes } from "./canonical.
 import type { RejectReason } from "./errors.ts";
 import { type Action, type BodyContext, BodyReject, type Header, parseHeader } from "./header.ts";
 import type { ResultFinalize, RunRenew, SessionStart, SessionStop, TaskCancel, TaskStart } from "./instruction.ts";
-import { CLOCK_SKEW_MS, CONTRACT, MESSAGE_TTL_MS } from "./limits.ts";
+import { CLOCK_SKEW_MS, CONTRACT, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS, STOP_SYNC_WAIT_MS } from "./limits.ts";
 import { type Principal, parsePrincipal } from "./principal.ts";
 import type { ReceiptAccepted, ReceiptCleaned, ReceiptSessionTakeover, ReceiptStarted, ReceiptStopped } from "./receipt.ts";
 import type { HookEvent, ResultReport, RuleCheck, SessionBroken } from "./report.ts";
@@ -69,19 +69,27 @@ export interface NonceStore {
   consume(sender: string, nonce: string, expiresAt: number): boolean | Promise<boolean>;
 }
 
+export interface PendingStopSync {
+  challenge: string;
+  sentAt: number;
+}
+
 export interface VerifyContext {
   now: number;
   // 받는 쪽 자기 이름. 실행기면 저장소 ID까지 든 이름이다.
   expectedRecipient: string;
   publicKeyFor(sender: string): KeyObject | undefined;
-  // 받는 쪽이 지금 적용한 정지 세대. 봉투의 값과 정확히 같아야 한다. 더 높은 값을 받아들이는 예외는 둘이다.
+  // 받는 쪽이 지금 적용한 정지 세대. 봉투의 값과 정확히 같아야 한다(규칙과 예외는 v1.md "정지 세대 올리기"의 정확 일치 규칙).
+  // 더 높은 값을 받아들이는 예외는 둘이다.
   // - 비상 종료 지시(task_cancel·session_stop의 reason emergency_stop): 받는 쪽이 아는 실행을 닫으며 새 세대를 옮긴다.
   // - stop_sync_reply: 연결의 첫 단계에서 감독이 서명한 지금의 세대. 같거나 높으면 받는다.
+  // 대조하지 않는 예외는 stop_sync_request 하나다(머리는 늘 0, 감독이 세대를 알 때만 받는다).
   // null은 "세대 없음"이다(저장소를 잃었거나 처음 뜬 실행기, 정지 기록을 아직 복원하지 못한 감독). 0과 다르다. 0은 "한 번도
   // 정지하지 않았다"는 알려진 세대이고, null은 모른다는 뜻이라 stop_sync_reply 밖의 모든 메시지를 거절한다(맞춤이 먼저다).
   stopGeneration: number | null;
-  // 이 연결에서 보내고 아직 답을 기다리는 stop_sync_request의 challenge. 없으면 null(또는 생략)이고 그때 오는 답은 거절한다.
-  stopSyncChallenge?: string | null;
+  // 이 연결에서 보내고 아직 답을 기다리는 stop_sync_request의 challenge와 그 요청을 연결에 실은 시각(sentAt, 받는 쪽 시계).
+  // 없으면 null(또는 생략)이고 그때 오는 답은 거절한다. now가 sentAt + STOP_SYNC_WAIT_MS 이상이면 버린 것으로 본다.
+  stopSyncChallenge?: PendingStopSync | null;
   // 받는 쪽이 아는 실행의 세대. 모르는 실행이면 undefined.
   runGeneration(runId: string): number | undefined;
   nonces: NonceStore;
@@ -105,7 +113,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 // 2. 서명. 이 뒤의 확인은 모두 머리의 내용을 믿고 하는 것이라, 서명이 맞기 전에는 내용으로 판정하지 않는다.
 //    키는 낸 쪽 이름으로 고르므로, 다른 주체의 키로 서명한 봉투는 여기서 bad_signature다.
 // 3. 방향(그 동작을 낼 수 있는 주체와 받을 수 있는 주체), 그다음 받는 쪽이 정말 나인지.
-// 4. 시한. 수명이 30초를 넘거나 거꾸로면 lifetime_invalid, 발급이 미래면 not_yet_valid, 지났으면 expired.
+// 4. 시한. 수명이 동작의 받는 쪽 상한(30초, 맞춤은 15초)을 넘거나 거꾸로면 lifetime_invalid, 발급이 미래면 not_yet_valid, 지났으면 expired.
 //    본문을 해시하기 전에 보아 시한 지난 큰 본문에 일을 쓰지 않는다.
 // 5. 본문: 정규화 → digest → 금지 칸 → 엄격한 모양 → 칸 사이·머리와의 관계(역할, 결과 크기 등).
 //    digest를 모양보다 먼저 보는 이유: 서명한 쪽이 보낸 본문인지부터 확인해야 그 뒤의 거절 사유가 서명한 쪽의 잘못을 가리킨다.
@@ -154,7 +162,7 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
 
   // 4. 시한
   const lifetime = header.expires_at - header.issued_at;
-  if (lifetime <= 0 || lifetime > (spec.lifetimeMs ?? MESSAGE_TTL_MS)) return reject("lifetime_invalid");
+  if (lifetime <= 0 || lifetime > (spec.maxLifetimeMs ?? MESSAGE_TTL_MAX_MS)) return reject("lifetime_invalid");
   if (header.issued_at > ctx.now + CLOCK_SKEW_MS) return reject("not_yet_valid");
   if (header.expires_at <= ctx.now) return reject("expired");
 
@@ -182,8 +190,11 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
   let adoptedStopGeneration: number | null = null;
   const current = ctx.stopGeneration;
   if (spec.stopSync === "reply") {
+    // 기다리는 기한은 답 봉투의 신선도(4)와 따로 잰다. 기한이 지났으면 challenge를 버린 것과 같다.
     const pending = ctx.stopSyncChallenge ?? null;
-    if (pending === null || (body as StopSyncReply).challenge !== pending) return reject("challenge_mismatch");
+    if (pending === null || ctx.now >= pending.sentAt + STOP_SYNC_WAIT_MS || (body as StopSyncReply).challenge !== pending.challenge) {
+      return reject("challenge_mismatch");
+    }
     if (current !== null && header.stop_generation < current) return reject("stop_generation_mismatch");
     if (current === null || header.stop_generation > current) adoptedStopGeneration = header.stop_generation;
   } else if (spec.stopSync === "request") {
@@ -242,10 +253,15 @@ export class SealError extends Error {
 }
 
 // 계약에 맞는 봉투만 만든다. 받는 쪽이 모양·방향·본문 때문에 거절할 봉투는 서명하기 전에 막는다.
-// 수명은 동작의 상한(정지 세대 맞춤은 STOP_SYNC_TTL_MS, 나머지는 MESSAGE_TTL_MS)을 꽉 채운다.
-// 세대와 받는 쪽이 맞는지는 서명하는 쪽 장부의 일이라 여기서 보지 않는다.
+// 수명은 동작의 내는 쪽 기본값(정지 세대 맞춤은 STOP_SYNC_TTL_MS, 나머지는 MESSAGE_TTL_MS)이다.
+// 세대와 받는 쪽이 맞는지는 서명하는 쪽 장부의 일이라 대부분 여기서 보지 않는다. 예외는 장부 없이 정해지는 맞춤의 상수다:
+// stop_sync_request의 머리 stop_generation은 0, 맞춤 두 메시지의 run_generation은 0. 다른 값이면 서명하기 전에 거절한다.
+// 칸을 타입에서 빼지 않고 거절하는 이유: 봉투를 만드는 공통 코드가 보관한 세대를 그대로 채워도 발급 시점에 바로 드러나고,
+// 받는 쪽이 낼 사유(stop_generation_mismatch·run_generation_mismatch)와 같은 사유로 실패한다.
 export function sealEnvelope<A extends Action>(input: SealInput<A>, privateKey: KeyObject): Envelope {
   const spec = ACTION_SPECS[input.action];
+  if (spec.stopSync === "request" && input.stop_generation !== 0) throw new SealError("stop_generation_mismatch");
+  if (spec.stopSync !== undefined && input.run_generation !== 0) throw new SealError("run_generation_mismatch");
   const header = buildHeader(input, input.issued_at + (spec.lifetimeMs ?? MESSAGE_TTL_MS));
   const sender = parsePrincipal(header.sender);
   const recipient = parsePrincipal(header.recipient);

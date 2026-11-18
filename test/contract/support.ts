@@ -22,7 +22,7 @@ export function contextOf(keys: Record<string, string>, context: CaseContext, no
     expectedRecipient: context.expected_recipient,
     publicKeyFor: (sender) => trusted.get(sender),
     stopGeneration: context.stop_generation,
-    stopSyncChallenge: context.stop_sync_challenge,
+    stopSyncChallenge: context.stop_sync_challenge === null ? null : { challenge: context.stop_sync_challenge.challenge, sentAt: context.stop_sync_challenge.sent_at },
     runGeneration: (runId) => (Object.hasOwn(runs, runId) ? runs[runId] : undefined),
     nonces,
   };

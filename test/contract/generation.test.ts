@@ -7,8 +7,17 @@ import type { RejectReason } from "../../src/contract/v1/errors.ts";
 import { INSTRUCTIONS } from "../../src/contract/v1/instruction.ts";
 import { type Envelope, rawPublicKey, sealEnvelope, type SealInput, signUnchecked, verifyEnvelope } from "../../src/contract/v1/envelope.ts";
 import type { Action, Header } from "../../src/contract/v1/header.ts";
-import { CLOCK_SKEW_MS, DELIVERY_MAX_MS, MESSAGE_TTL_MS, STOP_SYNC_TTL_MS } from "../../src/contract/v1/limits.ts";
-import { runsOutsideLedger, type RunStatus, STARTS_RUN } from "../../src/contract/v1/transport.ts";
+import {
+  CLOCK_SKEW_MS,
+  DELIVERY_MAX_MS,
+  MESSAGE_TTL_MAX_MS,
+  MESSAGE_TTL_MS,
+  STOP_SYNC_ANSWER_MAX_MS,
+  STOP_SYNC_TTL_MAX_MS,
+  STOP_SYNC_TTL_MS,
+  STOP_SYNC_WAIT_MS,
+} from "../../src/contract/v1/limits.ts";
+import { maySend, runsOutsideLedger, type RunStatus, STARTS_RUN } from "../../src/contract/v1/transport.ts";
 import {
   CHALLENGE,
   DIAGNOSIS,
@@ -46,13 +55,18 @@ function seal<A extends Action>(input: Omit<SealInput<A>, "request_id" | "nonce"
 // 실행기 하나의 상태를 흉내 낸다. 검증 함수는 순수하므로, 받아들인 새 정지 세대를 적용하는 것은 이 쪽(실행기)의 일이다.
 // challenge는 연결마다 하나다. requestSync가 새 연결의 맞춤 요청을 만들고, 답을 받아들이면 그 challenge를 버린다.
 function executor(recipient: string, stopGeneration: number | null, runs: Record<string, number>) {
-  const state = { stopGeneration, runs: { ...runs }, challenge: null as string | null };
+  const state = { stopGeneration, runs: { ...runs }, challenge: null as { challenge: string; sent_at: number } | null };
   const nonces = new MemoryNonces();
   return {
     state,
-    requestSync(challenge: string) {
-      state.challenge = challenge;
-      return seal({ sender: recipient, recipient: SUPERVISOR, action: "stop_sync_request", stop_generation: 0, run_generation: 0, body: { challenge } });
+    // sentAt: 요청을 연결에 실은 시각(기본은 요청의 발급 시각). 기다리는 기한은 여기서부터 잰다.
+    requestSync(challenge: string, sentAt = ISSUED) {
+      state.challenge = { challenge, sent_at: sentAt };
+      return seal({ sender: recipient, recipient: SUPERVISOR, action: "stop_sync_request", stop_generation: 0, run_generation: 0, issued_at: sentAt, body: { challenge } });
+    },
+    // 연결이 끝나면 기다리던 challenge를 버린다.
+    disconnect() {
+      state.challenge = null;
     },
     async receive(message: unknown, now = NOW) {
       const ctx = contextOf(
@@ -74,10 +88,10 @@ function supervisor(stopGeneration: number | null) {
   const nonces = new MemoryNonces();
   return {
     state,
-    async receive(message: unknown) {
+    async receive(message: unknown, now = NOW) {
       const ctx = contextOf(
         trusted,
-        { now: NOW, expected_recipient: SUPERVISOR, stop_generation: state.stopGeneration, stop_sync_challenge: null, run_generations: {}, spent_nonces: [] },
+        { now, expected_recipient: SUPERVISOR, stop_generation: state.stopGeneration, stop_sync_challenge: null, run_generations: {}, spent_nonces: [] },
         nonces,
       );
       const result = await verifyEnvelope(message, ctx);
@@ -353,6 +367,102 @@ test("정지 세대 맞춤: 답의 수명은 15초다(직전 통과, 정각 expi
   const worker = executor(DIAGNOSIS, 3, {});
   worker.requestSync(CHALLENGE);
   expect(await worker.receive(long)).toEqual({ ok: false, reason: "lifetime_invalid" });
+});
+
+test("정지 세대 맞춤: 기다리는 기한은 요청 전달 + 감독 처리 + 답 전달을 덮고, 수명 상한은 내는 쪽 기본값보다 작지 않다", () => {
+  // 전달은 DELIVERY_MAX_MS 미만(maySend의 경계)이고 감독은 받은 뒤 STOP_SYNC_ANSWER_MAX_MS 안에 답을 싣는다.
+  expect(STOP_SYNC_WAIT_MS).toBeGreaterThanOrEqual(2 * DELIVERY_MAX_MS + STOP_SYNC_ANSWER_MAX_MS);
+  expect(STOP_SYNC_WAIT_MS).toBe(25_000);
+  expect(STOP_SYNC_TTL_MAX_MS).toBe(15_000);
+  expect(MESSAGE_TTL_MAX_MS).toBe(30_000);
+  expect(STOP_SYNC_TTL_MS).toBeLessThanOrEqual(STOP_SYNC_TTL_MAX_MS);
+  expect(MESSAGE_TTL_MS).toBeLessThanOrEqual(MESSAGE_TTL_MAX_MS);
+  for (const [action, spec] of Object.entries(ACTION_SPECS)) {
+    expect(spec.lifetimeMs ?? MESSAGE_TTL_MS, action).toBeLessThanOrEqual(spec.maxLifetimeMs ?? MESSAGE_TTL_MAX_MS);
+  }
+});
+
+test("정지 세대 맞춤: 요청 8초, 답 8초가 걸린 왕복은 맞춘다(답의 신선도와 기다리는 기한을 따로 잰다)", async () => {
+  const sent = ISSUED;
+  const worker = executor(DIAGNOSIS, 3, {});
+  const sup = supervisor(4);
+  const request = worker.requestSync(CHALLENGE, sent);
+  expect(maySend(request.header, sent)).toEqual({ ok: true });
+  expect(await sup.receive(request, sent + 8_000)).toMatchObject({ ok: true, adopted: null });
+  const reply = syncReply(DIAGNOSIS, 4, CHALLENGE, sent + 8_000);
+  expect(maySend(reply.header, sent + 8_000)).toEqual({ ok: true });
+  expect(await worker.receive(reply, sent + 16_000)).toEqual({ ok: true, adopted: 4 });
+  expect(worker.state.challenge).toBeNull();
+
+  // 지원하는 가장 느린 왕복: 전달 상한 직전 두 번과 감독 처리 상한.
+  const slow = executor(DIAGNOSIS, 3, {});
+  const slowRequest = slow.requestSync(CHALLENGE, sent);
+  const arrived = sent + DELIVERY_MAX_MS - 1;
+  expect(await supervisor(4).receive(slowRequest, arrived)).toMatchObject({ ok: true });
+  const answered = arrived + STOP_SYNC_ANSWER_MAX_MS;
+  expect(await slow.receive(syncReply(DIAGNOSIS, 4, CHALLENGE, answered), answered + DELIVERY_MAX_MS - 1)).toEqual({ ok: true, adopted: 4 });
+});
+
+test("정지 세대 맞춤: 기다리는 기한 직전은 받고 정각은 challenge_mismatch, 답의 15초 신선도는 따로 expired다", async () => {
+  const sent = ISSUED;
+  // 기한 근처에서도 신선한 답(발급 10초 뒤에 받음).
+  const fresh = syncReply(DIAGNOSIS, 4, CHALLENGE, sent + STOP_SYNC_WAIT_MS - 10_000);
+  const at = (now: number) => {
+    const worker = executor(DIAGNOSIS, 3, {});
+    worker.requestSync(CHALLENGE, sent);
+    return worker.receive(fresh, now);
+  };
+  expect(await at(sent + STOP_SYNC_WAIT_MS - 1)).toEqual({ ok: true, adopted: 4 });
+  expect(await at(sent + STOP_SYNC_WAIT_MS)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  expect(await at(sent + STOP_SYNC_WAIT_MS + 1)).toEqual({ ok: false, reason: "challenge_mismatch" });
+
+  // 기한 안이어도 발급부터 15초가 지난 답은 expired다.
+  const early = syncReply(DIAGNOSIS, 4, CHALLENGE, sent + 1_000);
+  const worker = executor(DIAGNOSIS, 3, {});
+  worker.requestSync(CHALLENGE, sent);
+  expect(sent + 1_000 + STOP_SYNC_TTL_MS).toBeLessThan(sent + STOP_SYNC_WAIT_MS);
+  expect(await worker.receive(early, sent + 1_000 + STOP_SYNC_TTL_MS)).toEqual({ ok: false, reason: "expired" });
+  expect(worker.state.stopGeneration).toBe(3);
+});
+
+test("정지 세대 맞춤: 기다리는 기한 안에서도 다른 연결·앞선 challenge의 답과 연결이 끝난 뒤의 답은 받지 않는다", async () => {
+  const sent = ISSUED;
+  const inWindow = sent + STOP_SYNC_WAIT_MS - 5_000;
+  const reply = (challenge: string) => syncReply(DIAGNOSIS, 4, challenge, inWindow - 1_000);
+  // 다른 연결의 challenge.
+  const worker = executor(DIAGNOSIS, 3, {});
+  worker.requestSync(CHALLENGE, sent);
+  expect(await worker.receive(reply(OTHER_CHALLENGE), inWindow)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  // 연결이 끝나 challenge를 버렸으면 맞는 challenge의 답도 받지 않는다.
+  worker.disconnect();
+  expect(await worker.receive(reply(CHALLENGE), inWindow)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  // 새 연결의 새 challenge 앞에서, 앞선 연결의 challenge 답은 앞선 요청의 기한 안이어도 받지 않는다.
+  worker.requestSync(OTHER_CHALLENGE, sent + 1_000);
+  expect(await worker.receive(reply(CHALLENGE), inWindow)).toEqual({ ok: false, reason: "challenge_mismatch" });
+  expect(worker.state.stopGeneration).toBe(3);
+  expect(await worker.receive(reply(OTHER_CHALLENGE), inWindow)).toEqual({ ok: true, adopted: 4 });
+});
+
+test("정지 세대 맞춤: 발급 함수는 요청의 머리 정지 세대 0과 두 메시지의 실행 세대 0을 고정하고, 받는 쪽도 따로 거절한다", async () => {
+  const request = (stop: number, run: number) =>
+    seal({ sender: DIAGNOSIS, recipient: SUPERVISOR, action: "stop_sync_request", stop_generation: stop, run_generation: run, body: { challenge: CHALLENGE } });
+  const reply = (stop: number, run: number) =>
+    seal({ sender: SUPERVISOR, recipient: DIAGNOSIS, action: "stop_sync_reply", stop_generation: stop, run_generation: run, body: { challenge: CHALLENGE } });
+  // 정상 생성: 요청은 0/0, 답의 정지 세대는 감독의 지금 세대(0이 아니어도 된다).
+  expect(request(0, 0).header).toMatchObject({ stop_generation: 0, run_generation: 0 });
+  expect(reply(4, 0).header).toMatchObject({ stop_generation: 4, run_generation: 0 });
+  // 잘못된 생성: 보관한 세대(3)를 요청 머리에 채우거나 실행 세대를 실으면 서명 전에 거절한다.
+  expect(() => request(3, 0)).toThrow("stop_generation_mismatch");
+  expect(() => request(0, 1)).toThrow("run_generation_mismatch");
+  expect(() => reply(4, 1)).toThrow("run_generation_mismatch");
+  // 받는 쪽: 같은 봉투를 검사 없이 서명해 보내도 감독·실행기가 같은 사유로 거절한다.
+  const valid = request(0, 0);
+  expect(await supervisor(4).receive(forge(valid, { header: { stop_generation: 3 } }, DIAGNOSIS))).toEqual({ ok: false, reason: "stop_generation_mismatch" });
+  expect(await supervisor(4).receive(forge(valid, { header: { run_generation: 1 } }, DIAGNOSIS))).toEqual({ ok: false, reason: "run_generation_mismatch" });
+  const worker = executor(DIAGNOSIS, 3, {});
+  worker.requestSync(CHALLENGE);
+  expect(await worker.receive(forge(reply(4, 0), { header: { run_generation: 1 } }, SUPERVISOR))).toEqual({ ok: false, reason: "run_generation_mismatch" });
+  expect(worker.state.stopGeneration).toBe(3);
 });
 
 test("정지 세대 맞춤: 다른 실행기에게 준 답과 감독이 아닌 키로 서명한 답은 거절한다", async () => {

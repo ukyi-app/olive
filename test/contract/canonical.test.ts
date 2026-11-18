@@ -20,3 +20,12 @@ test("canonical: 같은 뜻이 다른 바이트가 될 수 있는 값은 받지 
   for (let i = 0; i < 20; i++) deep = [deep];
   expect(() => canonicalJson(deep)).toThrow();
 });
+
+test("canonical: 짝 없는 서로게이트는 값에서도 객체의 키에서도 lone_surrogate다(짝이 맞으면 둘 다 쓴다)", () => {
+  const lone = String.fromCharCode(0xd800);
+  expect(() => canonicalJson({ name: lone })).toThrow("lone_surrogate");
+  expect(() => canonicalJson({ [lone]: 1 })).toThrow("lone_surrogate");
+  expect(() => canonicalJson({ ok: { [`a${lone}`]: 1 } })).toThrow("lone_surrogate");
+  expect(() => digestOf({ [lone]: 1 })).toThrow("lone_surrogate");
+  expect(canonicalJson({ "😀": "😀" })).toBe('{"😀":"😀"}');
+});

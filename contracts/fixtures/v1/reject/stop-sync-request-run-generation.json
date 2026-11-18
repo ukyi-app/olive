@@ -1,0 +1,50 @@
+{
+  "fixture": "olive-control/v1",
+  "name": "reject/stop-sync-request-run-generation",
+  "description": "실행 세대를 실은 요청(맞춤은 실행에 묶이지 않아 0)",
+  "base": "accept/stop-sync-request",
+  "changed": [
+    "message.header.run_generation"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "run_generation_mismatch"
+  },
+  "keys": {
+    "supervisor": "JTv5Kxba1wfb77QZl3duapNCo7jSqNl8rdPzbuF5Ews",
+    "executor/session/olive-session-0/st-5e55": "v_jWUZ10Fp1latJ4nk3QeG_1ZyQA1HExL8unAnparcE",
+    "executor/diagnosis/olive-diagnosis-0/st-d1a9": "Wx1nKozGmbD-GucNibfMylhqDWczHHIKpA1lMlpKut8"
+  },
+  "context": {
+    "now": 1794960000000,
+    "expected_recipient": "supervisor",
+    "stop_generation": 3,
+    "stop_sync_challenge": null,
+    "run_generations": {
+      "00000000-0000-4000-8000-000000000101": 2,
+      "00000000-0000-4000-8000-000000000201": 5,
+      "00000000-0000-4000-8000-000000000200": 4
+    },
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v1",
+      "sender": "executor/diagnosis/olive-diagnosis-0/st-d1a9",
+      "recipient": "supervisor",
+      "action": "stop_sync_request",
+      "request_id": "00000000-0000-4000-8000-000000009019",
+      "stop_generation": 0,
+      "run_generation": 1,
+      "body_digest": "5aba6f054a240825dbd1515b323237f87a0ee185dd5136e5091115e30c72b3c6",
+      "issued_at": 1794959999000,
+      "expires_at": 1794960014000,
+      "nonce": "00000000000000000000000000000019"
+    },
+    "signature": "jFDKVC1X62etfQqa0oXUEeROnRwb-TmMLk8sOWH8XP85IKqU4rGYiZ2x2VYjos0IFJvMdRS7_51F5OuHZbqiDw",
+    "body": {
+      "challenge": "c0ffee00000000000000000000000001"
+    }
+  },
+  "signing_input": "{\"action\":\"stop_sync_request\",\"body_digest\":\"5aba6f054a240825dbd1515b323237f87a0ee185dd5136e5091115e30c72b3c6\",\"contract\":\"olive-control/v1\",\"expires_at\":1794960014000,\"issued_at\":1794959999000,\"nonce\":\"00000000000000000000000000000019\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000009019\",\"run_generation\":1,\"sender\":\"executor/diagnosis/olive-diagnosis-0/st-d1a9\",\"stop_generation\":0}"
+}
