@@ -23,14 +23,19 @@ export {
   REFUSALS,
   type Refused,
   type ReportInput,
+  type ReportSignal,
+  type RuleCheckFrom,
   type Run,
   type SlotHold,
+  type SlotHoldObservation,
+  type StartBar,
   STOP_PHASES,
   type StopRecord,
 } from "./ledger.ts";
 export { loadMigrations, type Migration, MIGRATIONS_DIR } from "./migrate.ts";
 export {
   type ClosedBecause,
+  type OccupancyAnswer,
   type OccupancyMismatch,
   type OccupancyPort,
   type PeersPort,

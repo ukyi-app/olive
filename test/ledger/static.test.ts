@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { HOOK_EVENTS, SESSION_BROKEN_CAUSES, STOP_FAILURE_ERRORS } from "../../src/contract/v1/index.ts";
 import * as contractSchema from "../../src/contract/v1/schema.ts";
 import { ACCOUNT, AUTH_METHODS, REVISION, SHA256, UUID } from "../../src/ledger/input.ts";
 import { list, readText } from "../files.ts";
@@ -99,6 +100,18 @@ test("정적: 장부 입력 확인의 UUID·SHA256·REVISION·계정·방식은 
   const instruction = await readText("src/contract/v1/instruction.ts");
   expect(instruction).toContain(`account: pattern(/${ACCOUNT.source}/)`);
   expect(instruction).toContain(`method: oneOf(${JSON.stringify(AUTH_METHODS).replaceAll(",", ", ")})`);
+});
+
+test("정적: 보고의 구조화 칸이 받는 값은 계약의 목록과 같다", async () => {
+  const sql = await readText("src/ledger/migrations/0001-core.sql");
+  const allowedIn = (column: string) => {
+    const match = new RegExp(`${column} IS NULL OR ${column} IN \\(([^)]*)\\)`).exec(sql);
+    if (match === null) throw new Error(`${column}의 허용 값 목록이 없다`);
+    return [...(match[1] as string).matchAll(/'([^']+)'/g)].map((value) => value[1] as string).sort();
+  };
+  expect(allowedIn("hook_event")).toEqual([...HOOK_EVENTS].sort());
+  expect(allowedIn("stop_failure")).toEqual([...STOP_FAILURE_ERRORS].sort());
+  expect(allowedIn("broken_cause")).toEqual([...SESSION_BROKEN_CAUSES].sort());
 });
 
 test("정적: 이름 검사가 원문·자격 이름을 실제로 잡는다", () => {

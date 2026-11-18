@@ -17,6 +17,9 @@ export const AUTH_METHODS = ["subscription", "api_key"] as const;
 export const SOURCE_REF = /^[a-z][a-z0-9-]{0,31}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // 감독이 저장한 결과의 자리. 원문 참조와 같은 꼴이다.
 export const STORED_REF = SOURCE_REF;
+// 인계 묶음의 자리. 인계 저장소의 ID 꼴은 설계에 없어 장부가 받을 수 있는 가장 좁은 꼴(저장소가 낸 불투명 ID)만 받는다.
+// 스킴·사용자·비밀번호·호스트를 담는 URI는 이 꼴이 될 수 없다.
+export const HANDOFF_REF = SOURCE_REF;
 
 export class LedgerInputError extends TypeError {
   constructor(message: string) {

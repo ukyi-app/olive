@@ -1,15 +1,15 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { type Ledger, LedgerInputError, TRANSITIONS } from "../../src/ledger/index.ts";
-import { RESTORE_KEY } from "../../src/ledger/ledger.ts";
-import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, session, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
+import { digest, from, grant, id, must, NOW, open, ready, SESSION_EXECUTOR, session, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
 
 const W = { sender: WORKER_EXECUTOR, runGeneration: 1 };
+const S = { sender: SESSION_EXECUTOR };
 
 function receipt(runId: string, instructionRequestId: string, action: "receipt_started" | "receipt_cleaned", receiptId = id()) {
   return { action, receiptId, runId, instructionRequestId, bodyDigest: digest(`${action}:${receiptId}`), now: NOW };
 }
-function accepted(runId: string, instructionRequestId: string, instruction: "task_start" | "result_finalize" | "task_cancel" | "run_renew" = "task_start", receiptId = id()) {
+function accepted(runId: string, instructionRequestId: string, instruction: "task_start" | "result_finalize" | "task_cancel" | "run_renew" | "session_start" | "session_stop" = "task_start", receiptId = id()) {
   return { action: "receipt_accepted" as const, receiptId, runId, instructionRequestId, instruction, bodyDigest: digest(`accepted:${receiptId}`), now: NOW };
 }
 function stopped(runId: string, exit: "completed" | "failed" = "completed", receiptId = id()) {
@@ -79,6 +79,93 @@ test("쓰기: 접수 영수증은 v1의 여섯 지시를 원래 이름과 함께
   // 정지 중이면 갱신을 적지 않는다.
   must(ledger.applyStop({ generation: 1, stopped: true, now: NOW }));
   expect(ledger.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 1, now: NOW })).toEqual({ ok: false, reason: "stopped" });
+});
+
+test("쓰기: 세션 시작·종료와 결과 확정 지시의 접수 영수증도 원래 이름으로 반영한다", () => {
+  const ledger = ready(open(tempPath()));
+  const run = must(ledger.admitRun(session())).run;
+  const marker = digest("marker");
+  const check = id();
+  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: id(), checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, S));
+  const sessionStart = id();
+  must(ledger.startSession({ runId: run.runId, requestId: sessionStart, stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check, handoffRef: null, handoffDigest: null }));
+  const sender = from(run);
+  expect(ledger.applyReceipt(accepted(run.runId, sessionStart, "session_stop"), sender)).toEqual({ ok: false, reason: "unknown_instruction" });
+  const startedReceipt = accepted(run.runId, sessionStart, "session_start");
+  expect(ledger.applyReceipt(startedReceipt, sender)).toMatchObject({ ok: true, delivery: "new" });
+  expect(ledger.getRun(run.runId)).toMatchObject({ value: { acceptedReceiptId: startedReceipt.receiptId } });
+  const sessionStop = id();
+  must(ledger.recordStopInstruction({ runId: run.runId, requestId: sessionStop, action: "session_stop", stopGeneration: 0, now: NOW }));
+  expect(ledger.applyReceipt(accepted(run.runId, sessionStop, "session_stop"), sender)).toMatchObject({ ok: true, delivery: "new" });
+
+  const { runId, requestId: taskStart } = startedWorker(ledger);
+  must(ledger.applyReceipt(stopped(runId), W));
+  must(ledger.markResult({ runId, resultDigest: digest("r"), now: NOW }));
+  const finalize = id();
+  must(ledger.recordFinalizeInstruction({ runId, requestId: finalize, stopGeneration: 0, now: NOW }));
+  expect(ledger.applyReceipt(accepted(runId, taskStart, "result_finalize"), W)).toEqual({ ok: false, reason: "unknown_instruction" });
+  const finalizeReceipt = accepted(runId, finalize, "result_finalize");
+  expect(ledger.applyReceipt(finalizeReceipt, W)).toMatchObject({ ok: true, delivery: "new" });
+  expect(ledger.getRun(runId)).toMatchObject({ value: { acceptedReceiptId: finalizeReceipt.receiptId } });
+});
+
+test("R13 영수증: 이미 받은 id의 다른 본문은 원 지시가 달라도 충돌로 남고, 다른 발신자는 충돌을 남기지 못한다", () => {
+  const ledger = open(tempPath());
+  const { runId, requestId } = startedWorker(ledger);
+  const first = accepted(runId, requestId, "task_start");
+  must(ledger.applyReceipt(first, W));
+  const other = { ...first, instruction: "task_cancel" as const, bodyDigest: digest("원 지시 이름만 다른 본문") };
+  expect(ledger.applyReceipt(other, { sender: "executor/diagnosis/1/store-b", runGeneration: 1 })).toEqual({ ok: false, reason: "sender_mismatch" });
+  expect(ledger.applyReceipt(other, { ...W, runGeneration: 2 })).toEqual({ ok: false, reason: "run_generation_mismatch" });
+  expect(ledger.conflicts()).toEqual({ known: true, value: [] });
+  expect(ledger.applyReceipt(other, W)).toEqual({ ok: false, reason: "receipt_conflict" });
+  expect(ledger.conflicts()).toEqual({ known: true, value: [{ id: first.receiptId, firstDigest: first.bodyDigest, otherDigest: other.bodyDigest }] });
+  // 처음 받는 id는 원 지시와 맞아야 적힌다.
+  expect(ledger.applyReceipt(accepted(runId, requestId, "task_cancel"), W)).toEqual({ ok: false, reason: "unknown_instruction" });
+});
+
+test("R15 증거: 영수증이 가리키는 지시와 쓴 허가는 저장 뒤 바뀌지 않고 rowid로도 교체되지 않는다", () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const { runId, requestId } = startedWorker(ledger);
+  must(ledger.applyReceipt(accepted(runId, requestId), W));
+  const run = must(ledger.admitRun(session())).run;
+  const marker = digest("marker");
+  const check = id();
+  const permit = id();
+  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: permit, checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, S));
+  must(ledger.startSession({ runId: run.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check, handoffRef: null, handoffDigest: null }));
+  ledger.close();
+  const raw = new Database(path);
+  raw.run("PRAGMA foreign_keys = ON");
+  for (const change of ["action = 'task_cancel'", `run_id = '${run.runId}'`, `request_id = '${id()}'`]) {
+    expect(() => raw.query(`UPDATE instructions SET ${change} WHERE request_id = ?`).run(requestId), change).toThrow("instruction_fixed");
+  }
+  expect(() => raw.query("DELETE FROM instructions WHERE request_id = ?").run(requestId)).toThrow("instruction_fixed");
+  expect(() => raw.query("INSERT OR REPLACE INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'task_cancel', 0, 1)").run(requestId, runId)).toThrow("instruction_fixed");
+  for (const change of [`start_permit_id = '${id()}'`, `run_id = '${runId}'`]) {
+    expect(() => raw.query(`UPDATE start_permit_uses SET ${change} WHERE start_permit_id = ?`).run(permit), change).toThrow("permit_used");
+  }
+  for (const table of ["instructions", "start_permit_uses", "deliveries", "runs", "session_takeovers", "rule_checks", "sessions"]) {
+    expect(() => raw.query(`SELECT rowid FROM ${table}`).all(), table).toThrow("rowid");
+  }
+  raw.close();
+});
+
+test("R16 세션: 인계 참조는 저장소가 낸 불투명 ID만 받고 digest와 짝을 이룬다", () => {
+  const ledger = ready(open(tempPath()));
+  const run = must(ledger.admitRun(session())).run;
+  const marker = digest("marker");
+  const check = id();
+  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: id(), checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, S));
+  const input = { runId: run.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check };
+  for (const handoffRef of ["https://user:secret@store.example/handoff/1", "s3://bucket/handoff", "user:secret@host/x", "handoffs/not-a-uuid"]) {
+    expect(() => ledger.startSession({ ...input, handoffRef, handoffDigest: digest("handoff") }), handoffRef).toThrow(LedgerInputError);
+  }
+  expect(() => ledger.startSession({ ...input, handoffRef: `handoffs/${id()}`, handoffDigest: null })).toThrow(LedgerInputError);
+  expect(() => ledger.startSession({ ...input, handoffRef: null, handoffDigest: digest("handoff") })).toThrow(LedgerInputError);
+  expect(ledger.getRun(run.runId)).toMatchObject({ value: { state: "queued" } });
+  expect(ledger.startSession({ ...input, handoffRef: `handoffs/${id()}`, handoffDigest: digest("handoff") })).toMatchObject({ ok: true });
 });
 
 test("쓰기: 허용되지 않은 상태 전이는 거절(코드와 장부의 트리거 둘 다)", () => {
@@ -305,9 +392,12 @@ test("정지: 정지 기록을 모르거나 세대가 다르면 새 실행을 �
   const ledger = ready(open(tempPath()));
   const queued = must(ledger.admitRun(worker())).run;
   must(ledger.applyStop({ generation: 2, stopped: false, now: NOW }));
+  // 세대가 바뀌면 앞 허가는 끝난다. 새 세대의 허가로 지시의 옛 세대를 대조한다.
+  expect(ledger.startRun({ runId: queued.runId, requestId: id(), stopGeneration: 2, now: NOW })).toEqual({ ok: false, reason: "intake_closed" });
+  grant(ledger);
   expect(ledger.startRun({ runId: queued.runId, requestId: id(), stopGeneration: 1, now: NOW })).toEqual({ ok: false, reason: "stop_generation_mismatch" });
   const fresh = open(tempPath());
-  fresh.openIntake(RESTORE_KEY);
+  expect(grant(fresh)).toBe(false);
   expect(fresh.admitRun(worker())).toEqual({ ok: false, reason: "stop_unknown" });
 });
 
@@ -346,7 +436,7 @@ test("세션: 규칙 확인과 확정된 인수를 대조하고 시작 허가는
   const marker1 = digest("marker-1");
   const permit1 = id();
   const check1 = id();
-  must(ledger.applyRuleCheck({ reportId: check1, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker1, startPermitId: permit1, checkedAt: NOW, bodyDigest: digest("rc1"), now: NOW }));
+  must(ledger.applyRuleCheck({ reportId: check1, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker1, startPermitId: permit1, checkedAt: NOW, bodyDigest: digest("rc1"), now: NOW }, S));
   const s1 = must(ledger.admitRun(session())).run;
   const base = { stopGeneration: 0, now: NOW, handoffRef: null, handoffDigest: null };
   expect(ledger.startSession({ ...base, runId: s1.runId, requestId: id(), sessionId: id(), generationMarkerDigest: digest("other"), takeoverReceiptId: null, ruleCheckId: check1 })).toEqual({ ok: false, reason: "reference_mismatch" });
@@ -363,7 +453,7 @@ test("세션: 규칙 확인과 확정된 인수를 대조하고 시작 허가는
   // 확정되지 않은 인수로는 다음 세션을 열지 않는다.
   const check2 = id();
   // 규칙 확인이 오면 같은 표식·허가의 인수를 확정하고 앞 세션을 끝낸다.
-  must(ledger.applyRuleCheck({ reportId: check2, outcome: "rule_present", firstMarkerDigest: digest("m1"), restartedMarkerDigest: marker2, startPermitId: permit2, checkedAt: NOW, bodyDigest: digest("rc2"), now: NOW }));
+  must(ledger.applyRuleCheck({ reportId: check2, outcome: "rule_present", firstMarkerDigest: digest("m1"), restartedMarkerDigest: marker2, startPermitId: permit2, checkedAt: NOW, bodyDigest: digest("rc2"), now: NOW }, S));
   expect(state(ledger, s1.runId)).toBe("finalized");
   // 앞 세션의 허가(이미 쓴 것)로는 열지 않는다.
   expect(ledger.startSession({ ...base, runId: s2.runId, requestId: id(), sessionId: id(), generationMarkerDigest: marker1, takeoverReceiptId: takeover.receiptId, ruleCheckId: check1 })).toEqual({ ok: false, reason: "reference_mismatch" });
@@ -387,8 +477,16 @@ test("넣지 않는 것: 쓰기 함수는 원문·자격 값 칸과 원문 꼴�
   expect(() => ledger.admitRun(worker({ credential: { ...credential, value: "sk-live-123" } as never }))).toThrow(LedgerInputError);
   expect(() => ledger.admitRun(worker({ credential: { ...credential, digest: "sk-ant-api03-abcdef" } }))).toThrow(LedgerInputError);
   expect(() => ledger.enqueueInput({ requestId: id(), source: "discord", sourceRef: { ref: "로그 전체:\nerror at line 3", expiresAt: NOW }, receivedAt: NOW })).toThrow(LedgerInputError);
-  expect(() => ledger.recordReport({ reportId: id(), action: "report_result", runId: id(), bodyDigest: digest("x"), storedRef: null, resultDigest: null, now: NOW, summary: "모델 출력" } as never, W)).toThrow(LedgerInputError);
   expect(ledger.listRuns()).toEqual({ known: true, value: [] });
+});
+
+test("넣지 않는 것: 유효한 결과 보고에 summary 칸 하나만 더해도 그 칸을 지목해 거절한다", () => {
+  const ledger = open(tempPath());
+  const { runId } = startedWorker(ledger);
+  const report = { reportId: id(), action: "report_result" as const, runId, bodyDigest: digest("x"), storedRef: `results/${id()}`, resultDigest: digest("r"), now: NOW };
+  expect(() => ledger.recordReport({ ...report, summary: "모델 출력" } as never, W)).toThrow("받지 않는 칸 summary");
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
+  expect(ledger.recordReport(report, W)).toMatchObject({ ok: true, delivery: "new" });
 });
 
 test("넣지 않는 것: 허용 칸에 자격·원문 꼴의 값이 들어오면 거절한다", () => {

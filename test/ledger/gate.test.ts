@@ -146,11 +146,21 @@ test("F05 복원: 필수 이웃의 응답이 빠지거나 겹치면 접수를 �
   }
 });
 
+test("F05 복원: 필수 이웃이 모두 한 번씩 답한 뒤 하나가 더 겹쳐도 접수를 열지 않는다", async () => {
+  const answer = [...PEERS, "front-door"].map((peer) => ({ peer, contract: "olive-control/v1" }));
+  const r = restorer(open(tempPath()), ports({ peers: { contracts: async () => answer } }));
+  const { s2, s5 } = await restore(r);
+  expect(s2.missingPeers).toEqual([]);
+  expect(s2.duplicatePeers).toEqual(["front-door"]);
+  expect(s5).toMatchObject({ intakeMayOpen: false, closedBecause: ["peer_unconfirmed"] });
+  expect(r.intakeOpen()).toBe(false);
+});
+
 test("F06 복원: 장부 밖 점유는 그 종류의 슬롯을 막는다", async () => {
   const ledger = open(tempPath());
   const ghost = id();
   const runs: RunStatus[] = [{ run_id: ghost, state: "running", run_generation: 1, last_receipt_id: null }];
-  const r = restorer(ledger, ports({ occupancy: { occupancy: async () => [{ executorId: EXECUTOR, runs }] } }));
+  const r = restorer(ledger, ports({ occupancy: { occupancy: async () => [{ executorId: EXECUTOR, coverage: "full", runs }] } }));
   const { s2, s5 } = await restore(r);
   expect(s2.terminate).toMatchObject([{ runId: ghost, why: "outside_ledger" }]);
   expect(s5.intakeMayOpen).toBe(true);
@@ -167,7 +177,7 @@ test("F06 복원: 장부의 대기 실행을 실행기가 돌리고 있다고 �
   const queued = must(ledger.admitRun(worker())).run;
   ledger = reopen(ledger, path);
   const runs: RunStatus[] = [{ run_id: queued.runId, state: "running", run_generation: queued.runGeneration, last_receipt_id: null }];
-  const { s2, s5 } = await restore(restorer(ledger, ports({ occupancy: { occupancy: async () => [{ executorId: EXECUTOR, runs }] } })));
+  const { s2, s5 } = await restore(restorer(ledger, ports({ occupancy: { occupancy: async () => [{ executorId: EXECUTOR, coverage: "full", runs }] } })));
   expect(s2.occupancyMismatches).toMatchObject([{ runId: queued.runId, why: "state" }]);
   expect(s5.queued).toEqual([]);
   expect(ledger.slotFree("worker")).toEqual({ known: true, value: false });
@@ -183,8 +193,8 @@ test("F06 복원: 지정 실행기가 아닌 실행기나 다른 세대의 보�
   ledger = reopen(ledger, path);
   const other = "executor/diagnosis/1/store-b";
   const occupancy = async () => [
-    { executorId: other, runs: [{ run_id: a.runId, state: "running" as const, run_generation: a.runGeneration, last_receipt_id: null }] },
-    { executorId: EXECUTOR, runs: [{ run_id: a.runId, state: "running" as const, run_generation: a.runGeneration + 1, last_receipt_id: null }] },
+    { executorId: other, coverage: "full" as const, runs: [{ run_id: a.runId, state: "running" as const, run_generation: a.runGeneration, last_receipt_id: null }] },
+    { executorId: EXECUTOR, coverage: "full" as const, runs: [{ run_id: a.runId, state: "running" as const, run_generation: a.runGeneration + 1, last_receipt_id: null }] },
   ];
   const { s2 } = await restore(restorer(ledger, ports({ occupancy: { occupancy } })));
   expect(s2.occupancyMismatches.map((m) => m.why).sort()).toEqual(["executor", "generation"]);
@@ -192,7 +202,7 @@ test("F06 복원: 지정 실행기가 아닌 실행기나 다른 세대의 보�
 
 test("F06 복원: 실행기 이름으로 슬롯 종류를 알 수 없으면 접수를 보류한다", async () => {
   const runs: RunStatus[] = [{ run_id: id(), state: "running", run_generation: 1, last_receipt_id: null }];
-  const { s5 } = await restore(restorer(open(tempPath()), ports({ occupancy: { occupancy: async () => [{ executorId: "someone", runs }] } })));
+  const { s5 } = await restore(restorer(open(tempPath()), ports({ occupancy: { occupancy: async () => [{ executorId: "someone", coverage: "full", runs }] } })));
   expect(s5).toMatchObject({ intakeMayOpen: false });
   expect(s5.closedBecause).toContain("occupancy_unresolved");
 });
@@ -220,18 +230,23 @@ test("F07 복원: 종료 확인이 장부에 있는 checking은 재시작 뒤에
   expect(ledger.slotFree("worker")).toEqual({ known: true, value: true });
 });
 
-test("F08 세션: 앞 세션의 표식과 이미 쓴 허가로는 인수가 끝나지 않는다", async () => {
+test("F08 세션: 앞 세션의 표식만 같거나 이미 쓴 허가만 같은 인수는 각각 거절되고 앞 세션이 끝나지 않는다", async () => {
   const ledger = open(tempPath());
   await restore(restorer(ledger));
   const marker1 = digest("marker-1");
   const permit1 = id();
   const check1 = id();
-  must(ledger.applyRuleCheck({ reportId: check1, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker1, startPermitId: permit1, checkedAt: NOW, bodyDigest: digest("rc1"), now: NOW }));
+  const sender = "executor/session/0/store-s";
+  must(ledger.applyRuleCheck({ reportId: check1, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker1, startPermitId: permit1, checkedAt: NOW, bodyDigest: digest("rc1"), now: NOW }, { sender }));
   const s1 = must(ledger.admitRun(session())).run;
   must(ledger.startSession({ runId: s1.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker1, takeoverReceiptId: null, ruleCheckId: check1, handoffRef: null, handoffDigest: null }));
   must(ledger.recordStopInstruction({ runId: s1.runId, requestId: id(), action: "session_stop", stopGeneration: 0, now: NOW }));
-  const stale = { action: "receipt_session_takeover" as const, receiptId: id(), previousRunId: s1.runId, newGenerationMarkerDigest: marker1, startPermitId: permit1, takenOverAt: NOW, bodyDigest: digest("tk-old"), now: NOW };
-  expect(ledger.applyReceipt(stale, { sender: "executor/session/0/store-s", runGeneration: s1.runGeneration })).toMatchObject({ ok: false });
+  const from = { sender, runGeneration: s1.runGeneration };
+  const takeover = { action: "receipt_session_takeover" as const, previousRunId: s1.runId, takenOverAt: NOW, now: NOW };
+  // 표식만 틀렸다: 허가는 처음 보는 것이다.
+  expect(ledger.applyReceipt({ ...takeover, receiptId: id(), newGenerationMarkerDigest: marker1, startPermitId: id(), bodyDigest: digest("tk-marker") }, from)).toEqual({ ok: false, reason: "reference_mismatch" });
+  // 허가만 틀렸다: 표식은 앞 세션과 다르다.
+  expect(ledger.applyReceipt({ ...takeover, receiptId: id(), newGenerationMarkerDigest: digest("marker-2"), startPermitId: permit1, bodyDigest: digest("tk-permit") }, from)).toEqual({ ok: false, reason: "permit_used" });
   expect(stateOf(ledger, s1.runId)).toBe("stopping");
   expect(ledger.slotFree("session")).toEqual({ known: true, value: false });
 });
@@ -263,7 +278,8 @@ test("F10 영수증: 지정 실행기가 아닌 인스턴스의 영수증은 상
   expect(ledger.applyReceipt(receipt, { sender: "executor/diagnosis/1/store-b", runGeneration: run.runGeneration })).toEqual({ ok: false, reason: "sender_mismatch" });
   expect(ledger.applyReceipt(receipt, { sender: EXECUTOR, runGeneration: run.runGeneration + 1 })).toEqual({ ok: false, reason: "run_generation_mismatch" });
   expect(stateOf(ledger, run.runId)).toBe("preparing");
-  const report = { reportId: id(), action: "report_hook_event" as const, runId: run.runId, bodyDigest: digest("hook"), storedRef: null, resultDigest: null, now: NOW };
+  const signal = { kind: "hook" as const, event: "Stop" as const, sessionId: id(), turnId: id(), stopFailure: null, observedAt: NOW };
+  const report = { reportId: id(), action: "report_hook_event" as const, runId: run.runId, bodyDigest: digest("hook"), storedRef: null, resultDigest: null, signal, now: NOW };
   expect(ledger.recordReport(report, { sender: "executor/diagnosis/1/store-b", runGeneration: run.runGeneration })).toEqual({ ok: false, reason: "sender_mismatch" });
   // 거절된 영수증은 적히지 않아 지정 실행기의 같은 영수증이 새것으로 반영된다.
   expect(ledger.applyReceipt(receipt, { sender: EXECUTOR, runGeneration: run.runGeneration })).toMatchObject({ ok: true, delivery: "new" });

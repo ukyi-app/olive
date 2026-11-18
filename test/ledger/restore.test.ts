@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import type { RunStatus } from "../../src/contract/v1/index.ts";
-import { type Ledger, type RestorePorts, RestoreOrderError, Restorer, RestoreStepError } from "../../src/ledger/index.ts";
-import { clock, digest, id, must, NOW, open, ready, startedWorker, tempPath, worker } from "./helpers.ts";
+import { type Ledger, LedgerInputError, type RestorePorts, RestoreOrderError, Restorer, RestoreStepError } from "../../src/ledger/index.ts";
+import { clock, digest, id, must, NOW, open, ready, session, startedWorker, tempPath, worker } from "./helpers.ts";
 
 const OPTS = { requiredPeers: ["front-door"] };
 
@@ -83,7 +83,7 @@ test("복원: 장부에 없는 실행은 종료 대상이고 장부에 올리지
     { run_id: ghost, state: "running", run_generation: 9, last_receipt_id: id() },
     { run_id: id(), state: "not_known", run_generation: null, last_receipt_id: null },
   ];
-  const restorer = new Restorer(ledger, ports({ occupancy: { occupancy: async () => [{ executorId: "executor/diagnosis/0/store-a", runs }] } }), clock, OPTS);
+  const restorer = new Restorer(ledger, ports({ occupancy: { occupancy: async () => [{ executorId: "executor/diagnosis/0/store-a", coverage: "full", runs }] } }), clock, OPTS);
   await restorer.step1();
   const s2 = await restorer.step2();
   expect(s2.terminate).toEqual([{ executorId: "executor/diagnosis/0/store-a", runId: ghost, runGeneration: 9, why: "outside_ledger" }]);
@@ -165,6 +165,8 @@ test("복원: 모두 맞으면 접수를 열어도 된다고 내고 예산·일�
     queued: [],
     staleQueued: [],
     cancelledQueued: [],
+    expiredQueued: [],
+    blockedQueued: [],
     inputs: { processedSeq: 0, pending: [], cancelled: [], expired: [] },
     budgets: [],
   });
@@ -225,4 +227,123 @@ test("복원: 확정된 게시와 같은 작업 ID에 다른 후보를 연결하
   );
   expect(() => raw.run("DELETE FROM publications WHERE front_job_id = 'job-a'")).toThrow("publication_confirmed");
   raw.close();
+});
+
+test("R14 게시: 확정된 게시의 키·후보·실행은 바뀌지 않고 다른 줄의 키 충돌이나 rowid로도 교체되지 않는다", () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const run = must(ledger.admitRun(worker())).run;
+  must(ledger.recordPublication({ frontJobId: "job-a", candidateDigest: digest("A"), runId: run.runId, now: NOW }));
+  must(ledger.settlePublication("job-a", { kind: "confirmed", outcome: "posted" }, NOW));
+  must(ledger.recordPublication({ frontJobId: "job-b", candidateDigest: digest("B"), runId: null, now: NOW }));
+  ledger.close();
+  const raw = new Database(path);
+  raw.run("PRAGMA foreign_keys = ON");
+  for (const change of ["candidate_digest = 'x'", "front_job_id = 'job-z'", "run_id = NULL", "state = 'unknown', outcome = NULL", "outcome = 'not_posted'"]) {
+    expect(() => raw.run(`UPDATE publications SET ${change} WHERE front_job_id = 'job-a'`), change).toThrow("publication_confirmed");
+  }
+  // 갱신 시각만은 바꿀 수 있다.
+  expect(() => raw.run("UPDATE publications SET updated_at = 5 WHERE front_job_id = 'job-a'")).not.toThrow();
+  // 같은 값의 교체와 다른 줄의 키를 확정된 키로 바꾸는 교체.
+  expect(() => raw.query("INSERT OR REPLACE INTO publications (front_job_id, candidate_digest, run_id, state, outcome, updated_at) VALUES ('job-a', ?, ?, 'confirmed', 'posted', 1)").run(digest("A"), run.runId)).toThrow("publication_confirmed");
+  expect(() => raw.run("UPDATE OR REPLACE publications SET front_job_id = 'job-a' WHERE front_job_id = 'job-b'")).toThrow("publication_confirmed");
+  expect(() => raw.query("SELECT rowid FROM publications").all()).toThrow("rowid");
+  expect(raw.query("SELECT front_job_id, candidate_digest, run_id FROM publications WHERE state = 'confirmed'").all()).toEqual([{ front_job_id: "job-a", candidate_digest: digest("A"), run_id: run.runId }]);
+  raw.close();
+});
+
+function checkingRun(ledger: Ledger) {
+  const { runId, from } = startedWorker(ledger);
+  must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId, exit: "completed", bodyDigest: digest("stop"), now: NOW }, from));
+  return { runId, from };
+}
+
+function resultReport(runId: string, result: string) {
+  return { reportId: id(), action: "report_result" as const, runId, bodyDigest: digest(`body:${result}`), storedRef: `results/${id()}`, resultDigest: digest(result), now: NOW };
+}
+
+test("R11 보고: 보고 ID 없이 판정해도 저장된 결과 보고가 미반영으로 남지 않고, 다른 결과는 충돌로 닫는다", () => {
+  const ledger = open(tempPath());
+  const { runId, from } = checkingRun(ledger);
+  const same = resultReport(runId, "result");
+  const other = resultReport(runId, "다른 결과");
+  must(ledger.recordReport(same, from));
+  must(ledger.recordReport(other, from));
+  must(ledger.markResult({ runId, resultDigest: same.resultDigest, now: NOW }));
+  expect(stateOf(ledger, runId)).toBe("ready_result");
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
+  expect(ledger.conflicts()).toEqual({ known: true, value: [{ id: other.reportId, firstDigest: same.resultDigest, otherDigest: other.resultDigest }] });
+});
+
+test("R11 보고: 판정이 끝난 실행의 늦은 보고는 같은 결과면 바로 마치고, 반영할 수 없으면 ack 없이 거절한다", () => {
+  const ledger = open(tempPath());
+  const { runId, from } = checkingRun(ledger);
+  const result = resultReport(runId, "result");
+  must(ledger.markResult({ runId, resultDigest: result.resultDigest, now: NOW }));
+  expect(ledger.recordReport(result, from)).toEqual({ ok: true, delivery: "new", ack: result.reportId });
+  expect(stateOf(ledger, runId)).toBe("ready_result");
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
+  expect(ledger.recordReport(result, from)).toEqual({ ok: true, delivery: "duplicate", ack: result.reportId });
+  const other = resultReport(runId, "다른 결과");
+  expect(ledger.recordReport(other, from)).toEqual({ ok: false, reason: "receipt_conflict" });
+  expect(ledger.conflicts()).toMatchObject({ value: [{ id: other.reportId, firstDigest: result.resultDigest, otherDigest: other.resultDigest }] });
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
+  // 결과가 없다고 판정한 실행의 결과는 적지 않는다.
+  const failed = open(tempPath());
+  const second = checkingRun(failed);
+  must(failed.markResult({ runId: second.runId, resultDigest: null, now: NOW }));
+  expect(failed.recordReport(resultReport(second.runId, "result"), second.from)).toEqual({ ok: false, reason: "transition_denied" });
+  expect(failed.pendingReports()).toEqual({ known: true, value: [] });
+});
+
+test("R11 보고: 판정 전에 받은 보고가 남은 실행은 상태를 되돌리지 않고 그 보고만 마친다", () => {
+  const ledger = open(tempPath());
+  const { runId, from } = startedWorker(ledger);
+  const report = resultReport(runId, "result");
+  must(ledger.recordReport(report, from));
+  must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId, exit: "failed", bodyDigest: digest("stop"), now: NOW }, from));
+  expect(stateOf(ledger, runId)).toBe("failed_stopped");
+  expect(ledger.markResult({ runId, resultDigest: report.resultDigest, reportId: report.reportId, now: NOW })).toEqual({ ok: false, reason: "transition_denied" });
+  must(ledger.markResult({ runId, resultDigest: null, reportId: report.reportId, now: NOW }));
+  expect(stateOf(ledger, runId)).toBe("failed_stopped");
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
+});
+
+test("R12 보고: 훅과 세션 깨짐 보고는 ack 뒤 재시작해도 어떤 사건이었는지 복원한다", async () => {
+  const path = tempPath();
+  let ledger = ready(open(path));
+  const run = must(ledger.admitRun(session())).run;
+  const marker = digest("marker");
+  const check = id();
+  const sender = run.executorId;
+  must(ledger.applyRuleCheck({ reportId: check, outcome: "rule_present", firstMarkerDigest: digest("m0"), restartedMarkerDigest: marker, startPermitId: id(), checkedAt: NOW, bodyDigest: digest("rc"), now: NOW }, { sender }));
+  must(ledger.startSession({ runId: run.runId, requestId: id(), stopGeneration: 0, now: NOW, sessionId: id(), generationMarkerDigest: marker, takeoverReceiptId: null, ruleCheckId: check, handoffRef: null, handoffDigest: null }));
+  const from = { sender, runGeneration: run.runGeneration };
+  const hookSignal = { kind: "hook" as const, event: "StopFailure" as const, sessionId: id(), turnId: id(), stopFailure: "rate_limit" as const, observedAt: NOW };
+  const brokenSignal = { kind: "session_broken" as const, cause: "relay_lost" as const, markerDigest: marker, observedAt: NOW };
+  const hook = { reportId: id(), action: "report_hook_event" as const, runId: run.runId, bodyDigest: digest("hook"), storedRef: null, resultDigest: null, signal: hookSignal, now: NOW };
+  const broken = { reportId: id(), action: "report_session_broken" as const, runId: run.runId, bodyDigest: digest("broken"), storedRef: null, resultDigest: null, signal: brokenSignal, now: NOW };
+  must(ledger.recordReport(hook, from));
+  must(ledger.recordReport(broken, from));
+  ledger.close();
+  ledger = open(path);
+  const { s3 } = await all(new Restorer(ledger, ports(), clock, OPTS));
+  const byId = new Map(s3.pendingReports.map((report) => [report.reportId, report.signal]));
+  expect(byId.get(hook.reportId)).toEqual(hookSignal);
+  expect(byId.get(broken.reportId)).toEqual(brokenSignal);
+  must(ledger.settleReport({ reportId: hook.reportId, now: NOW }));
+  expect((ledger.pendingReports() as { value: unknown[] }).value).toHaveLength(1);
+});
+
+test("R12 보고: 사건 칸이 없거나 v1이 허용하지 않는 값이면 적지 않는다", () => {
+  const ledger = open(tempPath());
+  const { runId, from } = startedWorker(ledger);
+  const report = { reportId: id(), action: "report_hook_event" as const, runId, bodyDigest: digest("hook"), storedRef: null, resultDigest: null, now: NOW };
+  const good = { kind: "hook" as const, event: "Stop" as const, sessionId: id(), turnId: id(), stopFailure: null, observedAt: NOW };
+  expect(() => ledger.recordReport(report, from)).toThrow(LedgerInputError);
+  for (const signal of [{ ...good, event: "Notification" }, { ...good, event: "StopFailure" }, { ...good, stopFailure: "rate_limit" }, { ...good, sessionId: "not-a-uuid" }, { ...good, text: "모델 출력" }]) {
+    expect(() => ledger.recordReport({ ...report, signal } as never, from), JSON.stringify(signal)).toThrow(LedgerInputError);
+  }
+  expect(() => ledger.recordReport({ ...resultReport(runId, "r"), signal: good }, from)).toThrow(LedgerInputError);
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
 });

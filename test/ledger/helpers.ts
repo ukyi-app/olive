@@ -66,8 +66,15 @@ export function session(overrides: Partial<AdmitRunInput> = {}): AdmitRunInput {
 // 복원의 단계 자체를 보는 시험은 Restorer를 쓴다. 이 도우미는 쓰기 규칙만 보는 시험이 복원을 매번 돌리지 않게 한다.
 export function ready(ledger: Ledger): Ledger {
   if (ledger.readStop().known && (ledger.readStop() as { value: unknown }).value === null) must(ledger.applyStop({ generation: 0, stopped: false, now: NOW }));
-  ledger.openIntake(RESTORE_KEY);
+  grant(ledger);
   return ledger;
+}
+
+// 복원 시도 하나를 건너뛰어 접수 허가만 낸다(정지 중이면 허가가 나지 않는다).
+export function grant(ledger: Ledger): boolean {
+  const attempt = ledger.beginRestore(RESTORE_KEY);
+  ledger.pinRestore(RESTORE_KEY, attempt);
+  return ledger.grantIntake(RESTORE_KEY, attempt);
 }
 
 export function from(run: { executorId: string; runGeneration: number }): EnvelopeFrom {

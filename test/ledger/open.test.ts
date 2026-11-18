@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as publicLedger from "../../src/ledger/index.ts";
-import { loadMigrations, openLedger } from "../../src/ledger/index.ts";
+import { loadMigrations, type Migration, openLedger } from "../../src/ledger/index.ts";
 import { Ledger } from "../../src/ledger/ledger.ts";
 import { clock, NOW, open, tempDir, tempPath } from "./helpers.ts";
 
@@ -132,4 +132,52 @@ test("마이그레이션: 호출자가 넘긴 목록도 어떤 판도 적용하�
     expect(raw.query("SELECT name FROM sqlite_master WHERE type = 'table'").all()).toEqual([]);
     raw.close();
   }
+});
+
+test("R17 마이그레이션: 목록에 빈 자리가 있으면 어떤 판도 적용하지 않고 거절한다", () => {
+  const sparse: Migration[] = [];
+  sparse[0] = { version: 1, name: "0001-a.sql", sql: "CREATE TABLE a (x INTEGER);" };
+  sparse[2] = { version: 3, name: "0003-c.sql", sql: "CREATE TABLE c (x INTEGER);" };
+  const path = tempPath();
+  expect(openLedger(path, { clock, mode: "create", migrations: sparse })).toMatchObject({ ok: false, reason: "migration_mismatch", detail: expect.stringContaining("2번째") });
+  expect(existsSync(path)).toBe(false);
+});
+
+test("R18 정수: 적용 시각이 안전 범위 밖이면 파일을 만들지 않고, 판 기록과 충돌 순번도 상한을 넘지 못한다", () => {
+  for (const bad of [2 ** 53, 0, Number.NaN]) {
+    const path = tempPath();
+    expect(openLedger(path, { clock: () => bad, mode: "create" }), String(bad)).toMatchObject({ ok: false, reason: "db_error" });
+    expect(existsSync(path), String(bad)).toBe(false);
+  }
+  const path = tempPath();
+  open(path).close();
+  const raw = new Database(path);
+  expect(() => raw.run("INSERT INTO ledger_migrations (version, name, applied_at) VALUES (2, 'x', 9007199254740992)")).toThrow("CHECK constraint failed");
+  expect(() => raw.run("INSERT INTO ledger_migrations (version, name, applied_at) VALUES (9007199254740992, 'x', 1)")).toThrow("CHECK constraint failed");
+  expect(() => raw.run("INSERT INTO receipt_conflicts (seq, id, first_digest, other_digest, received_at) VALUES (9007199254740992, 'x', 'a', 'b', 1)")).toThrow("CHECK constraint failed");
+  raw.close();
+});
+
+test("R09 마이그레이션: 이 설치의 끊긴 첫 설치만 이어 받는다", () => {
+  const path = tempPath();
+  const broken = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;", "0002-b.sql": "INSERT INTO nope VALUES (1);" });
+  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(broken) })).toMatchObject({ ok: false, reason: "migration_failed" });
+  expect(versions(path)).toEqual([1]);
+  expect(openLedger(path, { clock, mode: "reopen", migrations: loadMigrations(broken) })).toMatchObject({ ok: false, reason: "not_initialized" });
+  const fixed = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;", "0002-b.sql": "CREATE TABLE b (x INTEGER) STRICT;" });
+  const resumed = openLedger(path, { clock, mode: "create", migrations: loadMigrations(fixed) });
+  expect(resumed).toMatchObject({ ok: true, migrated: { from: 1, to: 2 } });
+  if (resumed.ok) resumed.ledger.close();
+  // 끝난 첫 설치는 다시 받지 않는다.
+  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(fixed) })).toMatchObject({ ok: false, reason: "already_initialized" });
+});
+
+test("R09 열기: 이 설치의 표식이 있어도 판 기록 없이 표가 있으면 이어 받지 않는다", () => {
+  const path = tempPath();
+  const broken = migrationDir({ "0001-a.sql": "INSERT INTO nope VALUES (1);" });
+  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(broken) })).toMatchObject({ ok: false, reason: "migration_failed" });
+  const raw = new Database(path);
+  raw.run("CREATE TABLE other (x INTEGER)");
+  raw.close();
+  expect(openLedger(path, { clock, mode: "create" })).toMatchObject({ ok: false, reason: "foreign_data" });
 });

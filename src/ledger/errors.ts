@@ -9,6 +9,7 @@ export const UNAVAILABLE_REASONS = [
   "migration_failed", // 마이그레이션 도중 실패(그 판 전체를 되돌렸다)
   "not_initialized", // 재개방인데 파일이 없거나 첫 설치 기록이 없다(빈 볼륨, 빈 대체 파일)
   "already_initialized", // 첫 설치로 열었는데 이미 만들어진 장부다
+  "foreign_data", // 첫 설치로 열었는데 이 설치가 만들지 않은 저장의 흔적이 있다(낯선 DB, 옛 스키마, 본체 없는 WAL·SHM)
   "closed", // 닫은 장부
   "db_error", // 그 밖의 DB 오류
 ] as const;

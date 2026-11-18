@@ -29,7 +29,9 @@ const from = { sender: EXECUTOR, runGeneration: 1 };
 // 복원을 다 거친 장부처럼 접수를 연다(이 자식은 쓰기 사이의 끊김만 본다).
 function startWorker() {
   ledger.applyStop({ generation: 0, stopped: false, now: NOW });
-  ledger.openIntake(RESTORE_KEY);
+  const attempt = ledger.beginRestore(RESTORE_KEY);
+  ledger.pinRestore(RESTORE_KEY, attempt);
+  ledger.grantIntake(RESTORE_KEY, attempt);
   const runId = randomUUID();
   const admitted = ledger.admitRun({
     kind: "worker",
