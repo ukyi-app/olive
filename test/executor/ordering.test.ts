@@ -325,8 +325,9 @@ test("취소: 정리 신호가 닿지 않아 자식이 끝나지 않으면 상�
   const r = await make({ mode: "hang", exitWaitMs: 200 });
   const { runId } = await start(r);
   await until(() => stateOf(r, runId) === "running");
+  const stuck = gate();
   r.cleanup.inert = true;
-  r.cleanup.hold = new Promise(() => {});
+  r.cleanup.hold = stuck.wait;
   r.cleanup.remaining = 1;
   await r.connection.receive(cancel(r, runId));
   await r.worker.idle();
@@ -339,6 +340,8 @@ test("취소: 정리 신호가 닿지 않아 자식이 끝나지 않으면 상�
   r.cleanup.inert = false;
   r.cleanup.hold = undefined;
   r.cleanup.remaining = 0;
+  stuck.open();
+  await pause(0);
   await r.connection.receive(cancel(r, runId));
   expect(stateOf(r, runId)).toBe("failed_stopped");
   expect(r.transport.of("receipt_stopped")).toHaveLength(1);

@@ -184,3 +184,11 @@ test("G01 대조군: 정상 부모의 스레드가 읽는 사이 사라져도 �
   await single.pod.terminate();
   expect(single.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
 });
+
+test("H06 정상 부모의 좀비 리더에서 빈 스레드 목록을 얻으면 전체 신호는 허용하되 남은 0으로 세지 않는다", async () => {
+  const { pod, proc } = await recorded({ 360: { state: "Z", ppid: SELF, threads: {}, survivesKill: true } });
+  expect(await pod.survivors()).toBeNull();
+  await pod.terminate();
+  expect(proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+  expect(proc.processes.has(360)).toBe(true);
+});

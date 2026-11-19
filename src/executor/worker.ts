@@ -15,7 +15,7 @@
 // - 상태와 사건은 store.commit 한 자리로만 남긴다. 적은 사건만 보낸다. 접수 영수증이 남기 전에는 자격을 받지도 띄우지도 않는다.
 // - 아는 실행 ID의 시작 지시는 새 실행을 열지 않는다. 처음 접수한 지시와 본문이 같을 때만 같은 영수증을 다시 보낸다.
 //   결과가 없다는 이유로 다시 띄우지 않는다.
-import { type KeyObject, randomBytes, randomUUID } from "node:crypto";
+import { generateKeyPairSync, type KeyObject, randomBytes, randomUUID } from "node:crypto";
 import {
   type Action,
   type Bodies,
@@ -160,7 +160,7 @@ export class WorkerExecutor {
   private heldSends = false;
   // 지우는 중인 실행. 첫 await 전에 넣어 슬롯을 쥐고, 같은 실행의 확정은 진행 중인 작업에 합류한다.
   private readonly cleaning = new Map<string, Promise<void>>();
-  // 끝을 확인하지 못해 다시 끝내고 세는 중인 실행. 같은 실행의 정리가 겹치지 않는다.
+  // 프로세스를 끝내고 세는 물리적 정리가 도는 실행. 첫 종료와 재정리가 함께 쓰고, 같은 실행의 정리가 겹치지 않는다.
   private readonly reclaiming = new Map<string, Promise<void>>();
   private readonly lastSent = new Map<string, number>();
   private readonly now: () => number;
@@ -173,11 +173,16 @@ export class WorkerExecutor {
     this.now = options.now ?? Date.now;
     this.launcher = options.launcher ?? bunLauncher;
     // 저장된 본문이 계약의 모양인지 서명해 보며 대조한다. 맞지 않는 본문은 다시 보낼 수 없으므로 그 사건은 보내지 않고 접수를 닫는다.
+    // 대조는 임시 키로 한다. 실제 서명 키의 장애는 본문 검사 뒤의 일이고 장부의 사실이 아니다.
+    // 본문을 거절한 것이 아닌 실패(시계·이름 등)는 그 본문을 끝까지 보지 못했다는 뜻이다. 걸러지지 않은 사건이 복원 증거로 남지 않게
+    // 표식 없이 기동을 실패시킨다. 회복한 뒤 다시 열면 대조가 처음부터 돈다.
+    const probeKey = generateKeyPairSync("ed25519").privateKey;
     for (const entry of options.store.outboxAll()) {
       try {
-        this.seal(entry.action, entry.body, entry.run_generation);
+        this.seal(entry.action, entry.body, entry.run_generation, probeKey);
       } catch (error) {
-        if (bodyRejected(error)) options.store.markInconsistent("outbox_body", entry.id);
+        if (!bodyRejected(error)) throw error;
+        options.store.markInconsistent("outbox_body", entry.id);
       }
     }
     // 본문까지 검증된 사건으로 실행마다 상태의 전제를 대조한다.
@@ -200,9 +205,15 @@ export class WorkerExecutor {
     return null;
   }
 
-  // 장부 전체를 설명할 수 없다. 완전한 목록인 것처럼 hello를 보내지 않는다(link.ts가 연결을 닫는다).
+  // 장부 전체를 설명할 수 없거나 지금의 점유·보류가 hello의 상한을 넘는다. 일부만 담은 목록으로 인사하지 않는다(link.ts가 연결을 닫는다).
   helloWithheld(): boolean {
-    return this.store.ledgerHeld();
+    return this.store.ledgerHeld() || this.store.durableRunList().filter((run) => this.occupies(run)).length > limits.STATUS_MAX_RUNS;
+  }
+
+  // 슬롯을 쥐었거나 장부가 설명하지 못하는 실행. hello의 목록은 파일의 기록으로 만들므로 파일과 메모리 어느 쪽이 쥐었어도 센다.
+  private occupies(run: RunRecord): boolean {
+    const current = this.store.run(run.run_id)?.state ?? run.state;
+    return this.store.suspectRun(run.run_id) || HOLDS_SLOT.includes(run.state) || HOLDS_SLOT.includes(current);
   }
 
   // 시험과 진입점이 지금 실행이 끝나기를 기다리는 자리.
@@ -419,7 +430,7 @@ export class WorkerExecutor {
     if (!spawned) return this.notStarted(runId, active.cause ?? "failed");
     // 시작 영수증의 쓰기를 기다리지 않고 정리로 간다. 사건의 차례는 저장소의 순번이 지킨다.
     const exit = this.exitOf(runId, active, outcome);
-    await this.confirmStopped(runId, exit, true, exit === "completed" ? (outcome?.stdout ?? null) : null, credential);
+    await this.reserveCleanup(runId, exit, true, exit === "completed" ? (outcome?.stdout ?? null) : null, credential);
   }
 
   // 0으로 끝났어도 끝난 시각이 기한·임대를 넘었으면 completed가 아니다(감시 주기 사이에 넘긴 경우).
@@ -458,7 +469,7 @@ export class WorkerExecutor {
   }
 
   private notStarted(runId: string, exit: ExitKind): Promise<void> {
-    return this.confirmStopped(runId, exit, false, null, null);
+    return this.reserveCleanup(runId, exit, false, null, null);
   }
 
   // 남은 프로세스를 끝내고 센다. 0개일 때만 종료 확인 영수증을 낸다. 띄우지 않은 실행도 센다(세는 쪽이 0을 말해야 낸다).
@@ -467,22 +478,24 @@ export class WorkerExecutor {
   // 종료 확인 영수증·결과 보고·최종 상태는 전이 하나로 남긴다. 이미 있는 사건은 새로 만들지 않고 같은 ID로 다시 보낸다.
   // 장부가 설명하지 못하는 실행은 끝내고 세기만 한다. 끝을 맺지 못한 상태는 슬롯을 쥔 미확인으로 두고, 영수증과 완료 상태를 내지 않는다.
   // physicalDone은 물리적 정리가 끝나고 그 결과가 메모리와 기록 순번에 들어간 뒤에 불린다(파일 쓰기의 완료는 기다리지 않는다).
-  // 상한으로 먼저 돌아와도 백엔드의 작업이 끝나기 전에는 부르지 않는다. 아직 신호를 낼 수 있는 정리와 새 정리가 겹치면 안 된다.
+  // 상한으로 먼저 돌아오거나 뒤에서 예외가 나도 백엔드의 작업이 끝나기 전에는 부르지 않는다. 아직 신호를 낼 수 있는 정리와 새 정리가 겹치면 안 된다.
   private async confirmStopped(
     runId: string,
     exit: ExitKind,
     launched: boolean,
     stdout: Uint8Array | null,
     credential: string | null,
-    physicalDone: () => void = () => {},
+    physicalDone: () => void,
   ): Promise<void> {
     const backend = this.options.cleanup;
     let physical: Promise<unknown> = Promise.resolve();
-    const watch = <T>(work: Promise<T>): Promise<T> => {
+    // 백엔드의 동기 예외도 거절로 받는다. 어느 실패든 아래의 physicalDone 예약에 닿아야 한다.
+    const watch = <T>(start: () => Promise<T>): Promise<T> => {
+      const work = new Promise<T>((resolve) => resolve(start()));
       physical = Promise.allSettled([physical, work]);
       return work;
     };
-    const cleanup = { terminate: () => watch(backend.terminate()), survivors: () => watch(backend.survivors()) };
+    const cleanup = { terminate: () => watch(() => backend.terminate()), survivors: () => watch(() => backend.survivors()) };
     if (launched) {
       if (!this.store.suspectRun(runId)) void this.transition(runId, { state: "stopping", exit });
       await bounded(cleanup.terminate(), this.exitWaitMs(), undefined);
@@ -514,18 +527,24 @@ export class WorkerExecutor {
     for (const entry of [stopped, report]) if (entry !== undefined) this.transmit(entry);
   }
 
-  // 끝을 확인하지 못한 실행을 다시 끝내고 센다. 부르는 즉시 정리를 시작하고, 같은 실행의 물리적 정리는 하나만 돈다.
+  // 물리적 정리를 예약하고 부르는 즉시 시작한다. 첫 종료와 재정리가 이 한 자리를 지나므로 같은 실행의 물리적 정리는 하나만 돈다.
   // 예약은 물리적 정리의 수명까지만 쥔다. 결과의 기록이 멈춰도 다음 검증된 취소가 종료를 다시 시도할 수 있다.
-  private reclaim(runId: string, exit: ExitKind): Promise<void> {
-    const reserved = this.reclaiming.get(runId);
-    if (reserved !== undefined) return reserved;
+  private reserveCleanup(runId: string, exit: ExitKind, launched: boolean, stdout: Uint8Array | null, credential: string | null): Promise<void> {
     const release = () => {
       if (this.reclaiming.get(runId) === work) this.reclaiming.delete(runId);
     };
-    const work: Promise<void> = this.confirmStopped(runId, exit, true, null, null, release);
+    const work: Promise<void> = this.confirmStopped(runId, exit, launched, stdout, credential, release);
     this.reclaiming.set(runId, work);
-    work.catch(release);
+    // 거절은 이 작업을 기다리는 쪽이 받는다. 기다리기 전에 거절돼도 처리되지 않은 거절로 치지 않는다.
+    work.catch(() => {});
     return work;
+  }
+
+  // 끝을 확인하지 못한 실행을 다시 끝내고 센다. 아직 도는 물리적 정리가 있으면 거기에 합류한다.
+  // 앞선 정리의 예외는 그 정리를 시작한 쪽이 받는다. 합류한 쪽은 끝나기만 기다린다.
+  private reclaim(runId: string, exit: ExitKind): Promise<void> {
+    const reserved = this.reclaiming.get(runId);
+    return reserved === undefined ? this.reserveCleanup(runId, exit, true, null, null) : reserved.catch(() => {});
   }
 
   private exitWaitMs(): number {
@@ -560,7 +579,9 @@ export class WorkerExecutor {
       active.controller.abort();
     }
     // 끝났다고 확인하지 못한 실행은 다시 끝내고 센다. 0이면 그때 종료 확인 영수증을 낸다.
-    const uncertain = this.active === undefined && (record.state === "unknown_running" || this.store.suspectRun(runId));
+    // 이 실행의 첫 종료가 미확인을 메모리에 남겼으면 그 기록의 파일 쓰기를 기다리지 않는다. 다른 실행이 도는 동안에는 공간에 신호를 보내지 않는다.
+    const firstExitUnknown = active !== undefined && record.state === "unknown_running";
+    const uncertain = firstExitUnknown || (this.active === undefined && (record.state === "unknown_running" || this.store.suspectRun(runId)));
     const reclaiming = uncertain ? this.reclaim(runId, record.exit ?? cause) : undefined;
     const answered = await this.answerCancel(header, runId, epoch);
     if (reclaiming !== undefined) return reclaiming;
@@ -842,7 +863,7 @@ export class WorkerExecutor {
 
   // ---- 봉투 ----
 
-  private seal<A extends Action>(action: A, body: unknown, runGeneration: number): Envelope {
+  private seal<A extends Action>(action: A, body: unknown, runGeneration: number, key: KeyObject = this.options.signingKey): Envelope {
     return sealEnvelope(
       {
         sender: this.name,
@@ -856,7 +877,7 @@ export class WorkerExecutor {
         nonce: randomBytes(16).toString("hex"),
         body: body as Bodies[A],
       },
-      this.options.signingKey,
+      key,
     );
   }
 
@@ -866,10 +887,10 @@ export class WorkerExecutor {
 
   // 맞춤 뒤 첫 메시지. 쥔 실행의 상태와 받음 확인을 못 받은 id를 싣는다. 감독은 이것을 시작·자격의 근거로 쓰지 않는다.
   // 끝을 모르는 실행, 슬롯을 쥔 실행, 나머지 차례로 싣는다. 확정되지 않은 실행은 refusesStart가 STATUS_MAX_RUNS개 안으로 묶고,
-  // 점유·보류가 상한을 넘거나 실행 기록을 잃은 기존 장부는 store가 기동 때 잡아 helloWithheld로 인사를 막는다.
+  // 점유·보류가 상한을 넘거나 실행 기록을 잃은 장부는 helloWithheld가 인사 직전에 막으므로 잘리는 것은 슬롯을 쥐지 않은 실행뿐이다.
   hello(): Envelope {
     const uncertain = (run: RunRecord) => run.state === "unknown_running" || this.store.suspectRun(run.run_id);
-    const rank = (run: RunRecord) => (uncertain(run) ? 0 : HOLDS_SLOT.includes(run.state) ? 1 : 2);
+    const rank = (run: RunRecord) => (uncertain(run) ? 0 : this.occupies(run) ? 1 : 2);
     const runs = this.store
       .durableRunList()
       .filter((run) => run.state !== "finalized" || this.store.suspectRun(run.run_id))

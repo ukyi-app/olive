@@ -16,7 +16,7 @@
 //   그 완료 시점에 tick과 무관하게 닫는다(늦은 완료는 연결을 열지 못한다).
 // - 맞춘 세대는 같은 값이어도 파일에 적힌 뒤에만 연결을 연다(앞서 저장에 실패해 메모리만 올라간 세대를 여기서 디스크에 맞춘다).
 // - 맞춘 연결에서 서명이 맞는 세대 불일치가 오면 연결을 닫는다. 다시 맞추는 것은 새 연결에서다.
-// - 장부 전체를 설명할 수 없으면 세대만 적고 hello 없이 닫는다. 완전한 목록인 것처럼 인사하지 않는다.
+// - 장부 전체를 설명할 수 없거나 지금의 점유·보류가 hello의 상한을 넘으면 세대만 적고 hello 없이 닫는다. 완전한 목록인 것처럼 인사하지 않는다.
 import { randomBytes } from "node:crypto";
 import { type Envelope, limits, type PendingStopSync, verifyEnvelope } from "../contract/v1/index.ts";
 import type { Outlet, WorkerExecutor } from "./worker.ts";

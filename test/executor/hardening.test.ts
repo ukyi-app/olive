@@ -474,7 +474,8 @@ test("R14 인사는 끝을 모르는 실행을 슬롯을 쥔 다른 실행보다
     exit: null,
     last_receipt_id: null,
   });
-  for (let i = 0; i < limits.STATUS_MAX_RUNS; i++) await r.store.beginRun(seed("cleanup_pending"));
+  // 점유가 상한 안이어야 인사가 나간다. 상한을 넘으면 일부만 담은 목록을 보내지 않는다.
+  for (let i = 0; i < limits.STATUS_MAX_RUNS - 1; i++) await r.store.beginRun(seed("cleanup_pending"));
   const uncertain = seed("unknown_running");
   await r.store.beginRun(uncertain);
   await reconnect(r, 0);
