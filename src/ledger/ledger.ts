@@ -5,6 +5,9 @@
 //   다른 프로세스가 열면 첫 접근에서 SQLITE_BUSY다(busy_timeout 0으로 기다리지 않는다). 프로세스가 죽으면 운영체제가 잠금을 푼다.
 //   별도 잠금 파일을 두지 않는 이유: SQLite가 이미 쥐는 잠금이라 장부와 잠금이 어긋날 수 없다.
 //   함정: POSIX 잠금은 같은 프로세스가 같은 파일의 다른 FD를 닫기만 해도 풀린다. 그래서 있는 장부 파일은 SQLite 연결로만 읽는다.
+//   예외는 한 곳이다: 판정에서 본체만 읽는 연결이 머리를 읽지 못하면, 이 프로세스가 그 파일의 잠금을 쥐지 않았음을 /proc/locks로
+//   확인한 뒤에만 머리 100바이트를 읽기 전용 FD로 읽는다(readHeader).
+// - chunk size 4,096: 체크포인트가 페이지를 옮기기 전에 본체를 늘리게 해서, 도중에 끊겨도 머리의 페이지 수가 본체보다 앞서지 않는다.
 // - journal_mode=WAL + synchronous=FULL: 커밋마다 WAL을 fsync한다. 그래서 커밋을 돌려준 쓰기(실행 줄, 영수증)는 전원이 나가도
 //   남고, 실행 줄의 커밋이 끝난 뒤에만 지시를 내므로 접수 기록이 영수증보다 먼저 남는다. NORMAL은 마지막 커밋을 잃을 수 있다.
 //   EXCLUSIVE와 함께 쓰면 공유 메모리(-shm) 파일 없이 동작한다. 로컬 볼륨 전제다(네트워크 파일시스템이 아님).
@@ -15,8 +18,8 @@
 //
 // 새 업무(접수·실행 줄·시작·자격·게시·갱신)의 공통 전제는 #write의 "start" 한 자리에 있다: 장부가 건강하고, 트랜잭션 안에서
 // 읽은 지금의 정지 기록이 있고 정지가 아니며, 지금의 복원 시도가 바로 그 정지 상태에서 낸 접수 허가(#grant)가 살아 있다.
-import { constants as sqliteOpen, Database } from "bun:sqlite";
-import { type BigIntStats, closeSync, constants as fileOpen, fstatSync, lstatSync, openSync, realpathSync } from "node:fs";
+import { constants as sqliteOpen, Database, SQLiteError } from "bun:sqlite";
+import { type BigIntStats, closeSync, constants as fileOpen, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   HOOK_EVENTS,
@@ -693,6 +696,85 @@ function userVersion(db: Database): number {
   return (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
 }
 
+// 이 설치의 표식과 처음 여는 사본의 표식. 본체만 읽는 연결이 읽은 값이든 본체 머리에서 읽은 값이든 같은 규칙으로 거절한다.
+// 길이 판정보다 먼저 본다. 처음 여는 사본 곁의 WAL은 그 사본의 것일 수 없어 길이 판정을 비켜 갈 근거가 되지 않는다.
+function requireMarks(mode: OpenMode, leftover: readonly string[], journalLeft: boolean, applicationId: number, version: () => number): void {
+  if (applicationId !== APPLICATION_ID) throw notOurs(mode, "이 설치가 만든 장부가 아니다");
+  if (mode === "reopen" && leftover.length > 0 && version() === SNAPSHOT_UNOPENED) {
+    // 저널만 남았으면 이 사본의 첫 열기가 끊겼을 수 있다. 저널을 SQLite 밖에서 읽지 않아 다른 시점의 저널과 가르지 못하므로, 받지 않고 사유만 가른다.
+    const reason = leftover.length === 1 && journalLeft ? "interrupted_install" : "not_initialized";
+    throw new LedgerUnavailableError(reason, `한 번도 열지 않은 사본 곁에 다른 시점의 파일이 있다: ${leftover.join(", ")}`);
+  }
+}
+
+// 이 프로세스가 그 파일에 잠금을 쥐고 있는지 /proc/locks로 본다. 읽지 못했거나 꼴을 모르는 줄이 있으면 null(모름).
+// 줄의 꼴: "<번호>: [->] <종류> <방식> <읽기·쓰기> <pid> <major>:<minor>:<inode> <시작> <끝>". "->"는 기다리는 요청이다.
+// pid가 이 프로세스이고 inode가 같으면 잠금의 종류와 장치 번호와 관계없이 쥔 것으로 본다. stat의 장치 번호가 잠금 목록의 것과
+// 다른 파일시스템(btrfs 하위 볼륨 등)에서 장치까지 맞추면 쥔 파일을 놓쳐 FD를 열게 되고, 넓게 잡으면 locked로 끝날 뿐이다.
+function heldHere(file: BigIntStats): boolean | null {
+  let text: string;
+  try {
+    text = readFileSync("/proc/locks", "utf8");
+  } catch {
+    return null;
+  }
+  const pid = String(process.pid);
+  let held = false;
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    const fields = line.trim().split(/\s+/).filter((field) => field !== "->");
+    if (fields.length !== 8 || !/^\d+:$/.test(fields[0] as string) || !/^-?\d+$/.test(fields[4] as string)) return null;
+    if (fields[4] !== pid) continue;
+    const inode = /^[0-9a-f]+:[0-9a-f]+:(\d+)$/.exec(fields[5] as string)?.[1];
+    if (inode === undefined || BigInt(inode) === file.ino) held = true;
+  }
+  return held;
+}
+
+// 판정 단계에서 본체 머리 100바이트를 읽기 전용 FD로 읽는다. 이 프로세스가 그 파일을 쥐고 있으면 FD를 열지 않는다:
+// 이 FD를 닫는 순간 쥔 쪽의 POSIX 잠금이 풀린다. 잠금 목록을 확인하지 못하면 FD를 열지 않고 null을 돌려준다.
+// 함정: 확인과 닫기 사이에 같은 프로세스의 다른 스레드가 이 파일을 열어 잠그면 그 잠금이 풀린다. 장부를 여는 스레드는 하나라는 전제다.
+function readHeader(path: string, judged: BigIntStats, mode: OpenMode): Buffer | null {
+  const held = heldHere(judged);
+  if (held === null) return null;
+  if (held) throw new LedgerUnavailableError("locked", "이 프로세스가 이미 쥔 장부다");
+  let fd: number;
+  try {
+    fd = openSync(path, fileOpen.O_RDONLY | fileOpen.O_NOFOLLOW);
+  } catch (error) {
+    throw new LedgerUnavailableError("io", `장부 머리를 열지 못함: ${describe(error)}`);
+  }
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (opened.dev !== judged.dev || opened.ino !== judged.ino) throw notOurs(mode, "판정한 뒤에 장부 경로의 파일이 바뀌었다");
+    const head = Buffer.alloc(100);
+    if (readSync(fd, head, 0, 100, 0) !== 100) throw new LedgerUnavailableError("corrupt", "SQLite 장부의 머리가 아니다");
+    return head;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// 머리의 페이지 수가 유효하고(offset 92 = offset 24) 본체 길이를 페이지로 올린 수보다 크다. SQLite는 이 머리를 본체만으로 읽지 못한다.
+function pagesAheadOfBody(head: Buffer, size: bigint): boolean {
+  const raw = head.readUInt16BE(16);
+  const page = raw === 1 ? 65536n : BigInt(raw);
+  if (page < 512n || head.readUInt32BE(92) !== head.readUInt32BE(24)) return false;
+  return BigInt(head.readUInt32BE(28)) > (size + page - 1n) / page;
+}
+
+// 본체만 읽는 연결이 머리를 읽지 못한 쌍 가운데 체크포인트가 파일을 늘리다 끊긴 모양만 WAL까지 읽은 판정으로 넘기고, 나머지는 그 오류로 거절한다.
+// 체크포인트는 페이지를 번호 순으로 옮겨, 새 1번 페이지(늘어난 페이지 수)가 본체 끝보다 먼저 남을 수 있다.
+// 본체 자신의 표식은 FD로 읽은 머리에서 본다. WAL까지 읽은 연결의 1번 페이지는 WAL이 덮은 것이라, 그것만 보면 잘린 미개봉 사본과 다른 시점의 WAL이 섞인 채 열린다.
+// 머리는 이 모양일 수 있는 입력(reopen, 저널 없음, 커밋을 담을 수 있는 WAL)에서만 읽는다. 본체만 읽는 연결이 머리를 읽는 보통의 장부는 FD를 열지 않는다.
+function requireCheckpointCut(error: unknown, path: string, main: BigIntStats, mode: OpenMode, leftover: readonly string[], journalLeft: boolean, view: Database): void {
+  if (!(error instanceof SQLiteError) || error.code !== "SQLITE_CORRUPT" || mode !== "reopen" || journalLeft || !walMayHoldCommit(path, view)) throw error;
+  const head = readHeader(path, main, mode);
+  if (head === null) throw error;
+  requireMarks(mode, leftover, journalLeft, head.readInt32BE(68), () => head.readInt32BE(60));
+  if (!pagesAheadOfBody(head, main.size)) throw error;
+}
+
 // SQLite가 파일이나 저널을 건드리기 전의 판정. fresh: 이 호출이 새로 예약했다. 그 밖의 받지 않는 모양은 던진다.
 function inspectFile(path: string, mode: OpenMode, migrations: readonly Migration[], faults: Faults): { fresh: boolean; file: BigIntStats } {
   const main = fileEntry(path, mode);
@@ -708,22 +790,26 @@ function inspectFile(path: string, mode: OpenMode, migrations: readonly Migratio
   let recovering = false;
   const view = readOnlyView(path);
   try {
-    const stored = view.query("PRAGMA application_id").get() as { application_id: number };
-    if (stored.application_id !== APPLICATION_ID) throw notOurs(mode, "이 설치가 만든 장부가 아니다");
-    // 길이 판정보다 먼저 본다. 처음 여는 사본 곁의 WAL은 그 사본의 것일 수 없어 길이 판정을 비켜 갈 근거가 되지 않는다.
-    if (mode === "reopen" && leftover.length > 0 && userVersion(view) === SNAPSHOT_UNOPENED) {
-      // 저널만 남았으면 이 사본의 첫 열기가 끊겼을 수 있다. 저널을 SQLite 밖에서 읽지 않아 다른 시점의 저널과 가르지 못하므로, 받지 않고 사유만 가른다.
-      const reason = leftover.length === 1 && journalLeft ? "interrupted_install" : "not_initialized";
-      throw new LedgerUnavailableError(reason, `한 번도 열지 않은 사본 곁에 다른 시점의 파일이 있다: ${leftover.join(", ")}`);
+    let stored: { application_id: number } | undefined;
+    try {
+      stored = view.query("PRAGMA application_id").get() as { application_id: number };
+    } catch (error) {
+      requireCheckpointCut(error, path, main, mode, leftover, journalLeft, view);
     }
-    recovering = mode === "reopen" && !journalLeft && walMayHoldCommit(path, view);
-    // 저널이 남은 본체는 되돌리기 전의 모습이다. 커밋이 든 WAL 곁의 본체는 체크포인트가 페이지 중간에서 끊겼을 수 있고, 논리 상태는 WAL까지 읽은 SQLite가 판단한다.
-    if (!journalLeft && !recovering) requireWholePages(view, main.size);
-    if (mode === "create") {
-      // 저널이 남으면 커밋되지 않은 식별 행이 본체에 보일 수 있어 내용 대조로만 가른다.
-      if (!journalLeft && hasIdentity(view)) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
-      if (leftover.some((suffix) => suffix !== "-journal")) throw new LedgerUnavailableError("foreign_data", "끊긴 첫 설치에는 WAL이 남지 않는다");
-      requireInterruptedInstall(view, migrations, journalLeft);
+    if (stored === undefined) {
+      // 머리가 본체보다 앞선 쌍: 표식은 본체 머리에서 봤고, 길이로는 판정하지 않고 WAL까지 읽은 SQLite가 판단한다.
+      recovering = true;
+    } else {
+      requireMarks(mode, leftover, journalLeft, stored.application_id, () => userVersion(view));
+      recovering = mode === "reopen" && !journalLeft && walMayHoldCommit(path, view);
+      // 저널이 남은 본체는 되돌리기 전의 모습이다. 커밋이 든 WAL 곁의 본체는 체크포인트가 페이지 중간에서 끊겼을 수 있고, 논리 상태는 WAL까지 읽은 SQLite가 판단한다.
+      if (!journalLeft && !recovering) requireWholePages(view, main.size);
+      if (mode === "create") {
+        // 저널이 남으면 커밋되지 않은 식별 행이 본체에 보일 수 있어 내용 대조로만 가른다.
+        if (!journalLeft && hasIdentity(view)) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
+        if (leftover.some((suffix) => suffix !== "-journal")) throw new LedgerUnavailableError("foreign_data", "끊긴 첫 설치에는 WAL이 남지 않는다");
+        requireInterruptedInstall(view, migrations, journalLeft);
+      }
     }
   } finally {
     view.close();
@@ -731,6 +817,9 @@ function inspectFile(path: string, mode: OpenMode, migrations: readonly Migratio
   if (recovering) requireInstalledThroughWal(path, migrations);
   return { fresh: false, file: main };
 }
+
+// 본체를 늘리고 줄이는 단위. 페이지 크기(4,096)와 같아 파일이 페이지 배수보다 커지지 않는다.
+const CHUNK_BYTES = 4096;
 
 function useWal(db: Database): void {
   const journal = (db.query("PRAGMA journal_mode = WAL").get() as { journal_mode: string }).journal_mode;
@@ -763,6 +852,9 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
     db = new Database(target, { readwrite: true, strict: true });
     // 연결이 파일을 처음 읽기 전에 본다(synchronous가 첫 읽기이고, 끊긴 트랜잭션의 저널은 그때 되돌려진다).
     requireSameFile(target, file, mode);
+    // 첫 쓰기 전에 건다. 이 연결의 체크포인트가 페이지를 옮기기 전에 본체를 늘리게 해, 도중에 끊겨도 머리의 페이지 수가 본체보다 앞서지 않는다.
+    // Bun 1.4.4·SQLite 3.53.4에서 체크포인트 도중 프로세스를 죽여 확인했다. 전원 차단에서의 디스크 반영 순서는 확인하지 못했다.
+    if (db.fileControl(sqliteOpen.SQLITE_FCNTL_CHUNK_SIZE, CHUNK_BYTES) !== 0) throw new LedgerUnavailableError("db_error", "본체의 chunk size를 걸지 못했다");
     db.run("PRAGMA busy_timeout = 0");
     db.run("PRAGMA locking_mode = EXCLUSIVE");
     db.run("PRAGMA synchronous = FULL");

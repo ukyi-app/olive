@@ -1,10 +1,12 @@
 // 사본·보류·파일 판정의 회귀: 대조와 복원 시도의 수명, 사본 표식과 사본 기록, WAL이 있는 본체의 길이, 다시 열 수 없는 판.
 import { Database } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
-import { copyFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import * as fs from "node:fs";
+import { copyFileSync, existsSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { type Ledger, loadMigrations, openLedger, type OpenResult, type RestorePorts, Restorer, RestoreStepError, type SnapshotResult } from "../../src/ledger/index.ts";
 import { SNAPSHOT_UNOPENED } from "../../src/ledger/snapshot.ts";
+import { CHECKPOINT_ROWS } from "./checkpoint-child.ts";
 import { clock, id, must, NOW, open, ready, tempDir, tempPath, worker } from "./helpers.ts";
 import { WAL_PAIR_GENERATION, WAL_PAIR_NONCES, WAL_PAIR_SENDER, walPairNonce } from "./wal-pair-child.ts";
 
@@ -95,15 +97,20 @@ async function walPair(): Promise<string> {
   return path;
 }
 
-// 체크포인트가 새 페이지의 앞 512바이트만 본체에 쓰고 끊긴 모습을 만든다. 쓰인 바이트는 같은 쌍을 끝까지 체크포인트한 결과에서 가져온다.
-function cutCheckpoint(path: string): void {
+// 같은 쌍을 끝까지 체크포인트한 본체의 바이트. 복제본에서 체크포인트하므로 원래 쌍은 그대로다.
+function checkpointed(path: string): Buffer {
   const control = join(tempDir(), "control.db");
   copyFileSync(path, control);
   copyFileSync(`${path}-wal`, `${control}-wal`);
   const raw = new Database(control);
   raw.query("PRAGMA wal_checkpoint(TRUNCATE)").all();
   raw.close();
-  const whole = readFileSync(control);
+  return readFileSync(control);
+}
+
+// 체크포인트가 새 페이지의 앞 512바이트만 본체에 쓰고 끊긴 모습을 만든다. 쓰인 바이트는 같은 쌍을 끝까지 체크포인트한 결과에서 가져온다.
+function cutCheckpoint(path: string): void {
+  const whole = checkpointed(path);
   const body = readFileSync(path);
   expect(whole.length).toBeGreaterThan(body.length);
   writeFileSync(path, Buffer.concat([body, whole.subarray(body.length, body.length + 512)]));
@@ -405,3 +412,250 @@ test("F12 사본: 시계가 던지면 사본 결과로 거절하고 장부는 �
   taken(ledger.createSnapshot({ path: target, maxBytes: MAX }));
   ledger.close();
 });
+
+// ---- 머리가 본체보다 앞선 본체(끊긴 체크포인트 뒤의 재기동) ----
+// 체크포인트는 페이지를 번호 순으로 옮기므로, 파일을 늘리다 끊기면 새 1번 페이지(늘어난 페이지 수)가 본체 끝보다 먼저 남는다.
+// 본체만 읽는 SQLite 연결은 이 머리를 읽지 못해(SQLITE_CORRUPT) 판정이 본체 머리 100바이트를 FD로 읽는다.
+// 그 FD는 이 프로세스가 그 파일의 잠금을 쥐지 않았을 때만 연다. 다른 FD를 닫으면 쥔 쪽의 POSIX 잠금이 풀리기 때문이다.
+
+const PAGE = 4096;
+const UNOPENED_SIDECAR = "한 번도 열지 않은 사본 곁에 다른 시점의 파일이 있다: -wal";
+const NOT_OURS = "이 설치가 만든 장부가 아니다";
+const HEADER_CORRUPT = "SQLITE_CORRUPT: database disk image is malformed";
+const HELD_HERE = "이 프로세스가 이미 쥔 장부다";
+
+// 머리의 페이지 수가 본체 길이(페이지 단위로 올림)보다 크다. 본체만 읽는 SQLite 연결은 이 머리를 SQLITE_CORRUPT로 거절한다.
+function headerAhead(body: Buffer): boolean {
+  return body.readUInt32BE(28) > Math.ceil(body.length / body.readUInt16BE(16));
+}
+
+// 체크포인트가 새 1번 페이지를 본체 끝보다 먼저 반영하고 끊긴 본체들. 모두 원래 쌍의 WAL과 짝을 이룬다.
+function aheadBodies(path: string): Record<"firstPage" | "prefix" | "prefixAligned", Buffer> {
+  const body = readFileSync(path);
+  const whole = checkpointed(path);
+  expect(body.length % PAGE).toBe(0);
+  expect(whole.length).toBeGreaterThan(body.length + PAGE);
+  return {
+    firstPage: Buffer.concat([whole.subarray(0, PAGE), body.subarray(PAGE)]),
+    prefix: whole.subarray(0, body.length + 512),
+    prefixAligned: whole.subarray(0, body.length + PAGE),
+  };
+}
+
+function place(body: Uint8Array, wal: Uint8Array | null): string {
+  const path = tempPath();
+  writeFileSync(path, body);
+  if (wal !== null) writeFileSync(`${path}-wal`, wal);
+  return path;
+}
+
+function cutPages(body: Buffer, pages: number): Buffer {
+  return body.subarray(0, body.length - pages * PAGE);
+}
+
+// 이 설치가 만들지 않은 여러 페이지의 SQLite 파일(application_id 7).
+function foreignBody(): Buffer {
+  const path = tempPath();
+  const raw = new Database(path);
+  raw.run("PRAGMA application_id = 7");
+  raw.run("CREATE TABLE t (x BLOB)");
+  raw.run("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12) INSERT INTO t SELECT randomblob(3000) FROM n");
+  raw.close();
+  return readFileSync(path);
+}
+
+// SQLite가 WAL까지 읽은 같은 쌍의 값. 복제본을 읽기 전용으로 열어 원래 쌍을 바꾸지 않는다.
+function throughWal(path: string) {
+  const control = join(tempDir(), "control.db");
+  copyFileSync(path, control);
+  copyFileSync(`${path}-wal`, `${control}-wal`);
+  const raw = new Database(control, { readonly: true });
+  try {
+    const check = raw.query("PRAGMA quick_check").all() as { quick_check: string }[];
+    const stop = raw.query("SELECT generation, stopped FROM stop_state").get() as { generation: number; stopped: number };
+    const { n } = raw.query("SELECT count(*) AS n FROM nonces").get() as { n: number };
+    return { check: check.map((row) => row.quick_check), generation: stop.generation, stopped: stop.stopped, nonces: n };
+  } finally {
+    raw.close();
+  }
+}
+
+// 공개 API로 다시 열어 정지 기록을 읽는다. 닫으면 장부가 WAL을 체크포인트하므로 그 뒤의 본체에서 nonce를 센다.
+function reopened(path: string) {
+  const result = openLedger(path, { clock, mode: "reopen" });
+  if (!result.ok) return { ok: false, reason: result.reason, detail: stripped(result.detail) };
+  const stop = result.ledger.readStop();
+  result.ledger.close();
+  const raw = new Database(path, { readonly: true });
+  const { n } = raw.query("SELECT count(*) AS n FROM nonces").get() as { n: number };
+  raw.close();
+  return { ok: true, stop: stop.known && stop.value !== null ? { generation: stop.value.generation, stopped: stop.value.stopped } : stop, nonces: n };
+}
+
+function stripped(detail: string): string {
+  return detail.replace(/^LedgerUnavailableError: ledger unavailable \(\w+\): /, "");
+}
+
+function listing(path: string): string[] {
+  return readdirSync(dirname(path)).sort();
+}
+
+// 거절의 사유와 상세, 그리고 판정이 본체·WAL의 바이트와 폴더의 이름 목록(곁 파일)을 바꾸지 않았는지.
+function refused(path: string) {
+  const body = readFileSync(path);
+  const wal = existsSync(`${path}-wal`) ? readFileSync(`${path}-wal`) : null;
+  const names = listing(path);
+  const result = openLedger(path, { clock, mode: "reopen" });
+  if (result.ok) {
+    result.ledger.close();
+    return { ok: true };
+  }
+  const walSame = wal === null ? !existsSync(`${path}-wal`) : readFileSync(`${path}-wal`).equals(wal);
+  return {
+    ok: false,
+    reason: result.reason,
+    detail: stripped(result.detail),
+    unchanged: readFileSync(path).equals(body) && walSame && JSON.stringify(listing(path)) === JSON.stringify(names),
+  };
+}
+
+// 시험이 지켜본 openSync 가운데 장부 경로를 연 호출의 플래그. SQLite의 열기는 node:fs를 거치지 않는다.
+function fdOpens(spy: { mock: { calls: unknown[][] } }, path: string): unknown[] {
+  return spy.mock.calls.filter((call) => call[0] === path).map((call) => call[1]);
+}
+
+test("R01 재기동: 1번 페이지만 새것·앞부분(페이지 중간·경계)인 본체와 온전한 WAL은 WAL까지 읽은 SQLite의 정지 세대와 기록 수로 열린다", async () => {
+  const pair = await walPair();
+  const wal = readFileSync(`${pair}-wal`);
+  const bodies = aheadBodies(pair);
+  expect(Object.fromEntries(Object.entries(bodies).map(([name, body]) => [name, { ahead: headerAhead(body), aligned: body.length % PAGE === 0 }]))).toEqual({
+    firstPage: { ahead: true, aligned: true },
+    prefix: { ahead: true, aligned: false },
+    prefixAligned: { ahead: true, aligned: true },
+  });
+
+  const expected: Record<string, unknown> = {};
+  const actual: Record<string, unknown> = {};
+  for (const [name, body] of Object.entries(bodies)) {
+    const path = place(body, wal);
+    const reference = throughWal(path);
+    expect(reference, name).toEqual({ check: ["ok"], generation: WAL_PAIR_GENERATION, stopped: 1, nonces: WAL_PAIR_NONCES });
+    expected[name] = { ok: true, stop: { generation: reference.generation, stopped: reference.stopped === 1 }, nonces: reference.nonces };
+    actual[name] = reopened(path);
+  }
+  expect(actual).toEqual(expected);
+});
+
+test("R01 거절: 페이지 경계에서 잘린 미개봉 사본과 옛·다른 장부의 WAL, 이 설치가 만들지 않은 잘린 본체와 이 장부의 WAL은 본체 머리의 표식으로 거절하고 파일을 바꾸지 않는다", async () => {
+  // 장부 A의 옛 운용 WAL을 떼어 두고, A를 다시 열어 처음 여는 사본을 만든다.
+  const a = await walPair();
+  const oldWal = readFileSync(`${a}-wal`);
+  const ledger = opened(openLedger(a, { clock, mode: "reopen" }));
+  const copy = join(tempDir(), "copy.db");
+  taken(ledger.createSnapshot({ path: copy, maxBytes: MAX }));
+  ledger.close();
+  const truncatedCopy = cutPages(readFileSync(copy), 1);
+  const otherWal = readFileSync(`${await walPair()}-wal`);
+  const inputs = {
+    unopenedOldWal: place(truncatedCopy, oldWal),
+    unopenedOtherWal: place(truncatedCopy, otherWal),
+    foreignThisWal: place(cutPages(foreignBody(), 1), oldWal),
+  };
+  // 셋 다 본체만 읽는 연결이 머리를 읽지 못하는 모양이고, 커밋을 담을 수 있는 WAL이 곁에 있어 머리 읽기까지 간다.
+  for (const [name, path] of Object.entries(inputs)) {
+    expect(readFileSync(path).length % PAGE, name).toBe(0);
+    expect(headerAhead(readFileSync(path)), name).toBe(true);
+    expect(statSync(`${path}-wal`).size, name).toBeGreaterThanOrEqual(56 + PAGE);
+  }
+  expect(Object.fromEntries(Object.entries(inputs).map(([name, path]) => [name, refused(path)]))).toEqual({
+    unopenedOldWal: { ok: false, reason: "not_initialized", detail: UNOPENED_SIDECAR, unchanged: true },
+    unopenedOtherWal: { ok: false, reason: "not_initialized", detail: UNOPENED_SIDECAR, unchanged: true },
+    foreignThisWal: { ok: false, reason: "not_initialized", detail: NOT_OURS, unchanged: true },
+  });
+});
+
+test("R01 잠금: 같은 프로세스가 쥔 장부를 다시 열면 머리 FD를 열지 않고 locked이며 쥔 쪽의 잠금이 풀리지 않는다(WAL이 있을 때와 없을 때)", async () => {
+  const pair = await walPair();
+  const { firstPage } = aheadBodies(pair);
+  const ahead = place(firstPage, readFileSync(`${pair}-wal`));
+  const plain = tempPath();
+  const holders = { withWal: opened(openLedger(ahead, { clock, mode: "reopen" })), withoutWal: open(plain) };
+  expect(statSync(`${ahead}-wal`).size).toBeGreaterThanOrEqual(56 + PAGE);
+  expect(existsSync(`${plain}-wal`) ? statSync(`${plain}-wal`).size : 0).toBeLessThan(56 + PAGE);
+
+  const opens = spyOn(fs, "openSync");
+  try {
+    const second = { withWal: openLedger(ahead, { clock, mode: "reopen" }), withoutWal: openLedger(plain, { clock, mode: "reopen" }) };
+    expect(second.withWal).toMatchObject({ ok: false, reason: "locked" });
+    expect(second.withoutWal).toMatchObject({ ok: false, reason: "locked" });
+    // WAL이 있는 쪽은 본체만 읽는 연결이 머리를 읽지 못해 머리 읽기 직전의 잠금 확인에서 멈췄다.
+    expect(second.withWal.ok ? null : stripped(second.withWal.detail)).toBe(HELD_HERE);
+    expect({ withWal: fdOpens(opens, ahead), withoutWal: fdOpens(opens, plain) }).toEqual({ withWal: [], withoutWal: [] });
+  } finally {
+    opens.mockRestore();
+  }
+  expect({ withWal: writeFromChild(ahead), withoutWal: writeFromChild(plain) }).toEqual({ withWal: "SQLITE_BUSY", withoutWal: "SQLITE_BUSY" });
+  must(holders.withWal.applyStop({ generation: WAL_PAIR_GENERATION + 1, stopped: true, now: NOW }));
+  must(holders.withoutWal.applyStop({ generation: 1, stopped: false, now: NOW }));
+  holders.withWal.close();
+  holders.withoutWal.close();
+});
+
+test("R01 잠금: /proc/locks를 읽지 못하거나 해석하지 못하면 머리 FD를 열지 않고 corrupt로 닫는다", async () => {
+  const pair = await walPair();
+  const { firstPage } = aheadBodies(pair);
+  const wal = readFileSync(`${pair}-wal`);
+  const realRead = fs.readFileSync;
+  const locks: Record<string, () => string> = {
+    unreadable: () => {
+      throw Object.assign(new Error("EACCES: permission denied, open '/proc/locks'"), { code: "EACCES" });
+    },
+    unparsable: () => "locks are not listed here\n",
+  };
+  const results: Record<string, unknown> = {};
+  for (const [name, answer] of Object.entries(locks)) {
+    const path = place(firstPage, wal);
+    const reads = spyOn(fs, "readFileSync").mockImplementation(((file: unknown, ...rest: unknown[]) =>
+      file === "/proc/locks" ? answer() : (realRead as (...args: unknown[]) => unknown)(file, ...rest)) as typeof fs.readFileSync);
+    const opens = spyOn(fs, "openSync");
+    try {
+      results[name] = { ...refused(path), fd: fdOpens(opens, path), asked: reads.mock.calls.filter((call) => call[0] === "/proc/locks").length };
+    } finally {
+      reads.mockRestore();
+      opens.mockRestore();
+    }
+  }
+  expect(results).toEqual({
+    unreadable: { ok: false, reason: "corrupt", detail: HEADER_CORRUPT, unchanged: true, fd: [], asked: 1 },
+    unparsable: { ok: false, reason: "corrupt", detail: HEADER_CORRUPT, unchanged: true, fd: [], asked: 1 },
+  });
+  // 같은 쌍도 잠금 목록을 읽을 수 있으면 열린다.
+  expect(reopened(place(firstPage, wal))).toMatchObject({ ok: true, nonces: WAL_PAIR_NONCES });
+});
+
+test("R01 예방: chunk size를 건 장부는 체크포인트 도중 강제 종료돼도 머리의 페이지 수가 본체 파일보다 앞서지 않고 다시 열린다", async () => {
+  const samples: { delayMicros: number; killed: boolean; walLeft: boolean; ahead: boolean; aligned: boolean; rows: unknown }[] = [];
+  for (const delayMicros of [0, 50, 200, 1000]) {
+    const path = tempPath();
+    // 자식은 체크포인트가 본체를 늘리기 시작한 뒤 delayMicros만큼 더 돌고 자기 자신에게 SIGKILL을 보낸다. 이 시험은 신호를 보내지 않는다.
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "checkpoint-child.ts"), path, String(delayMicros)], { stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(child.stdout).text();
+    await child.exited;
+    const killed = child.signalCode === "SIGKILL";
+    if (!killed && out.trim() !== "CLOSED") throw new Error(`자식이 체크포인트까지 가지 못함: ${out} ${await new Response(child.stderr).text()}`);
+    const body = readFileSync(path);
+    const walLeft = existsSync(`${path}-wal`) && statSync(`${path}-wal`).size >= 56 + PAGE;
+    const result = openLedger(path, { clock, mode: "reopen" });
+    let rows: unknown = result.ok ? null : result.reason;
+    if (result.ok) {
+      result.ledger.close();
+      const raw = new Database(path, { readonly: true });
+      rows = (raw.query("SELECT count(*) AS n FROM nonces").get() as { n: number }).n;
+      raw.close();
+    }
+    samples.push({ delayMicros, killed, walLeft, ahead: headerAhead(body), aligned: body.length % PAGE === 0, rows });
+  }
+  expect(samples.filter((sample) => sample.ahead || !sample.aligned || sample.rows !== CHECKPOINT_ROWS)).toEqual([]);
+  // 적어도 한 번은 체크포인트가 끝나기 전(WAL이 남은 채)에 끊겼다. 아니면 이 시험은 아무것도 보지 않은 것이다.
+  expect(samples.some((sample) => sample.killed && sample.walLeft)).toBe(true);
+}, 60_000);
