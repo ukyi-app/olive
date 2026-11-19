@@ -423,7 +423,8 @@ export class ExecutorStore implements NonceStore {
       } else continue;
       store.suspectRuns.add(record.run_id);
     }
-    if (store.overCapacity() && !store.ledgerHeld()) store.inconsistent = "over_capacity";
+    // 접수가 아닌 최초 기록은 감사가 뒤에서 뺀다. 여기서 세면 남은 파일만으로 장부 전체가 보류된다.
+    if (store.overCapacity((run) => !store.unaccepted(run)) && !store.ledgerHeld()) store.inconsistent = "over_capacity";
     if (store.ledgerHeld()) for (const id of store.events.keys()) store.suspectEvents.add(id);
     // 첫 판정과 더 강한 사유로의 승격은 지속시킨 뒤에만 연다. 적지 못하면 진단 자료를 그대로 두고 열기를 실패시킨다.
     if (store.inconsistent !== null && store.inconsistent !== held) {
@@ -511,8 +512,18 @@ export class ExecutorStore implements NonceStore {
   }
 
   // hello는 실행을 STATUS_MAX_RUNS개까지만 싣는다. 점유하거나 보류한 실행이 그보다 많은 장부는 v1의 인사로 다 말할 수 없다.
-  private overCapacity(): boolean {
-    return [...this.runMap.values()].filter((run) => HOLDS_SLOT.includes(run.state) || this.suspectRuns.has(run.run_id)).length > limits.STATUS_MAX_RUNS;
+  private overCapacity(counted: (run: RunRecord) => boolean = () => true): boolean {
+    return [...this.runMap.values()].filter((run) => counted(run) && (HOLDS_SLOT.includes(run.state) || this.suspectRuns.has(run.run_id))).length > limits.STATUS_MAX_RUNS;
+  }
+
+  // 사건도 마지막 영수증도 없는 preparing은 접수가 아니다(최초 쓰기의 재확인이 남긴 파일일 수도 있다). spawn은 접수 영수증이 지속된 뒤에만 나므로 끝낼 프로세스도 없다.
+  private unaccepted(record: RunRecord): boolean {
+    return record.state === "preparing" && record.last_receipt_id === null && !this.hasEvents(record.run_id);
+  }
+
+  // 메모리의 판정이 아직 파일에 없다. 파일 작업은 이 값이 거짓임을 본 동기 구간에서 시작한다(확인이 돌아오는 사이에도 판정이 설 수 있다).
+  private holdDue(): boolean {
+    return this.inconsistent !== this.holdOnDisk;
   }
 
   // 실행기가 outbox 본문의 계약 모양을 대조하고 맞지 않으면 알린다. 그 사건의 실행은 함께 보류하고, 판정은 다음 기동에도 남긴다.
@@ -544,8 +555,7 @@ export class ExecutorStore implements NonceStore {
   // 감사 뒤의 보류까지 세어 인사로 다 말할 수 없는 장부는 전체를 보류한다.
   auditRuns(): void {
     for (const record of [...this.runMap.values()]) {
-      // 사건이 하나도 없는 preparing은 접수가 아니다(최초 쓰기의 재확인이 남긴 파일일 수도 있다). spawn은 접수 영수증이 지속된 뒤에만 나므로 끝낼 프로세스도 없다.
-      if (record.state === "preparing" && record.last_receipt_id === null && !this.hasEvents(record.run_id)) {
+      if (this.unaccepted(record)) {
         this.runMap.delete(record.run_id);
         this.durableRuns.delete(record.run_id);
         continue;
@@ -632,8 +642,14 @@ export class ExecutorStore implements NonceStore {
         // 실패한 그 경로에 그 내용을 다시 써 본다. 접수하지 않은 실행의 기록이 남지 않게 바로 지운다.
         // 지우기 전에 꺼져 파일이 남아도 사건이 없는 preparing이라 다음 기동의 감사가 접수로 치지 않는다(auditRuns).
         for (const [path, data] of this.failedBegins) {
-          if (!(await this.persistHold())) return false;
+          do {
+            if (!(await this.persistHold())) return false;
+          } while (this.holdDue());
           await this.io.writeDurable(path, data);
+          // 다시 쓰는 사이 선 판정도 지우기 전에 지속한다.
+          do {
+            if (!(await this.persistHold())) return false;
+          } while (this.holdDue());
           await rm(path, { force: true });
           this.failedBegins.delete(path);
         }
@@ -665,7 +681,9 @@ export class ExecutorStore implements NonceStore {
     return this.serial(async () => {
       const onFile = this.durable;
       if (onFile !== null && onFile >= generation) return { saved: true, current: this.fence ?? onFile };
-      if (!(await this.persistHold())) return { saved: false, current: this.fence ?? generation };
+      do {
+        if (!(await this.persistHold())) return { saved: false, current: this.fence ?? generation };
+      } while (this.holdDue());
       try {
         await this.io.writeDurable(join(this.dir, "stop-generation.json"), JSON.stringify({ stop_generation: generation }));
       } catch {
@@ -756,7 +774,10 @@ export class ExecutorStore implements NonceStore {
   // 새 실행의 접수. 파일에 적었을 때만 메모리를 바꾼다. 적지 못하면 접수하지 않고 장애로 둔다.
   beginRun(record: RunRecord): Promise<boolean> {
     return this.serial(async () => {
-      if (this.runMap.has(record.run_id) || !(await this.persistHold())) return false;
+      if (this.runMap.has(record.run_id)) return false;
+      do {
+        if (!(await this.persistHold())) return false;
+      } while (this.holdDue());
       const path = join(this.dir, "runs", `${record.run_id}.json`);
       const data = JSON.stringify(record);
       try {
@@ -808,10 +829,12 @@ export class ExecutorStore implements NonceStore {
     try {
       for (;;) {
         // 파일을 하나 쓸 때마다 앞에서 본다. 쓰는 사이 세운 보류 판정은 다음 파일보다 먼저 지속한다.
-        if (!(await this.persistHold())) {
-          this.pendingRuns.add(runId);
-          return { saved: false, written };
-        }
+        do {
+          if (!(await this.persistHold())) {
+            this.pendingRuns.add(runId);
+            return { saved: false, written };
+          }
+        } while (this.holdDue());
         const next = [...this.unsaved.values()].filter((event) => event.entry.run_id === runId).sort((a, b) => a.seq - b.seq)[0];
         if (next === undefined) break;
         await this.io.writeDurable(join(this.dir, "outbox", `${next.entry.id}.json`), onDisk(next));
@@ -903,7 +926,9 @@ export class ExecutorStore implements NonceStore {
     return this.serial(async () => {
       let ok = true;
       for (const event of changed) {
-        if (!(await this.persistHold())) return false;
+        do {
+          if (!(await this.persistHold())) return false;
+        } while (this.holdDue());
         try {
           await this.io.writeDurable(join(this.dir, "outbox", `${event.entry.id}.json`), onDisk(event));
         } catch {

@@ -214,7 +214,7 @@ export class PidSweep implements ProcessCleanup {
 
   // 좀비는 도는 코드가 없어 세지 않는다(실행기가 PID 1이면 고아 좀비를 회수하지 않아 남을 수 있다).
   // 단 리더 스레드만 끝난 프로세스도 Z로 보인다. 다른 스레드가 살아 있으면 코드가 돌고 있는 것이다.
-  // 스레드 목록·상태가 읽는 사이 사라지면 끝났다는 증거가 아니라 경합이다("raced", 깨끗한 횟수에 넣지 않는다).
+  // 스레드 목록·상태가 읽는 사이 사라지거나 목록이 비어 있으면 끝났다는 증거가 아니라 경합이다("raced", 깨끗한 횟수에 넣지 않는다).
   // 함정: 스레드 하나의 소멸은 프로세스의 소멸이 아니다. 부모가 공간 밖으로 보인 프로세스는 합류자일 수 있으므로
   // 프로세스 자체가 사라졌을 때만 경합이고, 남아 있으면 생존을 가르지 못한 것이다(null). 빈 스레드 목록도 같다.
   private async alive(pid: number, state: string, parent: string): Promise<boolean | null | "raced"> {
@@ -228,7 +228,7 @@ export class PidSweep implements ProcessCleanup {
     } catch (error) {
       return VANISHED.has(errorCode(error)) ? lost() : null;
     }
-    let raced = outside && threads.length === 0;
+    let raced = threads.length === 0;
     for (const thread of threads) {
       try {
         const threadState = stateOf(await this.reader.threadStatus(pid, thread));
