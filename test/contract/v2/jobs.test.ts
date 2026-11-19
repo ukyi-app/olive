@@ -4,7 +4,7 @@ import { expect, test } from "bun:test";
 import { type Bundle, COMMON_BUNDLE } from "../../../src/contract/v2/actions.ts";
 import { type Contract, defineContract, SealError } from "../../../src/contract/v2/contract.ts";
 import type { Party } from "../../../src/contract/v2/header.ts";
-import { effectBody, literal, object, sha256 } from "../../../src/contract/v2/schema.ts";
+import { effectBody, generation, literal, object, sha256 } from "../../../src/contract/v2/schema.ts";
 import { baseContext, type CaseContext, contextOf, envelope, freshKeys, id, ISSUED, KNOWN_GENERATIONS, nonceOf, PROBE, PROBE_BUNDLE, probeBody, trustedRaw } from "./support.ts";
 
 const keys = freshKeys();
@@ -40,8 +40,9 @@ const SLIM: Bundle = {
       from: ["front-door"],
       duringClosedIntake: false,
       duringPolicyMismatch: false,
-      generations: { stop: "not_applicable", execution: "not_applicable" },
-      parse: (body) => ({ noteDigest: effectBody({ note_digest: sha256 })(body, "body").note_digest, job_id: OTHER_JOB }),
+      // 두 세대 모두 not_applicable은 닫힌 목록의 넷만 선언할 수 있어 정지 세대를 싣는다(KNOWN_GENERATIONS의 7).
+      generations: { stop: "current", execution: "not_applicable" },
+      parse: (body) => ({ noteDigest: effectBody({ note_digest: sha256, stop_generation: generation })(body, "body").note_digest, job_id: OTHER_JOB }),
       parseResult: object({ done: literal(true) }),
     },
     // 답 동작인데 해석기가 in_reply_to를 보지도 돌려주지도 않는다.
@@ -59,7 +60,7 @@ const SLIM_CONTRACT = defineContract([COMMON_BUNDLE, SLIM]);
 
 test("작업 ID: 해석기가 job_id를 빼거나 바꿔도 Verified.job은 서명된 원본의 job_id다", async () => {
   const job = id(0xb01);
-  const message = send("front-door", "slim_effect", { job_id: job, note_digest: "d".repeat(64) });
+  const message = send("front-door", "slim_effect", { job_id: job, note_digest: "d".repeat(64), stop_generation: 7 });
   const got = await at(SLIM_CONTRACT, message, "supervisor");
   expect(got.ok).toBe(true);
   if (!got.ok) return;

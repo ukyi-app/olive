@@ -1,6 +1,6 @@
 // 효과 동작의 세대 규칙(등록 때 선언, 받을 때 강제)과 동작마다의 정책 불일치 선언. 효과 동작은 시험 전용 probe 묶음으로 본다.
 import { expect, test } from "bun:test";
-import { type ActionSpec, type Bundle, COMMON_BUNDLE, EFFECTS_DURING_POLICY_MISMATCH, type EffectSpec } from "../../../src/contract/v2/actions.ts";
+import { type ActionSpec, type Bundle, COMMON_BUNDLE, EFFECTS_DURING_POLICY_MISMATCH, EFFECTS_WITHOUT_GENERATIONS, type EffectSpec } from "../../../src/contract/v2/actions.ts";
 import { defineContract, SealError } from "../../../src/contract/v2/contract.ts";
 import { type GenerationAuthorities, generationMismatch, type GenerationRule } from "../../../src/contract/v2/generations.ts";
 import { FRONTDOOR_CONTRACT } from "../../../src/contract/v2/index.ts";
@@ -54,8 +54,14 @@ test("등록: 효과 동작은 정지·실행 세대 규칙을 각각 선언해�
   const query = { ...base, class: "query", duringClosedIntake: true, duringPolicyMismatch: true, parseResult: undefined };
   expect(() => defineContract([COMMON_BUNDLE, bundle({ read_x: query })])).toThrow("세대 규칙");
   expect(() => defineContract([COMMON_BUNDLE, bundle({ read_x: { ...query, generations: undefined } })])).not.toThrow();
-  // 해당 없음도 명시적 선언이다.
-  expect(() => defineContract([COMMON_BUNDLE, bundle({ do_x: { ...base, generations: { stop: "not_applicable", execution: "not_applicable" } } })])).not.toThrow();
+  // 해당 없음도 명시적 선언이다. 다만 두 세대 모두 해당 없음은 닫힌 목록(EFFECTS_WITHOUT_GENERATIONS)의 넷만 선언할 수 있다
+  // (관리자 결정 2026-11-20). 목록 밖의 이름이면 표를 만들 때 던지고, 목록의 넷은 통과한다.
+  const none = { ...base, generations: { stop: "not_applicable", execution: "not_applicable" } };
+  for (const name of ["do_x", "input_submit", "approval_changed", "release_prepare", "probe_effect"]) {
+    expect(() => defineContract([COMMON_BUNDLE, bundle({ [name]: none })]), name).toThrow("EFFECTS_WITHOUT_GENERATIONS");
+  }
+  for (const name of EFFECTS_WITHOUT_GENERATIONS) expect(() => defineContract([COMMON_BUNDLE, bundle({ [name]: none })]), name).not.toThrow();
+  expect(() => defineContract([COMMON_BUNDLE, bundle({ do_x: { ...base, generations: { stop: "not_applicable", execution: "current" } } })])).not.toThrow();
 });
 
 test("등록: 동작마다 정책이 어긋난 연결에서 받는지 선언하고, 효과는 정지의 준비·확정만 받을 수 있다", () => {
@@ -200,8 +206,19 @@ test("판정: 닫힌 목록의 규칙마다 권위 값과의 관계", () => {
   expect(judge("newer", 6, known(5, null))).toBe("ok");
   expect(judge("newer", 9, known(5, null))).toBe("ok");
   expect(judge("newer", 5, known(5, null))).toBe("generation_mismatch");
-  expect(judge("prepared", 6, known(5, 6))).toBe("ok");
-  expect(judge("prepared", 6, known(5, null))).toBe("generation_mismatch");
+  // newer: 받아 둔 준비보다 낮은 준비는 거절한다(같은 번호와 더 큰 번호는 받는다).
+  expect(judge("newer", 8, known(5, 9))).toBe("generation_mismatch");
+  expect(judge("newer", 9, known(5, 9))).toBe("ok");
+  expect(judge("newer", 10, known(5, 9))).toBe("ok");
+  expect(judge("newer", 6, known(5, 5))).toBe("ok");
+  // prepared_newer: 받아 둔 준비와 같고 지금보다 크다(정지 준비의 확정). 같은 번호의 풀기 준비에는 묶이지 않는다.
+  expect(judge("prepared_newer", 6, known(5, 6))).toBe("ok");
+  expect(judge("prepared_newer", 6, known(5, null))).toBe("generation_mismatch");
+  expect(judge("prepared_newer", 5, known(5, 5))).toBe("generation_mismatch");
+  // prepared_current: 받아 둔 준비와 같고 지금과 같다(풀기 준비의 확정). 정지 준비에는 묶이지 않는다.
+  expect(judge("prepared_current", 5, known(5, 5))).toBe("ok");
+  expect(judge("prepared_current", 6, known(5, 6))).toBe("generation_mismatch");
+  expect(judge("prepared_current", 5, known(5, null))).toBe("generation_mismatch");
   expect(judge("current", 5, UNKNOWN_GENERATIONS)).toBe("generation_unknown");
   expect(judge("not_applicable", 5, UNKNOWN_GENERATIONS)).toBe("ok");
 });

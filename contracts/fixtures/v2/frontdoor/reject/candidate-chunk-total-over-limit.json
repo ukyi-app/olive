@@ -12,7 +12,7 @@
     "reason": "body_malformed"
   },
   "keys": {
-    "supervisor": "26NGJtsZjfDn-ajBiEaeJmkXL2MNpdRLhZxWXfGe-VM"
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
   },
   "context": {
     "now": 1795046400000,
@@ -31,7 +31,11 @@
     "awaiting": {
       "00000000-0000-4000-8000-000000000083": {
         "action": "candidate_fetch",
-        "job": null
+        "job": null,
+        "body": {
+          "candidate_digest": "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360",
+          "offset": 1048575
+        }
       }
     },
     "spent_nonces": []
@@ -48,7 +52,7 @@
       "request_id": "00000000-0000-4000-8000-000000000084",
       "nonce": "00000000000000000000000000000084"
     },
-    "signature": "4UgIuHNFrH9Uu2-XsJHTiGKQVNVu5HjA9XDDQnBS22wZNCvNW_oobmbLudUzfHmDoFSXMZ6GjI7m5vGlMI3PDQ",
+    "signature": "R8cqKofyXb0riIEuF0EnGeKoSHk3UVS6dWdftsoV7rWM73OgMHfHnTEAq718rFEy1mQ3XmHTe0NY1sQCayaYCw",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000083",
       "candidate_digest": "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360",

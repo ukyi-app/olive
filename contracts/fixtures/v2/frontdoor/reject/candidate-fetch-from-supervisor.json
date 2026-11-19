@@ -15,7 +15,7 @@
     "reason": "wrong_direction"
   },
   "keys": {
-    "supervisor": "26NGJtsZjfDn-ajBiEaeJmkXL2MNpdRLhZxWXfGe-VM"
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
   },
   "context": {
     "now": 1795046400000,
@@ -46,7 +46,7 @@
       "request_id": "00000000-0000-4000-8000-000000000080",
       "nonce": "00000000000000000000000000000080"
     },
-    "signature": "KaK1zUyUNMNTnhItp27n_URSyrAT9FxAD_GHi_wzrw2799MfiKS1LJHP3fO-7JyGTK0_Fcs3TNYDxqa8fK7XDA",
+    "signature": "xVwPQ1t3giq-A8X_WfdwcR3WtvK-CytgipEm62zxlf6f637o_jD3AMnzsEyNYyLZA2G48buuga75b6vym4bcDg",
     "body": {
       "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
       "offset": 0

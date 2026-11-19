@@ -1,7 +1,7 @@
 {
   "fixture": "olive-control/v2",
   "name": "accept/publication-candidate-posted",
-  "description": "게시 후보의 바로 답: 확정 posted",
+  "description": "게시 후보의 바로 답: 확정 posted와 게시 서비스가 정한 PR 번호(양의 안전 정수). 같은 작업의 조회도 같은 번호를 준다",
   "status": "candidate",
   "base": null,
   "changed": [],
@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "front-door": "Iif0NsJ3dC2Q80O928_N2yMbjXdgjo0FYn0L5DUs8KE"
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
   },
   "context": {
     "now": 1795046400000,
@@ -41,7 +41,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "b2814871b3b284d995b9697a4cc2aba83619380198fd71639dcd2157b1766c22",
+      "body_digest": "e4b2159d12e05c5d4bf809b117d8444fd66fb622f68b8f735f8f54d5027ee563",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "front-door",
@@ -50,7 +50,7 @@
       "request_id": "00000000-0000-4000-8000-000000000065",
       "nonce": "00000000000000000000000000000065"
     },
-    "signature": "d_QFMAL2_Hj0okDbKpi0BNvDbOLrx4yu_k41fdYls6Rz2BpTivUbWkXPbCrCNVaMCNbDti-6D3hJzT2IWTXiBg",
+    "signature": "6G29ApZDuJfq3_4Y5_AUPcpmvjxo7DYsS3gsN1z0bQuq9xUcweZtYKdmFp7E7WJJfJuBNYXjQ-Axb4nMWYwGDQ",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000064",
       "job_id": "00000000-0000-4000-8000-000000000072",
@@ -59,10 +59,11 @@
       "status": {
         "state": "confirmed",
         "result": {
-          "outcome": "posted"
+          "outcome": "posted",
+          "pr_number": 17
         }
       }
     }
   },
-  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"b2814871b3b284d995b9697a4cc2aba83619380198fd71639dcd2157b1766c22\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000065\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000065\",\"sender\":\"front-door\"}"
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"e4b2159d12e05c5d4bf809b117d8444fd66fb622f68b8f735f8f54d5027ee563\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000065\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000065\",\"sender\":\"front-door\"}"
 }

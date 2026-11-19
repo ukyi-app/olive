@@ -261,3 +261,73 @@ test("정책이 어긋난 연결: 정지의 준비·확정은 받고, 풀기의 
     expect((await at(message, "supervisor", { handshake: "agreed", generations })).ok, message.header.action).toBe(true);
   }
 });
+
+test("준비의 종류: 풀기 확정은 풀기 준비에만, 정지 확정은 정지 준비에만 묶인다", async () => {
+  const mismatch = { ok: false, reason: "generation_mismatch" } as const;
+  const releaseCommit = fromFront("release_commit", { job_id: id(0xe01), stop_generation: 8, execution_generation: 4 });
+  const stopCommit = fromFront("stop_commit", { job_id: id(0xe02), stop_generation: 8 });
+  // 감독이 지금 7에서 정지 준비 8만 받아 둠: 같은 번호(8)의 풀기 확정을 받지 않는다. 정지 확정은 받는다.
+  const stopPrepared = { generations: gens(known(7, 8), known(3)) };
+  expect(await at(releaseCommit, "supervisor", stopPrepared)).toEqual(mismatch);
+  expect((await at(stopCommit, "supervisor", stopPrepared)).ok).toBe(true);
+  // 감독이 지금 8에서 풀기 준비 8만 받아 둠: 같은 번호(8)의 정지 확정을 받지 않는다. 풀기 확정은 받는다.
+  const releasePrepared = { generations: gens(known(8, 8), known(3)) };
+  expect(await at(stopCommit, "supervisor", releasePrepared)).toEqual(mismatch);
+  expect((await at(releaseCommit, "supervisor", releasePrepared)).ok).toBe(true);
+});
+
+test("늦은 낮은 정지 준비: 더 높은 정지 준비를 받아 둔 뒤의 낮은 준비는 거절하고, 같은 번호의 새 봉투와 더 큰 번호는 받는다", async () => {
+  const higher = { generations: gens(known(7, 10)) };
+  expect(await at(fromFront("stop_prepare", { job_id: id(0xe11), stop_generation: 8 }), "supervisor", higher)).toEqual({ ok: false, reason: "generation_mismatch" });
+  expect(await at(fromFront("stop_prepare", { job_id: id(0xe12), stop_generation: 9 }), "supervisor", higher)).toEqual({ ok: false, reason: "generation_mismatch" });
+  expect((await at(fromFront("stop_prepare", { job_id: id(0xe13), stop_generation: 10 }), "supervisor", higher)).ok).toBe(true);
+  expect((await at(fromFront("stop_prepare", { job_id: id(0xe14), stop_generation: 11 }), "supervisor", higher)).ok).toBe(true);
+  // 풀기 준비(지금과 같은 번호)를 받아 둔 동안의 새 정지 준비는 그대로 받는다(정지가 이긴다).
+  expect((await at(fromFront("stop_prepare", { job_id: id(0xe15), stop_generation: 9 }), "supervisor", { generations: gens(known(8, 8)) })).ok).toBe(true);
+});
+
+test("있을 수 없는 실행 세대: 조회 답은 1 이상, 풀기 준비가 약속하는 다음 값은 2 이상, 0은 권위 값이 되지 않는다", async () => {
+  const prepare = fromFront("release_prepare", { job_id: id(0xe21), stop_generation: 8 });
+  const prepared = (execution_generation: number) =>
+    at(confirmed(prepare, prepare.header.request_id, { outcome: "prepared", execution_generation }), "front-door", { awaiting: awaitingOf(prepare) });
+  for (const value of [0, 1]) expect(await prepared(value), `${value}`).toEqual({ ok: false, reason: "body_malformed" });
+  expect((await prepared(2)).ok).toBe(true);
+
+  const lookup = fromFront("execution_generation_lookup", {});
+  const reply = (generation: number) =>
+    at(fromSupervisor("execution_generation_reply", { in_reply_to: lookup.header.request_id, generation }), "front-door", {
+      awaiting: { [lookup.header.request_id]: { action: "execution_generation_lookup", job: null } },
+    });
+  expect(await reply(0)).toEqual({ ok: false, reason: "body_malformed" });
+  expect((await reply(1)).ok).toBe(true);
+
+  expect(adoptExecutionGeneration({ known: false }, { answered: true, generation: 0 })).toEqual({ authority: { known: false }, regressed: false });
+  expect(adoptExecutionGeneration(known(3), { answered: true, generation: 0 })).toEqual({ authority: known(3), regressed: false });
+  expect(adoptExecutionGeneration({ known: false }, { answered: true, generation: 1 })).toEqual({ authority: known(1), regressed: false });
+  // 정지 세대 0은 첫 설치의 유효값이다(권위 기록으로 받는다).
+  expect(latestStopOf({ answered: true, record: { state: "recorded", generation: 0, stopped: false } })).toEqual({ generation: 0, stopped: false });
+});
+
+test("정지 기록 변환의 재검사: 칸이 빠지거나 남은 기록, 범위 밖 값, -0은 모름이다", () => {
+  const bad: unknown[] = [
+    { state: "recorded", generation: 7 },
+    { state: "recorded", stopped: true },
+    { state: "recorded", generation: 7, stopped: true, extra: 1 },
+    { state: "absent", generation: 0 },
+    { state: "recorded", generation: -0, stopped: true },
+    { state: "recorded", generation: -1, stopped: true },
+    { state: "recorded", generation: 1.5, stopped: true },
+    { state: "recorded", generation: "7", stopped: true },
+    { state: "recorded", generation: 7, stopped: "true" },
+    [],
+  ];
+  for (const record of bad) {
+    let reason = "returned";
+    try {
+      latestStopOf({ answered: true, record } as unknown as StopRecordOutcome);
+    } catch (error) {
+      reason = error instanceof StopRecordUnknown ? error.reason : String(error);
+    }
+    expect(reason, JSON.stringify(record)).toBe("reply_rejected");
+  }
+});

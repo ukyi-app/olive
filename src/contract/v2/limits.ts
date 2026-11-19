@@ -23,3 +23,7 @@ export const CANDIDATE_CHUNK_MAX_BYTES = 32 * 1024;
 // 후보 하나의 전체 바이트 상한 1MiB(조각 32개). 관리자 결정(2026-11-19). 이보다 큰 후보는 이 판으로 옮기지 않는다: 감독은 그런
 // 후보를 내지 않고, 현관은 total·offset이 이 값을 넘는 묻기·답을 본문 해석에서 거절한다. 바꾸면 offset·total의 경계가 바뀌어 새 판이다.
 export const CANDIDATE_MAX_BYTES = 1024 * 1024;
+// 후보 하나를 이루는 내용 조각의 최대 개수(관리자 결정 2026-11-19: 1MiB, 최대 32조각). 현관은 한 후보에 위치 32곳까지만 묻고,
+// 조립은 조각이 이보다 많으면 거절한다. 같은 위치의 재시도는 그 위치의 결과를 바꿀 뿐 새 조각이 아니다. 감독이 마지막 조각 밖에서
+// 조각을 꽉 채워야(candidatePieceOf) 1MiB가 32조각에 든다.
+export const CANDIDATE_MAX_CHUNKS = CANDIDATE_MAX_BYTES / CANDIDATE_CHUNK_MAX_BYTES;

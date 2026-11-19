@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "supervisor": "26NGJtsZjfDn-ajBiEaeJmkXL2MNpdRLhZxWXfGe-VM"
+    "supervisor": "Zf-w9GaaOD0XDsZ4cbSbxNEpJO9y5YGBOXMBxyHlz1k"
   },
   "context": {
     "now": 1795046400000,
@@ -29,7 +29,11 @@
     "awaiting": {
       "00000000-0000-4000-8000-000000000080": {
         "action": "candidate_fetch",
-        "job": null
+        "job": null,
+        "body": {
+          "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+          "offset": 0
+        }
       }
     },
     "spent_nonces": []
@@ -46,7 +50,7 @@
       "request_id": "00000000-0000-4000-8000-000000000082",
       "nonce": "00000000000000000000000000000082"
     },
-    "signature": "EYq03c87JZEzL5YSkzLoEwT4fyoICQI0hVcuNB0MOZj5xEzFV1hnwrGnchQnw-se_B7mfOgLOZvdOnTqIyo2CQ",
+    "signature": "95L0Trn8JknOy75M0Rzaf4gdVBfQilBs1GUd7AwaEQ79GfxxV_JMY4PcUecJLF9KCYpNXltu74v4KwComIS2Cg",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000080",
       "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",

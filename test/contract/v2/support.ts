@@ -132,7 +132,7 @@ export const PROBE_BUNDLE: Bundle = {
     probe_return: probe("supervisor", false, { stop: "current", execution: "current" }),
     // 새 정지의 준비(지금 + 1)와 준비에 묶인 확정.
     probe_stop_prepare: probe("front-door", true, { stop: "next", execution: "not_applicable" }),
-    probe_stop_commit: probe("front-door", true, { stop: "prepared", execution: "not_applicable" }),
+    probe_stop_commit: probe("front-door", true, { stop: "prepared_newer", execution: "not_applicable" }),
   },
 };
 export const PROBE: Contract = defineContract([COMMON_BUNDLE, PROBE_BUNDLE]);
@@ -148,7 +148,7 @@ export function probeBody(action: string, jobId: string, over: Record<string, un
     const rule = spec.generations[kind];
     const known = KNOWN_GENERATIONS[kind];
     if (rule === "not_applicable" || !known.known) continue;
-    body[GENERATION_FIELDS[kind]] = rule === "current" ? known.current : rule === "prepared" ? known.prepared : known.current + 1;
+    body[GENERATION_FIELDS[kind]] = rule === "current" ? known.current : rule === "prepared_newer" || rule === "prepared_current" ? known.prepared : known.current + 1;
   }
   for (const [key, value] of Object.entries(over)) {
     if (value === undefined) delete body[key];

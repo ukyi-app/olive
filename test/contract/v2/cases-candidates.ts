@@ -22,7 +22,7 @@ export function buildCandidateCases(keys: Keys): V2Case[] {
     );
   // 현관: 인사가 끝났고 candidate_fetch 하나를 보내 기다린다. 조회라 세대는 몰라도 된다.
   const atFront = (over: Partial<CaseContext> = {}) =>
-    baseContext("front-door", { handshake: "agreed", intake_open: true, awaiting: { [fetchMsg.header.request_id]: { action: "candidate_fetch", job: null } }, ...over });
+    baseContext("front-door", { handshake: "agreed", intake_open: true, awaiting: { [fetchMsg.header.request_id]: { action: "candidate_fetch", job: null, body: fetchMsg.body } }, ...over });
 
   const fetch = accept(
     keys,
@@ -72,7 +72,7 @@ export function buildCandidateCases(keys: Keys): V2Case[] {
     "candidate-chunk-last-byte",
     "1MiB 후보의 마지막 1바이트 조각(total = 1,048,576, offset + 길이 = total). 32번째 조각의 끝이다",
     "front-door",
-    baseContext("front-door", { handshake: "agreed", intake_open: true, awaiting: { [lastFetchMsg.header.request_id]: { action: "candidate_fetch", job: null } } }),
+    baseContext("front-door", { handshake: "agreed", intake_open: true, awaiting: { [lastFetchMsg.header.request_id]: { action: "candidate_fetch", job: null, body: lastFetchMsg.body } } }),
     envelope(
       keys,
       { sender: "supervisor", recipient: "front-door", action: "candidate_chunk", request_id: id(0x84), nonce: nonceOf(0x84) },
@@ -182,6 +182,13 @@ export function buildCandidateCases(keys: Keys): V2Case[] {
       reason: "body_malformed",
       changed: ["message.body.piece.state"],
       edit: (c) => void ((c.message.body.piece as { state: string }).state = "expired"),
+    }),
+    on(unavailable)({
+      name: "candidate-chunk-unavailable-other-offset",
+      description: "위치 0을 물은 묻기에 위치 1을 되풀이한 줄 수 없음 답. 물은 위치와 다른 답은 그 묻기의 확정된 '줄 수 없음'이 아니다",
+      reason: "reply_mismatch",
+      changed: ["message.body.offset"],
+      edit: (c) => void (c.message.body.offset = 1),
     }),
   ];
 }

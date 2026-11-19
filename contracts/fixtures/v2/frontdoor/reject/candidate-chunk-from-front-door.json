@@ -15,7 +15,7 @@
     "reason": "wrong_direction"
   },
   "keys": {
-    "front-door": "Iif0NsJ3dC2Q80O928_N2yMbjXdgjo0FYn0L5DUs8KE"
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
   },
   "context": {
     "now": 1795046400000,
@@ -34,7 +34,11 @@
     "awaiting": {
       "00000000-0000-4000-8000-000000000080": {
         "action": "candidate_fetch",
-        "job": null
+        "job": null,
+        "body": {
+          "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
+          "offset": 0
+        }
       }
     },
     "spent_nonces": []
@@ -51,7 +55,7 @@
       "request_id": "00000000-0000-4000-8000-000000000081",
       "nonce": "00000000000000000000000000000081"
     },
-    "signature": "Fc1Reia8Kfsh2a3cSe8dkXzQTex15RG9yfd-YQQhvWb9baPcNMHzsw5VQdMtoAEjq_-aKt5Dv8gwmaIXSK1MDA",
+    "signature": "PPDmg0IbuPYoDA-Fj7uRvVrppBXf1irXnR1LOxhibsXDbTLF0_xAsfHu_laJzQ7NklDGpXwEIx4e2gX_Aq2NAg",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000080",
       "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",

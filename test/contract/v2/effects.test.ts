@@ -92,10 +92,26 @@ test("게시 후보 벡터 재생", async () => {
   expect(gotOther.ok && gotOther.job?.request_digest).not.toBe(candidate.header.body_digest);
 
   // 바로 답: posted·not_posted 둘 다 확정이다. 다른 작업·다른 본문의 답은 받지 않는다.
-  for (const outcome of ["posted", "not_posted"]) {
-    expect((await at(status(candidate, candidate.header.request_id, { state: "confirmed", result: { outcome } }), "supervisor", { awaiting: awaitingOf(candidate) })).ok, outcome).toBe(true);
+  for (const result of [{ outcome: "posted", pr_number: 17 }, { outcome: "not_posted" }]) {
+    expect((await at(status(candidate, candidate.header.request_id, { state: "confirmed", result }), "supervisor", { awaiting: awaitingOf(candidate) })).ok, result.outcome).toBe(true);
   }
-  expect(await at(status(other, candidate.header.request_id, { state: "confirmed", result: { outcome: "posted" } }), "supervisor", { awaiting: awaitingOf(candidate) })).toEqual({ ok: false, reason: "reply_mismatch" });
+  expect(await at(status(other, candidate.header.request_id, { state: "confirmed", result: { outcome: "posted", pr_number: 17 } }), "supervisor", { awaiting: awaitingOf(candidate) })).toEqual({
+    ok: false,
+    reason: "reply_mismatch",
+  });
+  // posted는 PR 번호를 반드시 싣는다: 없거나 양의 안전 정수가 아니면 body_malformed. 바로 답과 같은 작업의 조회가 같은 번호를 준다.
+  // not_posted에는 번호가 없다(실으면 unknown_field).
+  const postedWith = (result: unknown) => at(status(candidate, candidate.header.request_id, { state: "confirmed", result }), "supervisor", { awaiting: awaitingOf(candidate) });
+  // 소수는 정규화가 먼저 거절해 봉투를 만들 수 없으므로 여기 두지 않는다.
+  for (const bad of [{ outcome: "posted" }, { outcome: "posted", pr_number: 0 }, { outcome: "posted", pr_number: -1 }, { outcome: "posted", pr_number: "17" }, { outcome: "posted", pr_number: null }]) {
+    expect(await postedWith(bad), JSON.stringify(bad)).toEqual({ ok: false, reason: "body_malformed" });
+  }
+  expect(await postedWith({ outcome: "not_posted", pr_number: 17 })).toEqual({ ok: false, reason: "unknown_field" });
+  const lookup = fromSupervisor("job_lookup", { job_id: id(0xe03), action: "publication_candidate", request_digest: candidate.header.body_digest });
+  const viaLookup = await at(status(candidate, lookup.header.request_id, { state: "confirmed", result: { outcome: "posted", pr_number: 17 } }), "supervisor", {
+    awaiting: { [lookup.header.request_id]: { action: "job_lookup", job: { job_id: id(0xe03), action: "publication_candidate", request_digest: candidate.header.body_digest } } },
+  });
+  expect(viaLookup.ok && (viaLookup.body as { status: unknown }).status).toEqual({ state: "confirmed", result: { outcome: "posted", pr_number: 17 } });
 
   // 세대: 현관의 지금 값(정지 8, 실행 4)과 같아야 한다. 정지를 풀기 전 실행 세대(3)의 늦은 후보, 새 정지(9)가 원장에 적힌 뒤의 옛 정지 세대 후보는 거절.
   const mismatch = { ok: false, reason: "generation_mismatch" } as const;
@@ -268,8 +284,10 @@ test("멈춤의 이유: stopped에만 닫힌 목록의 값 하나가 반드시 �
 
 test("모름 조회가 확정 없음과 다름", async () => {
   // 묻는 쪽의 결론: 확정만 posted·not_posted, 대기는 대기, 현관의 unknown과 답 없음은 던진다(포트의 모름).
-  const confirmed = (outcome: string): LookupOutcome => ({ answered: true, status: { state: "confirmed", result: { outcome } } });
+  const confirmed = (outcome: string): LookupOutcome => ({ answered: true, status: { state: "confirmed", result: outcome === "posted" ? { outcome, pr_number: 17 } : { outcome } } });
   expect(publicationLookupOf(confirmed("posted"))).toEqual({ kind: "confirmed", outcome: "posted" });
+  // 번호 없는 posted(타입을 어긴 입력)는 확정으로 읽지 않는다.
+  expect(() => publicationLookupOf({ answered: true, status: { state: "confirmed", result: { outcome: "posted" } } })).toThrow(PublicationUnknown);
   expect(publicationLookupOf(confirmed("not_posted"))).toEqual({ kind: "confirmed", outcome: "not_posted" });
   expect(publicationLookupOf({ answered: true, status: { state: "pending" } })).toEqual({ kind: "pending" });
   const unknownOf = (outcome: LookupOutcome) => {

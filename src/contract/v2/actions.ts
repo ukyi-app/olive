@@ -15,10 +15,12 @@ export interface JobRef {
 }
 
 // 이 연결에서 보내고 아직 답을 기다리는 요청 하나. action은 그 요청의 동작, job은 그 요청이 가리키는 작업(효과 요청이면 그 작업,
-// job_lookup이면 묻는 작업, 그 밖은 null).
+// job_lookup이면 묻는 작업, 그 밖은 null). body는 그 요청에 실어 보낸 본문이고, 답이 요청 본문의 값을 되풀이하는 동작(지금은
+// candidate_fetch의 답)만 쓴다. 그런 요청에 body가 없으면 답은 reply_mismatch다(물은 것과 대조하지 못한 답을 받지 않는다).
 export interface Awaited {
   action: string;
   job: JobRef | null;
+  body?: unknown;
 }
 
 export interface BodyContext {
@@ -162,6 +164,12 @@ const QUERIES_DURING_POLICY_MISMATCH = true;
 // 확정은 받고, 풀기와 새 일은 막는다. 효과가 duringPolicyMismatch: true를 선언하려면 이름이 이 목록에 있어야 한다(defineContract).
 // 이 목록을 넓히는 것은 관리자 결정을 넓히는 일이다: 풀기를 넣으면 정책이 맞지 않는 현관이 실행을 다시 열 수 있다.
 export const EFFECTS_DURING_POLICY_MISMATCH: readonly string[] = Object.freeze(["stop_prepare", "stop_commit"]);
+
+// 정지 세대·실행 세대를 모두 싣지 않는(둘 다 not_applicable) 효과 동작의 닫힌 목록. 관리자 결정(2026-11-20): 입력 취소와 이미 일어난
+// 바깥 사실 셋은 감독이 세대를 모르는 복원 1단계와 정지 중에도 받아야 잃지 않으므로 이름으로 예외를 둔다. 효과가 두 세대를 모두
+// not_applicable로 선언하려면 이름이 이 목록에 있어야 한다(defineContract). 목록을 넓히는 것은 관리자 결정을 넓히는 일이다: 세대 없는
+// 효과는 서명이 맞으면 어느 정지 세대에서 발행됐는지 대조하지 않고 받는다.
+export const EFFECTS_WITHOUT_GENERATIONS: readonly string[] = Object.freeze(["input_cancel", "publication_changed", "merge_observed", "source_forgotten"]);
 
 export const COMMON_BUNDLE: Bundle = {
   name: "common",

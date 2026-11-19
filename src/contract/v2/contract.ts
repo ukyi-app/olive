@@ -13,11 +13,12 @@ import {
   type Bundle,
   COMMON_BUNDLE,
   EFFECTS_DURING_POLICY_MISMATCH,
+  EFFECTS_WITHOUT_GENERATIONS,
   type HandshakeState,
   type JobRef,
 } from "./actions.ts";
 import type { RejectReason } from "./errors.ts";
-import { type GenerationAuthorities, generationFieldFault, generationMismatch, isGenerationRules } from "./generations.ts";
+import { GENERATION_KINDS, type GenerationAuthorities, generationFieldFault, generationMismatch, isGenerationRules } from "./generations.ts";
 import { type Header, isParty, type Party, parseHeader } from "./header.ts";
 import { CLOCK_SKEW_MS, CONTRACT, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS } from "./limits.ts";
 import { ACTION_NAME, FORBIDDEN_FIELD_NAMES, findForbidden, isPlainObject, SchemaError, SUPERVISOR_FORBIDDEN_FIELD_NAMES, UUID } from "./schema.ts";
@@ -115,6 +116,9 @@ export function defineContract(bundles: readonly Bundle[]): Contract {
       }
       if (spec.class === "effect" ? !isGenerationRules(spec.generations) : spec.generations !== undefined) {
         throw new Error(`${where}: 효과 동작만, 그리고 모두 정지·실행 세대 규칙(generations)을 닫힌 목록에서 하나씩 선언한다`);
+      }
+      if (spec.class === "effect" && GENERATION_KINDS.every((kind) => spec.generations[kind] === "not_applicable") && !EFFECTS_WITHOUT_GENERATIONS.includes(name)) {
+        throw new Error(`${where}: 효과 동작은 세대 하나 이상을 싣는다(두 세대 모두 not_applicable은 EFFECTS_WITHOUT_GENERATIONS의 넷만 예외)`);
       }
       const from = Object.freeze([...spec.from]);
       table[name] = Object.freeze(spec.class === "effect" ? { ...spec, from, generations: Object.freeze({ ...spec.generations }) } : { ...spec, from });

@@ -12,7 +12,7 @@
     "reason": "unknown_field"
   },
   "keys": {
-    "front-door": "Iif0NsJ3dC2Q80O928_N2yMbjXdgjo0FYn0L5DUs8KE"
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
   },
   "context": {
     "now": 1795046400000,
@@ -43,7 +43,7 @@
       "request_id": "00000000-0000-4000-8000-000000000080",
       "nonce": "00000000000000000000000000000080"
     },
-    "signature": "l6Xgzf4RRoK-3FqDBdcOBwhpTimxpIRcNrtgsRiJhji5aTgyKr3wJsux_urlzQkBvFZgd3a0504HuTmOCAHjCA",
+    "signature": "_SbHWNhXpv0iy43PJDy05wN-Kf3dFnONvBKZQ70jYoGMLrKuACfQxcClfmww1Mvg51XPStjCDNvgunxRUhkvBg",
     "body": {
       "candidate_digest": "f7919ba32b7f4a663c289e59c9663c5f0a95c33439919106ad541ad1ae39e8b2",
       "offset": 0,

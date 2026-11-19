@@ -7,7 +7,7 @@ const transpiler = new Bun.Transpiler({ loader: "ts" });
 const files = await list("src/contract/**/*.ts");
 
 test("정적: 계약 모듈은 자기 판 폴더 안과 node:crypto만 import한다(v2는 v1 공개 면도)", async () => {
-  expect(files.length).toBeGreaterThan(5);
+  expect(files.filter((file) => file.startsWith("src/contract/v1/")).length).toBeGreaterThan(5);
   for (const file of files) {
     const source = await readText(file);
     for (const { path } of transpiler.scanImports(source)) {

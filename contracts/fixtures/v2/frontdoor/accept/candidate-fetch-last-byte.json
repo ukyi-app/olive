@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "front-door": "Iif0NsJ3dC2Q80O928_N2yMbjXdgjo0FYn0L5DUs8KE"
+    "front-door": "EhZEvroQRmeQbDZFU1rTvLRX0-cXABMHuppB2KeU_6k"
   },
   "context": {
     "now": 1795046400000,
@@ -41,7 +41,7 @@
       "request_id": "00000000-0000-4000-8000-000000000083",
       "nonce": "00000000000000000000000000000083"
     },
-    "signature": "FqP2j_VZbGLRB98G2aw7uKY5HnUXzLSNMVTiddXtxnBstr7GLAW7AO4OIkCLim5hD_MxGlSb4z23IZfvw1apCw",
+    "signature": "PgVQTBXYMHZRePXIeSTLSJSYs66KSMFmKE2ER8Z34___kbJnrvNl7Yx25HkGAEgP6kps9ovgJr_Hf4D-Yt8hAQ",
     "body": {
       "candidate_digest": "9bc1b2a288b26af7257a36277ae3816a7d4f16e89c1e7e77d0a5c48bad62b360",
       "offset": 1048575

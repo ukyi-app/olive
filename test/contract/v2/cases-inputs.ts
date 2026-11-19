@@ -14,6 +14,8 @@ export const INPUT_JOB = id(0x70);
 const CARD_JOB = id(0x7a);
 const PUBLICATION_JOB = id(0x7b);
 const CANDIDATE = "d".repeat(64);
+// 병합 시각: 봉투를 낸 때보다 한 시간 앞. 재전달 봉투도 같은 본문이라 같은 값이다.
+export const MERGED_AT = ISSUED - 3_600_000;
 
 const jobOf = (message: Envelope) => ({ job_id: (message.body as { job_id: string }).job_id, action: message.header.action, request_digest: message.header.body_digest });
 
@@ -96,10 +98,10 @@ export function buildInputCases(keys: Keys): V2Case[] {
   const merge = accept(
     keys,
     "merge-observed",
-    "게시한 PR의 병합 관측: 게시 요청의 작업 ID와 병합 커밋",
+    "게시한 PR의 병합 관측: 게시 요청의 작업 ID, 병합 커밋, 현관이 게시 서비스에서 확인한 병합 시각. 감독이 두 세대를 모두 몰라도 받는다(세대 없는 효과의 닫힌 목록)",
     "supervisor",
     closedUnknown,
-    fromFront("merge_observed", 0x68, { job_id: id(0x75), publication_job_id: PUBLICATION_JOB, merge_commit: "e".repeat(40) }),
+    fromFront("merge_observed", 0x68, { job_id: id(0x75), publication_job_id: PUBLICATION_JOB, merge_commit: "e".repeat(40), merged_at: MERGED_AT }),
     OK,
   );
   const forget = accept(
@@ -236,6 +238,13 @@ export function buildInputCases(keys: Keys): V2Case[] {
       reason: "body_malformed",
       changed: ["message.body.seq"],
       edit: (c) => void delete c.message.body.seq,
+    }),
+    variant(keys, merge, {
+      name: "merge-observed-without-merged-at",
+      description: "병합 관측에 병합 시각이 없다. 봉투의 발급 시각은 보낼 때마다 새로 정해져 병합 뒤 확인의 기준이 될 수 없다",
+      reason: "body_malformed",
+      changed: ["message.body.merged_at"],
+      edit: (c) => void delete c.message.body.merged_at,
     }),
     variant(keys, forget, {
       name: "source-forgotten-raw-text",

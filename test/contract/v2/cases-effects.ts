@@ -68,10 +68,10 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
   const publicationPosted = accept(
     keys,
     "publication-candidate-posted",
-    "게시 후보의 바로 답: 확정 posted",
+    "게시 후보의 바로 답: 확정 posted와 게시 서비스가 정한 PR 번호(양의 안전 정수). 같은 작업의 조회도 같은 번호를 준다",
     "supervisor",
     atSupervisor({ awaiting: awaitingOf(publicationMsg) }),
-    statusOf(0x65, publicationMsg, publicationMsg.header.request_id, { state: "confirmed", result: { outcome: "posted" } }),
+    statusOf(0x65, publicationMsg, publicationMsg.header.request_id, { state: "confirmed", result: { outcome: "posted", pr_number: 17 } }),
     OK,
   );
   // 바로 답을 잃은 감독이 재시작 복원(§8의 4)에서 같은 작업 ID로 묻는다. 정책이 어긋나도, 접수가 닫혀도 된다(이미 보낸 작업의 결과).
@@ -211,6 +211,13 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
       changed: ["message.body.status.result.outcome"],
       edit: (c) => void ((c.message.body.status as { result: { outcome: string } }).result.outcome = "unknown"),
     }),
+    on(publicationPosted)({
+      name: "publication-posted-without-pr-number",
+      description: "게시됨(posted)인데 PR 번호가 없는 확정 답. 감독이 장애 색인에 적을 번호를 복원할 수 없으므로 받지 않는다",
+      reason: "body_malformed",
+      changed: ["message.body.status.result.pr_number"],
+      edit: (c) => void delete (c.message.body.status as { result: Record<string, unknown> }).result.pr_number,
+    }),
     on(lookupUnknown)({
       name: "publication-lookup-unknown-with-result",
       description: "모름 답에 결과 칸(not_posted)을 붙임. 모름은 결과를 실을 수 없다",
@@ -288,6 +295,13 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
       reason: "body_malformed",
       changed: ["message.body.generation"],
       edit: (c) => void (c.message.body.generation = -1),
+    }),
+    on(executionReply)({
+      name: "execution-generation-reply-zero",
+      description: "실행 세대가 0인 답. 감독 장부의 실행 세대는 1에서 시작하므로 0은 권위 값이 될 수 없다",
+      reason: "body_malformed",
+      changed: ["message.body.generation"],
+      edit: (c) => void (c.message.body.generation = 0),
     }),
   ];
 }

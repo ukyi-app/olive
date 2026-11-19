@@ -18,9 +18,13 @@ export const GENERATION_FIELDS: Readonly<Record<GenerationKind, string>> = Objec
 // - not_applicable: 이 세대와 무관한 동작. 칸을 싣지 않는다(실으면 body_malformed: 검사되지 않는 세대 값이 처리기에 가지 않게).
 // - current: 받는 쪽의 지금 세대와 같아야 한다. 일반 효과.
 // - next: 지금 세대 + 1이어야 한다. 새 세대를 여는 준비(예: 새 정지의 준비).
-// - newer: 지금 세대보다 커야 한다. 건너뛴 세대를 허용하는 준비.
-// - prepared: 받는 쪽이 받아 둔 준비의 세대와 같아야 한다. 준비에 묶인 확정. 받아 둔 준비가 없으면 거절한다.
-export const GENERATION_RULES = ["not_applicable", "current", "next", "newer", "prepared"] as const;
+// - newer: 지금 세대보다 크고, 받아 둔 준비가 있으면 그 세대 이상이어야 한다. 건너뛴 세대를 허용하는 준비. 더 높은 준비를 받은 뒤
+//   늦게 온 낮은 준비는 받지 않는다(받으면 처리기가 준비 칸을 낮춰 더 높은 준비의 확정이 막힌다).
+// - prepared_newer: 받아 둔 준비의 세대와 같고 그 세대가 지금보다 커야 한다. 새 세대를 여는 준비(정지 준비)에 묶인 확정.
+// - prepared_current: 받아 둔 준비의 세대와 같고 그 세대가 지금과 같아야 한다. 지금 세대 안의 준비(풀기 준비)에 묶인 확정.
+//   준비 칸 하나를 두 종류의 준비가 함께 쓰므로, 확정은 번호만이 아니라 준비의 종류(지금보다 큰가, 같은가)까지 맞아야 한다.
+//   두 prepared 규칙 모두 받아 둔 준비가 없으면 거절한다.
+export const GENERATION_RULES = ["not_applicable", "current", "next", "newer", "prepared_newer", "prepared_current"] as const;
 export type GenerationRule = (typeof GENERATION_RULES)[number];
 
 // 효과 동작이 등록할 때 반드시 두는 선언. 두 세대 각각에 규칙 하나.
@@ -83,9 +87,11 @@ function satisfies(rule: Exclude<GenerationRule, "not_applicable">, value: numbe
     case "next":
       return value === known.current + 1;
     case "newer":
-      return value > known.current;
-    case "prepared":
-      return known.prepared !== null && value === known.prepared;
+      return value > known.current && (known.prepared === null || value >= known.prepared);
+    case "prepared_newer":
+      return known.prepared !== null && value === known.prepared && value > known.current;
+    case "prepared_current":
+      return known.prepared !== null && value === known.prepared && value === known.current;
   }
 }
 
@@ -98,11 +104,12 @@ export type ExecutionGenerationOutcome = { answered: true; generation: number } 
 // (execution_generation_reply), 그리고 release_commit이 released로 확정된 본문의 execution_generation({ answered: true, generation }).
 // 실행 세대는 풀 때만 오르므로 받은 값이 아는 값보다 작으면 낮추지 않는다. 작은 값은 늦게 온 옛 답이거나 감독 장부의 되돌림이고,
 // 낮추면 옛 실행의 후보가 다시 통과한다. 그대로 두면 감독의 후보가 generation_mismatch로 닫힌다(regressed로 알린다).
-// 답이 없거나 값의 꼴이 틀리면 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다).
+// 답이 없거나 값의 꼴이 틀리면 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다). 실행 세대는 1 이상이다(감독 장부의
+// run_epoch는 1에서 시작한다): 0은 감독이 확정할 수 없는 값이라 꼴이 틀린 값과 같이 받지 않는다.
 export function adoptExecutionGeneration(previous: GenerationAuthority, outcome: ExecutionGenerationOutcome): { authority: GenerationAuthority; regressed: boolean } {
   if (outcome.answered !== true) return { authority: previous, regressed: false };
   const value: unknown = outcome.generation;
-  if (!isGeneration(value)) return { authority: previous, regressed: false };
+  if (!isGeneration(value) || value < 1) return { authority: previous, regressed: false };
   if (!previous.known) return { authority: { known: true, current: value, prepared: null }, regressed: false };
   if (value < previous.current) return { authority: previous, regressed: true };
   return { authority: { known: true, current: value, prepared: previous.prepared }, regressed: false };

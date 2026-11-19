@@ -4,6 +4,7 @@ import { expect, test } from "bun:test";
 import { type Envelope, SealError } from "../../../src/contract/v2/contract.ts";
 import type { GenerationAuthorities } from "../../../src/contract/v2/generations.ts";
 import {
+  EFFECTS_WITHOUT_GENERATIONS,
   EVENT_ACTIONS,
   EVENT_BUNDLE,
   FRONTDOOR_CONTRACT,
@@ -16,7 +17,7 @@ import {
 import { REF as LEDGER_REF, SOURCE_REF as LEDGER_SOURCE_REF, sourceRef as ledgerSourceRef } from "../../../src/ledger/input.ts";
 import { list, readText } from "../../files.ts";
 import { FIXTURE_DIR } from "./cases.ts";
-import { buildInputCases, INPUT_JOB, SOURCE_REF_EXAMPLE, SUPERVISOR_GENERATIONS } from "./cases-inputs.ts";
+import { buildInputCases, INPUT_JOB, MERGED_AT, SOURCE_REF_EXAMPLE, SUPERVISOR_GENERATIONS } from "./cases-inputs.ts";
 import { baseContext, type CaseContext, contextOf, envelope, freshKeys, id, ISSUED, nonceOf, trustedRaw, UNKNOWN_GENERATIONS } from "./support.ts";
 
 const keys = freshKeys();
@@ -59,7 +60,7 @@ const DIGEST = "d".repeat(64);
 const EVENT_BODIES: Record<(typeof EVENT_ACTIONS)[number], Record<string, unknown>> = {
   approval_changed: { job_id: id(0xc10), stop_generation: 7, card_job_id: CARD, candidate_digest: DIGEST, seq: 1, state: "approved" },
   publication_changed: { job_id: id(0xc11), publication_job_id: PUBLICATION, candidate_digest: DIGEST, seq: 1, state: "posted" },
-  merge_observed: { job_id: id(0xc12), publication_job_id: PUBLICATION, merge_commit: "e".repeat(40) },
+  merge_observed: { job_id: id(0xc12), publication_job_id: PUBLICATION, merge_commit: "e".repeat(40), merged_at: MERGED_AT },
   source_forgotten: { job_id: id(0xc13), source_ref: SOURCE_REF_EXAMPLE.ref },
 };
 
@@ -292,5 +293,32 @@ test("이벤트 종류 밖 거절", async () => {
   // 순번은 1 이상의 정수다(소수는 정규화가 먼저 거절해 봉투를 만들 수 없으므로 여기 두지 않는다).
   for (const seq of [0, -1, "1", null]) {
     expect(await at(fromFront("publication_changed", { ...EVENT_BODIES.publication_changed, seq }), "supervisor"), String(seq)).toEqual({ ok: false, reason: "body_malformed" });
+  }
+  // 병합 시각은 1 이상의 밀리초 정수다. 재전달(같은 본문, 새 봉투)은 같은 병합 시각과 같은 request_digest를 준다.
+  for (const merged_at of [0, -1, "2026-11-19", null]) {
+    expect(await at(fromFront("merge_observed", { ...EVENT_BODIES.merge_observed, merged_at }), "supervisor"), String(merged_at)).toEqual({ ok: false, reason: "body_malformed" });
+  }
+  const merge = await at(fromFront("merge_observed", EVENT_BODIES.merge_observed), "supervisor");
+  const mergeAgain = await at(fromFront("merge_observed", EVENT_BODIES.merge_observed), "supervisor");
+  expect(merge.ok && (merge.body as { merged_at: number }).merged_at).toBe(MERGED_AT);
+  expect(mergeAgain.ok && mergeAgain.job).toEqual(merge.ok ? merge.job : null);
+});
+
+test("세대 없는 효과는 닫힌 목록의 넷뿐이고, 넷은 감독이 두 세대를 모두 몰라도 받는다", async () => {
+  expect(EFFECTS_WITHOUT_GENERATIONS).toEqual(["input_cancel", "publication_changed", "merge_observed", "source_forgotten"]);
+  expect(Object.isFrozen(EFFECTS_WITHOUT_GENERATIONS)).toBe(true);
+  // 표에서 두 세대가 모두 not_applicable인 효과는 정확히 이 넷이다.
+  const without = Object.entries(FRONTDOOR_CONTRACT.actions)
+    .filter(([, spec]) => spec.class === "effect" && spec.generations.stop === "not_applicable" && spec.generations.execution === "not_applicable")
+    .map(([name]) => name);
+  expect(without).toEqual([...EFFECTS_WITHOUT_GENERATIONS]);
+  const bodies: Record<string, Record<string, unknown>> = {
+    input_cancel: { job_id: id(0xc20), input_job_id: INPUT_JOB },
+    publication_changed: EVENT_BODIES.publication_changed,
+    merge_observed: EVENT_BODIES.merge_observed,
+    source_forgotten: EVENT_BODIES.source_forgotten,
+  };
+  for (const name of EFFECTS_WITHOUT_GENERATIONS) {
+    expect((await at(fromFront(name, bodies[name]), "supervisor", { intake_open: false, generations: UNKNOWN_GENERATIONS })).ok, name).toBe(true);
   }
 });

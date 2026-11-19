@@ -3,8 +3,8 @@
 // chunk_b64url 하나뿐이다. 어느 digest에 답할지, 보관 기한, 내용을 로그에 남기지 않는 것은 감독 처리기의 일이다. 표는 v2.md
 // "후보 내용 조회".
 import { createHash } from "node:crypto";
-import type { Bundle, ExchangeSpec, NoAnswerCause } from "./actions.ts";
-import { CANDIDATE_CHUNK_MAX_BYTES, CANDIDATE_MAX_BYTES } from "./limits.ts";
+import type { Awaited, Bundle, ExchangeSpec, NoAnswerCause } from "./actions.ts";
+import { CANDIDATE_CHUNK_MAX_BYTES, CANDIDATE_MAX_BYTES, CANDIDATE_MAX_CHUNKS } from "./limits.ts";
 import { int, isPlainObject, literal, object, type Parser, SchemaError, SHA256, sha256, uuid } from "./schema.ts";
 
 // 내용을 싣는 유일한 칸. 금지 이름(원문·비밀·v1, 감독 쪽 승인·목적지)과 겹치지 않고, 다른 동작의 본문은 모두 닫혀 있어
@@ -31,7 +31,7 @@ export interface CandidateChunkReply {
 // 다른 갈래로 둔다.
 export type CandidateFetchOutcome = { answered: true; reply: CandidateChunkReply } | { answered: false; cause: NoAnswerCause };
 
-export const ASSEMBLY_FAULTS = ["malformed", "other_candidate", "size_mismatch", "order", "overlap", "gap", "digest_mismatch"] as const;
+export const ASSEMBLY_FAULTS = ["malformed", "other_candidate", "too_many_chunks", "size_mismatch", "order", "overlap", "gap", "digest_mismatch"] as const;
 export type AssemblyFault = (typeof ASSEMBLY_FAULTS)[number];
 
 // complete만 내용으로 쓴다. unavailable은 감독의 확정된 "줄 수 없음", unknown은 답이 없어 모름(같은 묻기를 다시 낼 수 있다).
@@ -98,8 +98,10 @@ const rejected = (fault: AssemblyFault): CandidateAssembly => ({ kind: "rejected
 // 1. 꼴(타입을 어긴 입력도 런타임에 다시 본다)과 물은 digest의 되풀이. 서명이 맞아도 틀린 답은 무엇보다 먼저 거절한다.
 // 2. 감독이 줄 수 없다고 한 답이 있으면 unavailable. 다른 묻기의 시간 초과가 있어도 결론은 같다(그 후보를 쓸 수 없다).
 // 3. 답을 못 받은 묻기가 있으면 unknown. 빠진 조각을 gap으로 읽지 않는다(없다는 증거가 아니다).
-// 4. 조각의 이어짐: 전체 크기가 하나인지, offset이 줄지 않는지, 0부터 total까지 겹침·빈틈이 없는지.
+// 4. 조각의 개수(CANDIDATE_MAX_CHUNKS 이하)와 이어짐: 전체 크기가 하나인지, offset이 줄지 않는지, 0부터 total까지 겹침·빈틈이 없는지.
+//    개수를 먼저 본다: 32조각에서 멈추는 현관과 이 검증을 따르는 쪽이 같은 후보의 완료를 다르게 판정하지 않게.
 // 5. 이은 바이트의 digest. 앞의 검사를 다 지나도 내용이 하나라도 다르면 여기서 거절된다.
+// outcomes는 위치마다 마지막 결과 하나다(답을 받지 못한 위치를 다시 물으면 그 위치의 결과를 바꾼다).
 export function assembleCandidate(candidateDigest: string, outcomes: readonly CandidateFetchOutcome[]): CandidateAssembly {
   if (typeof candidateDigest !== "string" || !SHA256.test(candidateDigest) || !Array.isArray(outcomes)) return rejected("malformed");
   const chunks: { offset: number; total: number; bytes: Buffer }[] = [];
@@ -127,6 +129,7 @@ export function assembleCandidate(candidateDigest: string, outcomes: readonly Ca
   if (unanswered !== null) return { kind: "unknown", cause: unanswered };
 
   if (chunks.length === 0) return rejected("gap");
+  if (chunks.length > CANDIDATE_MAX_CHUNKS) return rejected("too_many_chunks");
   const total = chunks[0]!.total;
   if (chunks.some((chunk) => chunk.total !== total)) return rejected("size_mismatch");
   for (let i = 1; i < chunks.length; i++) if (chunks[i]!.offset < chunks[i - 1]!.offset) return rejected("order");
@@ -151,8 +154,14 @@ const candidateFetch: ExchangeSpec = {
   duringPolicyMismatch: false,
   parse: (body) => parseFetch(body, "body"),
 };
-// 감독만 답한다. in_reply_to가 이 연결에서 기다리는 candidate_fetch를 가리켜야 한다. 기다리는 요청(Awaited)에 묻기의 본문이 없어
-// 물은 digest·offset과의 대조는 현관이 한다(assembleCandidate가 digest를, 최종 digest가 내용 전체를 본다).
+// 감독만 답한다. in_reply_to가 이 연결에서 기다리는 candidate_fetch를 가리켜야 하고, 답의 candidate_digest·offset이 그 묻기의 본문
+// (Awaited.body)과 같아야 한다(reply_mismatch). 조각 답과 unavailable 답 모두 같다: 다른 위치를 되풀이한 unavailable이 그 묻기의
+// "확정된 줄 수 없음"으로 읽히지 않게.
+const sameFetch = (body: unknown, awaited: Awaited): boolean => {
+  const reply = body as CandidateChunkReply;
+  const asked = awaited.body;
+  return isPlainObject(asked) && asked.candidate_digest === reply.candidate_digest && asked.offset === reply.offset;
+};
 const candidateChunk: ExchangeSpec = {
   class: "query",
   from: ["supervisor"],
@@ -160,6 +169,7 @@ const candidateChunk: ExchangeSpec = {
   duringPolicyMismatch: false,
   parse: (body) => parseCandidateChunk(body, "body"),
   answers: (awaitedAction) => awaitedAction === "candidate_fetch",
+  matches: sameFetch,
 };
 
 // 이 묶음의 본문이 가질 수 있는 칸 이름 전부. 금지 이름과 부딪히지 않는다는 것을 시험이 본다.

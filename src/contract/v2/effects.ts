@@ -4,7 +4,7 @@
 // 보관소에 두어 digest로만 가리킨다. 선로 형식과 검증뿐이고 장부·Discord를 다루지 않는다. 표와 이유는 v2.md "답·카드·게시·진행".
 import type { Bundle, EffectSpec, ExchangeSpec, LookupOutcome, NoAnswerCause } from "./actions.ts";
 import { type GenerationRules, generationShape } from "./generations.ts";
-import { effectBody, generation, int, isPlainObject, object, oneOf, type Parser, sha256, uuid } from "./schema.ts";
+import { byOutcome, effectBody, int, isPlainObject, literal, object, oneOf, type Parser, sha256, uuid } from "./schema.ts";
 
 // 넷 모두 받는 쪽(현관)의 지금 정지·실행 세대와 같아야 한다. 정지 준비가 현관 원장에 적힌 뒤의 옛 정지 세대 후보, 풀기 전 실행
 // 세대의 늦은 후보(정지 중에 만들어져 풀린 뒤 닿은 것)를 서명이 맞아도 거절하려면 둘 다 필요하다.
@@ -90,14 +90,22 @@ export type ProgressUpdate =
   | (ProgressUpdateCommon & { stage: "stopped"; stop_cause: ProgressStopCause });
 
 // 확정 결과(job_status의 confirmed.result). 카드 요청의 결과에 승인은 없다: 승인은 현관의 이벤트로만 온다.
-// 게시의 결과는 복원 포트(PublicationPort)의 확정 두 값과 같다.
+// 게시의 결과 갈래는 복원 포트(PublicationPort)의 확정 두 값과 같다. posted는 게시 서비스가 정한 PR 번호(양의 안전 정수)를 싣는다:
+// 번호는 게시한 뒤에야 생기고 감독이 장애 색인에 적어야 하므로, 바로 답과 같은 job_id의 조회가 같은 번호를 준다.
 export type ReplyResult = { outcome: "posted" } | { outcome: "refused" };
 export type CardResult = { outcome: "shown" } | { outcome: "refused" };
-export type PublicationResult = { outcome: "posted" } | { outcome: "not_posted" };
+export type PublicationResult = { outcome: "posted"; pr_number: number } | { outcome: "not_posted" };
 // superseded: 같은 입력에서 이 순번 이상을 이미 보여 무시했다.
 export type ProgressResult = { outcome: "shown" } | { outcome: "superseded" } | { outcome: "refused" };
 
 const outcomes = <const T extends string>(values: readonly T[]): Parser<{ outcome: T }> => object({ outcome: oneOf(values) });
+// PR 번호. 금지 이름(정규화하면 prnumber)과 겹치지 않는다(시험이 EFFECTS_FIELD_NAMES로 본다).
+const PR_NUMBER_FIELD = "pr_number";
+const parsePublicationResult: Parser<PublicationResult> = byOutcome<PublicationResult>({
+  posted: object({ outcome: literal("posted"), pr_number: int(1) }),
+  not_posted: object({ outcome: literal("not_posted") }),
+});
+const isPrNumber = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 1;
 
 const outboundBody = (fields: Record<string, Parser<unknown>>) => effectBody({ ...fields, ...generationShape(OUTBOUND_GENERATIONS) });
 
@@ -129,6 +137,7 @@ export interface ExecutionGenerationReply {
 
 // 현관이 묻고 감독이 장부의 지금 실행 세대(run_epoch)로 답한다. 효과가 없고 세대를 싣지 않으므로 감독의 접수가 닫혀도,
 // 정책이 어긋난 연결에서도 오간다(계약 판이 뜻을 고정한 사실). 감독이 자기 값을 모르면 답하지 않는다: 모름 상태의 답은 없다.
+// 답의 generation은 1 이상이다: 감독 장부의 run_epoch는 1에서 시작하므로 0은 감독이 확정할 수 없는 값이다(현관의 권위 값이 되면 안 된다).
 // 현관은 답의 generation을 adoptExecutionGeneration(generations.ts)으로 받는다. 풀기 확정 값도 같은 함수라 두 길의 규칙이 같다.
 const executionGenerationLookup: ExchangeSpec = {
   class: "query",
@@ -142,7 +151,7 @@ const executionGenerationReply: ExchangeSpec = {
   from: ["supervisor"],
   duringClosedIntake: true,
   duringPolicyMismatch: true,
-  parse: (body) => object({ in_reply_to: uuid, generation })(body, "body"),
+  parse: (body) => object({ in_reply_to: uuid, generation: int(1) })(body, "body"),
   answers: (awaitedAction) => awaitedAction === "execution_generation_lookup",
 };
 
@@ -170,7 +179,8 @@ export function publicationLookupOf(outcome: LookupOutcome): PublicationLookup {
   if (status.state === "unknown") throw new PublicationUnknown("unknown");
   if (status.state === "confirmed" && isPlainObject(status.result)) {
     const result = status.result.outcome;
-    if (result === "posted" || result === "not_posted") return { kind: "confirmed", outcome: result };
+    if (result === "posted" && isPrNumber(status.result[PR_NUMBER_FIELD])) return { kind: "confirmed", outcome: result };
+    if (result === "not_posted") return { kind: "confirmed", outcome: result };
   }
   throw new PublicationUnknown("reply_rejected");
 }
@@ -192,6 +202,7 @@ export const EFFECTS_FIELD_NAMES: readonly string[] = Object.freeze([
     ...Object.keys(PROGRESS_FIELDS),
     ...Object.keys(PROGRESS_STOP_FIELD),
     "outcome",
+    PR_NUMBER_FIELD,
     "in_reply_to",
     "generation",
   ]),
@@ -202,7 +213,7 @@ export const EFFECTS_BUNDLE: Bundle = {
   actions: {
     reply_candidate: outboundEffect(outboundBody(REPLY_FIELDS), outcomes(["posted", "refused"])),
     approval_card_request: outboundEffect(outboundBody(CARD_FIELDS), outcomes(["shown", "refused"])),
-    publication_candidate: outboundEffect(outboundBody(PUBLICATION_FIELDS), outcomes(["posted", "not_posted"])),
+    publication_candidate: outboundEffect(outboundBody(PUBLICATION_FIELDS), parsePublicationResult),
     progress_update: outboundEffect(parseProgress, outcomes(["shown", "superseded", "refused"])),
     execution_generation_lookup: executionGenerationLookup,
     execution_generation_reply: executionGenerationReply,

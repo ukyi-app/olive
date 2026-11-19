@@ -233,6 +233,22 @@ export function buildStopCases(keys: Keys): V2Case[] {
         c.context.expected_recipient = "front-door";
       },
     }),
+    P({
+      name: "stop-prepare-below-prepared",
+      description: "더 높은 정지 준비(10)를 이미 받아 둔 감독에게 늦게 온 낮은 정지 준비(8). 받으면 준비 칸이 낮아져 10의 확정이 막힌다",
+      reason: "generation_mismatch",
+      changed: ["context.generations.stop.prepared"],
+      edit: (c) => void (c.context.generations = { ...c.context.generations, stop: known(7, 10) }),
+      signer: null,
+    }),
+    C({
+      name: "stop-commit-after-release-prepare",
+      description: "감독이 지금 정지 세대 8에서 풀기 준비(8)만 받아 둔 때 온 정지 확정(8). 번호가 같아도 정지 확정은 정지 준비(지금보다 큰 번호)에만 묶인다",
+      reason: "generation_mismatch",
+      changed: ["context.generations.stop.current"],
+      edit: (c) => void (c.context.generations = { ...c.context.generations, stop: known(8, 8) }),
+      signer: null,
+    }),
     C({
       name: "stop-commit-without-prepare",
       description: "받아 둔 준비가 없는 감독에게 온 정지 확정",
@@ -278,6 +294,21 @@ export function buildStopCases(keys: Keys): V2Case[] {
       changed: ["context.generations.stop.prepared"],
       edit: (c) => void (c.context.generations = { ...c.context.generations, stop: known(8, 9) }),
       signer: null,
+    }),
+    RC({
+      name: "release-commit-after-stop-prepare-only",
+      description: "감독이 지금 정지 세대 7에서 정지 준비(8)만 받아 둔 때 온 풀기 확정(8). 번호가 같아도 풀기 확정은 풀기 준비(지금과 같은 번호)에만 묶인다",
+      reason: "generation_mismatch",
+      changed: ["context.generations.stop.current"],
+      edit: (c) => void (c.context.generations = { ...c.context.generations, stop: known(7, 8) }),
+      signer: null,
+    }),
+    on(releasePrepareConfirmed)({
+      name: "release-prepare-execution-generation-one",
+      description: "풀기 준비의 답이 약속한 다음 실행 세대가 1. 감독 장부의 실행 세대는 1에서 시작하고 풀기가 1 올리므로 2 이상만 받는다",
+      reason: "body_malformed",
+      changed: ["message.body.status.result.execution_generation"],
+      edit: (c) => void ((c.message.body.status as { result: { execution_generation: number } }).result.execution_generation = 1),
     }),
     RC({
       name: "release-commit-execution-unknown",

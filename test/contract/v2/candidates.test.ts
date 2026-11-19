@@ -35,7 +35,7 @@ function at(message: unknown, receiver: Receiver, over: Partial<CaseContext> = {
 let n = 0xf00;
 const fromFront = (action: string, body: unknown) => envelope(keys, { sender: "front-door", recipient: "supervisor", action, request_id: id(++n), nonce: nonceOf(n) }, body);
 const fromSupervisor = (action: string, body: unknown) => envelope(keys, { sender: "supervisor", recipient: "front-door", action, request_id: id(++n), nonce: nonceOf(n) }, body);
-const awaitingFetch = (fetch: Envelope) => ({ [fetch.header.request_id]: { action: "candidate_fetch", job: null } });
+const awaitingFetch = (fetch: Envelope) => ({ [fetch.header.request_id]: { action: "candidate_fetch", job: null, body: fetch.body } });
 
 // 꾸며 낸 시험 글. 한국어 글자는 UTF-8로 3바이트라 조각 경계가 글자 가운데에 떨어진다(바이트 그대로 해시해야 맞는다).
 const encode = (text: string) => new TextEncoder().encode(text);
@@ -191,6 +191,43 @@ test("줄 수 없음과 무응답이 다른 값: unavailable은 감독의 답이
   expect(noReply.answered).toBe(false);
 });
 
+test("조각 수의 상한: 한 후보는 최대 32조각이다. 32조각은 완성하고 33조각은 too_many_chunks로 거절한다", () => {
+  expect(limits.CANDIDATE_MAX_CHUNKS).toBe(32);
+  // 위치마다 1바이트 조각으로 답한다(감독이 조각을 꽉 채우지 않은 경우). 같은 위치의 재시도는 결과를 바꿀 뿐 조각 수를 늘리지 않는다.
+  const oneByteEach = (content: Uint8Array): CandidateFetchOutcome[] =>
+    [...content].map((byte, offset) => ({
+      answered: true,
+      reply: {
+        in_reply_to: id(0xf80 + offset),
+        candidate_digest: candidateDigestOf(content),
+        offset,
+        piece: { state: "chunk", total: content.length, chunk_b64url: Buffer.from([byte]).toString("base64url") },
+      },
+    }));
+  const c32 = new Uint8Array(32).fill(0x62);
+  const c33 = new Uint8Array(33).fill(0x62);
+  const got32 = assembleCandidate(candidateDigestOf(c32), oneByteEach(c32));
+  expect(got32.kind === "complete" && Buffer.from(got32.bytes).equals(Buffer.from(c32))).toBe(true);
+  expect(assembleCandidate(candidateDigestOf(c33), oneByteEach(c33))).toEqual({ kind: "rejected", fault: "too_many_chunks" });
+  // 꽉 찬 조각이면 1MiB도 32조각에 든다(candidatePieceOf).
+  expect(Math.ceil(limits.CANDIDATE_MAX_BYTES / limits.CANDIDATE_CHUNK_MAX_BYTES)).toBe(32);
+});
+
+test("답의 위치는 물은 위치여야 한다: 다른 위치나 다른 digest를 되풀이한 답은 조각이든 줄 수 없음이든 reply_mismatch다", async () => {
+  const digest = candidateDigestOf(LONG);
+  const fetch = fromFront("candidate_fetch", { candidate_digest: digest, offset: 0 });
+  const answer = (offset: number, piece: unknown, asked = digest) =>
+    at(fromSupervisor("candidate_chunk", { in_reply_to: fetch.header.request_id, candidate_digest: asked, offset, piece }), "front-door", { awaiting: awaitingFetch(fetch) });
+  expect((await answer(0, { state: "unavailable" })).ok).toBe(true);
+  expect(await answer(1, { state: "unavailable" })).toEqual({ ok: false, reason: "reply_mismatch" });
+  expect(await answer(1, candidatePieceOf(LONG, 1))).toEqual({ ok: false, reason: "reply_mismatch" });
+  expect(await answer(0, { state: "unavailable" }, "e".repeat(64))).toEqual({ ok: false, reason: "reply_mismatch" });
+  // 묻기의 본문을 보관하지 않은 기다리는 요청에는 답을 받지 않는다(대조할 수 없다).
+  const unrecorded = { [fetch.header.request_id]: { action: "candidate_fetch", job: null } };
+  const reply = fromSupervisor("candidate_chunk", { in_reply_to: fetch.header.request_id, candidate_digest: digest, offset: 0, piece: { state: "unavailable" } });
+  expect(await at(reply, "front-door", { awaiting: unrecorded })).toEqual({ ok: false, reason: "reply_mismatch" });
+});
+
 test("정책이 어긋난 연결에서는 묻기도 답도 받지 않고, 접수가 닫혀도 받는다", async () => {
   const digest = candidateDigestOf(SHORT);
   const fetch = fromFront("candidate_fetch", { candidate_digest: digest, offset: 0 });
@@ -293,9 +330,11 @@ test("상한의 경계: 1MiB 정확히는 받고 +1은 거절, 마지막 조각�
   for (const offset of [MAX, MAX + 1]) expect(await ask(offset), `${offset}`).toEqual(malformed);
 
   // 답: 감독이 만든 마지막 조각 둘(꽉 찬 32KiB, 1바이트)을 받는다. 같은 자리의 total이 상한 +1이거나 조각이 total을 넘으면 거절한다.
-  const fetch = fromFront("candidate_fetch", { candidate_digest: digest, offset: 0 });
-  const send = (offset: number, piece: unknown) =>
-    at(fromSupervisor("candidate_chunk", { in_reply_to: fetch.header.request_id, candidate_digest: digest, offset, piece }), "front-door", { awaiting: awaitingFetch(fetch) });
+  // 답은 그 위치를 물은 묻기에만 받는다.
+  const send = (offset: number, piece: unknown) => {
+    const fetch = fromFront("candidate_fetch", { candidate_digest: digest, offset });
+    return at(fromSupervisor("candidate_chunk", { in_reply_to: fetch.header.request_id, candidate_digest: digest, offset, piece }), "front-door", { awaiting: awaitingFetch(fetch) });
+  };
   const last = candidatePieceOf(FULL, MAX - CHUNK);
   expect(Buffer.from(last.chunk_b64url, "base64url").length).toBe(CHUNK);
   expect(last.total).toBe(MAX);

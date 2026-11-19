@@ -5,7 +5,7 @@
 // 모델의 글이 승인 사실로 올라갈 자리가 없다. 감독이 낸 본문의 승인 이름은 공통부가 막는다(SUPERVISOR_FORBIDDEN_FIELD_NAMES).
 import type { Bundle, EffectSpec } from "./actions.ts";
 import { type GenerationRules, generationShape } from "./generations.ts";
-import { effectBody, int, literal, object, oneOf, type Parser, pattern, sha256, sourceRefId, uuid } from "./schema.ts";
+import { effectBody, int, literal, object, oneOf, type Parser, pattern, sha256, sourceRefId, time, uuid } from "./schema.ts";
 
 // 세대 규칙(v2.md "세대를 고른 이유").
 // - approval_changed는 한 정지 세대 안의 사실이라 current다. 정지를 건너온 승인은 받지 않는다(닫힌 쪽). 정지 세대가 바뀌면 처리기는
@@ -52,6 +52,9 @@ export interface MergeObserved {
   job_id: string;
   publication_job_id: string;
   merge_commit: string;
+  // 현관이 게시 서비스에서 확인한 병합 시각(Unix epoch 밀리초). 봉투의 issued_at은 보낼 때마다 새로 정해지므로 병합 뒤 확인의 기준이
+  // 될 수 없다. 같은 사실의 재전달은 같은 본문이라 이 값도 같다.
+  merged_at: number;
 }
 export interface SourceForgotten {
   job_id: string;
@@ -90,7 +93,12 @@ const parsePublicationChanged = effectBody({
   state: oneOf(PUBLICATION_STATES),
   ...generationShape(EVENT_GENERATIONS.publication_changed),
 });
-const parseMergeObserved = effectBody({ publication_job_id: uuid, merge_commit: pattern(MERGE_COMMIT), ...generationShape(EVENT_GENERATIONS.merge_observed) });
+const parseMergeObserved = effectBody({
+  publication_job_id: uuid,
+  merge_commit: pattern(MERGE_COMMIT),
+  merged_at: time,
+  ...generationShape(EVENT_GENERATIONS.merge_observed),
+});
 const parseSourceForgotten = effectBody({ source_ref: sourceRefId, ...generationShape(EVENT_GENERATIONS.source_forgotten) });
 
 export const EVENT_BUNDLE: Bundle = {

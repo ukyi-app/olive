@@ -18,6 +18,7 @@ export {
   type Bundle,
   COMMON_BUNDLE,
   EFFECTS_DURING_POLICY_MISMATCH,
+  EFFECTS_WITHOUT_GENERATIONS,
   type EffectSpec,
   type ExchangeSpec,
   type HandshakeState,
