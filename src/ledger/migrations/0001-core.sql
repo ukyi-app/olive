@@ -6,6 +6,48 @@
 
 -- 첫 설치 기록(ledger_identity)은 마이그레이션이 아니라 openLedger의 create가 만든다(ledger.ts).
 
+-- 이 파일이 어느 장부의 어느 시각의 사본인지의 기록. 원본 장부에는 줄이 없고, 사본을 만드는 연산이 사본 파일에만 넣는다.
+-- 대조가 끝나지 않은 줄이 하나라도 있으면 새 업무가 닫힌다(ledger.md "사본에서 뜬 장부의 보류").
+-- 줄은 지울 수 없고, 바꿀 수 있는 것은 "대조 끝" 한 번뿐이다. 대조 끝은 사본의 식별을 함께 적어야 한다.
+-- REPLACE가 지우는 줄에는 DELETE 트리거가 걸리지 않으므로(recursive_triggers 꺼짐) INSERT 쪽에서 옛 줄과 비교한다.
+CREATE TABLE ledger_snapshots (
+  seq INTEGER PRIMARY KEY CHECK (seq BETWEEN 1 AND 9007199254740991),
+  snapshot_id TEXT NOT NULL UNIQUE,
+  ledger_id TEXT NOT NULL,
+  taken_at INTEGER NOT NULL CHECK (taken_at BETWEEN 1 AND 9007199254740991),
+  reconciled_at INTEGER CHECK (reconciled_at IS NULL OR reconciled_at BETWEEN 1 AND 9007199254740991),
+  reconciled_snapshot_id TEXT,
+  CHECK ((reconciled_at IS NULL) = (reconciled_snapshot_id IS NULL)),
+  CHECK (reconciled_snapshot_id IS NULL OR reconciled_snapshot_id = snapshot_id)
+) STRICT;
+
+CREATE TRIGGER ledger_snapshots_insert BEFORE INSERT ON ledger_snapshots
+WHEN NEW.reconciled_at IS NOT NULL
+  OR NEW.reconciled_snapshot_id IS NOT NULL
+  OR EXISTS (SELECT 1 FROM ledger_snapshots WHERE reconciled_at IS NULL OR seq = NEW.seq OR snapshot_id = NEW.snapshot_id)
+BEGIN
+  SELECT RAISE(ABORT, 'ledger_snapshot_fixed');
+END;
+
+CREATE TRIGGER ledger_snapshots_permanent BEFORE DELETE ON ledger_snapshots
+BEGIN
+  SELECT RAISE(ABORT, 'ledger_snapshot_fixed');
+END;
+
+CREATE TRIGGER ledger_snapshots_reconcile_only BEFORE UPDATE ON ledger_snapshots
+WHEN NOT (
+  OLD.reconciled_at IS NULL
+  AND NEW.reconciled_at IS NOT NULL
+  AND NEW.reconciled_snapshot_id IS OLD.snapshot_id
+  AND NEW.seq = OLD.seq
+  AND NEW.snapshot_id = OLD.snapshot_id
+  AND NEW.ledger_id = OLD.ledger_id
+  AND NEW.taken_at = OLD.taken_at
+)
+BEGIN
+  SELECT RAISE(ABORT, 'ledger_snapshot_fixed');
+END;
+
 -- 정지·일시 중지. 줄이 없으면 "아직 적지 않음"이다(0과 다르다). 0도 줄로 적는다. 줄은 지울 수 없다(아래 트리거).
 CREATE TABLE stop_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),

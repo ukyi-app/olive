@@ -325,11 +325,12 @@ test("정지: 트리거가 없어도 코드가 낮은 세대를 막는다(두 �
   const ledger = open(path);
   must(ledger.applyStop({ generation: 5, stopped: true, now: NOW }));
   ledger.close();
-  const raw = new Database(path);
-  raw.run("DROP TRIGGER stop_generation_monotonic");
-  raw.run("DROP TRIGGER stop_generation_monotonic_insert");
-  raw.close();
-  const again = open(path);
+  // 재개방은 트리거가 빠진 파일을 받지 않으므로 연 뒤의 연결에서 뺀다.
+  const dropTriggers = (db: Database) => {
+    db.run("DROP TRIGGER stop_generation_monotonic");
+    db.run("DROP TRIGGER stop_generation_monotonic_insert");
+  };
+  const again = open(path, { faults: { at() {}, onOpen: dropTriggers } });
   expect(again.applyStop({ generation: 4, stopped: false, now: NOW })).toEqual({ ok: false, reason: "stop_generation_lower" });
   expect(again.mergeStop({ generation: 4, stopped: false }, NOW)).toMatchObject({ ok: true, source: "ledger", record: { generation: 5, stopped: true } });
   expect(again.readStop()).toMatchObject({ value: { generation: 5, stopped: true } });
