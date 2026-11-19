@@ -17,6 +17,13 @@ test("정적: 계약 모듈은 src/contract/v1 안과 node:crypto만 import한�
   }
 });
 
+// 위 시험이 이미 막지만(../ 금지), 실행기 코드가 생긴 뒤 뜻을 이름으로 남긴다.
+test("정적: src/contract/는 src/executor/를 import하지 않는다", async () => {
+  for (const file of files) {
+    for (const { path } of transpiler.scanImports(await readText(file))) expect(path.includes("executor/"), `${file} → ${path}`).toBe(false);
+  }
+});
+
 test("정적: 계약 모듈은 입출력·프로세스·시계·무작위 API를 쓰지 않는다", async () => {
   const banned = [
     /\bBun\.\w+/,

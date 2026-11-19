@@ -195,9 +195,11 @@ export async function verifyEnvelope(raw: unknown, ctx: VerifyContext): Promise<
     // 기다리는 기한은 답 봉투의 신선도(4)와 따로 잰다. 기한이 지났으면 challenge를 버린 것과 같다.
     // sentAt은 실행기의 로컬 값이라 상대가 정할 수 없지만, 빠뜨리거나(NaN) 시계가 뒤로 가 미래가 되면 기한 비교가 거짓이 되어
     // 통과해 버린다. 그래서 안전 정수이고 경과 시간이 0 이상·기한 미만일 때만 받는다(통과 조건을 직접 쓴다).
+    // 안전 정수 확인을 뺄셈보다 먼저 한다. bigint 같은 값이면 뺄셈이 예외를 던져 거절 사유 대신 실패가 된다.
     const pending = ctx.stopSyncChallenge ?? null;
-    const waited = pending === null ? Number.NaN : ctx.now - pending.sentAt;
-    const inWindow = pending !== null && Number.isSafeInteger(pending.sentAt) && waited >= 0 && waited < STOP_SYNC_WAIT_MS;
+    const sentAt: unknown = pending?.sentAt;
+    const waited = pending !== null && Number.isSafeInteger(sentAt) ? ctx.now - (sentAt as number) : Number.NaN;
+    const inWindow = pending !== null && waited >= 0 && waited < STOP_SYNC_WAIT_MS;
     if (!inWindow || (body as StopSyncReply).challenge !== pending.challenge) return reject("challenge_mismatch");
     if (current !== null && header.stop_generation < current) return reject("stop_generation_mismatch");
     if (current === null || header.stop_generation > current) adoptedStopGeneration = header.stop_generation;
