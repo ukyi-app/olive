@@ -131,8 +131,16 @@ test("reopen: 판 목록을 넘겨도 같은 규칙이고, 적용 기록이 없�
   // 같은 이름의 판이어도 내용이 다르면 적용된 스키마와 맞지 않는다.
   const changed = [{ version: 1, name: "0001-a.sql", sql: "CREATE TABLE a (y INTEGER) STRICT;" }];
   expect(openLedger(path, { clock, mode: "reopen", migrations: changed })).toMatchObject({ ok: false, reason: "not_initialized" });
+  // 빈 목록으로는 재개방이 대조할 적용 기록이 남지 않으므로 처음부터 만들지 않는다.
   const bare = tempPath();
-  open(bare, { migrations: [] }).close();
+  expect(openLedger(bare, { clock, mode: "create", migrations: [] })).toMatchObject({ ok: false, reason: "migration_mismatch" });
+  expect(existsSync(bare)).toBe(false);
+  // 적용 기록이 없는 파일은 빈 목록의 재개방도 거절한다.
+  markedFile(bare, (raw) => {
+    raw.run(IDENTITY_TABLE);
+    raw.run(IDENTITY_TRIGGER);
+    raw.query("INSERT INTO ledger_identity VALUES (1, ?, 1)").run(LEDGER_ID);
+  });
   expect(openLedger(bare, { clock, mode: "reopen", migrations: [] })).toMatchObject({ ok: false, reason: "not_initialized" });
 });
 

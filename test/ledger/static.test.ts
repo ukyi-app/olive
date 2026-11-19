@@ -133,7 +133,7 @@ function fsViolations(file: string, text: string): string[] {
   const allowed = FS_ALLOWED[file] ?? [];
   const out: string[] = [];
   for (const banned of source.matchAll(/\b(Bun\.file|Bun\.write|Bun\.mmap|process\.binding|require)\s*\(|\bfs\.promises\b|\bimport\s*\(/g)) out.push(banned[0]);
-  for (const statement of source.matchAll(/\bimport\s+([^;]*?)\s+from\s+"((?:node:)?fs(?:\/promises)?)"/g)) {
+  for (const statement of source.matchAll(/\bimport\s+([^;]*?)\s+from\s+["']((?:node:)?fs(?:\/promises)?)["']/g)) {
     const [, clause, module] = statement as unknown as [string, string, string];
     if (module !== "node:fs") out.push(`모듈 ${module}`);
     const named = /^\{([\s\S]*)\}$/.exec(clause.trim());
@@ -169,6 +169,10 @@ test("정적: 파일 API 검사가 전체 읽기·쓰기, promises, 별칭, 이�
   for (const [source, caught] of [
     [`import { readFileSync } from "node:fs";`, "허용하지 않는 이름: readFileSync"],
     [`import { writeFileSync } from "node:fs";`, "허용하지 않는 이름: writeFileSync"],
+    [`import { readFileSync } from 'node:fs';`, "허용하지 않는 이름: readFileSync"],
+    [`import { readSync as read } from 'fs';`, "모듈 fs"],
+    [`import { open } from 'node:fs/promises';`, "모듈 node:fs/promises"],
+    [`import * as fs from 'node:fs';`, "이름을 고르지 않은 import: * as fs"],
     [`import { open } from "node:fs/promises";`, "모듈 node:fs/promises"],
     [`import { readFileSync as read } from "fs";`, "모듈 fs"],
     [`import { lstatSync as look } from "node:fs";`, "별칭: lstatSync as look"],

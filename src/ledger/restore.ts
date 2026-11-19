@@ -216,10 +216,10 @@ export class Restorer {
     }
   }
 
-  // 더 새로운 복원 시도가 시작됐으면 이 시도의 늦은 응답으로 장부를 바꾸지 않는다.
+  // 더 새로운 복원 시도가 시작됐거나 사본 대조가 끝나 이 시도가 끝났으면 늦은 응답으로 장부를 바꾸지 않는다.
   #requireCurrent(step: number): RestoreAttempt {
     const attempt = this.#attempt;
-    if (attempt === null || !this.ledger.isCurrentRestore(attempt)) throw new RestoreStepError(step, "더 새로운 복원 시도가 시작됨");
+    if (attempt === null || !this.ledger.isCurrentRestore(attempt)) throw new RestoreStepError(step, "이 복원 시도는 더는 지금의 시도가 아니다");
     return attempt;
   }
 

@@ -51,6 +51,20 @@ export interface SnapshotRecord {
   takenAt: number;
 }
 
+// 사본 표식이 약속하는 기록: 대조가 끝나지 않은 줄이 정확히 하나이고 그 줄이 가장 최근 줄이다. 아니면 null.
+export function latestOpenRecord(db: Database): SnapshotRecord | null {
+  const rows = db.query("SELECT snapshot_id, ledger_id, taken_at, reconciled_at FROM ledger_snapshots ORDER BY seq DESC").all() as {
+    snapshot_id: string;
+    ledger_id: string;
+    taken_at: number;
+    reconciled_at: number | null;
+  }[];
+  const latest = rows[0];
+  if (latest === undefined || latest.reconciled_at !== null) return null;
+  if (rows.slice(1).some((row) => row.reconciled_at === null)) return null;
+  return { snapshotId: latest.snapshot_id, ledgerId: latest.ledger_id, takenAt: latest.taken_at };
+}
+
 // 커밋된 장부의 그림에 사본 기록을 넣어 파일로 쓸 바이트를 만든다. 메모리 안에서만 일어난다.
 export function sealSnapshot(image: Uint8Array, record: SnapshotRecord): Uint8Array {
   // 머리의 18·19번째 바이트가 WAL(2)이면 메모리 DB로 열리지 않는다(SQLITE_CANTOPEN). 사본은 저널 모드 파일이고 처음 열 때 WAL로 바뀐다.
@@ -58,9 +72,14 @@ export function sealSnapshot(image: Uint8Array, record: SnapshotRecord): Uint8Ar
   image[19] = 1;
   const copy = Database.deserialize(image);
   try {
-    copy
+    const written = copy
       .query("INSERT INTO ledger_snapshots (seq, snapshot_id, ledger_id, taken_at) VALUES ((SELECT COALESCE(MAX(seq), 0) + 1 FROM ledger_snapshots), ?, ?, ?)")
       .run(record.snapshotId, record.ledgerId, record.takenAt);
+    // 판이 더한 트리거는 INSERT를 오류 없이 0행으로 끝낼 수 있다. 기록 없는 표식을 파일로 내면 그 사본은 보류되지 않는다.
+    const latest = latestOpenRecord(copy);
+    if (written.changes !== 1 || latest === null || latest.snapshotId !== record.snapshotId || latest.ledgerId !== record.ledgerId || latest.takenAt !== record.takenAt) {
+      throw new SnapshotRefused("snapshot_unsupported", "사본 기록이 최신 미대조 기록으로 들어가지 않았다");
+    }
     copy.run(`PRAGMA user_version = ${SNAPSHOT_UNOPENED}`);
     return copy.serialize();
   } finally {
@@ -75,9 +94,11 @@ const CHUNK = 64 * 1024;
 export function publishSnapshot(target: string, bytes: Uint8Array, faults: Faults): void {
   const temp = `${target}.partial-${crypto.randomUUID()}`;
   let fd: number | undefined;
+  let created = false;
   let linked = false;
   try {
     fd = openSync(temp, fileOpen.O_CREAT | fileOpen.O_EXCL | fileOpen.O_WRONLY | fileOpen.O_NOFOLLOW, 0o600);
+    created = true;
     for (let offset = 0; offset < bytes.length; ) {
       offset += writeSync(fd, bytes, offset, Math.min(CHUNK, bytes.length - offset));
       faults.at("snapshot:writing");
@@ -91,10 +112,11 @@ export function publishSnapshot(target: string, bytes: Uint8Array, faults: Fault
     unlinkSync(temp);
   } catch (error) {
     if (fd !== undefined) closeQuietly(fd);
-    removeQuietly(temp);
+    // 임시 이름을 확보하지 못했으면 그 자리의 파일은 이 호출의 것이 아니다.
+    if (created) removeQuietly(temp);
     if (linked) removeQuietly(target);
     if (error instanceof SnapshotRefused) throw error;
-    if ((error as { code?: string }).code === "EEXIST") throw new SnapshotRefused("target_exists", `이미 있다: ${target}`);
+    if (created && (error as { code?: string }).code === "EEXIST") throw new SnapshotRefused("target_exists", `이미 있다: ${target}`);
     throw new SnapshotRefused("io", `사본을 쓰지 못함: ${describe(error)}`);
   }
 }
@@ -107,10 +129,11 @@ function closeQuietly(fd: number): void {
   }
 }
 
-function removeQuietly(path: string): void {
+// 이 호출이 만든 이름만 넘긴다. 지우지 못한 임시 파일은 끊긴 사본이라 열리지 않거나, 온전해도 사본 기록이 있어 보류로 뜬다.
+export function removeQuietly(path: string): void {
   try {
     unlinkSync(path);
   } catch {
-    // 지우지 못한 임시 파일은 끊긴 사본이라 열리지 않거나, 온전해도 사본 기록이 있어 보류로 뜬다.
+    // 이미 돌려줄 결과가 있다.
   }
 }

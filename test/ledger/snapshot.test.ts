@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Ledger, openLedger, type OpenResult, type RestorePorts, Restorer, SNAPSHOT_STALE_RECORDS, type SnapshotResult } from "../../src/ledger/index.ts";
+import { type Ledger, openLedger, type OpenResult, type RestorePorts, Restorer, RestoreStepError, SNAPSHOT_STALE_RECORDS, type SnapshotResult } from "../../src/ledger/index.ts";
 import { clock, digest, grant, id, must, NOW, open, ready, session, startedWorker, tempDir, tempPath, worker } from "./helpers.ts";
 
 const MAX = 10_000_000;
@@ -345,9 +345,13 @@ test("restore: 처음 여는 사본 곁에 다른 시점의 곁 파일이 남아
   taken(ledger.createSnapshot({ path: target, maxBytes: MAX }));
   ledger.close();
   const before = readFileSync(target);
-  for (const suffix of ["-wal", "-journal"]) {
+  // 저널 하나만 남은 경우는 이 사본의 첫 열기가 끊겼을 수 있어 사유를 가른다. 받지 않는 것은 같다.
+  for (const [suffix, reason] of [
+    ["-wal", "not_initialized"],
+    ["-journal", "interrupted_install"],
+  ] as const) {
     writeFileSync(`${target}${suffix}`, "stale");
-    expect(openLedger(target, { clock, mode: "reopen" }), suffix).toMatchObject({ ok: false, reason: "not_initialized", detail: expect.stringContaining("다른 시점") });
+    expect(openLedger(target, { clock, mode: "reopen" }), suffix).toMatchObject({ ok: false, reason, detail: expect.stringContaining("다른 시점") });
     expect(readFileSync(target).equals(before), suffix).toBe(true);
     expect(readFileSync(`${target}${suffix}`, "utf8"), suffix).toBe("stale");
     rmSync(`${target}${suffix}`);
@@ -476,7 +480,8 @@ test("restore: 대조 끝 연산 하나만 보류를 풀고, 풀어도 새 복�
   // 풀렸어도 허가가 없으면 닫혀 있다.
   expect(ledger.intakeOpen()).toBe(false);
   expect(ledger.admitRun(worker())).toEqual({ ok: false, reason: "intake_closed" });
-  expect((await earlier.step5()).intakeMayOpen).toBe(false);
+  await expect(earlier.step5()).rejects.toBeInstanceOf(RestoreStepError);
+  expect(earlier.intakeOpen()).toBe(false);
   expect(ledger.admitRun(worker())).toEqual({ ok: false, reason: "intake_closed" });
 
   const fresh = await restore(ledger);
