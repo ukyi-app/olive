@@ -1,6 +1,7 @@
 // 이 연결에 이 역할의 일을 배정할 수 있는가를 고르는 순수 판단. 모든 자료는 인자로 받는다(파일·환경·Secret을 읽지 않는다).
-// 고정 역할 표, 주입된 대상 허용 표, 주입된 등록행의 단일 역할, 인증된 연결의 주체 전체, hello의 두 revision이
-// 모두 맞아야 후보다. 등록·hello·연결 하나만으로는 자격이 생기지 않는다. 모르면 보류다.
+// 고정 역할 표, 주입된 대상 허용 표, 주입된 등록행의 단일 역할, 인증된 연결의 주체 전체(역할·인스턴스·저장소를 등록행과 대조),
+// hello의 두 revision이 모두 맞아야 후보다. 등록·hello·연결 하나만으로는 자격이 생기지 않는다.
+// 모르거나 꼴이 틀리면 보류·거절이고 예외로 끊기지 않는다.
 //
 // 후보(candidate)는 실행 허가가 아니다. 장부의 정지·슬롯·세대·기한 검사와 접수 열림 확인을 이 판단은 하지 않는다.
 // 부르는 쪽은 후보를 받은 뒤에도 장부의 시작 트랜잭션을 통과해야 지시를 낼 수 있다.
@@ -24,6 +25,8 @@ export interface Registration {
   readonly target: string;
   readonly role: Role;
   readonly instance: string;
+  // 관리자가 승인한 저장소 ID. 저장소를 잃어 새로 만들면 ID가 바뀌므로, 연결 주체의 저장소가 이 값과 정확히 같아야 후보다.
+  readonly storage: string;
   // 서명 공개 키의 식별. 키 값이 아니다.
   readonly keyId: string;
   readonly active: boolean;
@@ -77,6 +80,8 @@ export const HOLD_REASONS = [
   "registration_role_mismatch",
   "registration_target_mismatch",
   "registration_instance_mismatch",
+  "registration_storage_mismatch",
+  // 기대 revision이 없거나 계약 v1의 revision 문법에 맞지 않을 때
   "expected_revision_missing",
   "profile_revision_mismatch",
   "policy_revision_mismatch",
@@ -94,6 +99,12 @@ export type AssignmentJudgement =
 
 const isRole = (value: unknown): value is Role => typeof value === "string" && (ROLES as readonly string[]).includes(value);
 const isName = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const isObject = (value: unknown): value is object => typeof value === "object" && value !== null;
+
+// 계약 v1의 revision 문법(src/contract/v1/schema.ts의 REVISION, hello 파서가 쓰는 꼴). 계약의 공개 면이 내지 않아 여기 다시 두고,
+// 계약 스키마·장부의 REVISION과 같은지는 시험이 대조한다.
+export const REVISION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const isRevision = (value: unknown): value is string => typeof value === "string" && REVISION.test(value);
 
 function checkInput(ctx: AssignmentContext): InputRejectReason | null {
   if (!Array.isArray(ctx.allowed) || !Array.isArray(ctx.registrations)) return "malformed_input";
@@ -107,7 +118,7 @@ function checkInput(ctx: AssignmentContext): InputRejectReason | null {
   const roleByKey = new Map<string, Role>();
   const activeInstances = new Set<string>();
   for (const row of ctx.registrations) {
-    if (!isName(row?.target) || !isName(row.instance) || !isName(row.keyId) || typeof row.active !== "boolean") return "malformed_input";
+    if (!isName(row?.target) || !isName(row.instance) || !isName(row.storage) || !isName(row.keyId) || typeof row.active !== "boolean") return "malformed_input";
     if (!isRole(row.role)) return "unknown_role";
     // 비활성 행의 키도 센다. 한 번 어떤 역할에 등록된 키는 다른 역할로 다시 쓰이지 않아야 한다.
     const seen = roleByKey.get(row.keyId);
@@ -123,6 +134,8 @@ function checkInput(ctx: AssignmentContext): InputRejectReason | null {
 }
 
 export function judgeAssignment(job: Job, connection: AuthenticatedConnection, ctx: AssignmentContext): AssignmentJudgement {
+  // 타입 밖 호출(빈 값)도 예외가 아니라 입력 거절로 끝내야 목록 함수가 같은 거절 분기를 쓴다.
+  if (!isObject(job) || !isObject(connection) || !isObject(ctx)) return { kind: "input_rejected", reason: "malformed_input" };
   const rejected = checkInput(ctx);
   if (rejected) return { kind: "input_rejected", reason: rejected };
   const held = (reason: HoldReason) => ({ kind: "held", reason }) as const;
@@ -144,9 +157,12 @@ export function judgeAssignment(job: Job, connection: AuthenticatedConnection, c
   if (row.role !== role) return held("registration_role_mismatch");
   if (row.target !== target) return held("registration_target_mismatch");
   if (row.instance !== principal.instance) return held("registration_instance_mismatch");
+  // row.storage는 checkInput이 빈 값 아닌 문자열로 확인했으므로, 정확 일치가 빈 값·누락·문자열 아님도 함께 막는다.
+  if (principal.storage !== row.storage) return held("registration_storage_mismatch");
 
+  // 기대값을 문법으로 먼저 거른다. 양쪽이 같은 무효 문자열이면 정확 비교만으로는 통과하기 때문이다.
   const expected = ctx.expected;
-  if (!isName(expected?.profile_revision) || !isName(expected.policy_revision)) return held("expected_revision_missing");
+  if (!isRevision(expected?.profile_revision) || !isRevision(expected.policy_revision)) return held("expected_revision_missing");
   if (connection.hello?.profile_revision !== expected.profile_revision) return held("profile_revision_mismatch");
   if (connection.hello.policy_revision !== expected.policy_revision) return held("policy_revision_mismatch");
 
@@ -156,7 +172,7 @@ export function judgeAssignment(job: Job, connection: AuthenticatedConnection, c
     role,
     target,
     instance: row.instance,
-    storage: principal.storage,
+    storage: row.storage,
     keyId: row.keyId,
     profile_revision: expected.profile_revision,
     policy_revision: expected.policy_revision,
@@ -167,6 +183,7 @@ export function judgeAssignment(job: Job, connection: AuthenticatedConnection, c
 // 후보가 둘 이상일 때 어느 것을 쓸지는 슬롯·대기열을 보는 뒤 조각이 정한다.
 export function eligibleConnections(job: Job, connections: readonly AuthenticatedConnection[], ctx: AssignmentContext): AssignmentCandidate[] {
   const out: AssignmentCandidate[] = [];
+  if (!Array.isArray(connections)) return out;
   for (const connection of connections) {
     const judged = judgeAssignment(job, connection, ctx);
     if (judged.kind === "input_rejected") return [];

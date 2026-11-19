@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { ROLES, type Role } from "../../src/contract/v1/index.ts";
 import type { RoleProfile } from "../../src/executor/profile.ts";
-import { AUTH_METHODS as LEDGER_AUTH_METHODS } from "../../src/ledger/input.ts";
-import { type AccountRef, selectAccount } from "../../src/supervisor/accounts/fixed.ts";
+import { REVISION as CONTRACT_REVISION } from "../../src/contract/v1/schema.ts";
+import { ACCOUNT as LEDGER_ACCOUNT, AUTH_METHODS as LEDGER_AUTH_METHODS, REVISION as LEDGER_REVISION } from "../../src/ledger/input.ts";
+import { ACCOUNT_NAME, type AccountRef, selectAccount } from "../../src/supervisor/accounts/fixed.ts";
 import {
   type AssignmentContext,
   type AuthenticatedConnection,
@@ -10,6 +11,7 @@ import {
   type Job,
   judgeAssignment,
   type Registration,
+  REVISION,
 } from "../../src/supervisor/roles/assign.ts";
 import { AUTH_METHODS, ROLE_POLICIES } from "../../src/supervisor/roles/policy.ts";
 
@@ -27,7 +29,7 @@ function readerConnection(role: Role = "isolated_reader", over: Partial<Authenti
 }
 
 function registration(over: Partial<Registration> = {}): Registration {
-  return { target: "reader", role: "isolated_reader", instance: "r1", keyId: "key-r1", active: true, ...over };
+  return { target: "reader", role: "isolated_reader", instance: "r1", storage: "s1", keyId: "key-r1", active: true, ...over };
 }
 
 function context(over: Partial<AssignmentContext> = {}): AssignmentContext {
@@ -59,16 +61,27 @@ describe("역할 표", () => {
     }
   });
 
-  test("설계가 정한 값만 있다: 대상은 isolated_reader의 reader 하나, 나머지는 비어 있다", () => {
-    expect(ROLES.map((role) => [role, ROLE_POLICIES[role].target])).toEqual([
-      ["diagnosis", null],
-      ["isolated_reader", "reader"],
-      ["code_author", null],
-      ["pr_review", null],
-      ["memory_curator", null],
+  test("설계가 정한 값만 있다: 대상은 diagnosis·reader·writer 셋, 리뷰·기억은 비어 있다", () => {
+    expect(ROLES.map((role) => [role, ROLE_POLICIES[role].target, [...ROLE_POLICIES[role].methods]])).toEqual([
+      ["diagnosis", "diagnosis", ["api_key", "subscription"]],
+      ["isolated_reader", "reader", ["api_key"]],
+      ["code_author", "writer", ["api_key", "subscription"]],
+      ["pr_review", null, []],
+      ["memory_curator", null, []],
     ]);
-    expect(ROLE_POLICIES.pr_review.methods).toEqual([]);
-    expect(ROLE_POLICIES.memory_curator.methods).toEqual([]);
+  });
+
+  test("revision 문법이 계약 스키마·장부의 REVISION과 같다", () => {
+    expect([REVISION.source, REVISION.flags]).toEqual([CONTRACT_REVISION.source, CONTRACT_REVISION.flags]);
+    expect([REVISION.source, REVISION.flags]).toEqual([LEDGER_REVISION.source, LEDGER_REVISION.flags]);
+  });
+
+  test("계정 이름 규칙이 장부의 ACCOUNT와 같다(32·33자 경계 포함)", () => {
+    expect([ACCOUNT_NAME.source, ACCOUNT_NAME.flags]).toEqual([LEDGER_ACCOUNT.source, LEDGER_ACCOUNT.flags]);
+    const names = ["a".repeat(31), "a".repeat(32), "a".repeat(33), "acct-a", "0a", "-a", "Acct", "acct_a", "", " acct", "acct "];
+    const supervisor = names.map((account) => selectAccount("diagnosis", [{ account, method: "api_key" }]).kind === "fixed");
+    expect(supervisor).toEqual(names.map((name) => LEDGER_ACCOUNT.test(name)));
+    expect(supervisor.slice(0, 3)).toEqual([true, true, false]);
   });
 });
 
@@ -110,6 +123,25 @@ describe("인수 시험", () => {
       kind: "held",
       reason: "registration_inactive",
     });
+  });
+
+  test("진단·작성은 대상 ID가 있어도 허용 표와 활성 등록이 없으면 보류, 모두 맞추면 후보", () => {
+    for (const [role, target] of [
+      ["diagnosis", "diagnosis"],
+      ["code_author", "writer"],
+    ] as const) {
+      const conn = readerConnection(role, { target });
+      const row = registration({ role, target });
+      // 대상 ID를 표에 둔 것은 배정을 연 것이 아니다. 주입 자료가 없으면 지금처럼 보류다.
+      expect(judgeAssignment({ role }, conn, context({ allowed: [], registrations: [] })), role).toEqual({ kind: "held", reason: "target_not_allowed" });
+      expect(judgeAssignment({ role }, conn, context({ allowed: [{ target, roles: [role] }], registrations: [] })), role).toEqual({ kind: "held", reason: "not_registered" });
+      expect(judgeAssignment({ role }, conn, context({ allowed: [{ target, roles: [role] }], registrations: [{ ...row, active: false }] })), role).toEqual({
+        kind: "held",
+        reason: "registration_inactive",
+      });
+      const full = context({ allowed: [{ target, roles: [role] }], registrations: [row] });
+      expect(judgeAssignment({ role }, conn, full), role).toMatchObject({ kind: "candidate", role, target });
+    }
   });
 
   test("요청이 프로필·계정을 바꾸지 못함", () => {
@@ -205,6 +237,7 @@ describe("모두 맞아야 후보: 조건 하나씩 어긋나게", () => {
     ["등록 역할만 다름", readerConnection(), context({ registrations: [registration({ role: "pr_review" })] }), "registration_role_mismatch"],
     ["등록 대상만 다름", readerConnection(), context({ registrations: [registration({ target: "other" })] }), "registration_target_mismatch"],
     ["등록 인스턴스만 다름", readerConnection(), context({ registrations: [registration({ instance: "r9" })] }), "registration_instance_mismatch"],
+    ["등록 저장소만 다름", readerConnection(), context({ registrations: [registration({ storage: "s2" })] }), "registration_storage_mismatch"],
     ["주체 역할만 다름", readerConnection("pr_review"), context(), "principal_role_mismatch"],
     ["주체 인스턴스만 다름", readerConnection(undefined, { principal: { kind: "worker_executor", role: "isolated_reader", instance: "r9", storage: "s1" } }), context(), "registration_instance_mismatch"],
     ["주체가 작업자 실행기가 아님", readerConnection(undefined, { principal: { kind: "session_executor", instance: "r1", storage: "s1" } }), context(), "principal_not_worker"],
@@ -223,6 +256,65 @@ describe("모두 맞아야 후보: 조건 하나씩 어긋나게", () => {
   test.each(cases)("%s → 보류", (_name, connection, ctx, reason) => {
     expect(judgeAssignment(job, connection, ctx)).toEqual({ kind: "held", reason } as never);
     expect(eligibleConnections(job, [connection], ctx)).toEqual([]);
+  });
+
+  test("P1 저장소: 등록한 저장소와 다른 주체는 후보가 아니다", () => {
+    const withStorage = (storage: unknown) =>
+      readerConnection(undefined, { principal: { kind: "worker_executor", role: "isolated_reader", instance: "r1", storage } as unknown as AuthenticatedConnection["principal"] });
+    expect(judgeAssignment(job, withStorage("s2"), context()).kind).toBe("held");
+    expect(judgeAssignment(job, withStorage("s2"), context())).toEqual({ kind: "held", reason: "registration_storage_mismatch" });
+    expect(eligibleConnections(job, [withStorage("s2")], context())).toEqual([]);
+    for (const storage of ["", null, undefined, 7]) {
+      expect(judgeAssignment(job, withStorage(storage), context()), String(storage)).toEqual({ kind: "held", reason: "registration_storage_mismatch" });
+      expect(eligibleConnections(job, [withStorage(storage)], context()), String(storage)).toEqual([]);
+    }
+    const missing = readerConnection(undefined, { principal: { kind: "worker_executor", role: "isolated_reader", instance: "r1" } as unknown as AuthenticatedConnection["principal"] });
+    expect(judgeAssignment(job, missing, context()).kind).toBe("held");
+    expect(eligibleConnections(job, [missing], context())).toEqual([]);
+    expect(eligibleConnections(job, [withStorage("s1")], context()).map((c) => c.storage)).toEqual(["s1"]);
+    // 등록행의 저장소가 빈 값이면 주입 자료 자체가 틀린 것이다.
+    expect(judgeAssignment(job, readerConnection(), context({ registrations: [registration({ storage: "" })] }))).toEqual({ kind: "input_rejected", reason: "malformed_input" });
+  });
+
+  test("P1 revision: 문법에 맞지 않는 revision은 양쪽이 같아도 후보가 아니다", () => {
+    const blankProfile = { profile_revision: " ", policy_revision: "pol-1" };
+    const blankPolicy = { profile_revision: "prof-1", policy_revision: " " };
+    for (const revs of [blankProfile, blankPolicy]) {
+      const conn = readerConnection(undefined, { hello: revs });
+      const ctx = context({ expected: revs });
+      expect(judgeAssignment(job, conn, ctx).kind, JSON.stringify(revs)).toBe("held");
+      expect(judgeAssignment(job, conn, ctx), JSON.stringify(revs)).toEqual({ kind: "held", reason: "expected_revision_missing" });
+      expect(eligibleConnections(job, [conn], ctx), JSON.stringify(revs)).toEqual([]);
+    }
+    // 문법에 맞는 값의 정상·단일 불일치 결과는 그대로다.
+    expect(judgeAssignment(job, readerConnection(), context()).kind).toBe("candidate");
+    expect(judgeAssignment(job, readerConnection(undefined, { hello: { profile_revision: "prof-2", policy_revision: "pol-1" } }), context())).toEqual({ kind: "held", reason: "profile_revision_mismatch" });
+    expect(judgeAssignment(job, readerConnection(undefined, { hello: { profile_revision: "prof-1", policy_revision: "pol-2" } }), context())).toEqual({ kind: "held", reason: "policy_revision_mismatch" });
+  });
+
+  test("필수 입력이 없으면 예외가 아니라 입력 거절이다", () => {
+    const rejected = { kind: "input_rejected", reason: "malformed_input" };
+    for (const empty of [null, undefined]) {
+      const none = empty as never;
+      for (const [name, args] of [
+        ["job", [none, readerConnection(), context()]],
+        ["connection", [job, none, context()]],
+        ["ctx", [job, readerConnection(), none]],
+      ] as const) {
+        const [j, c, x] = args as unknown as [Job, AuthenticatedConnection, AssignmentContext];
+        expect(judgeAssignment(j, c, x), `${name}=${empty}`).toEqual(rejected as never);
+        expect(eligibleConnections(j, [c], x), `${name}=${empty}`).toEqual([]);
+      }
+      expect(eligibleConnections(job, none, context())).toEqual([]);
+    }
+  });
+
+  test("내장 속성 이름의 역할은 예외 없이 선택 없음·보류다", () => {
+    for (const name of ["__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"]) {
+      const role = name as Role;
+      expect(selectAccount(role, [{ account: "acct-a", method: "api_key" }]), name).toEqual({ kind: "none", reason: "method_not_allowed" });
+      expect(judgeAssignment({ role }, readerConnection(), context()), name).toEqual({ kind: "held", reason: "unknown_job_role" });
+    }
   });
 
   test("판단은 입력을 바꾸지 않는다", () => {
