@@ -1,0 +1,35 @@
+{
+  "status": "candidate",
+  "tool": "start_worker",
+  "case": "ok",
+  "description": "고정된 입력과 허용된 역할·목적. 새 접수는 실행 참조와 단계만 받는다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000001",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": { "diagnosis": ["diagnose"] },
+    "pinned": [{ "owner": "aaaaaaaa-0000-4000-8000-000000000001", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" }],
+    "works": [],
+    "results": {},
+    "newRefs": ["cccccccc-0000-4000-8000-000000000001"],
+    "startPhase": "queued"
+  },
+  "arguments": {
+    "role": "diagnosis",
+    "task": {
+      "purpose": "diagnose",
+      "brief": "파드가 재시작을 반복하는 원인을 찾는다",
+      "source_ref": "inputs/aaaaaaaa-1111-4000-8000-000000000001",
+      "input_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  "expect": {
+    "answer": { "outcome": "ok", "tool": "start_worker", "ref": "cccccccc-0000-4000-8000-000000000001", "phase": "queued" },
+    "writes": 1
+  }
+}

@@ -23,7 +23,8 @@ export type SchedulerRun = Pick<Run, "runId" | "kind" | "role" | "state" | "queu
 };
 
 // 실행 줄에 연결된 입력. 장부의 inputs 표에 있는 칸만 둔다(원문은 없다. 본문으로 우선순위를 정하지 않기 위해 타입에 없다).
-// origin과 receivedAt은 장부 표에 있지만 지금의 queueView()가 내주지 않는다. 부르는 쪽이 채우지 못하면 이 항목을 넣지 않는다
+// queueView()는 출처와 접수 시각을 내주지 않는다. 장부의 listInputs()가 출처 이름(source)과 receivedAt을 내고, 출처 이름을
+// origin으로 나누는 것은 접수 정책의 몫이다. 부르는 쪽이 채우지 못하면 이 항목을 넣지 않는다
 // (그러면 그 실행은 input_unknown으로 보류된다). 넣었더라도 칸이 빠졌거나 꼴이 틀리면 같은 보류다.
 export interface SchedulerInput {
   requestId: string;
@@ -73,7 +74,7 @@ export type HoldReason =
   | "budget_unknown"
   // 남은 예산이 없다(이 실행, 또는 같은 입력에 묶인 다른 실행 중 하나. 대기 순번과 무관하다).
   | "budget_exhausted"
-  // 같은 입력 ID의 앞 순번 실행이나 상태가 queued가 아닌 실행(뒤 순번의 not_started 포함)보다 남은 예산이 많다.
+  // 같은 입력 ID의 앞 순번 실행이나 상태가 queued가 아닌 실행보다 남은 예산이 많다(시작 전에 닫힌 not_started 줄은 비교하지 않는다).
   | "budget_replenished";
 
 export interface Held {
@@ -132,11 +133,10 @@ function budgetBar(view: SchedulerView, run: SchedulerRun): HoldReason | null {
   // 모름보다 먼저 본다.
   if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
   if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
-  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. 뒤 순번의 not_started도 포함한다.
-  // not_started는 시작하지 않고 닫힌 줄이라 그 숫자는 실제로 쓰고 남긴 잔액이 아니다. 그래서 시작 전에 닫힌 뒤 순번 줄의
-  // 작은 배정액 때문에, 입력이 유효하고 슬롯이 비고 아무도 예산을 쓰지 않았어도 앞 순번의 대기 실행이 시작하지 못한 채
-  // 만료될 수 있다.
-  const bounds = others.filter((other) => other.queueSeq < run.queueSeq || other.state !== "queued");
+  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. not_started 행은 뺀다: 장부의 전이 표에서
+  // not_started로 가는 길은 queued뿐이라 그 숫자는 시작하지 않은 줄의 배정액이고 쓰고 남긴 잔액이 아니다. 시험이 표를 읽어
+  // 이 전제를 지킨다. 잔액 0의 not_started는 위의 소진 검사가 이미 막는다.
+  const bounds = others.filter((other) => other.state !== "not_started" && (other.queueSeq < run.queueSeq || other.state !== "queued"));
   if (bounds.some((other) => run.budgetLeft > other.budgetLeft)) return "budget_replenished";
   return null;
 }
