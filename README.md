@@ -73,7 +73,7 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 감독, 실행기, 현관이 함께 쓰는 계약(서명 봉투, 지시 여섯, 영수증, 보고, 전송 규칙, 거절 사유)이다. 코드는 `src/contract/v1/`이고 다른 코드는 `index.ts`만 import한다. 요약 표는 `src/contract/v1.md`.
 
 - 입출력이 없는 순수 모듈이다. 시계, 키, 세대, nonce 저장소, 무작위 값은 인자로 받는다. `test/contract/static.test.ts`가 import와 API를 막는다.
-- **판 규칙:** main에 병합된 판 안에서 칸, 동작, 받는 쪽 거절 경계(수명 상한, 시계 오차, 맞춤 대기 기한, 임대 상한, 크기·개수 상한, 허용 값, 거절 사유)를 바꾸지 않는다. 바꾸면 `v2`를 새로 만든다. 병합 전의 판은 아직 아무도 고정하지 않았으므로 그 PR 안에서 고친다. `limits.ts`에서 "기본값(관리자 미확정)"으로 적은 것은 내는 쪽 기본값(예: 맞춤 봉투의 발급 수명 `STOP_SYNC_TTL_MS`)과 운영 숫자(전달 상한, 갱신·끊김 시간 등)뿐이다. 이것들은 받는 쪽 경계 안에서만 같은 판에서 바꾼다(예: `STOP_SYNC_TTL_MS`는 `STOP_SYNC_TTL_MAX_MS` 15초 이하). 경계와의 관계는 시험이 지킨다.
+- **판 규칙:** main에 병합된 판 안에서 칸, 동작, 받는 쪽 거절 경계(수명 상한, 시계 오차, 맞춤 대기 기한, 임대 상한, 크기·개수 상한, 허용 값, 거절 사유)를 바꾸지 않는다. 바꾸면 새 판을 만든다. `v2`는 현관 계약(아래)의 이름이고, 실행기 계약의 다음 판의 이름은 그때 정한다. 병합 전의 판은 아직 아무도 고정하지 않았으므로 그 PR 안에서 고친다. `limits.ts`에서 "기본값(관리자 미확정)"으로 적은 것은 내는 쪽 기본값(예: 맞춤 봉투의 발급 수명 `STOP_SYNC_TTL_MS`)과 운영 숫자(전달 상한, 갱신·끊김 시간 등)뿐이다. 이것들은 받는 쪽 경계 안에서만 같은 판에서 바꾼다(예: `STOP_SYNC_TTL_MS`는 `STOP_SYNC_TTL_MAX_MS` 15초 이하). 경계와의 관계는 시험이 지킨다.
 
 ### fixture
 
@@ -82,6 +82,14 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 - 사례의 칸: `keys`(믿는 공개 키, 주체 이름 → Ed25519 32바이트의 base64url), `context`(`now`, `expected_recipient`, `stop_generation`(`null`은 세대 없음), `stop_sync_challenge`(기다리는 정지 세대 맞춤의 `challenge`와 그 요청을 실은 시각 `sent_at`, 없으면 `null`), `run_generations`, `spent_nonces`), `message`(봉투), `expect`(`{ok: true, adopted_stop_generation}` 또는 `{ok: false, reason}`. `adopted_stop_generation`은 받아들이며 올린 정지 세대, 아니면 `null`), `signing_input`(서명한 바이트의 글).
 - 거절 사례는 `base`(통과 사례)에서 `changed`에 적은 곳만 다르다. 시험이 이것을 대조한다.
 - **개인 키는 저장소에 없다.** `bun run fixtures`가 부를 때마다 주체별 키를 새로 만들어 서명하고 공개 키만 파일에 쓴다. 그래서 사례 하나만 고쳐 다시 서명할 수 없고 늘 전부 다시 만든다(모든 파일의 서명과 키가 바뀐다). 사례를 지웠으면 그 파일도 지운다(시험이 남은 파일을 잡는다).
+
+## 계약 `olive-control/v2` (현관, 후보)
+
+현관과 감독 사이의 계약이다(D-65·D-66·D-68). 실행기 연결은 `olive-control/v1`을 그대로 쓰고, 감독은 연결의 상대마다 판을 대조한다. 코드는 `src/contract/v2/`이고 다른 코드는 `index.ts`만 import한다. 요약은 `src/contract/v2.md`(맨 위에 동작 스물넷의 전체 표).
+
+- **후보다.** `v2.md`의 머리와 모든 표본의 `"status": "candidate"`는 현관(O08)이 이 표본으로 자기 검증기를 독립 검증하기 전이라는 표시이고, 그때까지 표본은 상호 운용의 증거가 아니다. **후보로 표시된 판은 main에 있어도 고칠 수 있고, 현관이 독립 검증해 후보 표시를 떼는 PR에서 굳는다**(관리자 결정 2026-11-20). 굳은 뒤에는 판 규칙(위 v1 절)이 v2에도 같아서, 칸, 동작, 받는 쪽 거절 경계를 바꾸려면 새 판을 만든다. `v2.md`가 값 옆에 적은 "후보"(관리자가 숫자를 따로 정하지 않은 상한)도 받는 쪽 경계면 후보 표시를 뗄 때 함께 굳는다. **후보인 동안에는 이 계약으로 실제 연결을 켜지 않는다.** 실행기 계약 v1의 판 규칙은 이 결정과 무관하게 그대로다.
+- **v1과 다른 점.** 정지·실행 세대는 머리가 아니라 효과 동작의 본문에 실려 서명에 묶이고, 받는 쪽이 자기 권위 값과 대조해 옛 세대를 거절한다. 연결은 인사(`handshake`)로 시작해 판과 정책 revision을 대조한다. 정책이 어긋난 연결에서는 뜻이 고정된 사실의 조회와 정지의 준비·확정만 받는다. 효과 요청은 (보낸 쪽, `job_id`)로 가리키는 작업이고, 그 결과는 `job_lookup`·`job_status`로 묻는다. 서명 바이트는 v1 공개 면의 `canonicalJson`·`digestOf`로 만들어 정규화가 한 벌이다.
+- **표본.** `contracts/fixtures/v2/frontdoor/accept/`와 `reject/`(통과 46, 거절 93). `bun run fixtures:v2`로 다시 만든다. v1 생성기(`bun run fixtures`)와 따로이고 v1 폴더에는 쓰지 않는다. 개인 키를 남기지 않는 것과 늘 전부 다시 만드는 것은 v1 표본과 같다.
 
 ## 폴더
 
@@ -92,6 +100,7 @@ src/main/
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
+src/contract/v2/    # 계약 olive-control/v2(현관과 감독, 후보), 요약은 src/contract/v2.md
 src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다. 진입점 조립은 아직 없다)
 ├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 상태와 사건의 전이(commit), 연산별 저장 장애, 장부 대조와 표식
 ├── worker.ts       # 지시 처리, 효과 직전 확인, 영수증·결과 보고, 재시작 뒤 대조
@@ -102,6 +111,7 @@ src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다.
 └── containment-core.ts # PID 공간의 스캔·종료·세기 알고리즘(신호 능력을 스스로 만들지 않는다)
 src/ledger/         # 감독 장부(SQLite)와 재시작 복원, 요약은 src/ledger/ledger.md
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
+contracts/fixtures/v2/frontdoor/  # v2 표본(accept/, reject/, 후보)
 test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성, test/executor/는 실행기 시험과 가짜 역할 프로그램
 ```
 
