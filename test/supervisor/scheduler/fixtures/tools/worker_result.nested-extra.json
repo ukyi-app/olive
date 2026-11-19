@@ -1,0 +1,49 @@
+{
+  "status": "candidate",
+  "tool": "worker_result",
+  "case": "nested-extra",
+  "description": "결과의 항목과 참조에 계약 v1 밖의 칸(PID·계정·실행기 ID·경로)이 붙었다. 그 칸을 옮기지 않고 결과 전체를 unknown으로 닫는다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000023",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": {},
+    "pinned": [],
+    "works": [
+      {
+        "ref": "cccccccc-0000-4000-8000-000000000001",
+        "owner": "aaaaaaaa-0000-4000-8000-000000000001",
+        "retryKey": "start_worker:aaaaaaaa-0000-4000-8000-000000000001:diagnose",
+        "content": { "role": "diagnosis", "purpose": "diagnose", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" },
+        "phase": "ready_result"
+      }
+    ],
+    "results": {
+      "cccccccc-0000-4000-8000-000000000001": {
+        "state": "settled",
+        "checksPassed": true,
+        "valid": true,
+        "cleanupPending": false,
+        "result": {
+          "role": "diagnosis",
+          "outcome": "completed",
+          "summary": "이미지 태그가 잘못돼 기동에 실패한다",
+          "items": [{ "kind": "finding", "text": "이미지를 받지 못했다는 사건이 세 번 있다", "pid": 42, "executorId": "example" }],
+          "refs": [{ "kind": "path", "ref": "apps/sample/deployment.yaml", "digest": null, "account": "demo", "path": "/example" }]
+        }
+      }
+    },
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": { "ref": "cccccccc-0000-4000-8000-000000000001" },
+  "expect": {
+    "answer": { "outcome": "unknown", "tool": "worker_result" },
+    "writes": 0
+  }
+}
