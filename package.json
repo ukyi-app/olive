@@ -6,7 +6,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "bun test/run.ts",
-    "fixtures": "bun test/contract/generate-fixtures.ts"
+    "fixtures": "bun test/contract/generate-fixtures.ts",
+    "fixtures:v2": "bun test/contract/v2/generate-fixtures.ts"
   },
   "devDependencies": {
     "@types/bun": "1.4.4",

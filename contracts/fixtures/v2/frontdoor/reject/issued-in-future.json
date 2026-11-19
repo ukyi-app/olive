@@ -1,0 +1,45 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/issued-in-future",
+  "description": "발급 시각이 받는 쪽 시계보다 1초 넘게 앞섬",
+  "status": "candidate",
+  "base": "accept/handshake",
+  "changed": [
+    "message.header.issued_at",
+    "message.header.expires_at"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "not_yet_valid"
+  },
+  "keys": {
+    "front-door": "Vo-BR9UecDua7oJ3m8_uwLk1a95EvsKT82O3IMMpSYc"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "none",
+    "intake_open": false,
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf",
+      "issued_at": 1795046401001,
+      "expires_at": 1795046431001,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "handshake",
+      "request_id": "00000000-0000-4000-8000-000000000010",
+      "nonce": "00000000000000000000000000000001"
+    },
+    "signature": "Mm8hlvpdf0UxMLiUlHLlBp2-zaD8cr-6dQ8UDpZQiZUs9Lyn5xCth3t-1hz7hbA4XnkDKYnCf-gxIcHhDj0yAA",
+    "body": {
+      "policy_revision": "policy-7"
+    }
+  },
+  "signing_input": "{\"action\":\"handshake\",\"body_digest\":\"e9efa21fbd3b8d9d4da9a246d88afa74fd05c702c4f4185a933e13b91c291abf\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046431001,\"issued_at\":1795046401001,\"nonce\":\"00000000000000000000000000000001\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000010\",\"sender\":\"front-door\"}"
+}
