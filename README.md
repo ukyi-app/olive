@@ -83,6 +83,14 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 - 거절 사례는 `base`(통과 사례)에서 `changed`에 적은 곳만 다르다. 시험이 이것을 대조한다.
 - **개인 키는 저장소에 없다.** `bun run fixtures`가 부를 때마다 주체별 키를 새로 만들어 서명하고 공개 키만 파일에 쓴다. 그래서 사례 하나만 고쳐 다시 서명할 수 없고 늘 전부 다시 만든다(모든 파일의 서명과 키가 바뀐다). 사례를 지웠으면 그 파일도 지운다(시험이 남은 파일을 잡는다).
 
+## 계약 `olive-control/v2` (현관, 후보)
+
+현관과 감독 사이의 계약이다(D-65·D-66·D-68). 실행기 연결은 `olive-control/v1`을 그대로 쓰고, 감독은 연결의 상대마다 판을 대조한다. 코드는 `src/contract/v2/`이고 다른 코드는 `index.ts`만 import한다. 요약은 `src/contract/v2.md`(맨 위에 동작 스물넷의 전체 표).
+
+- **후보다.** `v2.md`의 머리와 모든 표본의 `"status": "candidate"`는 현관(O08)이 이 표본으로 자기 검증기를 독립 검증하기 전이라는 표시이고, 그때까지 표본은 상호 운용의 증거가 아니다. 바꿔도 된다는 뜻은 아니다: 판 규칙(위 v1 절)은 v2에도 같아서, main에 병합하면 이 판의 칸, 동작, 받는 쪽 거절 경계는 굳고, 현관의 검증이 고칠 것을 찾으면 새 판을 만든다. `v2.md`가 값 옆에 적은 "후보"(관리자가 숫자를 따로 정하지 않은 상한)도 받는 쪽 경계면 병합과 함께 굳는다.
+- **v1과 다른 점.** 정지·실행 세대는 머리가 아니라 효과 동작의 본문에 실려 서명에 묶이고, 받는 쪽이 자기 권위 값과 대조해 옛 세대를 거절한다. 연결은 인사(`handshake`)로 시작해 판과 정책 revision을 대조한다. 정책이 어긋난 연결에서는 뜻이 고정된 사실의 조회와 정지의 준비·확정만 받는다. 효과 요청은 (보낸 쪽, `job_id`)로 가리키는 작업이고, 그 결과는 `job_lookup`·`job_status`로 묻는다. 서명 바이트는 v1 공개 면의 `canonicalJson`·`digestOf`로 만들어 정규화가 한 벌이다.
+- **표본.** `contracts/fixtures/v2/frontdoor/accept/`와 `reject/`(통과 46, 거절 85). `bun run fixtures:v2`로 다시 만든다. v1 생성기(`bun run fixtures`)와 따로이고 v1 폴더에는 쓰지 않는다. 개인 키를 남기지 않는 것과 늘 전부 다시 만드는 것은 v1 표본과 같다.
+
 ## 폴더
 
 ```text
@@ -92,6 +100,7 @@ src/main/
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
+src/contract/v2/    # 계약 olive-control/v2(현관과 감독, 후보), 요약은 src/contract/v2.md
 src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다. 진입점 조립은 아직 없다)
 ├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 상태와 사건의 전이(commit), 연산별 저장 장애, 장부 대조와 표식
 ├── worker.ts       # 지시 처리, 효과 직전 확인, 영수증·결과 보고, 재시작 뒤 대조
@@ -102,6 +111,7 @@ src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다.
 └── containment-core.ts # PID 공간의 스캔·종료·세기 알고리즘(신호 능력을 스스로 만들지 않는다)
 src/ledger/         # 감독 장부(SQLite)와 재시작 복원, 요약은 src/ledger/ledger.md
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
+contracts/fixtures/v2/frontdoor/  # v2 표본(accept/, reject/, 후보)
 test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성, test/executor/는 실행기 시험과 가짜 역할 프로그램
 ```
 

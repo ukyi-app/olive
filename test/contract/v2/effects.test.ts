@@ -12,6 +12,7 @@ import {
   type LookupOutcome,
   OUTBOUND_GENERATIONS,
   PROGRESS_STAGES,
+  PROGRESS_STOP_CAUSES as PUBLIC_PROGRESS_STOP_CAUSES,
   publicationLinkOf,
   publicationLookupOf,
   PublicationUnknown,
@@ -204,6 +205,8 @@ test("임의 진행 문구 거절", async () => {
 });
 
 test("멈춤의 이유: stopped에만 닫힌 목록의 값 하나가 반드시 있고, 다른 단계·목록 밖·자유로운 글은 거절한다", async () => {
+  // 현관은 공개 면(index.ts)으로만 이 목록을 읽어 표시 문구를 만든다.
+  expect(PUBLIC_PROGRESS_STOP_CAUSES).toBe(PROGRESS_STOP_CAUSES);
   // 목록(후보)은 이 아홉뿐이다. 바뀌면 v2.md 표와 인계 글의 근거도 함께 바꾼다.
   expect([...PROGRESS_STOP_CAUSES]).toEqual([
     "deadline",
