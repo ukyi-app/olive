@@ -49,6 +49,10 @@ class FakeBackend implements ResultBackend {
   readonly calls: { op: Op; key: string }[] = [];
   // remove가 "지웠다"고 답하면서 실제로는 남기는 백엔드.
   lieOnRemove = false;
+  // putNew가 stored라고 답하면서 아무것도 남기지 않거나(drop) 마지막 바이트 하나를 바꿔 남기는(flip) 백엔드.
+  putFault: "drop" | "flip" | null = null;
+  // readRange가 요청보다 한 바이트 짧게 ok로 답하는 백엔드.
+  rangeShort = false;
 
   #fault<T>(op: Op, key: string): T | null {
     this.calls.push({ op, key });
@@ -62,7 +66,10 @@ class FakeBackend implements ResultBackend {
     const f = this.#fault<{ status: "unknown" }>("putNew", key);
     if (f) return f;
     if (this.data.has(key)) return { status: "exists" as const };
-    this.data.set(key, bytes.slice());
+    if (this.putFault === "drop") return { status: "stored" as const };
+    const copy = bytes.slice();
+    if (this.putFault === "flip") copy[copy.length - 1] ^= 0x01;
+    this.data.set(key, copy);
     return { status: "stored" as const };
   }
   read(key: string): BackendRead {
@@ -75,7 +82,7 @@ class FakeBackend implements ResultBackend {
     const f = this.#fault<BackendRead>("readRange", key);
     if (f) return f;
     const bytes = this.data.get(key);
-    return bytes === undefined ? { status: "absent" } : { status: "ok", bytes: bytes.slice(offset, offset + length) };
+    return bytes === undefined ? { status: "absent" } : { status: "ok", bytes: bytes.slice(offset, offset + length - (this.rangeShort ? 1 : 0)) };
   }
   remove(key: string) {
     const f = this.#fault<{ status: "unknown" }>("remove", key);
@@ -93,6 +100,15 @@ class FakeBackend implements ResultBackend {
     const f = this.#fault<{ status: "unknown" }>("keys", prefix);
     if (f) return f;
     return { status: "ok" as const, keys: [...this.data.keys()].filter((key) => key.startsWith(prefix)) };
+  }
+}
+
+// 읽기에 기록과 같은 메모리의 Buffer를 그대로 내주는 백엔드. Buffer는 포트가 받는 Uint8Array의 한 종류다.
+class BufferBackend extends FakeBackend {
+  override read(key: string): BackendRead {
+    this.calls.push({ op: "read", key });
+    const bytes = this.data.get(key);
+    return bytes === undefined ? { status: "absent" } : { status: "ok", bytes: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength) };
   }
 }
 
@@ -252,6 +268,52 @@ describe("인수 시험", () => {
   });
 });
 
+describe("보관 확인", () => {
+  const r = result("되읽기");
+  const input = { runId: RUN_A, owner: OWNER, digest: resultDigest(r), body: resultBody(r), now: NOW };
+
+  test("신규 보관: 넣었다는 답 뒤 같은 자리에서 넣은 그대로 읽히지 않으면 참조 없이 모름이고, 넣은 것을 지운다", () => {
+    const { gate } = gates(true);
+    for (const putFault of ["drop", "flip"] as const) {
+      const backend = new FakeBackend();
+      backend.putFault = putFault;
+      expect(storeResult(backend, input)).toEqual({ status: "unknown" });
+      expect(backend.calls.map((c) => c.op)).toEqual(["putNew", "read", "remove"]);
+      expect(backend.data.size).toBe(0);
+      // 같은 실행의 재보관(재전송): 백엔드가 정상이면 새로 넣고, 그 참조로 같은 바이트가 읽힌다.
+      backend.putFault = null;
+      const again = storeResult(backend, { ...input, now: NOW + 5_000 });
+      expect(again).toEqual({ status: "stored", ref: expect.stringMatching(/^results\//), created: true });
+      const read = readStored({ backend, gate }, { ref: (again as { ref: string }).ref, owner: OWNER, digest: input.digest });
+      expect(read.status === "ok" && read.bytes).toEqual(input.body);
+    }
+    {
+      // 다시 읽기가 모름이어도 참조가 없다.
+      const backend = new FakeBackend();
+      backend.faults.read = "unknown";
+      expect(storeResult(backend, input)).toEqual({ status: "unknown" });
+      expect(backend.data.size).toBe(0);
+    }
+  });
+
+  test("신규 보관의 확인과 지우기가 모두 실패하면, 남은 기록은 재보관을 모름으로 막고 고아 정리가 기한 뒤 지운다", () => {
+    const backend = new FakeBackend();
+    backend.putFault = "flip";
+    backend.faults.remove = "unknown";
+    expect(storeResult(backend, input)).toEqual({ status: "unknown" });
+    expect(backend.data.size).toBe(1);
+    backend.putFault = null;
+    delete backend.faults.remove;
+    // 이미 있는 자리가 넣으려는 그대로가 아니다: 같은 참조를 내지 않는다.
+    expect(storeResult(backend, { ...input, now: NOW + 5_000 })).toEqual({ status: "unknown" });
+    // 머리는 온전해 보관 시각이 확인되므로, 장부 밖이면 기한 뒤 지워진다.
+    const swept = sweepStored(backend, { keep: [], before: NOW + 1 });
+    if (swept.status !== "ok") throw new Error(swept.status);
+    expect(swept).toEqual({ status: "ok", deleted: [expect.stringMatching(/^results\//)], failed: [], unverified: [] });
+    expect(storeResult(backend, { ...input, now: NOW + 10_000 })).toEqual({ status: "stored", ref: swept.deleted[0], created: true });
+  });
+});
+
 describe("보관의 거절", () => {
   test("digest 불일치: 받은 digest가 본문의 것이 아니면 백엔드를 부르지 않고 거절한다", () => {
     const backend = new FakeBackend();
@@ -330,10 +392,11 @@ describe("손상", () => {
     const r = result("손상");
     expect(storeResult(backend, { runId: RUN_A, owner: OWNER, digest, body: resultBody(r), now: NOW })).toEqual({ status: "unknown" });
 
+    // 머리가 손상되면 소유자를 확인할 수 없으므로 보관한 소유자에게도 없는 참조와 같은 답이다(진단은 목록의 damaged).
     const head = bytes.slice();
     head[6] = 0x00;
     backend.data.set(key, head);
-    expect(readStored({ backend, gate }, { ref, owner: OWNER, digest })).toEqual({ status: "corrupt" });
+    expect(readStored({ backend, gate }, { ref, owner: OWNER, digest })).toEqual({ status: "absent" });
 
     // 다른 실행의 기록이 이 자리에 있으면(옮겨진 기록) 손상이다.
     const elsewhere = new FakeBackend();
@@ -341,10 +404,61 @@ describe("손상", () => {
     backend.data.set(key, [...elsewhere.data.values()][0]!);
     expect(readStored({ backend, gate }, { ref, owner: OWNER, digest })).toEqual({ status: "corrupt" });
   });
+
+  test("소유자를 확인하기 전에는 손상을 드러내지 않는다: 잘린 기록은 남에게 없는 참조와 같은 답이다", () => {
+    const backend = new FakeBackend();
+    const { ref, digest } = stored(backend, RUN_A, OWNER, result("잘림"));
+    const [key, bytes] = [...backend.data.entries()][0]!;
+    const open = gates(true);
+    const ask = (owner: string, at = ref) => [
+      readStored({ backend, gate: open.gate }, { ref: at, owner, digest }),
+      readStored({ backend, gate: open.gate }, { ref: at, owner, digest, range: { offset: 0, length: 1 } }),
+    ];
+    const missing = ask(OWNER, ref.replace(/.$/, (c) => (c === "0" ? "1" : "0")));
+    expect(missing).toEqual([{ status: "absent" }, { status: "absent" }]);
+
+    // 머리 손상: 누구의 기록인지 확인할 수 없다.
+    const head = bytes.slice();
+    head[6] = 0x00;
+    backend.data.set(key, head);
+    expect(ask(OTHER)).toEqual(missing);
+    expect(ask(OWNER)).toEqual(missing);
+    expect(listStored(backend)).toEqual({ status: "ok", entries: [{ ref, state: "damaged" }] });
+
+    // 본문이 1바이트 모자람: 머리로 소유자가 확인된 쪽에만 손상이다.
+    backend.data.set(key, bytes.slice(0, bytes.length - 1));
+    expect(ask(OTHER)).toEqual(missing);
+    expect(ask(OWNER)).toEqual([{ status: "corrupt" }, { status: "corrupt" }]);
+    // 판정 포트는 소유자가 확인된 두 읽기에서만 불렸다.
+    expect(open.asked).toHaveLength(2);
+  });
+});
+
+describe("Buffer 백엔드", () => {
+  test("Buffer를 내주는 백엔드에서도 돌려주는 바이트는 그 길이만 한 새 메모리다", () => {
+    const backend = new BufferBackend();
+    const { ref, body, digest } = stored(backend, RUN_A, OWNER, result("버퍼"));
+    const allowed = gates(true, { [digest]: ref });
+    const ports = { backend, gate: allowed.gate, candidates: allowed.candidates };
+    const answers = [
+      readStored(ports, { ref, owner: OWNER, digest, range: { offset: 0, length: 1 } }),
+      readCandidate(ports, { digest, offset: 0, length: 1, maxChunkBytes: CHUNK_MAX, maxContentBytes: CONTENT_MAX }),
+      readStored(ports, { ref, owner: OWNER, digest }),
+    ];
+    for (const answer of answers) {
+      if (answer.status !== "ok") throw new Error(answer.status);
+      expect(answer.bytes.byteOffset).toBe(0);
+      expect(answer.bytes.buffer.byteLength).toBe(answer.bytes.byteLength);
+      answer.bytes.fill(0);
+    }
+    // 돌려받은 바이트를 고쳐도 백엔드의 기록은 그대로다.
+    const again = readStored(ports, { ref, owner: OWNER, digest });
+    expect(again.status === "ok" && again.bytes).toEqual(body);
+  });
 });
 
 describe("고아 정리", () => {
-  test("목록은 참조·실행·보관 시각만 싣고, 정리는 장부 밖의 오래된 것과 손상된 것만 지운다", () => {
+  test("목록은 참조·실행·보관 시각만 싣고, 정리는 장부 밖의 오래된 것만 지우고 보관 시각을 모르는 손상 기록은 남긴다", () => {
     const backend = new FakeBackend();
     const kept = stored(backend, RUN_A, OWNER, result("장부에 있음"), NOW);
     const orphan = stored(backend, RUN_B, OWNER, result("고아"), NOW);
@@ -364,8 +478,8 @@ describe("고아 정리", () => {
     expect(listed.entries.filter((e) => e.state === "damaged").map((e) => e.ref)).toEqual(["results/ffffffff-0000-8000-8000-00000000000f"]);
 
     const swept = sweepStored(backend, { keep: [kept.ref], before: NOW + 1 });
-    expect(swept).toEqual({ status: "ok", deleted: expect.arrayContaining([orphan.ref, "results/ffffffff-0000-8000-8000-00000000000f"]), failed: [] });
-    expect(swept.status === "ok" ? swept.deleted : []).toHaveLength(2);
+    expect(swept).toEqual({ status: "ok", deleted: [orphan.ref], failed: [], unverified: ["results/ffffffff-0000-8000-8000-00000000000f"] });
+    expect(backend.data.has("result/ffffffff-0000-8000-8000-00000000000f")).toBe(true);
     const { gate } = gates(true);
     expect(readStored({ backend, gate }, { ref: orphan.ref, owner: OWNER, digest: orphan.digest })).toEqual({ status: "absent" });
     expect(readStored({ backend, gate }, { ref: kept.ref, owner: OWNER, digest: kept.digest }).status).toBe("ok");
@@ -374,13 +488,51 @@ describe("고아 정리", () => {
     expect(backend.data.has("elsewhere/kept")).toBe(true);
   });
 
-  test("머리를 읽지 못한 기록은 지우지 않고 실패로 남긴다", () => {
+  test("머리를 읽지 못한 기록은 지우지 않고 unverified로 남긴다", () => {
     const backend = new FakeBackend();
     const orphan = stored(backend, RUN_B, OWNER, result("고아"), NOW);
     backend.faults.readRange = "unknown";
-    expect(sweepStored(backend, { keep: [], before: NOW + 1 })).toEqual({ status: "ok", deleted: [], failed: [orphan.ref] });
+    expect(sweepStored(backend, { keep: [], before: NOW + 1 })).toEqual({ status: "ok", deleted: [], failed: [], unverified: [orphan.ref] });
     expect(backend.data.size).toBe(1);
     expect(sweepStored(backend, { keep: [], before: Number.NaN })).toEqual({ status: "invalid" });
+  });
+
+  test("머리 조각이 덜 읽히거나 저장된 머리가 손상돼 보관 시각을 모르면, 기한 안의 본문을 지우지 않는다", () => {
+    const { gate } = gates(true);
+    {
+      // 머리 길이 4바이트를 요청한 조각 읽기가 3바이트만 ok로 돌려준다. 실제 보관 시각(NOW + 1)은 기한(NOW) 뒤다.
+      const backend = new FakeBackend();
+      const young = stored(backend, RUN_A, OWNER, result("유예 안"), NOW + 1);
+      backend.rangeShort = true;
+      expect(sweepStored(backend, { keep: [], before: NOW })).toEqual({ status: "ok", deleted: [], failed: [], unverified: [young.ref] });
+      const read = readStored({ backend, gate }, { ref: young.ref, owner: OWNER, digest: young.digest });
+      expect(read.status === "ok" && read.bytes).toEqual(young.body);
+    }
+    {
+      // 저장된 머리 자체가 손상됐다(조각 읽기는 정상). 같은 시각 조건에서 지우지 않는다.
+      const backend = new FakeBackend();
+      const damaged = stored(backend, RUN_A, OWNER, result("머리 손상"), NOW + 1);
+      const [key, bytes] = [...backend.data.entries()][0]!;
+      const broken = bytes.slice();
+      broken[6] = 0x00;
+      backend.data.set(key, broken);
+      expect(sweepStored(backend, { keep: [], before: NOW })).toEqual({ status: "ok", deleted: [], failed: [], unverified: [damaged.ref] });
+      expect(backend.data.get(key)).toEqual(broken);
+    }
+  });
+
+  test("머리 길이 필드가 손상되면 목록의 내부 읽기는 본문에 닿을 수 있지만, 답에는 참조와 상태만 싣고 정리는 남긴다", () => {
+    const backend = new FakeBackend();
+    const { ref } = stored(backend, RUN_A, OWNER, result("길이 손상"));
+    const [key, bytes] = [...backend.data.entries()][0]!;
+    const longer = bytes.slice();
+    const view = new DataView(longer.buffer);
+    view.setUint32(0, view.getUint32(0) + 1);
+    backend.data.set(key, longer);
+    const listed = listStored(backend);
+    expect(listed).toEqual({ status: "ok", entries: [{ ref, state: "damaged" }] });
+    expect(JSON.stringify(listed)).not.toContain(SECRET);
+    expect(sweepStored(backend, { keep: [], before: NOW + 1 })).toEqual({ status: "ok", deleted: [], failed: [], unverified: [ref] });
   });
 });
 

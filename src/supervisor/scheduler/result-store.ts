@@ -88,7 +88,9 @@ export type ListedEntry =
 export type ListAnswer = { readonly status: "ok"; readonly entries: readonly ListedEntry[] } | { readonly status: "unknown" };
 export type DeleteAnswer = { readonly status: "deleted" } | { readonly status: "absent" } | { readonly status: "invalid" } | { readonly status: "unknown" };
 export type SweepAnswer =
-  | { readonly status: "ok"; readonly deleted: readonly string[]; readonly failed: readonly string[] }
+  // deleted: 지웠고 없음을 확인했다. failed: 지우려 했으나 없음을 확인하지 못했다.
+  // unverified: 보관 시각을 확인하지 못해(머리를 못 읽음·덜 읽힘·꼴이 틀림) 지우지 않고 남겼다. 정리된 것이 아니라 사람이 볼 것이다.
+  | { readonly status: "ok"; readonly deleted: readonly string[]; readonly failed: readonly string[]; readonly unverified: readonly string[] }
   | { readonly status: "invalid" }
   | { readonly status: "unknown" };
 
@@ -137,7 +139,9 @@ const ownerTagOf = (owner: string) => sha256Text(`olive/result-store/v1/owner\u0
 
 // ---- 기록의 바이트 ----
 
-// [머리 길이 4바이트(빅엔디언)][머리: 정규 JSON][본문]. 목록은 머리만 조각으로 읽어 본문을 꺼내지 않는다.
+// [머리 길이 4바이트(빅엔디언)][머리: 정규 JSON][본문]. 목록은 머리 길이 필드만큼만 조각으로 읽는다.
+// 길이 필드가 맞으면 본문에 닿지 않는다. 길이 필드가 손상돼 크면 내부 읽기가 본문 앞부분까지 받을 수 있다.
+// 어느 쪽이든 목록의 답에는 참조·상태와, 머리를 해석한 기록의 실행·보관 시각만 싣는다.
 interface Head {
   readonly v: 1;
   readonly run: string;
@@ -175,16 +179,31 @@ function parseHead(bytes: Uint8Array): Head | null {
   return value as unknown as Head;
 }
 
-// 머리와 본문을 가른다. 본문의 길이가 머리와 다르면 null(잘린 기록).
-function decodeRecord(bytes: Uint8Array): { readonly head: Head; readonly body: Uint8Array } | null {
+interface StoredRecord {
+  readonly head: Head;
+  readonly body: Uint8Array;
+}
+
+// 머리와 그 뒤의 바이트를 가른다. 본문의 길이는 보지 않는다(소유자를 먼저 확인해야 하는 읽기가 쓴다).
+function splitRecord(bytes: Uint8Array): StoredRecord | null {
   const length = headLength(bytes);
   if (length === null || HEAD_LENGTH_BYTES + length > bytes.length) return null;
   const head = parseHead(bytes.subarray(HEAD_LENGTH_BYTES, HEAD_LENGTH_BYTES + length));
   if (head === null) return null;
-  const body = bytes.subarray(HEAD_LENGTH_BYTES + length);
-  if (body.length !== head.size) return null;
-  return { head, body };
+  return { head, body: bytes.subarray(HEAD_LENGTH_BYTES + length) };
 }
+
+// 머리와 본문을 가른다. 본문의 길이가 머리와 다르면 null(잘린 기록).
+function decodeRecord(bytes: Uint8Array): StoredRecord | null {
+  const record = splitRecord(bytes);
+  return record !== null && record.body.length === record.head.size ? record : null;
+}
+
+// 본문이 머리의 길이와 digest 그대로인가(잘림·바뀜).
+const intactBody = (record: StoredRecord) => record.body.length === record.head.size && sha256(record.body) === record.head.digest;
+
+const sameHead = (a: Head, b: Head) =>
+  a.v === b.v && a.run === b.run && a.owner === b.owner && a.digest === b.digest && a.storedAt === b.storedAt && a.size === b.size;
 
 // ---- 포트 호출 ----
 
@@ -236,10 +255,14 @@ function askCandidate(gate: CandidateGate, digest: string): string | null | "unk
 
 const entryOf = (slot: string, head: Head): StoredEntry => ({ ref: refOf(slot), runId: head.run, storedAt: head.storedAt });
 
-// 조각: 위치가 본문 안이어야 하고, 길이는 끝에서 자른다. 돌려주는 바이트는 사본이다.
+// 조각: 위치가 본문 안이어야 하고, 길이는 끝에서 자른다. 돌려주는 바이트는 그 길이만 한 새 메모리의 사본이다.
+// 백엔드가 Buffer를 내줄 수 있는데, Buffer의 slice는 사본이 아니라 같은 메모리의 창이라 쓰지 않는다.
 function slice(body: Uint8Array, offset: number, length: number): Uint8Array | null {
   if (offset >= body.length) return null;
-  return body.slice(offset, Math.min(body.length, offset + length));
+  const end = Math.min(body.length, offset + length);
+  const out = new Uint8Array(end - offset);
+  out.set(body.subarray(offset, end));
+  return out;
 }
 
 // ---- 보관 ----
@@ -268,13 +291,21 @@ export function storeResult(backend: ResultBackend, input: StoreInput): StoreAns
   const key = keyOf(slot);
   const head: Head = { v: 1, run: runId, owner: ownerTagOf(owner), digest, storedAt: now, size: body.length };
   const put = backendStatus(() => backend.putNew(key, encodeRecord(head, body)), ["stored", "exists"] as const);
-  if (put === "stored") return { status: "stored", ref: refOf(slot), created: true };
   if (put === "unknown") return { status: "unknown" };
 
+  // 넣었다·이미 있다는 답만으로는 참조를 내지 않는다. 같은 자리를 다시 읽어 온전한 기록이 보일 때만 낸다.
+  const check = backendRead(() => backend.read(key));
+  const record = check.status === "ok" ? decodeRecord(check.bytes) : null;
+  if (put === "stored") {
+    // 방금 넣은 그대로(머리 전부와 본문)여야 한다. 아니면 참조 없는 unknown이고, 넣은 것을 지워 본다.
+    // 지우기의 답은 이 답을 바꾸지 않는다. 남은 기록은 같은 실행의 재보관에서 unknown으로 걸리고, 머리가 온전하면 고아 정리가 기한 뒤 지운다.
+    if (record !== null && sameHead(record.head, head) && sha256(record.body) === digest) return { status: "stored", ref: refOf(slot), created: true };
+    backendStatus(() => backend.remove(key), ["removed", "absent"] as const);
+    return { status: "unknown" };
+  }
+
   // 이미 있는 자리: 그 기록이 온전하고 같은 내용이어야 같은 참조로 답한다. 손상된 자리는 "보관됨"을 입증하지 못한다.
-  const existing = backendRead(() => backend.read(key));
-  if (existing.status !== "ok") return { status: "unknown" };
-  const record = decodeRecord(existing.bytes);
+  // 앞선 보관이 낸 참조가 장부에 적혔을 수 있는 자리라 여기서는 지우지 않는다.
   if (record === null || record.head.run !== runId || sha256(record.body) !== record.head.digest) return { status: "unknown" };
   if (record.head.digest !== digest || record.head.owner !== head.owner) return { status: "conflict" };
   return { status: "stored", ref: refOf(slot), created: false };
@@ -304,16 +335,17 @@ export function readStored(ports: { readonly backend: ResultBackend; readonly ga
 
   const got = backendRead(() => ports.backend.read(keyOf(slot)));
   if (got.status !== "ok") return got;
-  const record = decodeRecord(got.bytes);
-  if (record === null) return { status: "corrupt" };
-  if (record.head.owner !== ownerTagOf(input.owner)) return { status: "absent" };
+  // 소유자를 먼저 본다. 머리를 해석하지 못해 소유자를 확인할 수 없는 기록은 남의 참조·없는 참조와 같은 absent다.
+  // corrupt는 소유자가 확인된 뒤에만 답한다. 그 전에 답하면 그 자리에 기록이 있음이 드러난다. 손상의 진단은 listStored(damaged)가 맡는다.
+  const record = splitRecord(got.bytes);
+  if (record === null || record.head.owner !== ownerTagOf(input.owner)) return { status: "absent" };
   if (slotOf(record.head.run) !== slot) return { status: "corrupt" };
   if (record.head.digest !== input.digest) return { status: "absent" };
 
   const readable = askReadable(ports.gate, entryOf(slot, record.head));
   if (readable === "unknown") return { status: "unknown" };
   if (!readable) return { status: "closed" };
-  if (sha256(record.body) !== record.head.digest) return { status: "corrupt" };
+  if (!intactBody(record)) return { status: "corrupt" };
 
   const offset = range?.offset ?? 0;
   const bytes = slice(record.body, offset, range?.length ?? record.body.length);
@@ -427,8 +459,9 @@ export interface SweepInput {
   readonly before: number;
 }
 
-// 장부에 없는 오래된 기록(보관 뒤 장부에 적히지 못한 고아)과 장부에 없는 손상 기록을 지운다.
-// 머리를 읽지 못한 기록은 나이를 모르므로 지우지 않고 failed에 남긴다. 목록을 못 읽으면 아무것도 지우지 않는다.
+// 장부에 없고 보관 시각이 기한보다 앞선 것으로 확인된 기록(보관 뒤 장부에 적히지 못한 고아)만 지운다.
+// 머리를 읽지 못했거나 덜 읽혔거나 꼴이 틀려 보관 시각을 모르는 기록은 유예 안의 본문일 수 있으므로 지우지 않고 unverified에 남긴다.
+// 목록을 못 읽으면 아무것도 지우지 않는다.
 export function sweepStored(backend: ResultBackend, input: SweepInput): SweepAnswer {
   if (!isPlainObject(input) || !hasOnly(input, ["keep", "before"]) || !Array.isArray(input.keep) || !isCount(input.before, 0)) return { status: "invalid" };
   if (!input.keep.every((ref) => matches(ref, REF))) return { status: "invalid" };
@@ -437,16 +470,17 @@ export function sweepStored(backend: ResultBackend, input: SweepInput): SweepAns
   if (listed.status !== "ok") return { status: "unknown" };
   const deleted: string[] = [];
   const failed: string[] = [];
+  const unverified: string[] = [];
   for (const entry of listed.entries) {
     if (keep.has(entry.ref)) continue;
-    if (entry.state === "unknown") {
-      failed.push(entry.ref);
+    if (entry.state !== "stored") {
+      unverified.push(entry.ref);
       continue;
     }
-    if (entry.state === "stored" && entry.storedAt >= input.before) continue;
+    if (entry.storedAt >= input.before) continue;
     const removed = removeSlot(backend, (REF.exec(entry.ref) as RegExpExecArray)[1] as string);
     if (removed.status === "deleted" || removed.status === "absent") deleted.push(entry.ref);
     else failed.push(entry.ref);
   }
-  return { status: "ok", deleted, failed };
+  return { status: "ok", deleted, failed, unverified };
 }
