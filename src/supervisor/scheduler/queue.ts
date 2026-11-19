@@ -34,7 +34,9 @@ export interface SchedulerInput {
 }
 
 export interface SchedulerView {
-  // 장부의 실행 줄. 같은 논리 요청의 앞 실행(끝난 것 포함)을 넣어야 예산 보충을 잡는다(listRuns()의 범위).
+  // 장부의 실행 줄. 같은 입력의 실행 줄을 끝난 실행과 뒤 순번까지 포함해 전부 넣는다(listRuns()의 범위).
+  // 줄이 하나 빠지면 그 줄의 소진을 볼 수 없어 막혀야 할 실행이 후보가 될 수 있고, 이 판단은 빠진 줄을 알아차리지 못한다.
+  // queueView·listRuns·slotHolds 중 하나라도 known이 false면 부르는 쪽이 이 판단을 부르지 않는다.
   runs: readonly SchedulerRun[];
   inputs: readonly SchedulerInput[];
   // 장부의 slotHolds(): 재시작 복원이 남긴 점유 관측.
@@ -71,7 +73,7 @@ export type HoldReason =
   | "budget_unknown"
   // 남은 예산이 없다(이 실행, 또는 같은 입력에 묶인 다른 실행 중 하나. 대기 순번과 무관하다).
   | "budget_exhausted"
-  // 같은 입력의 앞 순번 실행이나 이미 시작한 실행보다 남은 예산이 많다. 재시도·새 세션이 예산을 보충한 줄이다.
+  // 같은 입력 ID의 앞 순번 실행이나 상태가 queued가 아닌 실행(뒤 순번의 not_started 포함)보다 남은 예산이 많다.
   | "budget_replenished";
 
 export interface Held {
@@ -120,14 +122,20 @@ function sameInputRuns(view: SchedulerView, run: SchedulerRun): SchedulerRun[] {
   return view.runs.filter((other) => other.runId !== run.runId && other.inputRequestId === run.inputRequestId);
 }
 
+// 같은 입력 ID의 줄만 본다. 입력 ID가 다른 줄의 잔액은 이 판단이 거르지 않는다.
 function budgetBar(view: SchedulerView, run: SchedulerRun): HoldReason | null {
+  // 이 실행의 잔액을 모르면 다른 줄을 보기 전에 모름으로 보고한다(다른 줄의 0이 있어도 사유는 budget_unknown, 보류는 같다).
   if (!isBudget(run.budgetLeft)) return "budget_unknown";
   if (run.budgetLeft === 0) return "budget_exhausted";
   const others = sameInputRuns(view, run);
-  // 소진을 확인한 실행이 하나라도 있으면 순번과 무관하게 막는다. 읽지 못한 잔액이 이 0을 가리지 않게 모름보다 먼저 본다.
+  // 소진을 확인한 실행이 하나라도 있으면 순번과 무관하게 막는다. 다른 줄들 사이에서는 읽지 못한 잔액이 이 0을 가리지 않게
+  // 모름보다 먼저 본다.
   if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
   if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
-  // 상한: 앞 순번 실행과 이미 시작한 실행(실제로 쓰고 남긴 잔액). 아직 시작하지 않은 뒤 순번 줄의 최초 배정액은 상한이 아니다.
+  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. 뒤 순번의 not_started도 포함한다.
+  // not_started는 시작하지 않고 닫힌 줄이라 그 숫자는 실제로 쓰고 남긴 잔액이 아니다. 그래서 시작 전에 닫힌 뒤 순번 줄의
+  // 작은 배정액 때문에, 입력이 유효하고 슬롯이 비고 아무도 예산을 쓰지 않았어도 앞 순번의 대기 실행이 시작하지 못한 채
+  // 만료될 수 있다.
   const bounds = others.filter((other) => other.queueSeq < run.queueSeq || other.state !== "queued");
   if (bounds.some((other) => run.budgetLeft > other.budgetLeft)) return "budget_replenished";
   return null;

@@ -1,6 +1,7 @@
 // 실행 하나의 다음 의도를 고르는 순수 판단. 상태를 갖지 않고 장부를 열거나 쓰지 않는다.
 // 의도(LifecycleIntent)는 실행 허가가 아니다. 지시는 장부의 record*Instruction이 커밋한 뒤에만 나가지만, 그 메서드들이
-// 다시 보는 것은 저마다 다르다(갱신은 상태·실행 세대·정지 세대만 보고 임대 끝과 기한은 보지 않는다). 임대가 살아 있는지와
+// 다시 보는 것은 저마다 다르다(갱신은 접수 허가·정지 상태 같은 공통 접수 전제에 더해 상태·실행 세대·정지 세대를 보고,
+// 임대 끝과 실행 기한은 보지 않는다). 임대가 살아 있는지와
 // 시각은 이 판단과 부르는 쪽이 확인한다.
 //
 // 의도마다 그 의도가 실행을 데려가려는 장부 상태(toward)가 있다. 의도는 장부의 전이 표(TRANSITIONS)가
@@ -11,11 +12,13 @@ export interface LifecycleView {
   run: Pick<Run, "runId" | "kind" | "state" | "deadlineAt">;
   // 마지막 시작·갱신 지시의 발행 시각과 실제로 발급한 그 임대의 끝. 모르면 null이다.
   // null이거나 두 시각이 유한한 수가 아니거나 issuedAt <= now < expiresAt가 아니면 갱신하지 않고 같은 ID로 조회한다.
+  // 이 칸 자체는 언제나 넣는다(모르면 null). 칸이 빠진 객체는 상태와 무관하게, 임대가 필요 없는 판단에서도 예외가 난다.
   lease: { issuedAt: number; expiresAt: number } | null;
   // 이 실행을 멈추라는 요청(입력 취소 등)이 있다.
   cancelRequested: boolean;
   // 지금 상태에서 낸 마지막 종료·확정 지시의 시각. 아직 내지 않았음을 확인했으면 null, 읽지 못했으면 "unknown"
-  // (그러면 응답 대기 시간을 셀 수 없어 확정 재시도와 stopping의 조회를 내지 않는다).
+  // (그러면 응답 대기 시간을 셀 수 없어 확정 재시도와 stopping의 조회를 내지 않는다. 계속 읽지 못하면 stopping·cleanup_pending·
+  // failed_stopped, 보관을 마친 ready_result 실행은 시간이 지나도 wait에 머물러 같은 종류의 슬롯을 쥔 채 남는다).
   lastInstructionAt: number | null | "unknown";
   // 결과 검사와 결과 본문의 보관이 끝났다(ready_result에서 확정 지시를 내도 된다). 결과 쪽 판단(S6)이 정한다.
   resultSettled: boolean;
