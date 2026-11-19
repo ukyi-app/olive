@@ -173,6 +173,20 @@ export function barrier(): Barrier {
   };
 }
 
+// 그 실행의 물리적 정리 예약이 풀리는 순간을 잡는다. 백엔드를 끝내는 문을 열기 전에 건다.
+// 해제가 늦거나 오지 않으면 이 Promise도 늦거나 오지 않으므로, 이벤트 루프 한 바퀴의 양보와 달리 해제의 시점 자체를 기다린다.
+export function reservationFreed(worker: WorkerExecutor, runId: string): Promise<void> {
+  const reclaiming = (worker as unknown as { reclaiming: Map<string, Promise<void>> }).reclaiming;
+  const freed = gate();
+  const remove = reclaiming.delete.bind(reclaiming);
+  reclaiming.delete = (key) => {
+    const removed = remove(key);
+    if (removed && key === runId) freed.open();
+    return removed;
+  };
+  return freed.wait;
+}
+
 type WriteMatch = (path: string, data: string) => boolean;
 // 어느 파일 쓰기인지 고르는 조건.
 export const outboxWrite = (action: string): WriteMatch => (path, data) => path.includes("/outbox/") && (JSON.parse(data) as { action?: string }).action === action;

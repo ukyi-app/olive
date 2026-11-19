@@ -12,6 +12,7 @@ import { WorkerExecutor } from "../../src/executor/worker.ts";
 import {
   barrier,
   cancelReceiptWrite,
+  executorKeys,
   fakeProfile,
   fromSupervisor,
   gate,
@@ -19,6 +20,8 @@ import {
   onDiskRun,
   outboxWrite,
   pause,
+  reconnect,
+  reservationFreed,
   rig,
   type Rig,
   runWrite,
@@ -253,8 +256,9 @@ test("F04 미확인 실행의 취소: 접수 영수증의 저장을 기다리지
   const r = await make({ mode: "hang", io: disk.io, exitWaitMs: 200 });
   const { runId } = await start(r);
   await until(() => r.store.run(runId)?.state === "running");
+  const stuck = gate();
   r.cleanup.inert = true;
-  r.cleanup.hold = new Promise(() => {});
+  r.cleanup.hold = stuck.wait;
   r.cleanup.remaining = 1;
   await r.connection.receive(cancel(r, runId));
   await r.worker.idle();
@@ -263,6 +267,10 @@ test("F04 미확인 실행의 취소: 접수 영수증의 저장을 기다리지
   r.cleanup.inert = false;
   r.cleanup.hold = undefined;
   r.cleanup.remaining = 0;
+  // 앞선 정리의 백엔드가 끝나야 다음 정리가 시작된다(같은 공간에 신호가 겹치지 않는다).
+  const freed = reservationFreed(r.worker, runId);
+  stuck.open();
+  await freed;
   const writing = disk.hold(cancelReceiptWrite);
   const pending = r.connection.receive(cancel(r, runId));
   await writing.entered;
@@ -629,19 +637,25 @@ test("G03 백엔드의 정리가 끝나지 않은 동안은 다음 취소가 합
   await r.worker.idle();
   const stuck = gate();
   r.cleanup.hold = stuck.wait;
-  const base = r.cleanup.terminations;
-  // 첫 정리는 상한으로 먼저 돌아오지만 백엔드의 작업은 아직 끝나지 않았다.
-  await r.connection.receive(cancel(r, runId));
-  expect(r.store.run(runId)?.state).toBe("unknown_running");
-  expect(r.cleanup.terminations).toBe(base + 1);
-  await r.connection.receive(cancel(r, runId));
-  expect(r.cleanup.terminations).toBe(base + 1);
-  r.cleanup.hold = undefined;
-  stuck.open();
-  // 마이크로태스크가 모두 돈 뒤(시간이 아니라 이벤트 루프 한 바퀴로 순서를 만든다).
-  await pause(0);
-  await r.connection.receive(cancel(r, runId));
-  expect(r.cleanup.terminations).toBe(base + 2);
+  try {
+    const base = r.cleanup.terminations;
+    // 첫 정리는 상한으로 먼저 돌아오지만 백엔드의 작업은 아직 끝나지 않았다.
+    await r.connection.receive(cancel(r, runId));
+    expect(r.store.run(runId)?.state).toBe("unknown_running");
+    expect(r.cleanup.terminations).toBe(base + 1);
+    await r.connection.receive(cancel(r, runId));
+    expect(r.cleanup.terminations).toBe(base + 1);
+    r.cleanup.hold = undefined;
+    const freed = reservationFreed(r.worker, runId);
+    stuck.open();
+    await freed;
+    await r.connection.receive(cancel(r, runId));
+    expect(r.cleanup.terminations).toBe(base + 2);
+  } finally {
+    // 단언이 실패해도 afterEach의 정리가 닫힌 문에 걸리지 않는다.
+    r.cleanup.hold = undefined;
+    stuck.open();
+  }
 });
 
 // ---- G04 미확인 결과의 마지막 영수증 ----
@@ -808,4 +822,463 @@ test("G09 시작 기록을 적는 사이 연결이 닫히면 새 접수 영수�
   await r.worker.idle();
   expect(r.store.outboxFor(runId).filter((e) => e.action === "receipt_accepted")).toEqual([]);
   expect(r.launcher.spawned).toBe(0);
+});
+
+// ---- H01 첫 종료와 재정리의 같은 예약 ----
+
+// 시험이 끝을 정하는 실행을 띄운다. entered는 프로그램이 뜬 뒤, open은 프로그램의 끝이다.
+function heldRun(r: Rig) {
+  const running = barrier();
+  fakeLauncher(r, async (hooks) => {
+    await running.pass();
+    hooks.exited?.();
+    return goodResult;
+  });
+  return running;
+}
+
+test("H01 첫 종료의 계수가 메모리에 반영된 바로 뒤에 처리되는 검증된 비상 취소도 기록을 기다리지 않고 물리적 종료를 다시 시작한다", async () => {
+  const disk = scriptedIo();
+  const r = await make({ io: disk.io, stopWriteWaitMs: 1 });
+  r.cleanup.remaining = 1;
+  const running = heldRun(r);
+  const { runId } = await start(r);
+  await running.entered;
+
+  // 비상 취소는 세대 쓰기가 저장 줄을 막은 채 상한을 지나 onCancel 바로 앞에 선다. 처리는 시험이 정한 자리에서 시작한다.
+  const emergency = randomUUID();
+  const arrived = gate();
+  let dispatch: (() => void) | undefined;
+  const worker = r.worker as unknown as { onCancel(header: Header, body: unknown, epoch: number): Promise<void> };
+  const onCancel = worker.onCancel.bind(r.worker);
+  worker.onCancel = (header, body, epoch) => {
+    if (header.request_id !== emergency) return onCancel(header, body, epoch);
+    return new Promise<void>((resolve, reject) => {
+      dispatch = () => void onCancel(header, body, epoch).then(resolve, reject);
+      arrived.open();
+    });
+  };
+  const handOver = () => {
+    const run = dispatch;
+    dispatch = undefined;
+    run?.();
+  };
+  // 첫 정리의 계수 1이 메모리에 반영되는 바로 그때, 기다리던 취소를 처리한다. 계수 뒤 처리가 그 동기 구간에서 등록하는
+  // 어떤 콜백보다도 앞선 자리다(계수 뒤 처리 바로 다음에 마이크로태스크로 이미 줄 서 있던 취소와 같다).
+  const reflected = gate();
+  let restarted: number | undefined;
+  const commit = r.store.commit.bind(r.store);
+  r.store.commit = (id, patch, events) => {
+    const done = commit(id, patch, events);
+    if (id === runId && patch.state === "unknown_running" && dispatch !== undefined) {
+      const before = r.cleanup.terminations;
+      handOver();
+      restarted = r.cleanup.terminations - before;
+      reflected.open();
+    }
+    return done;
+  };
+  const stopWriting = disk.hold(stopWrite);
+  const receiving = r.connection.receive(
+    fromSupervisor(r.clock, r.worker.name, "task_cancel", { run_id: runId, reason: "emergency_stop" }, { stop_generation: 1, run_generation: 1, request_id: emergency }),
+  );
+  await stopWriting.entered;
+  await arrived.wait;
+
+  try {
+    // 프로그램이 끝나고 첫 정리의 계수 1이 메모리에 반영된다. 그 상태 쓰기는 세대 쓰기 뒤에 멈춰 있다.
+    running.open();
+    await reflected.wait;
+    expect(onDiskRun(r.dir, runId).state).not.toBe("unknown_running");
+    expect(restarted).toBe(1);
+  } finally {
+    running.open();
+    handOver();
+    stopWriting.open();
+  }
+  await receiving;
+  await r.worker.idle();
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+  expect(r.transport.of("receipt_stopped")).toHaveLength(0);
+});
+
+test("H01 첫 종료의 백엔드가 도는 동안 다음 취소는 합류하고, 끝난 뒤에는 기록이 멈춰 있어도 다시 시작한다", async () => {
+  const disk = scriptedIo();
+  const r = await make({ io: disk.io, exitWaitMs: 20 });
+  r.cleanup.remaining = 1;
+  const stuck = gate();
+  r.cleanup.hold = stuck.wait;
+  const running = heldRun(r);
+  const { runId } = await start(r);
+  await running.entered;
+
+  // 저장 줄이 멈춘 뒤에는 nonce도 줄을 지나지 못하므로 취소 둘은 검증까지 끝낸 뒤 처리 바로 앞에서 세운다.
+  const ids: readonly [string, string] = [randomUUID(), randomUUID()];
+  const verified = new Map(ids.map((id) => [id, barrier()]));
+  const reached = new Map(ids.map((id) => [id, gate()]));
+  const handle = r.worker.handle.bind(r.worker);
+  r.worker.handle = async (envelope, epoch) => {
+    await verified.get(envelope.header.request_id)?.pass();
+    const work = handle(envelope, epoch);
+    reached.get(envelope.header.request_id)?.open();
+    return work;
+  };
+  const writing = disk.hold(runWrite("unknown_running"));
+  const receiving = ids.map((id) => r.connection.receive(cancel(r, runId, id)));
+  await Promise.all(ids.map((id) => verified.get(id)!.entered));
+  try {
+    running.open();
+    await writing.entered;
+    const base = r.cleanup.terminations;
+    verified.get(ids[0])!.open();
+    await reached.get(ids[0])!.wait;
+    expect(r.cleanup.terminations).toBe(base);
+
+    r.cleanup.hold = undefined;
+    const freed = reservationFreed(r.worker, runId);
+    stuck.open();
+    await freed;
+    verified.get(ids[1])!.open();
+    await reached.get(ids[1])!.wait;
+    expect(r.cleanup.terminations).toBe(base + 1);
+  } finally {
+    r.cleanup.hold = undefined;
+    stuck.open();
+    for (const id of ids) verified.get(id)!.open();
+    writing.open();
+  }
+  await Promise.all(receiving);
+  await r.worker.idle();
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+});
+
+test("H01 첫 종료가 예외로 끝나도 백엔드가 끝나기 전에는 새 정리를 시작하지 않는다", async () => {
+  const r = await make({ exitWaitMs: 20 });
+  const stuck = gate();
+  r.cleanup.hold = stuck.wait;
+  const running = heldRun(r);
+  const { runId } = await start(r);
+  await running.entered;
+  // 종료 영수증을 만들 때 서명이 실패한다. 백엔드의 terminate는 아직 돌아오지 않았다.
+  const options = (r.worker as unknown as { options: { signingKey: KeyObject } }).options;
+  const key = options.signingKey;
+  options.signingKey = supervisorKeys.publicKey;
+  try {
+    running.open();
+    await r.worker.idle();
+    options.signingKey = key;
+    expect(r.store.run(runId)?.state).toBe("unknown_running");
+    const base = r.cleanup.terminations;
+    await r.connection.receive(cancel(r, runId));
+    expect(r.cleanup.terminations).toBe(base);
+
+    r.cleanup.hold = undefined;
+    const freed = reservationFreed(r.worker, runId);
+    stuck.open();
+    await freed;
+    await r.connection.receive(cancel(r, runId));
+    expect(r.cleanup.terminations).toBe(base + 1);
+    expect(r.store.run(runId)?.state).toBe("failed_stopped");
+  } finally {
+    options.signingKey = key;
+    r.cleanup.hold = undefined;
+    stuck.open();
+  }
+});
+
+test("H01 대조군: 다른 실행이 도는 동안에는 옛 실행의 취소가 공간을 정리하지 않는다", async () => {
+  const r = await make();
+  const { runId: earlier } = await start(r);
+  await r.worker.idle();
+  const running = heldRun(r);
+  const { runId: current } = await start(r);
+  await running.entered;
+  try {
+    await r.store.noteRun({ ...r.store.run(earlier)!, state: "unknown_running" });
+    const before = r.cleanup.terminations;
+    await r.connection.receive(cancel(r, earlier));
+    expect(r.cleanup.terminations).toBe(before);
+    expect(r.store.run(current)?.state).toBe("running");
+  } finally {
+    // 단언이 실패해도 역할 프로그램의 끝을 열어 afterEach가 닫힌 문에 걸리지 않는다.
+    running.open();
+    await r.worker.idle();
+  }
+});
+
+// ---- H02 실제 점유로 세는 상한 ----
+
+const leftover = (r: Rig) => ({ ...runRecord(r, "running"), state: "preparing" as const });
+
+test("H02 사건 없는 preparing 기록이 아홉이어도 보류하지 않고 새 시작을 받으며, 그 파일을 지우지 않는다", async () => {
+  const r = await make();
+  const records = Array.from({ length: limits.STATUS_MAX_RUNS + 1 }, () => leftover(r));
+  for (const record of records) expect(await r.store.beginRun(record)).toBe(true);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBeNull();
+  expect(existsSync(join(r.dir, "ledger-hold"))).toBe(false);
+  expect(again.worker.intakeClosed()).toBeNull();
+  expect(again.transport.of("hello")).toHaveLength(1);
+  const { runId } = await start(again);
+  await again.worker.idle();
+  expect(again.launcher.spawned).toBe(1);
+  expect(again.store.run(runId)?.state).toBe("ready_result");
+  for (const record of records) expect(existsSync(join(r.dir, "runs", `${record.run_id}.json`))).toBe(true);
+});
+
+test("H02 경계: 진짜 점유 여덟에 사건 없는 기록이 더해져도 보류하지 않는다", async () => {
+  const r = await make();
+  for (let i = 0; i < limits.STATUS_MAX_RUNS; i++) expect(await r.store.beginRun(runRecord(r, "unknown_running"))).toBe(true);
+  expect(await r.store.beginRun(leftover(r))).toBe(true);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBeNull();
+  expect(again.transport.of("hello")[0]!.body.runs).toHaveLength(limits.STATUS_MAX_RUNS);
+});
+
+test("H02 진짜 점유 아홉은 표식을 먼저 남기고 보류하며, 표식을 적지 못하면 열지 않는다", async () => {
+  const r = await make();
+  for (let i = 0; i <= limits.STATUS_MAX_RUNS; i++) expect(await r.store.beginRun(runRecord(r, "unknown_running"))).toBe(true);
+  const disk = scriptedIo();
+  disk.fail((path) => path.endsWith("ledger-hold"));
+  const outcome = await ExecutorStore.open(r.dir, { now: r.clock.now, io: disk.io }).then(
+    () => "opened",
+    (error: StoreError) => error.code,
+  );
+  expect(outcome).toBe("store_unavailable");
+  expect(existsSync(join(r.dir, "ledger-hold"))).toBe(false);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBe("over_capacity");
+  expect(JSON.parse(readFileSync(join(r.dir, "ledger-hold"), "utf8"))).toEqual({ reason: "over_capacity" });
+  expect(again.transport.of("hello")).toHaveLength(0);
+  expect(again.transport.closed).toBe(true);
+});
+
+test("H02 이미 적힌 over_capacity 표식은 실제 점유가 없어도 저절로 지우지 않는다", async () => {
+  const r = await make();
+  for (let i = 0; i <= limits.STATUS_MAX_RUNS; i++) expect(await r.store.beginRun(leftover(r))).toBe(true);
+  writeFileSync(join(r.dir, "ledger-hold"), JSON.stringify({ reason: "over_capacity" }));
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBe("over_capacity");
+  expect(JSON.parse(readFileSync(join(r.dir, "ledger-hold"), "utf8"))).toEqual({ reason: "over_capacity" });
+  expect(again.transport.of("hello")).toHaveLength(0);
+});
+
+test("H02 기동 뒤 점유가 아홉이 되면 일부만 담은 hello를 보내지 않고, 여덟로 줄면 다시 인사한다", async () => {
+  const r = await make();
+  const records = Array.from({ length: limits.STATUS_MAX_RUNS }, () => runRecord(r, "unknown_running"));
+  for (const record of records) expect(await r.store.beginRun(record)).toBe(true);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.transport.of("hello")).toHaveLength(1);
+
+  const ninth = runRecord(again, "unknown_running");
+  expect(await again.store.beginRun(ninth)).toBe(true);
+  await reconnect(again, 0);
+  expect(again.transport.of("hello")).toHaveLength(0);
+  expect(again.transport.closed).toBe(true);
+  expect(again.store.inconsistency()).toBeNull();
+
+  const id = randomUUID();
+  const body = { receipt_id: id, run_id: ninth.run_id, remaining_processes: 0, exit: "failed", stopped_at: again.clock.now() };
+  await again.store.commit(ninth.run_id, { state: "failed_stopped" }, [{ entry: { id, action: "receipt_stopped", run_id: ninth.run_id, run_generation: 1, body, acked: false } }]);
+  await reconnect(again, 0);
+  const listed = again.transport.of("hello")[0]!.body.runs.map((run) => run.run_id);
+  expect(listed).toEqual(expect.arrayContaining(records.map((record) => record.run_id)));
+});
+
+// 같은 실행·세대의 종료 영수증과 맞는 마지막 포인터를 가진 failed_stopped 실행. 슬롯을 쥐지 않으므로 몇 개든 기동을 막지 않는다.
+async function stoppedRuns(r: Rig, count: number): Promise<string[]> {
+  const ids: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const record = runRecord(r, "unknown_running");
+    expect(await r.store.beginRun(record)).toBe(true);
+    const id = randomUUID();
+    const body = { receipt_id: id, run_id: record.run_id, remaining_processes: 0, exit: "failed", stopped_at: r.clock.now() };
+    const { saved } = await r.store.commit(record.run_id, { state: "failed_stopped" }, [
+      { entry: { id, action: "receipt_stopped", run_id: record.run_id, run_generation: 1, body, acked: false } },
+    ]);
+    expect(saved).toBe(true);
+    ids.push(record.run_id);
+  }
+  return ids;
+}
+
+test("H02 점유가 여덟이면 점유하지 않던 실행에 새 정리를 예약하지 않고, 점유 중인 실행의 재시도는 받으며, 자리가 나면 아홉째도 정리한다", async () => {
+  const seed = await make();
+  const ids = await stoppedRuns(seed, limits.STATUS_MAX_RUNS + 1);
+  const r = await make({ dir: seed.dir, clock: seed.clock });
+  await r.worker.recover();
+  expect(r.store.inconsistency()).toBeNull();
+  expect(r.transport.of("hello")).toHaveLength(1);
+  const ninth = ids.at(-1)!;
+
+  // 폴더 지우기가 실패해 서명된 확정마다 cleanup_pending이 남는다. 여덟에 이르면 아홉째는 예약하지 않는다.
+  r.space.cleanResult = false;
+  for (const id of ids) await r.connection.receive(finalize(r, id));
+  expect(r.space.cleaned).toEqual(ids.slice(0, limits.STATUS_MAX_RUNS));
+  expect(r.store.run(ninth)?.state).toBe("failed_stopped");
+  expect(onDiskRun(r.dir, ninth).state).toBe("failed_stopped");
+  // 이미 점유 중인 실행의 정리 재시도는 상한에서도 받는다.
+  await r.connection.receive(finalize(r, ids[0]!));
+  expect(r.space.cleaned).toHaveLength(limits.STATUS_MAX_RUNS + 1);
+  expect(r.store.run(ids[0]!)?.state).toBe("cleanup_pending");
+
+  // 지우기가 회복된 뒤 재연결하면 인사하고, 정리 재시도로 자리가 나면 아홉째도 정리한다.
+  r.space.cleanResult = true;
+  await reconnect(r, 0);
+  expect(r.transport.closed).toBe(false);
+  expect(r.transport.of("hello")).toHaveLength(1);
+  await r.connection.receive(finalize(r, ids[0]!));
+  expect(r.store.run(ids[0]!)?.state).toBe("finalized");
+  await r.connection.receive(finalize(r, ninth));
+  expect(r.store.run(ninth)?.state).toBe("finalized");
+  expect(r.transport.of("receipt_cleaned").map((receipt) => receipt.body.run_id)).toEqual(expect.arrayContaining([ids[0], ninth]));
+
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBeNull();
+  expect(again.transport.of("hello")).toHaveLength(1);
+});
+
+// ---- H03 본문 대조를 끝내지 못한 기동 ----
+
+function workerOver(r: Rig, store: ExecutorStore, now: () => number) {
+  return new WorkerExecutor({
+    instance: "worker-1",
+    profile: fakeProfile("complete", r.cwd),
+    policyRevision: "policy-r1",
+    store,
+    signingKey: executorKeys.privateKey,
+    supervisorKey: supervisorKeys.publicKey,
+    credentials: r.credentials,
+    cleanup: r.cleanup,
+    space: r.space,
+    now,
+  });
+}
+
+function refusesToBuild(build: () => unknown): boolean {
+  try {
+    build();
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+test("H03 본문 검사 전에 실패한 기동은 실행기를 만들지 않고 표식도 남기지 않으며, 회복하면 계약에 맞지 않는 종료 영수증으로 슬롯을 열지 않는다", async () => {
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  await r.store.noteRun({ ...r.store.run(runId)!, state: "stopping" });
+  breakStopped(r.dir, runId);
+  const failures: (() => number)[] = [
+    () => 0,
+    () => {
+      throw new Error("clock");
+    },
+  ];
+  for (const now of failures) {
+    const store = await ExecutorStore.open(r.dir, { now: r.clock.now });
+    expect(refusesToBuild(() => workerOver(r, store, now))).toBe(true);
+    expect(store.inconsistency()).toBeNull();
+    await store.flush();
+    expect(existsSync(join(r.dir, "ledger-hold"))).toBe(false);
+  }
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBe("outbox_body");
+  again.cleanup.remaining = null;
+  await again.worker.recover();
+  expect(again.store.run(runId)?.state).toBe("unknown_running");
+  await start(again);
+  await again.worker.idle();
+  expect(again.launcher.spawned).toBe(0);
+});
+
+test("H03 정상 장부는 로컬 실패가 사라진 뒤 표식 없이 다시 열려 정상 대조가 돈다", async () => {
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  const store = await ExecutorStore.open(r.dir, { now: r.clock.now });
+  expect(refusesToBuild(() => workerOver(r, store, () => 0))).toBe(true);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBeNull();
+  expect(again.worker.intakeClosed()).toBeNull();
+  await again.worker.recover();
+  expect(again.store.run(runId)?.state).toBe("ready_result");
+});
+
+// ---- H05 표식 확인 뒤의 파일 작업 ----
+
+// 표식 확인이 돌아온 뒤, 부르는 쪽의 파일 작업이 시작되기 전에 판정을 한 번 세운다.
+function verdictAfterCheck(store: ExecutorStore) {
+  const target = store as unknown as { persistHold(): Promise<boolean> };
+  const persist = target.persistHold.bind(store);
+  let armed = true;
+  target.persistHold = async () => {
+    const saved = await persist();
+    if (armed) {
+      armed = false;
+      store.markInconsistent("outbox_body");
+    }
+    return saved;
+  };
+}
+
+const holdSites: Record<string, (r: Rig, runId: string) => { file: string; act: () => Promise<unknown> }> = {
+  "실행 기록": (r, runId) => ({ file: `${runId}.json`, act: () => r.store.commit(runId, {}) }),
+  "정지 세대": (r) => ({ file: "stop-generation.json", act: () => r.store.adoptStopGeneration(9) }),
+  "최초 기록": (r) => {
+    const record = runRecord(r, "running");
+    return { file: `${record.run_id}.json`, act: () => r.store.beginRun(record) };
+  },
+  "받음 표시": (r, runId) => {
+    const event = r.store.outboxFor(runId)[0]!;
+    return { file: `${event.id}.json`, act: () => r.store.ack([event.id]) };
+  },
+};
+
+for (const [site, plan] of Object.entries(holdSites)) {
+  test(`H05 확인이 돌아온 뒤 선 판정은 ${site} 파일보다 먼저 지속한다`, async () => {
+    const disk = scriptedIo();
+    const order: string[] = [];
+    const write = disk.io.writeDurable!;
+    disk.io.writeDurable = async (path, data) => {
+      order.push(path.split("/").at(-1)!);
+      await write(path, data);
+    };
+    const r = await make({ io: disk.io });
+    const { runId } = await start(r);
+    await r.worker.idle();
+    const { file, act } = plan(r, runId);
+    order.length = 0;
+    verdictAfterCheck(r.store);
+    await act();
+    await r.store.flush();
+    expect(order).toContain("ledger-hold");
+    expect(order).toContain(file);
+    expect(order.indexOf("ledger-hold")).toBeLessThan(order.indexOf(file));
+  });
+}
+
+test("H05 재확인 파일은 다시 쓰는 사이 선 판정이 지속되기 전에 지우지 않는다", async () => {
+  const disk = scriptedIo();
+  const heal = disk.fail(preparingWrite);
+  const r = await make({ io: disk.io });
+  const { runId } = await start(r);
+  await r.worker.idle();
+  expect(r.worker.intakeClosed()).toBe("store_unavailable");
+  heal();
+  const path = join(r.dir, "runs", `${runId}.json`);
+  const writing = disk.hold(preparingWrite);
+  const flushing = r.worker.flush();
+  await writing.entered;
+  const healHold = disk.fail((file) => file.endsWith("ledger-hold"));
+  r.store.markInconsistent("outbox_body");
+  writing.open();
+  await flushing;
+  expect(existsSync(path)).toBe(true);
+  expect(r.store.healthy()).toBe(false);
+  healHold();
+  await r.worker.flush();
+  expect(JSON.parse(readFileSync(join(r.dir, "ledger-hold"), "utf8"))).toEqual({ reason: "outbox_body" });
+  expect(existsSync(path)).toBe(false);
 });
