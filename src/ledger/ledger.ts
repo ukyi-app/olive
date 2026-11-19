@@ -16,7 +16,7 @@
 // 새 업무(접수·실행 줄·시작·자격·게시·갱신)의 공통 전제는 #write의 "start" 한 자리에 있다: 장부가 건강하고, 트랜잭션 안에서
 // 읽은 지금의 정지 기록이 있고 정지가 아니며, 지금의 복원 시도가 바로 그 정지 상태에서 낸 접수 허가(#grant)가 살아 있다.
 import { constants as sqliteOpen, Database } from "bun:sqlite";
-import { type BigIntStats, closeSync, constants as fileOpen, lstatSync, openSync, realpathSync } from "node:fs";
+import { type BigIntStats, closeSync, constants as fileOpen, fstatSync, lstatSync, openSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import {
   HOOK_EVENTS,
@@ -52,7 +52,8 @@ import {
   time,
   UUID,
 } from "./input.ts";
-import { applyMigration, loadMigrations, migrate, type Migration, validateMigrations } from "./migrate.ts";
+import { appliedCount, applyMigration, BOOTSTRAP, loadMigrations, migrate, type Migration, validateMigrations } from "./migrate.ts";
+import { latestOpenRecord, publishSnapshot, removeQuietly, sealSnapshot, SIDECARS, SNAPSHOT_UNOPENED, type SnapshotFailure, SnapshotRefused, snapshotTarget } from "./snapshot.ts";
 import { type LedgerRunState, mayTransition, type RunKind, SLOT_FREE, TERMINAL } from "./states.ts";
 
 // ---- 결과의 모양 ----
@@ -85,6 +86,7 @@ export const REFUSALS = [
   "reference_mismatch",
   "permit_used",
   "session_start_closed",
+  "snapshot_hold",
   "invariant_violation",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
@@ -418,6 +420,29 @@ export interface Publication {
 
 export type Delivery = "new" | "duplicate";
 
+// 대조 전까지 옛 시점일 수 있는 기록. 뒤의 관리 진입점이 이 목록을 그대로 관리자에게 전한다.
+export const SNAPSHOT_STALE_RECORDS = ["account_locks", "receipts"] as const;
+
+// 이 장부가 사본에서 떴다는 사실. held면 대조가 끝나지 않아 새 업무가 닫혀 있다.
+export interface SnapshotOrigin {
+  snapshotId: string;
+  ledgerId: string;
+  takenAt: number;
+  reconciledAt: number | null;
+  held: boolean;
+  mayBeStale: typeof SNAPSHOT_STALE_RECORDS;
+}
+
+// path: 없는 경로 하나. maxBytes: 장부나 완성한 사본이 이 크기를 넘으면 사본을 내지 않는다. 쓰기가 막히는 시간이나 메모리의 상한은 아니다.
+export interface SnapshotRequest {
+  path: string;
+  maxBytes: number;
+}
+
+export type SnapshotResult =
+  | { ok: true; snapshotId: string; ledgerId: string; takenAt: number; path: string; bytes: number; sha256: string; blockedMs: number }
+  | { ok: false; reason: SnapshotFailure; detail: string };
+
 export interface OpenOptions {
   // 장부에 적는 시각, nonce 정리, 시작 직전의 기한 확인에 쓰는 시계(밀리초).
   clock: () => number;
@@ -454,7 +479,6 @@ function hasIdentity(db: Database): boolean {
 
 // 이 설치가 만든 파일의 표식(SQLite 머리의 application_id, "OLV1"). 첫 쓰기로 적어 본체 파일의 머리에 남긴다.
 const APPLICATION_ID = 0x4f4c5631;
-const SIDECARS = ["-wal", "-shm", "-journal"] as const;
 
 type OpenMode = "create" | "reopen";
 
@@ -488,16 +512,22 @@ function fileEntry(path: string, mode: OpenMode): BigIntStats | null {
   return stats;
 }
 
-// 없는 경로를 이 호출의 것으로 예약한다. 방금 만든 파일이라 이 FD를 닫아도 풀릴 잠금이 없다.
-function reserveFile(path: string): BigIntStats {
+// 없는 경로를 이 호출의 것으로 예약하고, FD가 살아 있을 때 그 개체의 장치·inode를 기준으로 삼는다.
+// 닫은 뒤에 이름으로 다시 읽으면 그 사이에 바뀐 파일이 기준이 된다. 방금 만든 파일이라 이 FD를 닫아도 풀릴 잠금이 없다.
+function reserveFile(path: string, faults: Faults): BigIntStats {
+  let reserved: BigIntStats;
   try {
-    closeSync(openSync(path, fileOpen.O_CREAT | fileOpen.O_EXCL | fileOpen.O_WRONLY | fileOpen.O_NOFOLLOW, 0o600));
+    const fd = openSync(path, fileOpen.O_CREAT | fileOpen.O_EXCL | fileOpen.O_WRONLY | fileOpen.O_NOFOLLOW, 0o600);
+    try {
+      reserved = fstatSync(fd, { bigint: true });
+    } finally {
+      closeSync(fd);
+    }
   } catch (error) {
     if ((error as { code?: string }).code === "EEXIST") throw new LedgerUnavailableError("foreign_data", "예약하는 사이에 다른 파일이 생겼다");
     throw new LedgerUnavailableError("io", `장부 파일을 만들지 못함: ${describe(error)}`);
   }
-  const reserved = fileEntry(path, "create");
-  if (reserved === null) throw new LedgerUnavailableError("foreign_data", "예약한 파일이 사라졌다");
+  faults.at("open:reserved");
   return reserved;
 }
 
@@ -532,7 +562,9 @@ function sameContents(db: Database, expected: Database): boolean {
 
 // 끊긴 첫 설치의 증거: 파일의 스키마와 모든 행이 이 코드의 첫 설치가 어느 판까지 적용했을 때 남기는 내용과 정확히 같다.
 // 업무 기록이 한 줄이라도 있거나 판 기록만 흉내 낸 파일은 여기서 걸린다. 내용이 같으면 이어 받아도 잃을 것이 없다.
-function requireInterruptedInstall(db: Database, migrations: readonly Migration[]): void {
+// journalLeft: 본체 곁에 저널이 남아 있다. 본체가 끊긴 트랜잭션의 중간 모습일 수 있어, 다르면 낯선 파일이 아니라 끊긴 설치로 가른다.
+function requireInterruptedInstall(db: Database, migrations: readonly Migration[], journalLeft: boolean): void {
+  const refused = (detail: string) => new LedgerUnavailableError(journalLeft ? "interrupted_install" : "foreign_data", detail);
   const expected = new Database(":memory:");
   try {
     if (sameContents(db, expected)) return;
@@ -541,36 +573,162 @@ function requireInterruptedInstall(db: Database, migrations: readonly Migration[
       if (sameContents(db, expected)) return;
     }
   } catch (error) {
-    throw new LedgerUnavailableError("foreign_data", `끊긴 첫 설치와 대조하지 못함: ${describe(error)}`);
+    throw refused(`끊긴 첫 설치와 대조하지 못함: ${describe(error)}`);
   } finally {
     expected.close();
   }
-  throw new LedgerUnavailableError("foreign_data", "끊긴 첫 설치의 내용과 다르다");
+  throw refused("끊긴 첫 설치의 내용과 다르다");
+}
+
+// 코드가 적용된 판까지 만들었을 스키마. 식별 표와 트리거를 포함한다.
+// 재개방은 이 결과와 장부를 대조하므로, 빈 DB에서 재생하지 못하는 판 목록으로는 장부를 만들거나 올리지 않는다.
+function installedSchema(migrations: readonly Migration[], applied: number): string {
+  const expected = new Database(":memory:");
+  try {
+    for (const migration of migrations.slice(0, applied)) applyMigration(expected, migration, 1);
+    for (const sql of IDENTITY) expected.run(sql);
+    return schemaOf(expected);
+  } catch (error) {
+    throw new LedgerUnavailableError("migration_failed", `판 목록을 빈 DB에서 재생하지 못한다: ${describe(error)}`);
+  } finally {
+    expected.close();
+  }
+}
+
+function sqlOf(db: Database, name: string): string | null {
+  return (db.query("SELECT sql FROM sqlite_master WHERE name = ?").get(name) as { sql: string } | null)?.sql ?? null;
+}
+
+// 재개방이 마이그레이션과 쓰기를 허용하기 전의 검증: 식별 표·트리거·행과 적용 기록, 적용된 판의 스키마 전체가 코드가 만드는 것과 같아야 한다.
+// 첫 설치는 모든 판을 적용한 뒤에 식별 행을 적으므로, 식별 행이 있는데 적용 기록이 없는 파일은 이 코드가 만든 장부가 아니다.
+// 호출자가 넘긴 판 목록도 같은 규칙이다. 적용 기록이 없으면 무엇과 대조할지 정할 수 없어 빈 목록이어도 거절한다.
+function requireInstalled(db: Database, migrations: readonly Migration[]): void {
+  // 행을 읽기 전에 구조부터 본다. 칸이 다른 표를 읽으면 SQL 오류가 "받지 않는 파일"이 아닌 다른 이유로 나간다.
+  const reference = new Database(":memory:");
+  try {
+    reference.run(BOOTSTRAP);
+    for (const sql of IDENTITY) reference.run(sql);
+    for (const name of ["ledger_identity", "ledger_identity_permanent", "ledger_migrations"]) {
+      if (sqlOf(db, name) !== sqlOf(reference, name)) throw new LedgerUnavailableError("not_initialized", `${name}이(가) 없거나 이 코드가 만든 구조가 아니다`);
+    }
+  } finally {
+    reference.close();
+  }
+  const applied = appliedCount(db, migrations);
+  if (applied === 0) throw new LedgerUnavailableError("not_initialized", "첫 판의 적용 기록이 없다");
+  if (schemaOf(db) !== installedSchema(migrations, applied)) throw new LedgerUnavailableError("not_initialized", "적용된 판의 스키마가 이 코드의 것과 다르다");
+  const row = db.query("SELECT ledger_id, created_at FROM ledger_identity WHERE id = 1").get() as { ledger_id: unknown; created_at: unknown } | null;
+  if (row === null || typeof row.ledger_id !== "string" || !UUID.test(row.ledger_id) || !isTime(row.created_at)) throw new LedgerUnavailableError("not_initialized", "첫 설치 기록의 값이 이 코드의 것이 아니다");
+  requireSnapshotRecords(db, row.ledger_id, userVersion(db) === SNAPSHOT_UNOPENED);
+  // 판을 올리면 다음 재개방은 올린 판까지의 기준 스키마로 대조한다. 그 기준을 만들 수 없는 판은 커밋하기 전에 거절한다.
+  if (applied < migrations.length) installedSchema(migrations, migrations.length);
+}
+
+function isTime(value: unknown): boolean {
+  return Number.isSafeInteger(value) && (value as number) >= 1;
+}
+
+// 사본 기록이 있으면 이 장부의 것이고 값이 온전해야 한다. 깨졌거나 다른 장부를 가리키는 기록으로는 보류 여부를 판단할 수 없어 열지 않는다.
+// unopened: 처음 여는 사본의 표식이 있다. 표식을 소비하면 이 파일이 사본이라는 근거는 기록만 남으므로, 보류를 걸 기록이 없으면 열지 않는다.
+function requireSnapshotRecords(db: Database, ledgerId: string, unopened: boolean): void {
+  if (sqlOf(db, "ledger_snapshots") === null) {
+    if (unopened) throw new LedgerUnavailableError("corrupt", "사본 표식이 있는데 사본 기록의 표가 없다");
+    return;
+  }
+  const rows = db.query("SELECT snapshot_id, ledger_id, taken_at, reconciled_at, reconciled_snapshot_id FROM ledger_snapshots").all() as {
+    snapshot_id: unknown;
+    ledger_id: unknown;
+    taken_at: unknown;
+    reconciled_at: unknown;
+    reconciled_snapshot_id: unknown;
+  }[];
+  let open = 0;
+  for (const row of rows) {
+    if (row.ledger_id !== ledgerId) throw new LedgerUnavailableError("corrupt", "사본 기록이 다른 장부를 가리킨다");
+    if (typeof row.snapshot_id !== "string" || !UUID.test(row.snapshot_id) || !isTime(row.taken_at)) throw new LedgerUnavailableError("corrupt", "사본 기록의 값이 깨졌다");
+    if (row.reconciled_at === null && row.reconciled_snapshot_id === null) open += 1;
+    else if (!isTime(row.reconciled_at) || row.reconciled_snapshot_id !== row.snapshot_id) throw new LedgerUnavailableError("corrupt", "사본 기록의 대조 끝 표시가 깨졌다");
+  }
+  if (open > 1) throw new LedgerUnavailableError("corrupt", "대조가 끝나지 않은 사본 기록이 여럿이다");
+  if (unopened && latestOpenRecord(db) === null) throw new LedgerUnavailableError("corrupt", "사본 표식이 있는데 최신 미대조 사본 기록이 없다");
+}
+
+function pageSizeOf(view: Database): bigint {
+  return BigInt((view.query("PRAGMA page_size").get() as { page_size: number }).page_size);
+}
+
+// SQLite는 페이지 도중에서 잘린 마지막 페이지를 0으로 채워 읽어 quick_check가 통과할 수 있다. 끊긴 사본을 여기서 거른다.
+function requireWholePages(view: Database, size: bigint): void {
+  if (size % pageSizeOf(view) !== 0n) throw new LedgerUnavailableError("corrupt", "본체 파일이 페이지 경계에서 끝나지 않는다(끊긴 파일)");
+}
+
+// WAL 머리(32바이트)와 프레임 하나(머리 24바이트 + 페이지)를 담지 못하는 WAL에는 복구할 커밋이 없다. 이름과 크기만 본다.
+function walMayHoldCommit(path: string, view: Database): boolean {
+  const wal = fileEntry(`${path}-wal`, "reopen");
+  return wal !== null && wal.size >= 56n + pageSizeOf(view);
+}
+
+function requireIntact(db: Database): void {
+  const check = db.query("PRAGMA quick_check").all() as { quick_check: string }[];
+  if (check.length !== 1 || check[0].quick_check !== "ok") throw new LedgerUnavailableError("corrupt", `quick_check: ${check.map((r) => r.quick_check).join("; ")}`);
+}
+
+// 커밋이 든 WAL 곁의 장부를 읽기쓰기 연결을 열기 전에 판정한다. 읽기쓰기 연결은 닫을 때 WAL을 본체로 체크포인트하고 지워서, 거절하는 길에서도 파일 쌍이 바뀐다.
+// 읽기 전용 연결은 WAL의 커밋을 읽고 체크포인트하지 않는다. WAL을 읽으려고 만든 -shm만 남으므로 이 호출이 생기게 한 것을 지운다.
+function requireInstalledThroughWal(path: string, migrations: readonly Migration[]): void {
+  const shm = `${path}-shm`;
+  const shmLeft = fileEntry(shm, "reopen") !== null;
+  const uri = `file:${path.split("/").map(encodeURIComponent).join("/")}?mode=ro`;
+  const view = new Database(uri, sqliteOpen.SQLITE_OPEN_READONLY | sqliteOpen.SQLITE_OPEN_URI);
+  try {
+    requireIntact(view);
+    requireInstalled(view, migrations);
+  } finally {
+    view.close();
+    if (!shmLeft) removeQuietly(shm);
+  }
+}
+
+function userVersion(db: Database): number {
+  return (db.query("PRAGMA user_version").get() as { user_version: number }).user_version;
 }
 
 // SQLite가 파일이나 저널을 건드리기 전의 판정. fresh: 이 호출이 새로 예약했다. 그 밖의 받지 않는 모양은 던진다.
-function inspectFile(path: string, mode: OpenMode, migrations: readonly Migration[]): { fresh: boolean; file: BigIntStats } {
+function inspectFile(path: string, mode: OpenMode, migrations: readonly Migration[], faults: Faults): { fresh: boolean; file: BigIntStats } {
   const main = fileEntry(path, mode);
   const leftover = SIDECARS.filter((suffix) => fileEntry(`${path}${suffix}`, mode) !== null);
   if (main === null || main.size === 0n) {
     if (mode === "reopen") throw new LedgerUnavailableError("not_initialized", "장부 파일이 없거나 비었다");
     if (leftover.length > 0) throw new LedgerUnavailableError("foreign_data", `본체 없이 남은 파일: ${leftover.join(", ")}`);
     if (main !== null) throw new LedgerUnavailableError("foreign_data", "이미 있는 빈 파일은 이 설치가 예약했다는 증거가 없다");
-    return { fresh: true, file: reserveFile(path) };
+    return { fresh: true, file: reserveFile(path, faults) };
   }
   if (main.size < 100n) throw new LedgerUnavailableError("corrupt", "SQLite 장부의 머리가 아니다");
+  const journalLeft = leftover.includes("-journal");
+  let recovering = false;
   const view = readOnlyView(path);
   try {
     const stored = view.query("PRAGMA application_id").get() as { application_id: number };
     if (stored.application_id !== APPLICATION_ID) throw notOurs(mode, "이 설치가 만든 장부가 아니다");
+    // 길이 판정보다 먼저 본다. 처음 여는 사본 곁의 WAL은 그 사본의 것일 수 없어 길이 판정을 비켜 갈 근거가 되지 않는다.
+    if (mode === "reopen" && leftover.length > 0 && userVersion(view) === SNAPSHOT_UNOPENED) {
+      // 저널만 남았으면 이 사본의 첫 열기가 끊겼을 수 있다. 저널을 SQLite 밖에서 읽지 않아 다른 시점의 저널과 가르지 못하므로, 받지 않고 사유만 가른다.
+      const reason = leftover.length === 1 && journalLeft ? "interrupted_install" : "not_initialized";
+      throw new LedgerUnavailableError(reason, `한 번도 열지 않은 사본 곁에 다른 시점의 파일이 있다: ${leftover.join(", ")}`);
+    }
+    recovering = mode === "reopen" && !journalLeft && walMayHoldCommit(path, view);
+    // 저널이 남은 본체는 되돌리기 전의 모습이다. 커밋이 든 WAL 곁의 본체는 체크포인트가 페이지 중간에서 끊겼을 수 있고, 논리 상태는 WAL까지 읽은 SQLite가 판단한다.
+    if (!journalLeft && !recovering) requireWholePages(view, main.size);
     if (mode === "create") {
-      if (hasIdentity(view)) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
+      // 저널이 남으면 커밋되지 않은 식별 행이 본체에 보일 수 있어 내용 대조로만 가른다.
+      if (!journalLeft && hasIdentity(view)) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
       if (leftover.some((suffix) => suffix !== "-journal")) throw new LedgerUnavailableError("foreign_data", "끊긴 첫 설치에는 WAL이 남지 않는다");
-      requireInterruptedInstall(view, migrations);
+      requireInterruptedInstall(view, migrations, journalLeft);
     }
   } finally {
     view.close();
   }
+  if (recovering) requireInstalledThroughWal(path, migrations);
   return { fresh: false, file: main };
 }
 
@@ -590,12 +748,17 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
     } catch (error) {
       throw new LedgerUnavailableError("migration_mismatch", describe(error));
     }
+    // 첫 설치가 성공한 장부는 다음 재개방이 대조할 수 있어야 한다. 그럴 수 없는 목록은 파일을 만들기 전에 거절한다.
+    if (mode === "create") {
+      if (migrations.length === 0) throw new LedgerUnavailableError("migration_mismatch", "판이 없는 목록으로는 장부를 만들지 않는다. 재개방이 대조할 적용 기록이 남지 않는다");
+      installedSchema(migrations, migrations.length);
+    }
     // 적용 시각은 커밋된 뒤에는 고칠 수 없으므로 파일을 건드리기 전에 확인한다.
     const openedAt = options.clock();
     if (!Number.isSafeInteger(openedAt) || openedAt <= 0) throw new LedgerUnavailableError("db_error", "시계의 값이 안전한 시각이 아니다");
     const faults = options.faults ?? NO_FAULTS;
     const target = ledgerPath(path, mode);
-    const { fresh, file } = inspectFile(target, mode, migrations);
+    const { fresh, file } = inspectFile(target, mode, migrations, faults);
     faults.at("open:inspected");
     db = new Database(target, { readwrite: true, strict: true });
     // 연결이 파일을 처음 읽기 전에 본다(synchronous가 첫 읽기이고, 끊긴 트랜잭션의 저널은 그때 되돌려진다).
@@ -604,20 +767,25 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
     db.run("PRAGMA locking_mode = EXCLUSIVE");
     db.run("PRAGMA synchronous = FULL");
     db.run("PRAGMA foreign_keys = ON");
-    if (fresh) db.run(`PRAGMA application_id = ${APPLICATION_ID}`);
     // 빈 쓰기 트랜잭션으로 지금 잠금을 잡는다. EXCLUSIVE라 커밋 뒤에도 놓지 않는다.
     db.run("BEGIN EXCLUSIVE");
     db.run("COMMIT");
     requireSameFile(target, file, mode);
-    const check = db.query("PRAGMA quick_check").all() as { quick_check: string }[];
-    if (check.length !== 1 || check[0].quick_check !== "ok") throw new LedgerUnavailableError("corrupt", `quick_check: ${check.map((r) => r.quick_check).join("; ")}`);
-    // 마이그레이션 전에 본다: 재개방에 빈 파일이 오면 표를 만들지 않고 닫는다.
-    const identified = hasIdentity(db);
-    if (mode === "reopen" && !identified) throw new LedgerUnavailableError("not_initialized", "첫 설치 기록이 없다(빈 파일이거나 다른 파일)");
-    if (mode === "create" && identified) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
+    requireIntact(db);
+    // 파일에 처음 쓰기 전에 본다: 받지 않는 파일은 표식도 표도 적지 않고 닫는다.
     // 잠금을 쥔 뒤의 내용으로 다시 판정한다. 잠금 전의 판정은 파일을 바꾸지 않고 거절하려는 것이고, 쓰기의 근거는 이쪽이다.
-    if (mode === "create") requireInterruptedInstall(db, migrations);
-    if (mode === "reopen") useWal(db);
+    if (mode === "reopen") {
+      requireInstalled(db, migrations);
+    } else {
+      if (hasIdentity(db)) throw new LedgerUnavailableError("already_initialized", "이미 만든 장부다");
+      requireInterruptedInstall(db, migrations, false);
+    }
+    if (fresh) db.run(`PRAGMA application_id = ${APPLICATION_ID}`);
+    if (mode === "reopen") {
+      // WAL로 바꾸기 전에 지운다. 표식이 남은 채 WAL이 생기면 다음 기동이 그 WAL을 다른 시점의 파일로 보고 거절한다.
+      if (userVersion(db) === SNAPSHOT_UNOPENED) db.run("PRAGMA user_version = 0");
+      useWal(db);
+    }
     const migrated = migrate(db, migrations, openedAt, faults);
     if (mode === "create") {
       const conn = db;
@@ -630,7 +798,7 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
       useWal(conn);
     }
     options.faults?.onOpen?.(db);
-    return { ok: true, ledger: new Ledger(OPENED, db, options.clock, faults), migrated };
+    return { ok: true, ledger: new Ledger(OPENED, db, options.clock, faults, target), migrated };
   } catch (error) {
     try {
       db?.close();
@@ -660,12 +828,17 @@ export class Ledger {
   readonly #db: Database;
   readonly #clock: () => number;
   readonly #faults: Faults;
+  readonly #path: string;
+  // 호출자가 넘긴 판 목록으로 만든 장부에는 사본 기록의 표가 없을 수 있다.
+  readonly #snapshots: boolean;
 
-  constructor(key: symbol, db: Database, clock: () => number, faults: Faults) {
+  constructor(key: symbol, db: Database, clock: () => number, faults: Faults, path = "") {
     if (key !== OPENED) throw new TypeError("Ledger는 openLedger로만 연다");
     this.#db = db;
     this.#clock = clock;
     this.#faults = faults;
+    this.#path = path;
+    this.#snapshots = sqlOf(db, "ledger_snapshots") !== null;
   }
 
   health(): { writable: true } | { writable: false; reason: UnavailableReason } {
@@ -778,8 +951,13 @@ export class Ledger {
     return this.#grant !== null && this.#attempt?.id === this.#grant.attempt && this.#grant.generation === stop.generation && !stop.stopped;
   }
 
-  // 새 일을 막는 확인. 기록이 없으면(모름) 막고, 정지면 막고, 지금 정지 상태의 접수 허가가 없으면 막는다.
+  #snapshotHeld(): boolean {
+    return this.#snapshots && this.#db.query("SELECT 1 AS x FROM ledger_snapshots WHERE reconciled_at IS NULL LIMIT 1").get() !== null;
+  }
+
+  // 새 일을 막는 확인. 사본에서 떠 대조가 끝나지 않았으면 막고, 기록이 없으면(모름) 막고, 정지면 막고, 지금 정지 상태의 접수 허가가 없으면 막는다.
   #requireIntake(): void {
+    if (this.#snapshotHeld()) throw new Refuse("snapshot_hold");
     const stop = this.#stopRow();
     if (stop === null) throw new Refuse("stop_unknown");
     if (stop.stopped) throw new Refuse("stopped");
@@ -865,10 +1043,100 @@ export class Ledger {
     if (key !== RESTORE_KEY) throw new TypeError("접수는 재시작 복원만 연다");
     const current = this.#attempt;
     if (this.#closed || this.#broken !== null || current === null || current.id !== attempt || current.stopEpoch !== this.#stopEpoch) return false;
+    const held = this.#read(() => this.#snapshotHeld());
+    if (!held.known || held.value) return false;
     const stop = this.readStop();
     if (!stop.known || stop.value === null || stop.value.stopped) return false;
     this.#grant = { attempt, generation: stop.value.generation };
     return true;
+  }
+
+  // ---- 사본 ----
+
+  #snapshotOrigin(): SnapshotOrigin | null {
+    if (!this.#snapshots) return null;
+    const row = this.#db.query("SELECT snapshot_id, ledger_id, taken_at, reconciled_at FROM ledger_snapshots ORDER BY seq DESC LIMIT 1").get() as {
+      snapshot_id: string;
+      ledger_id: string;
+      taken_at: number;
+      reconciled_at: number | null;
+    } | null;
+    if (row === null) return null;
+    return { snapshotId: row.snapshot_id, ledgerId: row.ledger_id, takenAt: row.taken_at, reconciledAt: row.reconciled_at, held: this.#snapshotHeld(), mayBeStale: SNAPSHOT_STALE_RECORDS };
+  }
+
+  // 이 장부가 사본에서 떴는가. null이면 원본이다. held인 동안 계정 잠금과 영수증은 사본 시각(takenAt)의 것일 수 있다.
+  snapshotOrigin(): Read<SnapshotOrigin | null> {
+    return this.#read(() => this.#snapshotOrigin());
+  }
+
+  // 지금까지 커밋된 장부의 사본 파일을 만든다. 원본에는 아무것도 적지 않는다.
+  // 동기 호출이라 끝날 때까지 이 프로세스의 쓰기와 읽기가 기다린다. 그 시간에는 상한이 없고, 성공한 결과의 blockedMs가 실제 값이다.
+  // 열린 트랜잭션 안에서는 만들지 않는다. 그 연결의 그림에는 커밋되지 않은 페이지가 보인다.
+  createSnapshot(input: SnapshotRequest): SnapshotResult {
+    const v = exact(input, ["path", "maxBytes"], "createSnapshot");
+    if (typeof v.path !== "string" || v.path === "") throw new LedgerInputError("createSnapshot.path: 경로가 아니다");
+    const maxBytes = count(v.maxBytes, "maxBytes");
+    const refused = (reason: SnapshotFailure, detail: string) => ({ ok: false as const, reason, detail });
+    if (this.#closed || this.#broken !== null) return refused("ledger_unwritable", "장부를 쓸 수 없다");
+    if (this.#db.inTransaction) return refused("in_transaction", "열린 트랜잭션 안에서는 사본을 만들지 않는다");
+    if (!this.#snapshots) return refused("snapshot_unsupported", "이 장부의 판에는 사본 기록의 표가 없다");
+    const startedAt = Bun.nanoseconds();
+    let takenAt: number;
+    try {
+      takenAt = this.#clock();
+    } catch (error) {
+      return refused("ledger_unwritable", `시계를 읽지 못했다: ${describe(error)}`);
+    }
+    if (!Number.isSafeInteger(takenAt) || takenAt <= 0) return refused("ledger_unwritable", "시계의 값이 안전한 시각이 아니다");
+    try {
+      const target = snapshotTarget(v.path, this.#path);
+      let image: Uint8Array;
+      let ledgerId: string;
+      try {
+        if (this.#snapshotHeld()) return refused("snapshot_hold", "대조가 끝나지 않은 장부의 사본은 만들지 않는다");
+        // 사본 표식이 이 칸을 덮고 첫 열기가 0으로 되돌리므로, 판이 쓰는 값은 사본에서 보존되지 않는다.
+        if (userVersion(this.#db) !== 0) return refused("snapshot_unsupported", "이 장부의 판이 사본 표식의 칸(user_version)을 쓴다");
+        const { size } = this.#db.query("SELECT page_count * page_size AS size FROM pragma_page_count(), pragma_page_size()").get() as { size: number };
+        if (size > maxBytes) return refused("too_large", `장부 ${size}바이트 > 상한 ${maxBytes}바이트`);
+        ledgerId = (this.#db.query("SELECT ledger_id FROM ledger_identity WHERE id = 1").get() as { ledger_id: string }).ledger_id;
+        image = this.#db.serialize();
+        this.#faults.at("snapshot:serialized");
+      } catch (error) {
+        if (error instanceof SnapshotRefused) throw error;
+        this.#fail(classify(error));
+        return refused("ledger_unwritable", describe(error));
+      }
+      const snapshotId = crypto.randomUUID();
+      const sealed = sealSnapshot(image, { snapshotId, ledgerId, takenAt });
+      if (sealed.length > maxBytes) return refused("too_large", `사본 ${sealed.length}바이트 > 상한 ${maxBytes}바이트`);
+      publishSnapshot(target, sealed, this.#faults);
+      const sha256 = new Bun.CryptoHasher("sha256").update(sealed).digest("hex");
+      return { ok: true, snapshotId, ledgerId, takenAt, path: target, bytes: sealed.length, sha256, blockedMs: (Bun.nanoseconds() - startedAt) / 1e6 };
+    } catch (error) {
+      if (error instanceof SnapshotRefused) return refused(error.reason, error.detail);
+      return refused("io", describe(error));
+    }
+  }
+
+  // 관리자가 대조를 마쳤다는 기록. 보류를 푸는 유일한 연산이다. 사본의 식별이 맞아야 하고, 누가 불렀는지는 받지 않는다.
+  // 풀어도 접수는 닫힌 채다: 진행 중이던 복원 시도는 여기서 끝나고, 새 복원 시도가 1단계부터 끝까지 마쳐야 열린다.
+  // 대조 전에 물은 권위 응답이 대조 뒤에 도착해도 그 시도를 잇지 못하게, 허가뿐 아니라 시도 자체를 지운다.
+  confirmSnapshotReconciled(input: { snapshotId: string; now: number }): { ok: true; origin: SnapshotOrigin } | Refused {
+    const v = exact(input, ["snapshotId", "now"], "confirmSnapshotReconciled");
+    const snapshotId = str(v.snapshotId, UUID, "snapshotId");
+    const now = time(v.now, "now");
+    const result = this.#write("snapshot_reconcile", "new", () => {
+      if (!this.#snapshots) throw new Refuse("reference_mismatch");
+      const changed = this.#db.query("UPDATE ledger_snapshots SET reconciled_at = ?, reconciled_snapshot_id = snapshot_id WHERE snapshot_id = ? AND reconciled_at IS NULL").run(now, snapshotId).changes;
+      if (changed === 0) throw new Refuse("reference_mismatch");
+      return { ok: true as const, origin: this.#snapshotOrigin() as SnapshotOrigin };
+    });
+    if (result.ok) {
+      this.#attempt = null;
+      this.#revokeIntake();
+    }
+    return result;
   }
 
   // 맞춤 답(VerifyContext.stopGeneration)에 쓸 세대. 지금의 복원 시도가 권위 기록을 합쳤고 장부가 실패하지 않았을 때만 낸다.

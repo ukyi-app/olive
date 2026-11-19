@@ -86,10 +86,19 @@ test("마이그레이션: 한 번씩만 적용한다", () => {
   expect(versions(path)).toEqual([1, 2]);
 });
 
+// 판의 커밋 직전에 실패를 넣는다. 재생할 수 없는 목록은 파일을 만들기 전에 거절되므로, 도중 실패는 재생되는 판에 주입해 만든다.
+function failAt(point: string) {
+  return {
+    at(reached: string) {
+      if (reached === point) throw new Error(`주입한 실패: ${point}`);
+    },
+  };
+}
+
 test("마이그레이션: 도중 실패는 그 판 전체를 되돌린다", () => {
   const path = tempPath();
-  const dir = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;", "0002-b.sql": "CREATE TABLE b (x INTEGER) STRICT; INSERT INTO nope VALUES (1);" });
-  const result = openLedger(path, { clock, mode: "create", migrations: loadMigrations(dir) });
+  const dir = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;", "0002-b.sql": "CREATE TABLE b (x INTEGER) STRICT;" });
+  const result = openLedger(path, { clock, mode: "create", migrations: loadMigrations(dir), faults: failAt("migration:2") });
   expect(result).toMatchObject({ ok: false, reason: "migration_failed" });
   expect(versions(path)).toEqual([1]);
   const raw = new Database(path);
@@ -160,11 +169,10 @@ test("R18 정수: 적용 시각이 안전 범위 밖이면 파일을 만들지 �
 
 test("R09 마이그레이션: 이 설치의 끊긴 첫 설치만 이어 받는다", () => {
   const path = tempPath();
-  const broken = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;", "0002-b.sql": "INSERT INTO nope VALUES (1);" });
-  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(broken) })).toMatchObject({ ok: false, reason: "migration_failed" });
-  expect(versions(path)).toEqual([1]);
-  expect(openLedger(path, { clock, mode: "reopen", migrations: loadMigrations(broken) })).toMatchObject({ ok: false, reason: "not_initialized" });
   const fixed = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;", "0002-b.sql": "CREATE TABLE b (x INTEGER) STRICT;" });
+  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(fixed), faults: failAt("migration:2") })).toMatchObject({ ok: false, reason: "migration_failed" });
+  expect(versions(path)).toEqual([1]);
+  expect(openLedger(path, { clock, mode: "reopen", migrations: loadMigrations(fixed) })).toMatchObject({ ok: false, reason: "not_initialized" });
   const resumed = openLedger(path, { clock, mode: "create", migrations: loadMigrations(fixed) });
   expect(resumed).toMatchObject({ ok: true, migrated: { from: 1, to: 2 } });
   if (resumed.ok) resumed.ledger.close();
@@ -174,8 +182,8 @@ test("R09 마이그레이션: 이 설치의 끊긴 첫 설치만 이어 받는�
 
 test("R09 열기: 이 설치의 표식이 있어도 판 기록 없이 표가 있으면 이어 받지 않는다", () => {
   const path = tempPath();
-  const broken = migrationDir({ "0001-a.sql": "INSERT INTO nope VALUES (1);" });
-  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(broken) })).toMatchObject({ ok: false, reason: "migration_failed" });
+  const first = migrationDir({ "0001-a.sql": "CREATE TABLE a (x INTEGER) STRICT;" });
+  expect(openLedger(path, { clock, mode: "create", migrations: loadMigrations(first), faults: failAt("migration:1") })).toMatchObject({ ok: false, reason: "migration_failed" });
   const raw = new Database(path);
   raw.run("CREATE TABLE other (x INTEGER)");
   raw.close();

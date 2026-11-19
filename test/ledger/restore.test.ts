@@ -161,6 +161,7 @@ test("복원: 모두 맞으면 접수를 열어도 된다고 내고 예산·일�
   expect(s5).toEqual({
     intakeMayOpen: true,
     closedBecause: [],
+    snapshotOrigin: null,
     diagnosisPausedUntil: NOW + 3_600_000,
     queued: [],
     staleQueued: [],

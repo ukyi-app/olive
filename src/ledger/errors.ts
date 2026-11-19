@@ -6,10 +6,11 @@ export const UNAVAILABLE_REASONS = [
   "io", // 열기·읽기·쓰기의 입출력 오류
   "too_new", // 장부의 판이 코드보다 높다
   "migration_mismatch", // 적용 기록이 코드의 마이그레이션 폴더와 다르다
-  "migration_failed", // 마이그레이션 도중 실패(그 판 전체를 되돌렸다)
+  "migration_failed", // 마이그레이션 도중 실패(그 판 전체를 되돌렸다), 또는 판 목록을 빈 DB에서 재생하지 못해 적용하지 않았다
   "not_initialized", // 재개방인데 파일이 없거나 첫 설치 기록이 없거나 받지 않는 종류의 파일이다(빈 볼륨, 빈 대체 파일, 링크)
   "already_initialized", // 첫 설치로 열었는데 이미 만들어진 장부다
   "foreign_data", // 첫 설치로 열었는데 끊긴 첫 설치로 증명되지 않는 것이 그 자리에 있다(낯선 DB, 옛 스키마, 빈 파일, 링크, 본체 없는 WAL·SHM)
+  "interrupted_install", // 첫 설치나 사본의 첫 열기가 끊겼을 수 있는 저널이 남았고 본체만으로는 이어 받을 수 있는지 가를 수 없다(ledger.md "끊긴 첫 설치", "사본에서 뜬 장부의 보류")
   "closed", // 닫은 장부
   "db_error", // 그 밖의 DB 오류
 ] as const;
