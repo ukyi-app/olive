@@ -21,6 +21,7 @@ import {
   outboxWrite,
   pause,
   reconnect,
+  reservationFreed,
   rig,
   type Rig,
   runWrite,
@@ -267,8 +268,9 @@ test("F04 미확인 실행의 취소: 접수 영수증의 저장을 기다리지
   r.cleanup.hold = undefined;
   r.cleanup.remaining = 0;
   // 앞선 정리의 백엔드가 끝나야 다음 정리가 시작된다(같은 공간에 신호가 겹치지 않는다).
+  const freed = reservationFreed(r.worker, runId);
   stuck.open();
-  await pause(0);
+  await freed;
   const writing = disk.hold(cancelReceiptWrite);
   const pending = r.connection.receive(cancel(r, runId));
   await writing.entered;
@@ -644,9 +646,9 @@ test("G03 백엔드의 정리가 끝나지 않은 동안은 다음 취소가 합
     await r.connection.receive(cancel(r, runId));
     expect(r.cleanup.terminations).toBe(base + 1);
     r.cleanup.hold = undefined;
+    const freed = reservationFreed(r.worker, runId);
     stuck.open();
-    // 마이크로태스크가 모두 돈 뒤(시간이 아니라 이벤트 루프 한 바퀴로 순서를 만든다).
-    await pause(0);
+    await freed;
     await r.connection.receive(cancel(r, runId));
     expect(r.cleanup.terminations).toBe(base + 2);
   } finally {
@@ -835,7 +837,7 @@ function heldRun(r: Rig) {
   return running;
 }
 
-test("H01 첫 종료의 미확인 기록이 멈춰도 검증된 비상 취소가 물리적 종료를 다시 시작한다", async () => {
+test("H01 첫 종료의 계수가 메모리에 반영된 바로 뒤에 처리되는 검증된 비상 취소도 기록을 기다리지 않고 물리적 종료를 다시 시작한다", async () => {
   const disk = scriptedIo();
   const r = await make({ io: disk.io, stopWriteWaitMs: 1 });
   r.cleanup.remaining = 1;
@@ -843,24 +845,37 @@ test("H01 첫 종료의 미확인 기록이 멈춰도 검증된 비상 취소가
   const { runId } = await start(r);
   await running.entered;
 
-  // 비상 취소는 세대 쓰기가 저장 줄을 막은 채 상한을 지나 onCancel 바로 앞에 선다.
+  // 비상 취소는 세대 쓰기가 저장 줄을 막은 채 상한을 지나 onCancel 바로 앞에 선다. 처리는 시험이 정한 자리에서 시작한다.
   const emergency = randomUUID();
-  const arrived = barrier();
-  const reached = gate();
+  const arrived = gate();
+  let dispatch: (() => void) | undefined;
   const worker = r.worker as unknown as { onCancel(header: Header, body: unknown, epoch: number): Promise<void> };
   const onCancel = worker.onCancel.bind(r.worker);
-  worker.onCancel = async (header, body, epoch) => {
+  worker.onCancel = (header, body, epoch) => {
     if (header.request_id !== emergency) return onCancel(header, body, epoch);
-    await arrived.pass();
-    const work = onCancel(header, body, epoch);
-    reached.open();
-    return work;
+    return new Promise<void>((resolve, reject) => {
+      dispatch = () => void onCancel(header, body, epoch).then(resolve, reject);
+      arrived.open();
+    });
   };
+  const handOver = () => {
+    const run = dispatch;
+    dispatch = undefined;
+    run?.();
+  };
+  // 첫 정리의 계수 1이 메모리에 반영되는 바로 그때, 기다리던 취소를 처리한다. 계수 뒤 처리가 그 동기 구간에서 등록하는
+  // 어떤 콜백보다도 앞선 자리다(계수 뒤 처리 바로 다음에 마이크로태스크로 이미 줄 서 있던 취소와 같다).
   const reflected = gate();
+  let restarted: number | undefined;
   const commit = r.store.commit.bind(r.store);
   r.store.commit = (id, patch, events) => {
     const done = commit(id, patch, events);
-    if (patch.state === "unknown_running") reflected.open();
+    if (id === runId && patch.state === "unknown_running" && dispatch !== undefined) {
+      const before = r.cleanup.terminations;
+      handOver();
+      restarted = r.cleanup.terminations - before;
+      reflected.open();
+    }
     return done;
   };
   const stopWriting = disk.hold(stopWrite);
@@ -868,22 +883,17 @@ test("H01 첫 종료의 미확인 기록이 멈춰도 검증된 비상 취소가
     fromSupervisor(r.clock, r.worker.name, "task_cancel", { run_id: runId, reason: "emergency_stop" }, { stop_generation: 1, run_generation: 1, request_id: emergency }),
   );
   await stopWriting.entered;
-  await arrived.entered;
+  await arrived.wait;
 
   try {
     // 프로그램이 끝나고 첫 정리의 계수 1이 메모리에 반영된다. 그 상태 쓰기는 세대 쓰기 뒤에 멈춰 있다.
     running.open();
     await reflected.wait;
-    // 마이크로태스크가 모두 돈 뒤(물리적 정리의 예약이 풀린 뒤).
-    await pause(0);
     expect(onDiskRun(r.dir, runId).state).not.toBe("unknown_running");
-    const before = r.cleanup.terminations;
-    arrived.open();
-    await reached.wait;
-    expect(r.cleanup.terminations).toBe(before + 1);
+    expect(restarted).toBe(1);
   } finally {
     running.open();
-    arrived.open();
+    handOver();
     stopWriting.open();
   }
   await receiving;
@@ -925,9 +935,9 @@ test("H01 첫 종료의 백엔드가 도는 동안 다음 취소는 합류하고
     expect(r.cleanup.terminations).toBe(base);
 
     r.cleanup.hold = undefined;
+    const freed = reservationFreed(r.worker, runId);
     stuck.open();
-    // 마이크로태스크가 모두 돈 뒤(시간이 아니라 이벤트 루프 한 바퀴로 순서를 만든다).
-    await pause(0);
+    await freed;
     verified.get(ids[1])!.open();
     await reached.get(ids[1])!.wait;
     expect(r.cleanup.terminations).toBe(base + 1);
@@ -963,8 +973,9 @@ test("H01 첫 종료가 예외로 끝나도 백엔드가 끝나기 전에는 새
     expect(r.cleanup.terminations).toBe(base);
 
     r.cleanup.hold = undefined;
+    const freed = reservationFreed(r.worker, runId);
     stuck.open();
-    await pause(0);
+    await freed;
     await r.connection.receive(cancel(r, runId));
     expect(r.cleanup.terminations).toBe(base + 1);
     expect(r.store.run(runId)?.state).toBe("failed_stopped");
@@ -982,13 +993,17 @@ test("H01 대조군: 다른 실행이 도는 동안에는 옛 실행의 취소�
   const running = heldRun(r);
   const { runId: current } = await start(r);
   await running.entered;
-  await r.store.noteRun({ ...r.store.run(earlier)!, state: "unknown_running" });
-  const before = r.cleanup.terminations;
-  await r.connection.receive(cancel(r, earlier));
-  expect(r.cleanup.terminations).toBe(before);
-  expect(r.store.run(current)?.state).toBe("running");
-  running.open();
-  await r.worker.idle();
+  try {
+    await r.store.noteRun({ ...r.store.run(earlier)!, state: "unknown_running" });
+    const before = r.cleanup.terminations;
+    await r.connection.receive(cancel(r, earlier));
+    expect(r.cleanup.terminations).toBe(before);
+    expect(r.store.run(current)?.state).toBe("running");
+  } finally {
+    // 단언이 실패해도 역할 프로그램의 끝을 열어 afterEach가 닫힌 문에 걸리지 않는다.
+    running.open();
+    await r.worker.idle();
+  }
 });
 
 // ---- H02 실제 점유로 세는 상한 ----
@@ -1068,6 +1083,59 @@ test("H02 기동 뒤 점유가 아홉이 되면 일부만 담은 hello를 보내
   await reconnect(again, 0);
   const listed = again.transport.of("hello")[0]!.body.runs.map((run) => run.run_id);
   expect(listed).toEqual(expect.arrayContaining(records.map((record) => record.run_id)));
+});
+
+// 같은 실행·세대의 종료 영수증과 맞는 마지막 포인터를 가진 failed_stopped 실행. 슬롯을 쥐지 않으므로 몇 개든 기동을 막지 않는다.
+async function stoppedRuns(r: Rig, count: number): Promise<string[]> {
+  const ids: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const record = runRecord(r, "unknown_running");
+    expect(await r.store.beginRun(record)).toBe(true);
+    const id = randomUUID();
+    const body = { receipt_id: id, run_id: record.run_id, remaining_processes: 0, exit: "failed", stopped_at: r.clock.now() };
+    const { saved } = await r.store.commit(record.run_id, { state: "failed_stopped" }, [
+      { entry: { id, action: "receipt_stopped", run_id: record.run_id, run_generation: 1, body, acked: false } },
+    ]);
+    expect(saved).toBe(true);
+    ids.push(record.run_id);
+  }
+  return ids;
+}
+
+test("H02 점유가 여덟이면 점유하지 않던 실행에 새 정리를 예약하지 않고, 점유 중인 실행의 재시도는 받으며, 자리가 나면 아홉째도 정리한다", async () => {
+  const seed = await make();
+  const ids = await stoppedRuns(seed, limits.STATUS_MAX_RUNS + 1);
+  const r = await make({ dir: seed.dir, clock: seed.clock });
+  await r.worker.recover();
+  expect(r.store.inconsistency()).toBeNull();
+  expect(r.transport.of("hello")).toHaveLength(1);
+  const ninth = ids.at(-1)!;
+
+  // 폴더 지우기가 실패해 서명된 확정마다 cleanup_pending이 남는다. 여덟에 이르면 아홉째는 예약하지 않는다.
+  r.space.cleanResult = false;
+  for (const id of ids) await r.connection.receive(finalize(r, id));
+  expect(r.space.cleaned).toEqual(ids.slice(0, limits.STATUS_MAX_RUNS));
+  expect(r.store.run(ninth)?.state).toBe("failed_stopped");
+  expect(onDiskRun(r.dir, ninth).state).toBe("failed_stopped");
+  // 이미 점유 중인 실행의 정리 재시도는 상한에서도 받는다.
+  await r.connection.receive(finalize(r, ids[0]!));
+  expect(r.space.cleaned).toHaveLength(limits.STATUS_MAX_RUNS + 1);
+  expect(r.store.run(ids[0]!)?.state).toBe("cleanup_pending");
+
+  // 지우기가 회복된 뒤 재연결하면 인사하고, 정리 재시도로 자리가 나면 아홉째도 정리한다.
+  r.space.cleanResult = true;
+  await reconnect(r, 0);
+  expect(r.transport.closed).toBe(false);
+  expect(r.transport.of("hello")).toHaveLength(1);
+  await r.connection.receive(finalize(r, ids[0]!));
+  expect(r.store.run(ids[0]!)?.state).toBe("finalized");
+  await r.connection.receive(finalize(r, ninth));
+  expect(r.store.run(ninth)?.state).toBe("finalized");
+  expect(r.transport.of("receipt_cleaned").map((receipt) => receipt.body.run_id)).toEqual(expect.arrayContaining([ids[0], ninth]));
+
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBeNull();
+  expect(again.transport.of("hello")).toHaveLength(1);
 });
 
 // ---- H03 본문 대조를 끝내지 못한 기동 ----

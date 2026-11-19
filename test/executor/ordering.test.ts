@@ -7,7 +7,7 @@ import { readdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { limits, resultDigest } from "../../src/contract/v1/index.ts";
 import type { StoreIo } from "../../src/executor/store.ts";
-import { barrier, type Barrier, cancelReceiptWrite, fromSupervisor, gate, pause, reconnect, rig, type Rig, scriptedIo, start, syncReply, until } from "./support.ts";
+import { barrier, type Barrier, cancelReceiptWrite, fromSupervisor, gate, pause, reconnect, reservationFreed, rig, type Rig, scriptedIo, start, syncReply, until } from "./support.ts";
 
 const rigs: Rig[] = [];
 async function make(options: Parameters<typeof rig>[0] = {}) {
@@ -340,8 +340,9 @@ test("취소: 정리 신호가 닿지 않아 자식이 끝나지 않으면 상�
   r.cleanup.inert = false;
   r.cleanup.hold = undefined;
   r.cleanup.remaining = 0;
+  const freed = reservationFreed(r.worker, runId);
   stuck.open();
-  await pause(0);
+  await freed;
   await r.connection.receive(cancel(r, runId));
   expect(stateOf(r, runId)).toBe("failed_stopped");
   expect(r.transport.of("receipt_stopped")).toHaveLength(1);

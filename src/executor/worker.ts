@@ -206,8 +206,14 @@ export class WorkerExecutor {
   }
 
   // 장부 전체를 설명할 수 없거나 지금의 점유·보류가 hello의 상한을 넘는다. 일부만 담은 목록으로 인사하지 않는다(link.ts가 연결을 닫는다).
+  // 시작과 정리 예약은 상한 안에서만 점유를 늘린다. 실행 중에 넘는 것은 그 뒤에 선 보류가 더해졌거나 저장소의 낮은 쓰기 입구로 기록이 들어온 경우다.
   helloWithheld(): boolean {
-    return this.store.ledgerHeld() || this.store.durableRunList().filter((run) => this.occupies(run)).length > limits.STATUS_MAX_RUNS;
+    return this.store.ledgerHeld() || this.occupying().length > limits.STATUS_MAX_RUNS;
+  }
+
+  // hello가 반드시 실어야 하는 실행. 인사의 판정과 정리 예약의 상한이 같은 집합을 센다.
+  private occupying(): RunRecord[] {
+    return this.store.durableRunList().filter((run) => this.occupies(run));
   }
 
   // 슬롯을 쥐었거나 장부가 설명하지 못하는 실행. hello의 목록은 파일의 기록으로 만들므로 파일과 메모리 어느 쪽이 쥐었어도 센다.
@@ -477,8 +483,9 @@ export class WorkerExecutor {
   // 세는 쪽이 끝나지 않으면 상한에서 unknown_running으로 둔다(0을 만들어 내지 않는다).
   // 종료 확인 영수증·결과 보고·최종 상태는 전이 하나로 남긴다. 이미 있는 사건은 새로 만들지 않고 같은 ID로 다시 보낸다.
   // 장부가 설명하지 못하는 실행은 끝내고 세기만 한다. 끝을 맺지 못한 상태는 슬롯을 쥔 미확인으로 두고, 영수증과 완료 상태를 내지 않는다.
-  // physicalDone은 물리적 정리가 끝나고 그 결과가 메모리와 기록 순번에 들어간 뒤에 불린다(파일 쓰기의 완료는 기다리지 않는다).
-  // 상한으로 먼저 돌아오거나 뒤에서 예외가 나도 백엔드의 작업이 끝나기 전에는 부르지 않는다. 아직 신호를 낼 수 있는 정리와 새 정리가 겹치면 안 된다.
+  // physicalDone은 두 백엔드(terminate, survivors)가 실제로 끝난 뒤에만 부른다(파일 쓰기의 완료는 기다리지 않는다).
+  // 결과를 받은 동기 구간에서 이미 끝났으면 그 자리에서, 상한이 먼저 왔으면 마지막 백엔드가 끝날 때 부른다. 뒤에서 예외가 나도 같다.
+  // 아직 신호를 낼 수 있는 정리와 새 정리가 겹치면 안 된다.
   private async confirmStopped(
     runId: string,
     exit: ExitKind,
@@ -488,12 +495,25 @@ export class WorkerExecutor {
     physicalDone: () => void,
   ): Promise<void> {
     const backend = this.options.cleanup;
-    let physical: Promise<unknown> = Promise.resolve();
-    // 백엔드의 동기 예외도 거절로 받는다. 어느 실패든 아래의 physicalDone 예약에 닿아야 한다.
+    // 아직 끝나지 않은 백엔드 작업의 수. 결과가 bounded에 닿기 전에 줄이므로, 결과를 받은 시점에 0이면 두 백엔드가 실제로 끝났다.
+    let running = 0;
+    let lastSettled: (() => void) | undefined;
+    const settle = () => {
+      if (--running === 0) lastSettled?.();
+    };
+    // 백엔드의 동기 예외도 거절로 받는다. 어느 실패든 settle을 지나야 한다.
     const watch = <T>(start: () => Promise<T>): Promise<T> => {
-      const work = new Promise<T>((resolve) => resolve(start()));
-      physical = Promise.allSettled([physical, work]);
-      return work;
+      running++;
+      return new Promise<T>((resolve) => resolve(start())).then(
+        (value) => {
+          settle();
+          return value;
+        },
+        (error: unknown) => {
+          settle();
+          throw error;
+        },
+      );
     };
     const cleanup = { terminate: () => watch(() => backend.terminate()), survivors: () => watch(() => backend.survivors()) };
     if (launched) {
@@ -501,8 +521,10 @@ export class WorkerExecutor {
       await bounded(cleanup.terminate(), this.exitWaitMs(), undefined);
     }
     const survivors = await bounded(cleanup.survivors(), this.exitWaitMs(), null);
-    // 이 콜백은 아래의 동기 구간(결과 반영과 순번 예약)이 끝난 뒤에 돈다.
-    void physical.then(physicalDone);
+    // 여기서부터 결과의 메모리 반영과 순번 예약까지 한 동기 구간이다. 두 백엔드가 이미 끝났으면 이 구간에서 예약을 풀므로,
+    // 이 뒤에 처리되는 취소는 반영된 결과와 빈 예약을 함께 본다.
+    if (running === 0) physicalDone();
+    else lastSettled = physicalDone;
     if (this.store.suspectRun(runId)) {
       if (IN_FLIGHT.includes(this.store.run(runId)!.state)) await this.transition(runId, { state: "unknown_running", exit });
       return;
@@ -653,6 +675,10 @@ export class WorkerExecutor {
     if (record.state === "finalized") return this.answerCleaned(runId, header);
     // 프로세스가 살아 있을 수 있는 실행은 지우지 않는다. 쓰는 중인 파일을 지우거나 자격을 거둔 척하게 된다.
     if (!MAY_CLEAN.includes(record.state) || !this.store.settled(runId)) return;
+    // 점유가 hello의 상한에 이르렀으면 점유하지 않던 실행에 새 정리를 예약하지 않는다(아홉째 점유가 생기면 인사할 수 없어 정리 재시도도 받지 못한다).
+    // 이미 점유 중인 실행의 재시도는 받는다. 여기서 clean의 메모리 예약까지 await가 없다.
+    const occupying = this.occupying();
+    if (occupying.length >= limits.STATUS_MAX_RUNS && !occupying.some((run) => run.run_id === runId)) return;
     // 첫 await 전에 슬롯을 쥔다. 같은 실행의 다른 확정은 이 작업에 합류한다.
     const work = this.clean(runId, header, epoch);
     this.cleaning.set(runId, work);
