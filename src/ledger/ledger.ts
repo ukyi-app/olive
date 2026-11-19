@@ -16,7 +16,7 @@
 // - foreign_keys=ON: 지시·세션·게시·영수증이 없는 실행을 가리키지 못한다. 연결마다 켜야 하는 설정이다.
 // - quick_check: 깨진 파일은 열 때 SQLITE_NOTADB·SQLITE_CORRUPT로 걸러 "쓸 수 없음"으로 연다(열지 않는다).
 //
-// 새 업무(접수·실행 줄·시작·자격·게시·갱신)의 공통 전제는 #write의 "start" 한 자리에 있다: 장부가 건강하고, 트랜잭션 안에서
+// 새 업무(접수·작업 부탁·실행 줄·시작·자격·게시·갱신)의 공통 전제는 #write의 "start" 한 자리에 있다: 장부가 건강하고, 트랜잭션 안에서
 // 읽은 지금의 정지 기록이 있고 정지가 아니며, 지금의 복원 시도가 바로 그 정지 상태에서 낸 접수 허가(#grant)가 살아 있다.
 import { constants as sqliteOpen, Database, SQLiteError } from "bun:sqlite";
 import { type BigIntStats, closeSync, constants as fileOpen, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
@@ -28,6 +28,7 @@ import {
   limits,
   type NonceStore,
   parsePrincipal,
+  type Role,
   ROLES,
   type RunState,
   SESSION_BROKEN_CAUSES,
@@ -47,6 +48,7 @@ import {
   REF,
   REVISION,
   SHA256,
+  SOURCE_REF,
   type SourceRef,
   sourceRef,
   STORED_REF,
@@ -412,6 +414,72 @@ export interface InputEntry {
   receivedAt: number;
   expiresAt: number;
   cancelled: boolean;
+}
+
+// 작업 부탁(start_worker)이 배정 전에 가질 수 있는 단계. 처리기의 단계 이름(src/supervisor/scheduler/tools.ts의 PHASES) 안에 있다.
+// not_started는 배정 전에 취소돼 시작하지 않은 부탁이다. 배정한 뒤의 단계는 이 기록이 아니라 이은 실행 줄의 상태다(배정기의 몫).
+export const TOOL_REQUEST_PHASES = ["waiting_assignment", "not_started"] as const;
+export type ToolRequestPhase = (typeof TOOL_REQUEST_PHASES)[number];
+
+// 목적의 분류 코드. 처리기가 인자에서 받는 꼴과 같다(시험이 대조한다).
+export const PURPOSE = /^[a-z][a-z0-9_]{0,63}$/;
+
+// 작업 부탁 한 건. 원문·자유 글·실행기·자격은 없다. ref는 장부가 돌려주는 불투명 참조이고, owner는 부탁을 낸 논리 요청이다.
+export interface ToolRequest {
+  ref: string;
+  owner: string;
+  dedupeKey: string;
+  role: Role;
+  purpose: string;
+  sourceRef: string;
+  inputDigest: string;
+  phase: ToolRequestPhase;
+}
+
+// 새 부탁의 기록(recordToolRequest). ref는 새 줄을 만들 때만 쓰는 후보다. 장부는 난수를 직접 부르지 않으므로 부르는 쪽이 UUID를
+// 넘기고, 같은 (owner, dedupeKey)의 줄이 이미 있으면 그 줄의 참조를 돌려주고 후보는 버린다.
+export interface ToolRequestInput {
+  ref: string;
+  owner: string;
+  dedupeKey: string;
+  role: string;
+  purpose: string;
+  sourceRef: string;
+  inputDigest: string;
+  sessionId: string;
+  callId: string;
+  now: number;
+}
+
+interface ToolRequestRow {
+  ref: string;
+  owner: string;
+  dedupe_key: string;
+  role: string;
+  purpose: string;
+  source_ref: string;
+  input_digest: string;
+  phase: string;
+  run_id: string | null;
+}
+
+// 읽은 줄을 값으로 바꾼다. 이 판의 코드는 부탁을 실행에 잇지 않으므로, 이어진 줄을 만나면 그 단계(실행 줄의 상태)를 지어내거나
+// 대기로 답하지 않고 읽지 못한 것(corrupt)으로 닫는다. 꼴이 어긋난 줄(스키마 CHECK를 지나친 파일)도 같다.
+function toToolRequest(row: ToolRequestRow): ToolRequest {
+  if (row.run_id !== null) throw new LedgerUnavailableError("corrupt", "tool_requests: 실행에 이은 부탁은 이 판의 코드가 읽지 않는다");
+  const fits =
+    UUID.test(row.ref) && UUID.test(row.owner) && (ROLES as readonly string[]).includes(row.role) && (TOOL_REQUEST_PHASES as readonly string[]).includes(row.phase);
+  if (!fits) throw new LedgerUnavailableError("corrupt", "tool_requests: 꼴이 맞지 않는 줄");
+  return {
+    ref: row.ref,
+    owner: row.owner,
+    dedupeKey: row.dedupe_key,
+    role: row.role as Role,
+    purpose: row.purpose,
+    sourceRef: row.source_ref,
+    inputDigest: row.input_digest,
+    phase: row.phase as ToolRequestPhase,
+  };
 }
 
 // 실행 하나의 지시 이력에서 판단이 쓰는 시각(instructionTimes). null은 그런 지시를 낸 적이 없음을 장부에서 확인한 값이다.
@@ -1464,6 +1532,90 @@ export class Ledger {
       else out.pending.push({ requestId: row.request_id, seq: row.seq, sourceRef: { ref: row.source_ref, expiresAt: row.source_expires_at } });
     }
     return out;
+  }
+
+  // ---- 작업 부탁(start_worker) ----
+
+  // 두 조회는 소유자가 같은 줄만 본다. 다른 소유자의 같은 키·같은 참조는 없는 줄과 같은 답(null)이다.
+  #toolRequestRow(column: "dedupe_key" | "ref", owner: string, value: string): ToolRequestRow | null {
+    const sql = `SELECT ref, owner, dedupe_key, role, purpose, source_ref, input_digest, phase, run_id FROM tool_requests WHERE owner = ? AND ${column} = ?`;
+    return (this.#db.query(sql).get(owner, value) as ToolRequestRow | null) ?? null;
+  }
+
+  findToolRequest(query: { owner: string; dedupeKey: string }): Read<ToolRequest | null> {
+    const v = exact(query, ["owner", "dedupeKey"], "findToolRequest");
+    const owner = str(v.owner, UUID, "owner");
+    const key = str(v.dedupeKey, REF, "dedupeKey");
+    return this.#read(() => {
+      const row = this.#toolRequestRow("dedupe_key", owner, key);
+      return row === null ? null : toToolRequest(row);
+    });
+  }
+
+  readToolRequest(query: { owner: string; ref: string }): Read<ToolRequest | null> {
+    const v = exact(query, ["owner", "ref"], "readToolRequest");
+    const owner = str(v.owner, UUID, "owner");
+    const ref = str(v.ref, UUID, "ref");
+    return this.#read(() => {
+      const row = this.#toolRequestRow("ref", owner, ref);
+      return row === null ? null : toToolRequest(row);
+    });
+  }
+
+  // 배정 전 대기의 기록. 실행 줄·슬롯·실행기·자격을 만들지 않는다. 새 업무라 같은 트랜잭션에서 정지와 접수 허가를 다시 본다(쓰기 모드 start).
+  // 같은 (소유자, 키)의 줄이 있으면 새 줄을 만들지 않고 그 줄을 돌려준다: 내용(역할·목적·원본·digest)이 같으면 existing, 다르면 conflict.
+  // 다른 소유자의 같은 키는 보지 않는다. 소유자가 접수한 입력이 아니면 외래 키가 막는다(invariant_violation).
+  recordToolRequest(input: ToolRequestInput): { ok: true; outcome: "created" | "existing" | "conflict"; request: ToolRequest } | Refused {
+    const v = exact(input, ["ref", "owner", "dedupeKey", "role", "purpose", "sourceRef", "inputDigest", "sessionId", "callId", "now"], "recordToolRequest");
+    const row = {
+      ref: str(v.ref, UUID, "ref"),
+      owner: str(v.owner, UUID, "owner"),
+      dedupe_key: str(v.dedupeKey, REF, "dedupeKey"),
+      role: oneOf(v.role, ROLES, "role"),
+      purpose: str(v.purpose, PURPOSE, "purpose"),
+      source_ref: str(v.sourceRef, SOURCE_REF, "sourceRef"),
+      input_digest: str(v.inputDigest, SHA256, "inputDigest"),
+      session_id: str(v.sessionId, REF, "sessionId"),
+      call_id: str(v.callId, UUID, "callId"),
+      now: time(v.now, "now"),
+    };
+    return this.#write("tool_request", "start", () => {
+      const same = this.#toolRequestRow("dedupe_key", row.owner, row.dedupe_key);
+      if (same !== null) {
+        const request = toToolRequest(same);
+        const sameContent = same.role === row.role && same.purpose === row.purpose && same.source_ref === row.source_ref && same.input_digest === row.input_digest;
+        return { ok: true as const, outcome: sameContent ? ("existing" as const) : ("conflict" as const), request };
+      }
+      this.#db
+        .query(
+          `INSERT INTO tool_requests (ref, owner, dedupe_key, role, purpose, source_ref, input_digest, session_id, call_id, phase, created_at)
+           VALUES ($ref, $owner, $dedupe_key, $role, $purpose, $source_ref, $input_digest, $session_id, $call_id, 'waiting_assignment', $now)`,
+        )
+        .run(row);
+      const created = this.#toolRequestRow("ref", row.owner, row.ref);
+      if (created === null) throw new Refuse("invariant_violation");
+      return { ok: true as const, outcome: "created" as const, request: toToolRequest(created) };
+    });
+  }
+
+  // 취소 접수. 자기 대기 부탁만 not_started로 적는다. 소유는 이 트랜잭션에서 다시 보고, 남의 부탁과 없는 부탁은 같은 거절(unknown_run)이다.
+  // 이미 not_started면 transition_denied. 닫는 기록이라 정지 중에도, 접수가 닫혀도 적는다(쓰기 모드 continue).
+  cancelToolRequest(input: { owner: string; ref: string; sessionId: string; callId: string; now: number }): { ok: true; phase: ToolRequestPhase } | Refused {
+    const v = exact(input, ["owner", "ref", "sessionId", "callId", "now"], "cancelToolRequest");
+    const owner = str(v.owner, UUID, "owner");
+    const ref = str(v.ref, UUID, "ref");
+    const sessionId = str(v.sessionId, REF, "sessionId");
+    const callId = str(v.callId, UUID, "callId");
+    const now = time(v.now, "now");
+    return this.#write("tool_request_cancel", "continue", () => {
+      const row = this.#toolRequestRow("ref", owner, ref);
+      if (row === null) throw new Refuse("unknown_run");
+      if (toToolRequest(row).phase !== "waiting_assignment") throw new Refuse("transition_denied");
+      this.#db
+        .query("UPDATE tool_requests SET phase = 'not_started', cancelled_at = ?, cancel_session_id = ?, cancel_call_id = ? WHERE ref = ? AND owner = ?")
+        .run(now, sessionId, callId, ref, owner);
+      return { ok: true as const, phase: "not_started" as const };
+    });
   }
 
   // ---- 실행 ----
