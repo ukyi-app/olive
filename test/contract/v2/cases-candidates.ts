@@ -1,12 +1,16 @@
 // 후보 내용 묶음(src/contract/v2/candidates.ts)의 표본 사례. cases.ts의 buildCases가 앞 묶음 사례 뒤에 붙인다.
 // 표본의 내용은 꾸며 낸 짧은 글이다(실제 대화나 비밀처럼 보이는 것을 넣지 않는다). 요청 ID·nonce는 0x80~0x8f를 쓴다.
 import { candidateDigestOf, candidatePieceOf } from "../../../src/contract/v2/candidates.ts";
+import { CANDIDATE_MAX_BYTES } from "../../../src/contract/v2/limits.ts";
 import { accept, type Expect, type V2Case, type Variant, variant } from "./case-kit.ts";
 import { baseContext, type CaseContext, envelope, id, type Keys, nonceOf } from "./support.ts";
 
 const OK: Expect & { ok: true } = { ok: true, handshake_after: null };
 const CONTENT = new TextEncoder().encode("시험용으로 꾸며 낸 답 글이에요.");
 const DIGEST = candidateDigestOf(CONTENT);
+// 상한 크기(1MiB) 후보. 메모리에서만 만들고 표본에는 마지막 1바이트 조각과 그 digest만 실린다.
+const FULL = new Uint8Array(CANDIDATE_MAX_BYTES).fill(0x61);
+const FULL_DIGEST = candidateDigestOf(FULL);
 
 export function buildCandidateCases(keys: Keys): V2Case[] {
   const fetchMsg = envelope(keys, { sender: "front-door", recipient: "supervisor", action: "candidate_fetch", request_id: id(0x80), nonce: nonceOf(0x80) }, { candidate_digest: DIGEST, offset: 0 });
@@ -48,11 +52,56 @@ export function buildCandidateCases(keys: Keys): V2Case[] {
     OK,
   );
 
+  // 상한의 경계: 1MiB 후보의 마지막 바이트(offset 1MiB - 1)를 묻고 1바이트 조각으로 답한다.
+  const lastFetchMsg = envelope(
+    keys,
+    { sender: "front-door", recipient: "supervisor", action: "candidate_fetch", request_id: id(0x83), nonce: nonceOf(0x83) },
+    { candidate_digest: FULL_DIGEST, offset: CANDIDATE_MAX_BYTES - 1 },
+  );
+  const lastFetch = accept(
+    keys,
+    "candidate-fetch-last-byte",
+    "전체 상한(1MiB = 1,048,576바이트, 관리자 결정 2026-11-19) 크기 후보의 마지막 바이트 위치(1,048,575)를 묻는다. 받는 위치의 끝이다",
+    "supervisor",
+    baseContext("supervisor", { handshake: "agreed", intake_open: true }),
+    lastFetchMsg,
+    OK,
+  );
+  const lastChunk = accept(
+    keys,
+    "candidate-chunk-last-byte",
+    "1MiB 후보의 마지막 1바이트 조각(total = 1,048,576, offset + 길이 = total). 32번째 조각의 끝이다",
+    "front-door",
+    baseContext("front-door", { handshake: "agreed", intake_open: true, awaiting: { [lastFetchMsg.header.request_id]: { action: "candidate_fetch", job: null } } }),
+    envelope(
+      keys,
+      { sender: "supervisor", recipient: "front-door", action: "candidate_chunk", request_id: id(0x84), nonce: nonceOf(0x84) },
+      { in_reply_to: lastFetchMsg.header.request_id, candidate_digest: FULL_DIGEST, offset: CANDIDATE_MAX_BYTES - 1, piece: candidatePieceOf(FULL, CANDIDATE_MAX_BYTES - 1) },
+    ),
+    OK,
+  );
+
   const on = (base: V2Case) => (v: Variant) => variant(keys, base, v);
   return [
     fetch,
     chunk,
     unavailable,
+    lastFetch,
+    lastChunk,
+    on(lastFetch)({
+      name: "candidate-fetch-offset-at-limit",
+      description: "전체 상한(1,048,576)과 같은 위치를 묻는다. 위치는 상한 미만이어야 한다",
+      reason: "body_malformed",
+      changed: ["message.body.offset"],
+      edit: (c) => void (c.message.body.offset = CANDIDATE_MAX_BYTES),
+    }),
+    on(lastChunk)({
+      name: "candidate-chunk-total-over-limit",
+      description: "전체 크기가 상한 +1(1,048,577). 상한을 넘는 후보는 옮기지 않는다",
+      reason: "body_malformed",
+      changed: ["message.body.piece.total"],
+      edit: (c) => void ((c.message.body.piece as { total: number }).total = CANDIDATE_MAX_BYTES + 1),
+    }),
     on(fetch)({
       name: "candidate-fetch-policy-mismatch",
       description: "정책 revision이 어긋난 연결의 내용 묻기. 후보의 내용은 뜻이 고정된 사실이 아니라 받지 않는다",

@@ -241,7 +241,9 @@ test("내용 칸은 이 답 하나뿐이다: 금지 이름과 겹치지 않고, 
 });
 
 test("상한: 가장 큰 조각의 봉투가 봉투 하나의 틀 안에 들고, 경계 밖의 조각·위치·크기는 body_malformed다", async () => {
-  expect(limits.CANDIDATE_MAX_BYTES).toBe(limits.MAX_MESSAGE_BYTES);
+  // 전체 상한은 관리자 결정(2026-11-19)의 1MiB, 조각 32개다.
+  expect(limits.CANDIDATE_MAX_BYTES).toBe(1_048_576);
+  expect(limits.CANDIDATE_MAX_BYTES / limits.CANDIDATE_CHUNK_MAX_BYTES).toBe(32);
   expect(limits.MAX_MESSAGE_BYTES).toBe(v1Limits.MAX_MESSAGE_BYTES);
   expect(limits.CANDIDATE_CHUNK_MAX_BYTES).toBe(32 * 1024);
 
@@ -276,6 +278,43 @@ test("상한: 가장 큰 조각의 봉투가 봉투 하나의 틀 안에 들고,
   expect(() => candidatePieceOf(new Uint8Array(0), 0)).toThrow(RangeError);
   expect(() => candidatePieceOf(SHORT, SHORT.length)).toThrow(RangeError);
   expect(() => candidatePieceOf(new Uint8Array(limits.CANDIDATE_MAX_BYTES + 1), 0)).toThrow(RangeError);
+});
+
+test("상한의 경계: 1MiB 정확히는 받고 +1은 거절, 마지막 조각의 위치(1MiB - 32KiB, 1MiB - 1)까지만 묻고 답한다", async () => {
+  const MAX = limits.CANDIDATE_MAX_BYTES;
+  const CHUNK = limits.CANDIDATE_CHUNK_MAX_BYTES;
+  const digest = candidateDigestOf(FULL);
+  expect(FULL.length).toBe(MAX);
+  const malformed = { ok: false, reason: "body_malformed" } as const;
+
+  // 묻기: 마지막 바이트의 위치까지는 받고, 상한 위치(전체 크기를 넘는 위치)는 거절한다.
+  const ask = (offset: number) => at(fromFront("candidate_fetch", { candidate_digest: digest, offset }), "supervisor");
+  for (const offset of [MAX - CHUNK, MAX - 1]) expect((await ask(offset)).ok, `${offset}`).toBe(true);
+  for (const offset of [MAX, MAX + 1]) expect(await ask(offset), `${offset}`).toEqual(malformed);
+
+  // 답: 감독이 만든 마지막 조각 둘(꽉 찬 32KiB, 1바이트)을 받는다. 같은 자리의 total이 상한 +1이거나 조각이 total을 넘으면 거절한다.
+  const fetch = fromFront("candidate_fetch", { candidate_digest: digest, offset: 0 });
+  const send = (offset: number, piece: unknown) =>
+    at(fromSupervisor("candidate_chunk", { in_reply_to: fetch.header.request_id, candidate_digest: digest, offset, piece }), "front-door", { awaiting: awaitingFetch(fetch) });
+  const last = candidatePieceOf(FULL, MAX - CHUNK);
+  expect(Buffer.from(last.chunk_b64url, "base64url").length).toBe(CHUNK);
+  expect(last.total).toBe(MAX);
+  expect((await send(MAX - CHUNK, last)).ok).toBe(true);
+  const tail = candidatePieceOf(FULL, MAX - 1);
+  expect(Buffer.from(tail.chunk_b64url, "base64url").length).toBe(1);
+  expect((await send(MAX - 1, tail)).ok).toBe(true);
+  expect(await send(MAX - 1, { ...tail, total: MAX + 1 })).toEqual(malformed);
+  expect(await send(MAX - 1, { ...tail, chunk_b64url: Buffer.alloc(2, 0x61).toString("base64url") })).toEqual(malformed);
+  expect(() => candidatePieceOf(FULL, MAX)).toThrow(RangeError);
+
+  // 대조: 조각을 모은 합이 상한을 넘는 답(total이 상한 +1)은 꼴에서 막혀 내용이 되지 않는다.
+  const outcomes = await fetchAll(FULL);
+  expect(outcomes.length).toBe(32);
+  const lastOutcome = outcomes[31]!;
+  expect(chunkOf(lastOutcome).reply.offset).toBe(MAX - CHUNK);
+  const overflow = [...outcomes.slice(0, 31).map((o) => withPiece(o, { total: MAX + 1 })), withPiece(lastOutcome, { total: MAX + 1 })];
+  expect(assembleCandidate(digest, overflow)).toEqual({ kind: "rejected", fault: "malformed" });
+  expect(assembleCandidate(digest, outcomes).kind).toBe("complete");
 });
 
 test("표: 후보 내용 묶음은 조회 둘(현관이 묻고 감독이 답함, 접수가 닫혀도 받고 정책이 어긋나면 받지 않음)이다", () => {

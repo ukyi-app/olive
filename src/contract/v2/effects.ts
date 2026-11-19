@@ -13,6 +13,31 @@ export const OUTBOUND_GENERATIONS = { stop: "current", execution: "current" } as
 // 진행의 고정된 단계(discord.md §5): 원인 확인, 패치 작성, 검증, PR, 끝났어요, 멈췄어요. 표시 문구는 현관이 이 이름에서 만든다.
 export const PROGRESS_STAGES = ["cause", "patch", "verify", "pull_request", "done", "stopped"] as const;
 export type ProgressStage = (typeof PROGRESS_STAGES)[number];
+// "멈췄어요(이유 한 마디)"(discord.md §5)의 이유. stopped 단계에만, 이 닫힌 목록의 값 하나를 반드시 싣는다(관리자 결정 2026-11-19).
+// 목록 자체는 후보다: 설계와 감독 코드에서 서로 구별되는 멈춤의 원인만 두었다. 표시 문구는 현관이 이 이름에서 만들고, 자유로운 글은
+// 받지 않는다. "기타" 같은 뜻 없는 값은 두지 않는다. 비상 정지는 없다: 정지 중에는 이 효과를 받지 않고(닫힌 접수) 풀린 뒤에는
+// 실행 세대가 올라 옛 후보가 거절되므로, 정지 때의 "멈췄어요"는 현관이 자기 정지 원장으로 쓴다.
+export const PROGRESS_STOP_CAUSES = [
+  // 실행 기한이 지났다(작업 취소 사유 deadline, 종료 영수증 exit deadline, 시작 전 deadline_passed).
+  "deadline",
+  // 남은 예산이 없다. 자동 연장·재시도가 예산을 새로 주지 않는다.
+  "budget_exhausted",
+  // 관리자가 취소했다(입력 취소, 작업 취소 사유 requested).
+  "cancelled",
+  // 시작하기 전에 입력이 만료됐다.
+  "input_expired",
+  // 방화벽·격리·자격 가림이 실패해 모델을 띄우지 않았다.
+  "launch_refused",
+  // 작업자가 실패로 끝났다(종료 영수증 exit failed, 결과 outcome failed).
+  "worker_failed",
+  // 결과 검사(모양·크기·출처 참조·digest·비밀 검사)가 결과를 거절했다.
+  "result_rejected",
+  // 네트워크 없는 검증이나 자체 리뷰가 통과 영수증을 내지 않았다.
+  "verification_failed",
+  // 실행기와의 연결을 잃어 종료를 확인하지 못했다(unknown_running).
+  "executor_lost",
+] as const;
+export type ProgressStopCause = (typeof PROGRESS_STOP_CAUSES)[number];
 // start: 일을 시작할 때의 한 줄(진행이 고칠 글). answer: 그 밖의 답. 경보 자동 진단의 시작(👀만)·두 번째 시작 글을 현관이 가른다.
 export const REPLY_PURPOSES = ["start", "answer"] as const;
 export const PUBLICATION_KINDS = ["pull_request", "pull_request_review", "knowledge_pull_request"] as const;
@@ -26,6 +51,8 @@ const CARD_FIELDS = { input_job_id: uuid, candidate_digest: sha256 };
 // job_id·candidate_digest·run_id는 장부 recordPublication의 frontJobId·candidateDigest·runId와 같은 식별이다.
 const PUBLICATION_FIELDS = { kind: oneOf(PUBLICATION_KINDS), candidate_digest: sha256, run_id: uuidOrNull, input_job_id: uuidOrNull };
 const PROGRESS_FIELDS = { input_job_id: uuid, stage: oneOf(PROGRESS_STAGES), seq: int(0) };
+// stopped 단계만 이 칸을 더 가진다. 다른 단계의 본문은 이 칸이 없는 닫힌 꼴이라 실으면 unknown_field, stopped인데 없으면 body_malformed다.
+const PROGRESS_STOP_FIELD = { stop_cause: oneOf(PROGRESS_STOP_CAUSES) };
 
 export interface ReplyCandidate {
   job_id: string;
@@ -51,14 +78,16 @@ export interface PublicationCandidate {
   stop_generation: number;
   execution_generation: number;
 }
-export interface ProgressUpdate {
+interface ProgressUpdateCommon {
   job_id: string;
   input_job_id: string;
-  stage: ProgressStage;
   seq: number;
   stop_generation: number;
   execution_generation: number;
 }
+export type ProgressUpdate =
+  | (ProgressUpdateCommon & { stage: Exclude<ProgressStage, "stopped"> })
+  | (ProgressUpdateCommon & { stage: "stopped"; stop_cause: ProgressStopCause });
 
 // 확정 결과(job_status의 confirmed.result). 카드 요청의 결과에 승인은 없다: 승인은 현관의 이벤트로만 온다.
 // 게시의 결과는 복원 포트(PublicationPort)의 확정 두 값과 같다.
@@ -70,9 +99,16 @@ export type ProgressResult = { outcome: "shown" } | { outcome: "superseded" } | 
 
 const outcomes = <const T extends string>(values: readonly T[]): Parser<{ outcome: T }> => object({ outcome: oneOf(values) });
 
+const outboundBody = (fields: Record<string, Parser<unknown>>) => effectBody({ ...fields, ...generationShape(OUTBOUND_GENERATIONS) });
+
+// 진행의 본문은 단계에 따라 두 닫힌 꼴 가운데 하나다. stage가 stopped가 아니면(틀린 값 포함) 이유 칸이 없는 꼴로 본다.
+const parseProgressRunning = outboundBody(PROGRESS_FIELDS);
+const parseProgressStopped = outboundBody({ ...PROGRESS_FIELDS, ...PROGRESS_STOP_FIELD });
+const parseProgress: Parser<unknown> = (value, path) =>
+  isPlainObject(value) && value.stage === "stopped" ? parseProgressStopped(value, path) : parseProgressRunning(value, path);
+
 // 감독만 내고, 현관의 접수가 닫혀 있으면(정지 중 게시·승인 닫힘, §7.3의 1) 받지 않는다.
-function outboundEffect(fields: Record<string, Parser<unknown>>, parseResult: Parser<unknown>): EffectSpec {
-  const parseBody = effectBody({ ...fields, ...generationShape(OUTBOUND_GENERATIONS) });
+function outboundEffect(parseBody: Parser<unknown>, parseResult: Parser<unknown>): EffectSpec {
   return {
     class: "effect",
     from: ["supervisor"],
@@ -154,6 +190,7 @@ export const EFFECTS_FIELD_NAMES: readonly string[] = Object.freeze([
     ...Object.keys(CARD_FIELDS),
     ...Object.keys(PUBLICATION_FIELDS),
     ...Object.keys(PROGRESS_FIELDS),
+    ...Object.keys(PROGRESS_STOP_FIELD),
     "outcome",
     "in_reply_to",
     "generation",
@@ -163,10 +200,10 @@ export const EFFECTS_FIELD_NAMES: readonly string[] = Object.freeze([
 export const EFFECTS_BUNDLE: Bundle = {
   name: "effects",
   actions: {
-    reply_candidate: outboundEffect(REPLY_FIELDS, outcomes(["posted", "refused"])),
-    approval_card_request: outboundEffect(CARD_FIELDS, outcomes(["shown", "refused"])),
-    publication_candidate: outboundEffect(PUBLICATION_FIELDS, outcomes(["posted", "not_posted"])),
-    progress_update: outboundEffect(PROGRESS_FIELDS, outcomes(["shown", "superseded", "refused"])),
+    reply_candidate: outboundEffect(outboundBody(REPLY_FIELDS), outcomes(["posted", "refused"])),
+    approval_card_request: outboundEffect(outboundBody(CARD_FIELDS), outcomes(["shown", "refused"])),
+    publication_candidate: outboundEffect(outboundBody(PUBLICATION_FIELDS), outcomes(["posted", "not_posted"])),
+    progress_update: outboundEffect(parseProgress, outcomes(["shown", "superseded", "refused"])),
     execution_generation_lookup: executionGenerationLookup,
     execution_generation_reply: executionGenerationReply,
   },

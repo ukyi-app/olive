@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "supervisor": "74Voj_EV_knTAYLTkoQBXwJZ3STqjhKK0WEG0ZlCpyc"
+    "supervisor": "26NGJtsZjfDn-ajBiEaeJmkXL2MNpdRLhZxWXfGe-VM"
   },
   "context": {
     "now": 1795046400000,
@@ -50,7 +50,7 @@
       "request_id": "00000000-0000-4000-8000-00000000002c",
       "nonce": "0000000000000000000000000000002c"
     },
-    "signature": "o-YLlBR_zi0UQ_ZKW-BsxPFhK4iT0rGdYez-Elmg8Ax1ycPpE5b_pCDi0CnIAJjaG1THvAqazc3Uf-rteKezBA",
+    "signature": "mVjWGNRnvqApeWGMfdKLHtLR_NdHdXJaRxWVa3Cwjex718vK_VIDh10TqJdgZ9eGesY80PyT2WdsK_SLYR_VBg",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-00000000002b",
       "job_id": "00000000-0000-4000-8000-000000000034",

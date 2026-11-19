@@ -98,6 +98,16 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
   // ---- 진행 ----
   const progressMsg = fromSupervisor("progress_update", 0x68, { job_id: id(0x73), input_job_id: INPUT, stage: "verify", seq: 3, ...GEN });
   const progress = accept(keys, "progress-update", "진행 표시: 고정된 단계 이름(verify = 검증)과 순번뿐이다. 표시 문구는 현관이 단계 이름에서 만든다", "front-door", atFront(), progressMsg, OK);
+  const progressStoppedMsg = fromSupervisor("progress_update", 0x6b, { job_id: id(0x74), input_job_id: INPUT, stage: "stopped", seq: 4, stop_cause: "verification_failed", ...GEN });
+  const progressStopped = accept(
+    keys,
+    "progress-update-stopped",
+    "진행 표시의 멈춤: stopped 단계에만 닫힌 목록의 이유(verification_failed = 검증 실패) 하나가 반드시 있다. \"멈췄어요(이유 한 마디)\"의 문구는 현관이 만든다",
+    "front-door",
+    atFront(),
+    progressStoppedMsg,
+    OK,
+  );
 
   // ---- 현관의 실행 세대 권위 값 ----
   const executionLookupMsg = fromFront("execution_generation_lookup", 0x69, {});
@@ -136,6 +146,7 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
     lookup,
     lookupUnknown,
     progress,
+    progressStopped,
     executionLookup,
     executionReply,
     P({
@@ -234,6 +245,34 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
       reason: "body_malformed",
       changed: ["message.body.stage"],
       edit: (c) => void (c.message.body.stage = "검증"),
+    }),
+    on(progress)({
+      name: "progress-update-cause-on-other-stage",
+      description: "멈춤이 아닌 단계(verify)에 이유 칸. 이유는 stopped 단계에만 있다",
+      reason: "unknown_field",
+      changed: ["message.body.stop_cause"],
+      edit: (c) => void (c.message.body.stop_cause = "deadline"),
+    }),
+    on(progressStopped)({
+      name: "progress-update-stopped-without-cause",
+      description: "멈춤 단계인데 이유 칸이 없다. stopped에서는 이유가 필수다",
+      reason: "body_malformed",
+      changed: ["message.body.stop_cause"],
+      edit: (c) => void delete c.message.body.stop_cause,
+    }),
+    on(progressStopped)({
+      name: "progress-update-stopped-unlisted-cause",
+      description: "멈춤의 이유가 닫힌 목록 밖의 값(other). 뜻 없는 값은 목록에 없다",
+      reason: "body_malformed",
+      changed: ["message.body.stop_cause"],
+      edit: (c) => void (c.message.body.stop_cause = "other"),
+    }),
+    on(progressStopped)({
+      name: "progress-update-stopped-free-text-cause",
+      description: "멈춤의 이유에 자유로운 글. 이유는 목록의 이름 하나뿐이고 표시 문구는 현관이 만든다",
+      reason: "body_malformed",
+      changed: ["message.body.stop_cause"],
+      edit: (c) => void (c.message.body.stop_cause = "검증이 실패해서 멈췄어요"),
     }),
     on(executionReply)({
       name: "execution-generation-reply-not-awaited",

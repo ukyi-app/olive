@@ -18,6 +18,7 @@ import {
   SUPERVISOR_FORBIDDEN_FIELD_NAMES,
 } from "../../../src/contract/v2/index.ts";
 import { recoveryPorts } from "../../../src/supervisor/frontdoor/recovery.ts";
+import { PROGRESS_STOP_CAUSES } from "../../../src/contract/v2/effects.ts";
 import { list, readText } from "../../files.ts";
 import { FIXTURE_DIR } from "./cases.ts";
 import { buildEffectsCases } from "./cases-effects.ts";
@@ -159,7 +160,10 @@ test("임의 진행 문구 거절", async () => {
   // 고정된 단계 여섯과 순번만 받는다.
   expect([...PROGRESS_STAGES]).toEqual(["cause", "patch", "verify", "pull_request", "done", "stopped"]);
   const progress = (over: Record<string, unknown>) => fromSupervisor("progress_update", { ...bodies.progress_update, ...over });
-  for (const stage of PROGRESS_STAGES) expect((await at(progress({ stage }), "front-door")).ok, stage).toBe(true);
+  for (const stage of PROGRESS_STAGES) {
+    const over = stage === "stopped" ? { stage, stop_cause: "deadline" } : { stage };
+    expect((await at(progress(over), "front-door")).ok, stage).toBe(true);
+  }
   for (const seq of [0, 1, 2 ** 31]) expect((await at(progress({ seq }), "front-door")).ok, `${seq}`).toBe(true);
 
   // 단계 밖의 값(표시 문구, 지어낸 단계, 대소문자 다름, 빈 글)과 꼴이 틀린 순번은 body_malformed.
@@ -197,6 +201,66 @@ test("임의 진행 문구 거절", async () => {
   for (const outcome of ["shown", "superseded", "refused"]) {
     expect((await at(status(update, update.header.request_id, { state: "confirmed", result: { outcome } }), "supervisor", { awaiting: awaitingOf(update) })).ok, outcome).toBe(true);
   }
+});
+
+test("멈춤의 이유: stopped에만 닫힌 목록의 값 하나가 반드시 있고, 다른 단계·목록 밖·자유로운 글은 거절한다", async () => {
+  // 목록(후보)은 이 아홉뿐이다. 바뀌면 v2.md 표와 인계 글의 근거도 함께 바꾼다.
+  expect([...PROGRESS_STOP_CAUSES]).toEqual([
+    "deadline",
+    "budget_exhausted",
+    "cancelled",
+    "input_expired",
+    "launch_refused",
+    "worker_failed",
+    "result_rejected",
+    "verification_failed",
+    "executor_lost",
+  ]);
+  // "기타"처럼 뜻 없는 값과 비상 정지는 목록에 없다.
+  for (const cause of ["other", "unknown", "emergency_stop", "stopped"]) expect((PROGRESS_STOP_CAUSES as readonly string[]).includes(cause), cause).toBe(false);
+  const progress = (over: Record<string, unknown>) => fromSupervisor("progress_update", { ...bodies.progress_update, ...over });
+  const stopped = (over: Record<string, unknown>) => progress({ stage: "stopped", ...over });
+
+  for (const cause of PROGRESS_STOP_CAUSES) {
+    const got = await at(stopped({ stop_cause: cause }), "front-door");
+    expect(got.ok, cause).toBe(true);
+    if (got.ok) expect((got.body as { stop_cause: string }).stop_cause).toBe(cause);
+  }
+  // stopped인데 이유가 없다.
+  expect(await at(stopped({}), "front-door")).toEqual({ ok: false, reason: "body_malformed" });
+  // 목록 밖의 값, 자유로운 글, 대소문자·공백 다름, 꼴이 틀린 값.
+  for (const cause of ["timeout", "other", "emergency_stop", "시간 초과", "멈췄어요(검증 실패)", "Deadline", "deadline ", "", null, 1, ["deadline"], { code: "deadline" }]) {
+    expect(await at(stopped({ stop_cause: cause }), "front-door"), JSON.stringify(cause)).toEqual({ ok: false, reason: "body_malformed" });
+  }
+  // 다른 다섯 단계에 이유를 실으면 그 단계의 닫힌 꼴에 없는 칸이다. 보내는 쪽도 봉하지 못한다.
+  for (const stage of PROGRESS_STAGES.filter((s) => s !== "stopped")) {
+    expect(await at(progress({ stage, stop_cause: "deadline" }), "front-door"), stage).toEqual({ ok: false, reason: "unknown_field" });
+    let sealed = "sealed";
+    try {
+      FRONTDOOR_CONTRACT.seal(
+        { sender: "supervisor", recipient: "front-door", action: "progress_update", request_id: id(0xef2), issued_at: ISSUED, nonce: nonceOf(0xef2), body: { ...bodies.progress_update, stage, stop_cause: "deadline" } },
+        keys.supervisor.privateKey,
+      );
+    } catch (error) {
+      sealed = error instanceof SealError ? error.reason : String(error);
+    }
+    expect(sealed, stage).toBe("unknown_field");
+  }
+  // 이유 옆에 글 칸을 더 실을 수 없다.
+  expect(await at(stopped({ stop_cause: "deadline", text: "15분이 지났어요" }), "front-door")).toEqual({ ok: false, reason: "unknown_field" });
+  // 이유 칸은 진행 표시에만 있다: 다른 출력 효과(거절·게시 안 됨의 결과 포함)에는 없다.
+  for (const action of ["reply_candidate", "approval_card_request", "publication_candidate"]) {
+    expect(await at(fromSupervisor(action, { ...bodies[action], stop_cause: "deadline" }), "front-door"), action).toEqual({ ok: false, reason: "unknown_field" });
+  }
+  const update = stopped({ stop_cause: "verification_failed" });
+  for (const result of [{ outcome: "refused", stop_cause: "deadline" }, { outcome: "refused", reason: "verification_failed" }]) {
+    expect(await at(status(update, update.header.request_id, { state: "confirmed", result }), "supervisor", { awaiting: awaitingOf(update) }), JSON.stringify(result)).toEqual({ ok: false, reason: "unknown_field" });
+  }
+  // 이름은 금지 이름과 부딪히지 않는다.
+  const normalize = (name: string) => name.toLowerCase().replace(/[-_\s]/g, "");
+  const forbidden = new Set([...FORBIDDEN_FIELD_NAMES, ...SUPERVISOR_FORBIDDEN_FIELD_NAMES].map(normalize));
+  expect(EFFECTS_FIELD_NAMES).toContain("stop_cause");
+  expect(forbidden.has(normalize("stop_cause"))).toBe(false);
 });
 
 test("모름 조회가 확정 없음과 다름", async () => {
