@@ -223,10 +223,12 @@ test("인코더: 접두는 4바이트 big-endian 본문 길이이고 디코더�
   expect(run([copy]).envelopes[0]!.value).toEqual({});
 });
 
-test("메모리: 디코더가 쥐는 바이트는 접두 폭 + 상한을 넘지 않는다", () => {
+test("메모리: push 호출 사이에 쥔 미완성 틀은 접두 폭 + 상한 이하이고, 한 push가 돌려주는 바이트는 조각 + 직전 미완성 틀 이하다", () => {
   const bound = FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES;
   const max = framed(bodyOfSize(65_536));
-  // 상한 틀 여덟 개를 한 조각으로 받아도, 고르지 않은 크기로 쪼개 받아도 쥐는 양은 한 틀의 몫이다.
+  const returnedBytes = (envelopes: readonly DecodedEnvelope[]) => envelopes.reduce((n, e) => n + e.bytes.length, 0);
+  // 상한 틀 여덟 개를 한 조각으로 받아도, 고르지 않은 크기로 쪼개 받아도 호출 사이에 쥐는 양은 한 틀의 몫이다.
+  // 한 push가 돌려주는 봉투 바이트는 이 상한에 들지 않는다. 그 양은 넣은 조각 + 직전에 쥐고 있던 미완성 틀 이하다.
   const stream = concat(...Array.from({ length: 8 }, () => max));
   for (const sizes of [[stream.length], [1, 3, 7, 4096, 65_539, 65_541, 100_000]]) {
     const decoder = createFrameDecoder();
@@ -234,10 +236,13 @@ test("메모리: 디코더가 쥐는 바이트는 접두 폭 + 상한을 넘지 
     let count = 0;
     for (let at = 0, k = 0; at < stream.length; k++) {
       const size = sizes[k % sizes.length]!;
-      const step = decoder.push(stream.subarray(at, at + size));
+      const chunk = stream.subarray(at, at + size);
+      const before = decoder.heldBytes();
+      const step = decoder.push(chunk);
       at += size;
       count += step.envelopes.length;
       expect(step.rejected).toBeNull();
+      expect(returnedBytes(step.envelopes)).toBeLessThanOrEqual(chunk.length + before);
       peak = Math.max(peak, decoder.heldBytes());
     }
     expect(count).toBe(8);
@@ -245,6 +250,22 @@ test("메모리: 디코더가 쥐는 바이트는 접두 폭 + 상한을 넘지 
     // 경계에서 멈추면 접두 칸만 남는다.
     expect(decoder.heldBytes()).toBe(FRAME_PREFIX_BYTES);
   }
+  // 한 조각에 상한 틀 여덟 개: 돌려주는 바이트는 524,288로 상한보다 크지만 조각 크기를 넘지 않는다.
+  const all = createFrameDecoder().push(stream);
+  expect(all.envelopes).toHaveLength(8);
+  expect(returnedBytes(all.envelopes)).toBe(8 * 65_536);
+  expect(returnedBytes(all.envelopes)).toBeLessThanOrEqual(stream.length);
+  // 상한 본문이 한 바이트만 남은 상태에서, 다음 조각이 그 바이트와 다음 상한 틀의 접두를 함께 실어 온다.
+  // 이 push는 65,536바이트 봉투를 돌려주면서 다음 틀의 본문 버퍼를 잡는다. 호출 사이 상한은 그대로 지켜진다.
+  const edge = createFrameDecoder();
+  expect(edge.push(max.subarray(0, max.length - 1))).toEqual({ envelopes: [], rejected: null });
+  expect(edge.heldBytes()).toBe(bound);
+  const tail = concat(max.subarray(max.length - 1), prefix(65_536));
+  const crossed = edge.push(tail);
+  expect(crossed.rejected).toBeNull();
+  expect(crossed.envelopes).toHaveLength(1);
+  expect(returnedBytes(crossed.envelopes)).toBe(65_536);
+  expect(edge.heldBytes()).toBeLessThanOrEqual(bound);
   // 낸 봉투 바이트는 디코더의 버퍼가 아니다(다음 틀이 덮어쓰지 않는다).
   const pair = run([concat(framed(utf8('{"a":1}')), framed(utf8('{"b":2}')))]);
   expect(new TextDecoder().decode(pair.envelopes[0]!.bytes)).toBe('{"a":1}');

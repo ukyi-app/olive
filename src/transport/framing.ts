@@ -3,8 +3,12 @@
 // 길이 0은 받지 않는다(빈 글은 JSON이 아니고, 0을 허용하면 상대가 접두만으로 연결을 붙잡을 수 있다).
 // 이 자리가 인증 전 바이트를 처음 받는 곳이라 순서가 중요하다:
 // 1. 접두가 상한(MAX_MESSAGE_BYTES)을 넘으면 본문 버퍼를 잡기 전에 거절한다.
-// 2. 본문이 다 오면 UTF-8 → 문법·중복 키·깊이 → 그 뒤에만 JSON.parse. JSON.parse는 같은 키를 뒤의 값으로 덮으므로,
+// 2. 본문이 다 오면 UTF-8 → 문법·중복 키·깊이를 훑는다. 훑는 중에는 문자열 토큰(키와 문자열 값)만 하나씩 JSON.parse로 풀고,
+//    봉투 전체를 값으로 만드는 JSON.parse(text)는 모든 검사를 마친 뒤 한 번 한다. JSON.parse는 같은 키를 뒤의 값으로 덮으므로,
 //    덮인 뒤에는 무엇이 서명됐는지 가릴 수 없다(계약의 정규 직렬화는 해석한 값에서 바이트를 다시 만든다).
+// 메모리: push 호출 사이에 디코더가 쥐고 있는 미완성 틀의 바이트(접두와 조립 중인 본문)는 최대 65,540바이트다.
+// 한 번의 push가 완성해 돌려주는 봉투들의 바이트는 이 상한에 들지 않고 넣은 조각의 크기에 비례한다
+// (조각 + 직전에 쥐고 있던 미완성 틀 이하). 한 번의 반환량은 부르는 쪽이 조각의 크기로 묶는다.
 // 거절하면 그 디코더는 끝난다. 다시 동기화하지 않는다: 틀이 어긋난 뒤의 바이트는 어디가 경계인지 믿을 근거가 없다.
 import { limits } from "../contract/v1/index.ts";
 
@@ -46,7 +50,8 @@ export interface FrameDecoder {
   push(chunk: Uint8Array): DecodeStep;
   // 입력의 끝. 틀의 중간이면 frame_truncated다.
   end(): DecodeStep;
-  // 지금 쥐고 있는 버퍼의 크기(접두 칸 + 본문 버퍼). FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES를 넘지 않는다.
+  // 미완성 틀을 담는 버퍼의 크기(접두 칸 + 조립 중인 본문 버퍼). push 호출 사이에는 FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES를 넘지 않는다.
+  // push가 돌려준 봉투의 바이트는 세지 않는다.
   heldBytes(): number;
 }
 
@@ -78,7 +83,8 @@ class Decoder implements FrameDecoder {
     if (this.ended) return this.fail([], "frame_after_end");
     const envelopes: DecodedEnvelope[] = [];
     let at = 0;
-    // 조각을 붙잡지 않고 접두 칸이나 본문 버퍼로 옮긴다. 그래서 쥐는 양은 조각의 크기와 상관없다.
+    // 조각을 붙잡지 않고 접두 칸이나 본문 버퍼로 옮긴다. 그래서 호출 사이에 쥐는 미완성 틀은 조각의 크기와 상관없다.
+    // 완성된 봉투는 envelopes에 모아 한꺼번에 돌려주므로, 그 양은 조각의 크기를 따라 커진다.
     while (at < chunk.length) {
       if (this.body === null) {
         const n = Math.min(FRAME_PREFIX_BYTES - this.prefixFilled, chunk.length - at);
@@ -163,7 +169,8 @@ const NUMBER = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
 const HEX4 = /^[0-9a-fA-F]{4}$/;
 const SIMPLE_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t"]);
 
-// RFC 8259 문법을 값을 만들지 않고 훑으며 객체마다 키를 모은다. 키는 JSON.parse로 이스케이프를 푼 값으로 비교한다.
+// RFC 8259 문법을 봉투 전체의 값을 만들지 않고 훑으며 객체마다 키를 모은다. 문자열 토큰은 하나씩 JSON.parse로 이스케이프를 풀고,
+// 키는 그 푼 값으로 비교한다.
 // 재귀 깊이는 MAX_DEPTH + 1에서 멈춘다.
 class Scan {
   private pos = 0;
