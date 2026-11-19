@@ -3,7 +3,7 @@
 // 정한다(설계 supervisor.md §4·§9.1). 그래서 본문에 승인·목적지·권한·보낼 글의 칸을 두지 않고, 후보의 바이트는 감독 쪽 결과
 // 보관소에 두어 digest로만 가리킨다. 선로 형식과 검증뿐이고 장부·Discord를 다루지 않는다. 표와 이유는 v2.md "답·카드·게시·진행".
 import type { Bundle, EffectSpec, ExchangeSpec, LookupOutcome, NoAnswerCause } from "./actions.ts";
-import { type GenerationAuthority, type GenerationRules, generationShape } from "./generations.ts";
+import { type GenerationRules, generationShape } from "./generations.ts";
 import { effectBody, generation, int, isPlainObject, object, oneOf, type Parser, sha256, uuid } from "./schema.ts";
 
 // 넷 모두 받는 쪽(현관)의 지금 정지·실행 세대와 같아야 한다. 정지 준비가 현관 원장에 적힌 뒤의 옛 정지 세대 후보, 풀기 전 실행
@@ -19,16 +19,17 @@ export const PUBLICATION_KINDS = ["pull_request", "pull_request_review", "knowle
 
 const uuidOrNull: Parser<string | null> = (value, path) => (value === null ? null : uuid(value, path));
 
-// 업무 칸. input_id는 현관이 그 입력을 접수시킨 효과의 job_id다. 보낼 곳은 현관이 이 입력에서 고른다.
-const REPLY_FIELDS = { input_id: uuid, purpose: oneOf(REPLY_PURPOSES), candidate_digest: sha256 };
-const CARD_FIELDS = { input_id: uuid, candidate_digest: sha256 };
+// 업무 칸. input_job_id는 현관이 그 입력을 접수시킨 input_submit의 job_id다(input_cancel의 input_job_id와 같은 이름·꼴·뜻).
+// 보낼 곳은 현관이 이 입력에서 고른다.
+const REPLY_FIELDS = { input_job_id: uuid, purpose: oneOf(REPLY_PURPOSES), candidate_digest: sha256 };
+const CARD_FIELDS = { input_job_id: uuid, candidate_digest: sha256 };
 // job_id·candidate_digest·run_id는 장부 recordPublication의 frontJobId·candidateDigest·runId와 같은 식별이다.
-const PUBLICATION_FIELDS = { kind: oneOf(PUBLICATION_KINDS), candidate_digest: sha256, run_id: uuidOrNull, input_id: uuidOrNull };
-const PROGRESS_FIELDS = { input_id: uuid, stage: oneOf(PROGRESS_STAGES), seq: int(0) };
+const PUBLICATION_FIELDS = { kind: oneOf(PUBLICATION_KINDS), candidate_digest: sha256, run_id: uuidOrNull, input_job_id: uuidOrNull };
+const PROGRESS_FIELDS = { input_job_id: uuid, stage: oneOf(PROGRESS_STAGES), seq: int(0) };
 
 export interface ReplyCandidate {
   job_id: string;
-  input_id: string;
+  input_job_id: string;
   purpose: (typeof REPLY_PURPOSES)[number];
   candidate_digest: string;
   stop_generation: number;
@@ -36,7 +37,7 @@ export interface ReplyCandidate {
 }
 export interface ApprovalCardRequest {
   job_id: string;
-  input_id: string;
+  input_job_id: string;
   candidate_digest: string;
   stop_generation: number;
   execution_generation: number;
@@ -46,13 +47,13 @@ export interface PublicationCandidate {
   kind: (typeof PUBLICATION_KINDS)[number];
   candidate_digest: string;
   run_id: string | null;
-  input_id: string | null;
+  input_job_id: string | null;
   stop_generation: number;
   execution_generation: number;
 }
 export interface ProgressUpdate {
   job_id: string;
-  input_id: string;
+  input_job_id: string;
   stage: ProgressStage;
   seq: number;
   stop_generation: number;
@@ -92,6 +93,7 @@ export interface ExecutionGenerationReply {
 
 // 현관이 묻고 감독이 장부의 지금 실행 세대(run_epoch)로 답한다. 효과가 없고 세대를 싣지 않으므로 감독의 접수가 닫혀도,
 // 정책이 어긋난 연결에서도 오간다(계약 판이 뜻을 고정한 사실). 감독이 자기 값을 모르면 답하지 않는다: 모름 상태의 답은 없다.
+// 현관은 답의 generation을 adoptExecutionGeneration(generations.ts)으로 받는다. 풀기 확정 값도 같은 함수라 두 길의 규칙이 같다.
 const executionGenerationLookup: ExchangeSpec = {
   class: "query",
   from: ["front-door"],
@@ -107,23 +109,6 @@ const executionGenerationReply: ExchangeSpec = {
   parse: (body) => object({ in_reply_to: uuid, generation })(body, "body"),
   answers: (awaitedAction) => awaitedAction === "execution_generation_lookup",
 };
-
-// 현관이 한 번 물어 얻은 것. 답을 받지 못했으면 모름이고 이 갈래는 값을 실을 수 없다.
-export type ExecutionGenerationOutcome = { answered: true; generation: number } | { answered: false; cause: NoAnswerCause };
-
-// 현관의 generations.execution을 감독이 확정해 준 값으로 고친다. 값의 출처는 둘이다: 이 조회의 답, 그리고 release_commit이
-// released로 확정된 본문의 execution_generation(그 값도 { answered: true, generation }으로 넣는다).
-// 실행 세대는 풀 때만 오르므로 받은 값이 아는 값보다 작으면 낮추지 않는다. 작은 값은 늦게 온 옛 답이거나 감독 장부의 되돌림이고,
-// 낮추면 옛 실행의 후보가 다시 통과한다. 그대로 두면 감독의 후보가 generation_mismatch로 닫힌다(regressed로 알린다).
-// 답이 없거나 값의 꼴이 틀리면 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다).
-export function adoptExecutionGeneration(previous: GenerationAuthority, outcome: ExecutionGenerationOutcome): { authority: GenerationAuthority; regressed: boolean } {
-  if (outcome.answered !== true) return { authority: previous, regressed: false };
-  const value: unknown = outcome.generation;
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return { authority: previous, regressed: false };
-  if (!previous.known) return { authority: { known: true, current: value, prepared: null }, regressed: false };
-  if (value < previous.current) return { authority: previous, regressed: true };
-  return { authority: { known: true, current: value, prepared: previous.prepared }, regressed: false };
-}
 
 // ---- 게시 조회의 결론 ----
 

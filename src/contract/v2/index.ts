@@ -16,6 +16,7 @@ export {
   type Awaited,
   type Bundle,
   COMMON_BUNDLE,
+  EFFECTS_DURING_POLICY_MISMATCH,
   type EffectSpec,
   type ExchangeSpec,
   type HandshakeState,
@@ -39,12 +40,10 @@ export {
   type VerifyContext,
 } from "./contract.ts";
 export {
-  adoptExecutionGeneration,
   type ApprovalCardRequest,
   type CardResult,
   EFFECTS_BUNDLE,
   EFFECTS_FIELD_NAMES,
-  type ExecutionGenerationOutcome,
   type ExecutionGenerationReply,
   OUTBOUND_GENERATIONS,
   PROGRESS_STAGES,
@@ -64,6 +63,8 @@ export {
 } from "./effects.ts";
 export { REJECT_REASONS, type RejectReason } from "./errors.ts";
 export {
+  adoptExecutionGeneration,
+  type ExecutionGenerationOutcome,
   GENERATION_FIELDS,
   GENERATION_KINDS,
   GENERATION_RULES,
@@ -77,7 +78,7 @@ export {
 export { type Header, PARTIES, type Party } from "./header.ts";
 export * as limits from "./limits.ts";
 export { CONTRACT } from "./limits.ts";
-export { FORBIDDEN_FIELD_NAMES, SUPERVISOR_FORBIDDEN_FIELD_NAMES } from "./schema.ts";
+export { FORBIDDEN_FIELD_NAMES, SOURCE_REF, SUPERVISOR_FORBIDDEN_FIELD_NAMES } from "./schema.ts";
 export {
   latestStopOf,
   type ReleaseCommit,
@@ -102,7 +103,6 @@ export {
   type InputSource,
   type InputSubmit,
   type InputSubmitResult,
-  SOURCE_REF,
   type SourceRef,
 } from "./inputs.ts";
 export {

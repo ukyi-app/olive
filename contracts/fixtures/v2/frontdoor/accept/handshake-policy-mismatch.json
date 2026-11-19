@@ -1,7 +1,7 @@
 {
   "fixture": "olive-control/v2",
   "name": "accept/handshake-policy-mismatch",
-  "description": "정책 revision이 다른 인사. 봉투는 받지만 이 연결은 policy_mismatch(효과 동작을 받지 않음)",
+  "description": "정책 revision이 다른 인사. 봉투는 받지만 이 연결은 policy_mismatch(정지의 준비·확정 밖의 효과 동작을 받지 않음)",
   "status": "candidate",
   "base": null,
   "changed": [],
@@ -10,7 +10,7 @@
     "handshake_after": "policy_mismatch"
   },
   "keys": {
-    "front-door": "nsqcO9WoDjdN_HnDZavE0XIlK7pI_FKonvkHE-l5vpo"
+    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
   },
   "context": {
     "now": 1795046400000,
@@ -41,7 +41,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "Ic9aeyevx1wJErFm7CQbxbZ9NSU0CYbFzBWmC5p4SBNzzlrpcLvUrcVXUU4kpBEkSXzNgz2OBnhpMp5wbmcDCQ",
+    "signature": "haK0wHaviTK1tpwL74bSNGdFIRMl9Co8P3DNf-Nnd3eyChCSkfx5NmSRFM6b4cP_wuHIKGS7Xlyp1DjdkUWaBw",
     "body": {
       "policy_revision": "policy-8"
     }

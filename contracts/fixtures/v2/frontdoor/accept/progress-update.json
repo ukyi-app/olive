@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+    "supervisor": "O5N4cdyrCNVuddEwiP-pvKbTueV2N7PJ3C5KC5gmfV8"
   },
   "context": {
     "now": 1795046400000,
@@ -36,7 +36,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "033bc13fdc926899d9f6150f15156fb8caeea03aec465040dd2aed2b478d05f6",
+      "body_digest": "55d7b5a2b8a6029e4d78d1d774bef6db77fecc084443e39d0e8a5cd887e649f5",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "supervisor",
@@ -45,15 +45,15 @@
       "request_id": "00000000-0000-4000-8000-000000000068",
       "nonce": "00000000000000000000000000000068"
     },
-    "signature": "PjJ8ufPtbNLou0SjmNLHkvIjs8GoMt_qDC_z_q5GEP9c8xbttsWAW1l94MY3KFjVkF417jJjBUslzbpLSyhQDw",
+    "signature": "lYkJlDgc-I_wx3If1GLtdqSfRDYgYLxAM0-c20MavC3dmAn0hyo-sbDluzsYWxqJrCgHofnxrWolnH_N6AdJCA",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000073",
-      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
       "stage": "verify",
       "seq": 3,
       "stop_generation": 8,
       "execution_generation": 4
     }
   },
-  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"033bc13fdc926899d9f6150f15156fb8caeea03aec465040dd2aed2b478d05f6\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"supervisor\"}"
+  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"55d7b5a2b8a6029e4d78d1d774bef6db77fecc084443e39d0e8a5cd887e649f5\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"supervisor\"}"
 }

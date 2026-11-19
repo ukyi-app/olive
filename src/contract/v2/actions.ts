@@ -34,7 +34,8 @@ interface SpecBase {
   from: readonly Party[];
   // 받는 쪽의 접수가 닫혀도 받는가. 인사와 조회는 늘 true다(defineContract가 확인한다).
   duringClosedIntake: boolean;
-  // 인사에서 정책 revision이 어긋난 연결에서도 받는가. 모든 동작이 선언한다. 효과는 늘 false다(설계 §9.1: 맞지 않으면 새 효과를 막는다).
+  // 인사에서 정책 revision이 어긋난 연결에서도 받는가. 모든 동작이 선언한다. 효과는 false다(설계 §9.1: 맞지 않으면 새 효과를 막는다).
+  // 효과 가운데 true를 선언할 수 있는 것은 EFFECTS_DURING_POLICY_MISMATCH의 정지 동작뿐이다(defineContract가 확인한다).
   duringPolicyMismatch: boolean;
   // 본문 해석기. 공통 칸(job_id, in_reply_to)은 공통부가 원본에서 따로 읽으므로 반환값에 없어도 된다.
   parse(body: unknown, ctx: BodyContext): unknown;
@@ -47,7 +48,6 @@ interface SpecBase {
 // 효과 동작. 세대 규칙과 확정 결과의 꼴을 반드시 둔다.
 export interface EffectSpec extends SpecBase {
   class: "effect";
-  duringPolicyMismatch: false;
   // 정지 세대·실행 세대 각각의 규칙(generations.ts의 닫힌 목록). 해당 없음도 "not_applicable"로 적는다.
   generations: GenerationRules;
   // job_status의 확정 결과(result)의 꼴.
@@ -157,6 +157,11 @@ const sameJob = (body: unknown, awaited: Awaited): boolean => {
 // 정책 revision이 어긋난 연결에서 작업 조회(job_lookup·job_status)를 받는가. 관리자 결정(2026-11-19): 어긋난 연결에서는 계약 판이
 // 뜻을 고정한 사실(정지 기록, 이미 보낸 작업의 결과)의 조회만 되고 새 일과 풀기는 막힌다. 작업 조회는 이미 보낸 작업의 결과라 true다.
 const QUERIES_DURING_POLICY_MISMATCH = true;
+
+// 정책 revision이 어긋난 연결에서도 받는 효과 동작의 닫힌 목록. 관리자 결정(2026-11-19): 멈추는 쪽은 늘 열어 두므로 정지의 준비와
+// 확정은 받고, 풀기와 새 일은 막는다. 효과가 duringPolicyMismatch: true를 선언하려면 이름이 이 목록에 있어야 한다(defineContract).
+// 이 목록을 넓히는 것은 관리자 결정을 넓히는 일이다: 풀기를 넣으면 정책이 맞지 않는 현관이 실행을 다시 열 수 있다.
+export const EFFECTS_DURING_POLICY_MISMATCH: readonly string[] = Object.freeze(["stop_prepare", "stop_commit"]);
 
 export const COMMON_BUNDLE: Bundle = {
   name: "common",

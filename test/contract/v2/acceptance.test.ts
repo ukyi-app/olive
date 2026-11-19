@@ -116,19 +116,25 @@ test("틀린 판·정책은 새 효과 0", async () => {
   );
   expect((await verifyAt(PROBE, lookup, "supervisor", { handshake: mismatched })).ok).toBe(true);
 
-  // 공개 면의 효과 동작마다: 그 통과 표본(표본 시험이 동작마다 요구한다)을 인사 없는 연결과 정책이 다른 연결로 옮기면 거절된다.
+  // 공개 면의 효과 동작마다: 그 통과 표본(표본 시험이 동작마다 요구한다)을 인사 없는 연결로 옮기면 모두 거절되고, 정책이 다른
+  // 연결로 옮기면 정지의 준비·확정만 받고 나머지(풀기 둘, 입력·이벤트·출력 묶음의 효과)는 거절된다(관리자 결정 2026-11-19).
   const publicCases = buildCases(keys);
   const publicEffects = Object.entries(FRONTDOOR_CONTRACT.actions).filter(([, spec]) => spec.class === "effect");
   expect(publicEffects.length).toBeGreaterThan(0);
+  const acceptedDuringMismatch: string[] = [];
   for (const [action] of publicEffects) {
-    const base = publicCases.find((c) => c.expect.ok && c.message.header.action === action);
+    const base = publicCases.find((c) => c.expect.ok && c.message.header.action === action && c.context.handshake === "agreed");
     expect(base, action).toBeDefined();
     if (base === undefined) continue;
     const replay = (handshake: HandshakeState) => FRONTDOOR_CONTRACT.verify(base.message, contextOf(base.keys, { ...base.context, handshake }));
     expect(await replay("none"), action).toEqual({ ok: false, reason: "handshake_required" });
-    expect(await replay("policy_mismatch"), action).toEqual({ ok: false, reason: "policy_mismatch" });
+    const mismatchedReplay = await replay("policy_mismatch");
+    if (mismatchedReplay.ok) acceptedDuringMismatch.push(action);
+    else expect(mismatchedReplay, action).toEqual({ ok: false, reason: "policy_mismatch" });
     expect((await replay("agreed")).ok, action).toBe(true);
   }
+  expect(acceptedDuringMismatch.sort()).toEqual(["stop_commit", "stop_prepare"]);
+  expect(publicEffects.map(([action]) => action)).toEqual(expect.arrayContaining(["release_prepare", "release_commit", "input_submit", "input_cancel", "publication_candidate"]));
 
   // 접수가 닫혀도 인사와 조회는 되고, 닫힌 접수에서 받지 않는 효과는 intake_closed다(인사가 끝난 연결에서도).
   expect((await verifyAt(PROBE, handshakeFrom(keys, POLICY, 4), "supervisor", { intake_open: false })).ok).toBe(true);

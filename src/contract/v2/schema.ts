@@ -74,6 +74,22 @@ export function object<S extends Shape>(shape: S): Parser<Parsed<S>> {
   };
 }
 
+// outcome 값으로 갈래를 고르는 닫힌 해석기. 효과의 확정 결과(job_status의 confirmed.result)를 묶음들이 이것으로 만든다.
+export function byOutcome<T>(cases: Readonly<Record<string, Parser<T>>>): Parser<T> {
+  return (value, path) => {
+    if (!isPlainObject(value)) throw new SchemaError("malformed", path);
+    const outcome = value.outcome;
+    if (typeof outcome !== "string" || !Object.hasOwn(cases, outcome)) throw new SchemaError("malformed", `${path}.outcome`);
+    return cases[outcome]!(value, path);
+  };
+}
+
+// 원문 참조: 원문 저장소가 발행한 `<저장소 이름>/<UUID>`. 장부(src/ledger/input.ts)의 SOURCE_REF와 같은 꼴이다(계약 모듈은 장부를
+// import하지 않으므로 다시 두고, 같은지는 시험이 대조한다). 공백·문장이 이 꼴이 될 수 없어 원문이 참조 칸으로 새지 않는다.
+// 입력의 접수와 잊기 이벤트가 함께 쓴다.
+export const SOURCE_REF = /^[a-z][a-z0-9-]{0,31}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const sourceRefId: Parser<string> = pattern(SOURCE_REF);
+
 // 효과 동작의 본문: 보낸 쪽이 정한 job_id를 맨 위 칸으로 갖는 닫힌 객체. 묶음은 이것으로 본문 해석기를 만든다.
 export function effectBody<S extends Shape>(shape: S): Parser<Parsed<S & { job_id: Parser<string> }>> {
   return object({ ...shape, job_id: uuid });

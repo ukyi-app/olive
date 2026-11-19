@@ -1,7 +1,7 @@
 {
   "fixture": "olive-control/v2",
   "name": "reject/stop-prepare-without-handshake",
-  "description": "인사가 끝나지 않은 연결에 온 정지 준비",
+  "description": "인사가 끝나지 않은 연결에 온 정지 준비. 정책이 어긋난 연결과 달리 인사 없는 연결에서는 정지도 받지 않는다",
   "status": "candidate",
   "base": "accept/stop-prepare",
   "changed": [
@@ -12,7 +12,7 @@
     "reason": "handshake_required"
   },
   "keys": {
-    "front-door": "nsqcO9WoDjdN_HnDZavE0XIlK7pI_FKonvkHE-l5vpo"
+    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
   },
   "context": {
     "now": 1795046400000,
@@ -47,7 +47,7 @@
       "request_id": "00000000-0000-4000-8000-000000000023",
       "nonce": "00000000000000000000000000000023"
     },
-    "signature": "B-RSCwQ6JWGfm8gp_e6ctoQj2cwNZdS8T1jTnz2maacqOI_SwVcazHypRevTFBUZRQuiNSxBTPz2LEnBWVWwDw",
+    "signature": "oAdSZN4ThMR-2ktxZMtNrXgM-Mrg2E2IhNREUyzI2XZboi8O90o7a3W9lQ4LUkjIJauZzraWoiuU3IbXG4DxAg",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000031",
       "stop_generation": 8

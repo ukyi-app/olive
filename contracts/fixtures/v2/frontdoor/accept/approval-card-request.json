@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+    "supervisor": "O5N4cdyrCNVuddEwiP-pvKbTueV2N7PJ3C5KC5gmfV8"
   },
   "context": {
     "now": 1795046400000,
@@ -36,7 +36,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "6ba8666d9325583bccf59914f1130b8d54f4d2b2996e49d3c95e4f18b746baf7",
+      "body_digest": "b1b5c5750d9930cd231e67157ce41ad684840cfba8815f8f22f76f4717542370",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "supervisor",
@@ -45,14 +45,14 @@
       "request_id": "00000000-0000-4000-8000-000000000062",
       "nonce": "00000000000000000000000000000062"
     },
-    "signature": "TiQOG0pgYNTymCLe1QRVRacDBtILEdKPLzHY1PM0ijAoVfec4iSCwGUbbAM5j4WUg36sN4IQ5vKX8-g7zOxVCQ",
+    "signature": "HIKXFcok7PwxDM5mf3XPmRamTF4St_bg9i5TTY8yzmZbqXQcAtEeevxgTaALmcvQtV9y08gut4o7g6PVB6jWCw",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000071",
-      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
       "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
       "stop_generation": 8,
       "execution_generation": 4
     }
   },
-  "signing_input": "{\"action\":\"approval_card_request\",\"body_digest\":\"6ba8666d9325583bccf59914f1130b8d54f4d2b2996e49d3c95e4f18b746baf7\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000062\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000062\",\"sender\":\"supervisor\"}"
+  "signing_input": "{\"action\":\"approval_card_request\",\"body_digest\":\"b1b5c5750d9930cd231e67157ce41ad684840cfba8815f8f22f76f4717542370\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000062\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000062\",\"sender\":\"supervisor\"}"
 }

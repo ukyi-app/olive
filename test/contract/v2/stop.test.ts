@@ -4,7 +4,7 @@ import { expect, test } from "bun:test";
 import { COMMON_BUNDLE } from "../../../src/contract/v2/actions.ts";
 import { defineContract, type Envelope, SealError, signUnchecked } from "../../../src/contract/v2/contract.ts";
 import type { GenerationAuthorities, GenerationAuthority } from "../../../src/contract/v2/generations.ts";
-import { FRONTDOOR_CONTRACT, latestStopOf, type StopRecordOutcome, StopRecordUnknown } from "../../../src/contract/v2/index.ts";
+import { adoptExecutionGeneration, FRONTDOOR_CONTRACT, latestStopOf, type StopRecordOutcome, StopRecordUnknown } from "../../../src/contract/v2/index.ts";
 import { list, readText } from "../../files.ts";
 import { FIXTURE_DIR } from "./cases.ts";
 import { buildStopCases } from "./cases-stop.ts";
@@ -212,6 +212,13 @@ test("실행 세대의 교환: 풀기 확정이 확정한 값으로 현관이 �
   const otherBody = fromFront("release_commit", { job_id: id(0xd02), stop_generation: 8, execution_generation: 5 });
   expect(await at(confirmed(otherBody, commit.header.request_id, { outcome: "released" }), "front-door", { awaiting: awaitingOf(commit) })).toEqual({ ok: false, reason: "reply_mismatch" });
 
+  // released로 확정된 본문의 실행 세대(4)를 현관은 실행 세대 조회의 답과 같은 함수로 받는다: 올리기만 하고 낮추지 않는다.
+  const releasedValue = { answered: true as const, generation: (commit.body as { execution_generation: number }).execution_generation };
+  expect(adoptExecutionGeneration({ known: false }, releasedValue)).toEqual({ authority: known(4), regressed: false });
+  expect(adoptExecutionGeneration(known(3), releasedValue)).toEqual({ authority: known(4), regressed: false });
+  // 조회의 답으로 이미 5를 안 현관에 늦게 닿은 풀기 확정(4)은 값을 낮추지 않고 regressed로 알린다.
+  expect(adoptExecutionGeneration(known(5), releasedValue)).toEqual({ authority: known(5), regressed: true });
+
   // 그 뒤 현관의 권위 값: 정지 8, 실행 4. 실행에 속한 감독의 효과(probe_return: 두 세대 모두 current)를 이 값으로 검증한다.
   const withProbe = defineContract([COMMON_BUNDLE, PROBE_BUNDLE]);
   const post = (execution: number) =>
@@ -225,4 +232,32 @@ test("실행 세대의 교환: 풀기 확정이 확정한 값으로 현관이 �
   // 풀기 전 실행 세대의 늦은 효과는 거절된다. 교환을 거치지 않아 값을 모르면 닫는다.
   expect(await at(post(3), "front-door", front(known(4)), withProbe)).toEqual({ ok: false, reason: "generation_mismatch" });
   expect(await at(post(4), "front-door", front({ known: false }), withProbe)).toEqual({ ok: false, reason: "generation_unknown" });
+});
+
+test("정책이 어긋난 연결: 정지의 준비·확정은 받고, 풀기의 준비·확정은 받지 않는다", async () => {
+  const mismatch = { handshake: "policy_mismatch" as const };
+  // 정지 세대 7 → 준비 8 → 확정 8이 정책이 어긋난 연결에서도 끝난다. 세대 규칙은 그대로 강제된다.
+  const prepare = fromFront("stop_prepare", { job_id: id(0xb01), stop_generation: 8 });
+  expect((await at(prepare, "supervisor", { ...mismatch, generations: gens(known(7)) })).ok).toBe(true);
+  expect(await at(fromFront("stop_prepare", { job_id: id(0xb02), stop_generation: 7 }), "supervisor", { ...mismatch, generations: gens(known(7)) })).toEqual({
+    ok: false,
+    reason: "generation_mismatch",
+  });
+  const commit = fromFront("stop_commit", { job_id: id(0xb03), stop_generation: 8 });
+  expect((await at(commit, "supervisor", { ...mismatch, generations: gens(known(7, 8)) })).ok).toBe(true);
+  expect(await at(commit, "supervisor", { ...mismatch, generations: gens(known(7, null)) })).toEqual({ ok: false, reason: "generation_mismatch" });
+  // 인사가 없는 연결은 정지도 받지 않는다(예외는 정책 불일치 하나뿐이다).
+  expect(await at(prepare, "supervisor", { handshake: "none", generations: gens(known(7)) })).toEqual({ ok: false, reason: "handshake_required" });
+
+  // 풀기는 세대가 맞아도 policy_mismatch다. 같은 봉투가 정책이 맞는 연결에서는 받아진다.
+  const releasePrepare = fromFront("release_prepare", { job_id: id(0xb04), stop_generation: 8 });
+  const releaseCommit = fromFront("release_commit", { job_id: id(0xb05), stop_generation: 8, execution_generation: 4 });
+  const cases = [
+    [releasePrepare, gens(known(8))],
+    [releaseCommit, gens(known(8, 8), known(3))],
+  ] as const;
+  for (const [message, generations] of cases) {
+    expect(await at(message, "supervisor", { ...mismatch, generations }), message.header.action).toEqual({ ok: false, reason: "policy_mismatch" });
+    expect((await at(message, "supervisor", { handshake: "agreed", generations })).ok, message.header.action).toBe(true);
+  }
 });

@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "front-door": "nsqcO9WoDjdN_HnDZavE0XIlK7pI_FKonvkHE-l5vpo"
+    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
   },
   "context": {
     "now": 1795046400000,
@@ -45,7 +45,7 @@
       "request_id": "00000000-0000-4000-8000-000000000027",
       "nonce": "00000000000000000000000000000027"
     },
-    "signature": "HMMNZIT4MvhK7znbbo9O-wSMHSnzfT_4wWGXv9fk8m_mB0T03xX7LqLU5f8GDb6XEG1ycX1ODi1ixta0zJ_6AA",
+    "signature": "NxMPiqx1bcQrt9WGVyyXWUq7pkHoSK1-PHaznbLo1pGmghseF0hNFNLvAgkVOW1wfqvhXdoKSTqmsPcwoeEnBg",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000032",
       "action": "stop_commit",

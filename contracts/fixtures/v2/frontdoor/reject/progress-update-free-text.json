@@ -12,7 +12,7 @@
     "reason": "unknown_field"
   },
   "keys": {
-    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+    "supervisor": "O5N4cdyrCNVuddEwiP-pvKbTueV2N7PJ3C5KC5gmfV8"
   },
   "context": {
     "now": 1795046400000,
@@ -38,7 +38,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "307393298bfad1f63bf48e748dc999a23bf749328cb890776fc1c8bc3601ab48",
+      "body_digest": "446bf63a80c81a229328a08d457d04400ef29674d8e0b20b5e2d064ce4b8ed71",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "supervisor",
@@ -47,10 +47,10 @@
       "request_id": "00000000-0000-4000-8000-000000000068",
       "nonce": "00000000000000000000000000000068"
     },
-    "signature": "tyq9MTEhcdbriW2O6ccdg9ZkAOCMvhUHwDzvX8Rg1qbU8U2mn6_S4H6zIHxi6EGIsImTA7hXe4FwZ6ljyCNMDg",
+    "signature": "mo_xYtWUZgi5FwsIn8HfUOyusZ0KXQQWtLNXRZfkLiHm_mqBj8_DW8zrMwGYSknpOPLMo3pg7HfqBXM2FN_CCw",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000073",
-      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
       "stage": "verify",
       "seq": 3,
       "stop_generation": 8,
@@ -58,5 +58,5 @@
       "text": "검증 중이에요. 거의 다 됐어요"
     }
   },
-  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"307393298bfad1f63bf48e748dc999a23bf749328cb890776fc1c8bc3601ab48\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"supervisor\"}"
+  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"446bf63a80c81a229328a08d457d04400ef29674d8e0b20b5e2d064ce4b8ed71\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"supervisor\"}"
 }

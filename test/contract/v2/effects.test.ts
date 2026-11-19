@@ -50,10 +50,10 @@ const DIGEST = "d".repeat(64);
 const RUN = id(0xe7b);
 const GEN = { stop_generation: 8, execution_generation: 4 };
 const bodies: Record<string, Record<string, unknown>> = {
-  reply_candidate: { job_id: id(0xe01), input_id: INPUT, purpose: "answer", candidate_digest: DIGEST, ...GEN },
-  approval_card_request: { job_id: id(0xe02), input_id: INPUT, candidate_digest: DIGEST, ...GEN },
-  publication_candidate: { job_id: id(0xe03), kind: "pull_request", candidate_digest: DIGEST, run_id: RUN, input_id: INPUT, ...GEN },
-  progress_update: { job_id: id(0xe04), input_id: INPUT, stage: "cause", seq: 1, ...GEN },
+  reply_candidate: { job_id: id(0xe01), input_job_id: INPUT, purpose: "answer", candidate_digest: DIGEST, ...GEN },
+  approval_card_request: { job_id: id(0xe02), input_job_id: INPUT, candidate_digest: DIGEST, ...GEN },
+  publication_candidate: { job_id: id(0xe03), kind: "pull_request", candidate_digest: DIGEST, run_id: RUN, input_job_id: INPUT, ...GEN },
+  progress_update: { job_id: id(0xe04), input_job_id: INPUT, stage: "cause", seq: 1, ...GEN },
 };
 
 function sealReason(action: string, body: unknown): string {
@@ -129,7 +129,7 @@ test("모델이 정한 승인·목적지 거절", async () => {
     { webhook_url: "https://discord.example/api/webhooks/1/x" },
     { permission: "post" },
     { Approved_By: "model" },
-    { input_id: { channelId: "1234" } },
+    { input_job_id: { channelId: "1234" } },
   ];
   for (const [action, body] of Object.entries(bodies)) {
     expect((await at(fromSupervisor(action, body), "front-door")).ok, action).toBe(true);
@@ -183,7 +183,7 @@ test("임의 진행 문구 거절", async () => {
     expect(sealed, JSON.stringify(extra)).toBe("unknown_field");
   }
   // 단계와 순번이 빠져도 거절이다.
-  for (const field of ["stage", "seq", "input_id"]) {
+  for (const field of ["stage", "seq", "input_job_id"]) {
     expect(await at(fromSupervisor("progress_update", without(bodies.progress_update, field)), "front-door"), field).toEqual({ ok: false, reason: "body_malformed" });
   }
   // 답 글 후보도 글을 싣지 않는다(digest만). 목적은 닫힌 목록이다.

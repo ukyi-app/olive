@@ -3,7 +3,7 @@
 // 두지 않는다. 각 단계의 약속과 실행 세대의 교환은 v2.md "정지·풀기·권위 조회".
 import type { Bundle, EffectSpec, ExchangeSpec, NoAnswerCause } from "./actions.ts";
 import { type GenerationRules, generationShape } from "./generations.ts";
-import { effectBody, generation, isPlainObject, literal, object, type Parser, SchemaError, uuid } from "./schema.ts";
+import { byOutcome, effectBody, generation, isPlainObject, literal, object, type Parser, SchemaError, uuid } from "./schema.ts";
 
 // 세대 규칙. 규칙은 받는 쪽(감독)의 권위 값 기준이다. 감독의 generations.stop.prepared는 받아 두고 확정하지 않은 준비의 정지
 // 세대이고, 정지 준비(지금보다 큼)와 풀기 준비(지금과 같음)가 그 칸 하나를 함께 쓴다.
@@ -32,16 +32,6 @@ export type StopCommitResult = { outcome: "stopped" };
 export type ReleasePrepareResult = { outcome: "prepared"; execution_generation: number } | { outcome: "refused" };
 export type ReleaseCommitResult = { outcome: "released" } | { outcome: "refused" };
 
-// outcome 값으로 갈래를 고르는 닫힌 해석기.
-function byOutcome<T>(cases: Readonly<Record<string, Parser<T>>>): Parser<T> {
-  return (value, path) => {
-    if (!isPlainObject(value)) throw new SchemaError("malformed", path);
-    const outcome = value.outcome;
-    if (typeof outcome !== "string" || !Object.hasOwn(cases, outcome)) throw new SchemaError("malformed", `${path}.outcome`);
-    return cases[outcome]!(value, path);
-  };
-}
-
 const parseStopPrepareResult: Parser<StopPrepareResult> = object({ outcome: literal("prepared") });
 const parseStopCommitResult: Parser<StopCommitResult> = object({ outcome: literal("stopped") });
 const parseReleasePrepareResult: Parser<ReleasePrepareResult> = byOutcome<ReleasePrepareResult>({
@@ -54,13 +44,15 @@ const parseReleaseCommitResult: Parser<ReleaseCommitResult> = byOutcome<ReleaseC
 });
 
 // 정지·풀기는 현관만 내고, 감독의 접수가 닫혀 있어도 받는다(정지는 언제든, 풀기는 감독이 접수를 닫은 채 진행한다, §7.6).
-function stopEffect(rules: GenerationRules, parseResult: Parser<unknown>): EffectSpec {
+// 정책이 어긋난 연결에서는 정지의 준비·확정만 받고 풀기는 받지 않는다(관리자 결정 2026-11-19: 멈추는 쪽은 늘 열어 둔다).
+// true를 선언할 수 있는 효과는 공통부의 닫힌 목록(EFFECTS_DURING_POLICY_MISMATCH)이 정한다.
+function stopEffect(rules: GenerationRules, parseResult: Parser<unknown>, duringPolicyMismatch: boolean): EffectSpec {
   const parseBody = effectBody(generationShape(rules));
   return {
     class: "effect",
     from: ["front-door"],
     duringClosedIntake: true,
-    duringPolicyMismatch: false,
+    duringPolicyMismatch,
     generations: rules,
     parse: (body) => parseBody(body, "body"),
     parseResult,
@@ -139,9 +131,9 @@ export const STOP_BUNDLE: Bundle = {
   actions: {
     stop_record_lookup: stopRecordLookup,
     stop_record: stopRecord,
-    stop_prepare: stopEffect(STOP_GENERATIONS.stop_prepare, parseStopPrepareResult),
-    stop_commit: stopEffect(STOP_GENERATIONS.stop_commit, parseStopCommitResult),
-    release_prepare: stopEffect(STOP_GENERATIONS.release_prepare, parseReleasePrepareResult),
-    release_commit: stopEffect(STOP_GENERATIONS.release_commit, parseReleaseCommitResult),
+    stop_prepare: stopEffect(STOP_GENERATIONS.stop_prepare, parseStopPrepareResult, true),
+    stop_commit: stopEffect(STOP_GENERATIONS.stop_commit, parseStopCommitResult, true),
+    release_prepare: stopEffect(STOP_GENERATIONS.release_prepare, parseReleasePrepareResult, false),
+    release_commit: stopEffect(STOP_GENERATIONS.release_commit, parseReleaseCommitResult, false),
   },
 };

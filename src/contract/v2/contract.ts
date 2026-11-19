@@ -12,6 +12,7 @@ import {
   type BodyContext,
   type Bundle,
   COMMON_BUNDLE,
+  EFFECTS_DURING_POLICY_MISMATCH,
   type HandshakeState,
   type JobRef,
 } from "./actions.ts";
@@ -109,7 +110,9 @@ export function defineContract(bundles: readonly Bundle[]): Contract {
       if (spec.class === "effect" && spec.answers !== undefined) throw new Error(`${where}: 효과 동작은 답이 아니다`);
       if (spec.matches !== undefined && spec.answers === undefined) throw new Error(`${where}: matches는 답 동작만 둔다`);
       if (typeof spec.duringPolicyMismatch !== "boolean") throw new Error(`${where}: 정책이 어긋난 연결에서 받는지(duringPolicyMismatch)를 선언한다`);
-      if (spec.class === "effect" && spec.duringPolicyMismatch) throw new Error(`${where}: 효과 동작은 정책이 어긋난 연결에서 받지 않는다`);
+      if (spec.class === "effect" && spec.duringPolicyMismatch && !EFFECTS_DURING_POLICY_MISMATCH.includes(name)) {
+        throw new Error(`${where}: 효과 동작은 정책이 어긋난 연결에서 받지 않는다(정지의 준비·확정만 예외)`);
+      }
       if (spec.class === "effect" ? !isGenerationRules(spec.generations) : spec.generations !== undefined) {
         throw new Error(`${where}: 효과 동작만, 그리고 모두 정지·실행 세대 규칙(generations)을 닫힌 목록에서 하나씩 선언한다`);
       }
@@ -130,8 +133,8 @@ export function defineContract(bundles: readonly Bundle[]): Contract {
 // 2. 서명. 이 뒤의 확인은 머리를 믿고 하는 것이라 서명이 맞기 전에는 내용으로 판정하지 않는다. 키는 낸 쪽 이름으로 고른다.
 // 3. 방향(그 동작을 낼 수 있는 쪽, 받는 쪽은 그 상대), 그다음 받는 쪽이 정말 나인지.
 // 4. 시한.
-// 5. 연결: 인사 상태(정책이 어긋난 연결은 duringPolicyMismatch인 동작만), 그다음 접수. 인사가 안 됐거나 정책이 다른 연결의 효과 요청은
-//    본문이 맞든 틀리든 받지 않으므로 본문보다 먼저 본다.
+// 5. 연결: 인사 상태(정책이 어긋난 연결은 duringPolicyMismatch인 동작만), 그다음 접수. 인사가 안 된 연결의 요청과 정책이 다른 연결에서
+//    받지 않는 동작은 본문이 맞든 틀리든 받지 않으므로 본문보다 먼저 본다.
 // 6. 본문: 정규화 → digest → 금지 칸 → 공통 칸(효과면 job_id, 답이면 in_reply_to) → (효과면 세대: 칸 → 권위 값과 대조) → 엄격한 모양.
 //    digest를 먼저 보아 서명한 쪽이 보낸 본문인지부터 확인한다. 세대는 그 뒤라 서명한 쪽이 실은 값만 대조한다.
 //    공통 칸은 여기서 원본에서 읽어 둔다. 묶음의 해석기가 반환값에서 빼거나 바꿔도 작업 참조와 답 대조는 서명된 값을 쓴다.

@@ -144,6 +144,26 @@ export function buildStopCases(keys: Keys): V2Case[] {
     OK,
   );
 
+  // ---- 정책이 어긋난 연결: 정지의 준비·확정만 받는다(관리자 결정 2026-11-19), 풀기는 아래 거절 사례 ----
+  const preparePolicyMismatch = accept(
+    keys,
+    "stop-prepare-policy-mismatch",
+    "정책 revision이 어긋난 연결에 온 정지 준비. 멈추는 쪽은 늘 열어 두므로 받는다(효과 가운데 정지의 준비·확정만 예외)",
+    "supervisor",
+    atSupervisor(known(7), { handshake: "policy_mismatch" }),
+    prepareMsg,
+    OK,
+  );
+  const commitPolicyMismatch = accept(
+    keys,
+    "stop-commit-policy-mismatch",
+    "정책 revision이 어긋난 연결에 온 정지 확정. 정지 준비와 같이 받는다",
+    "supervisor",
+    atSupervisor(known(7, 8), { handshake: "policy_mismatch" }),
+    commitMsg,
+    OK,
+  );
+
   const on = (base: V2Case) => (v: Variant) => variant(keys, base, v);
   const P = on(prepare);
   const C = on(commit);
@@ -163,20 +183,14 @@ export function buildStopCases(keys: Keys): V2Case[] {
     releasePrepareConfirmed,
     releaseCommit,
     releaseCommitConfirmed,
+    preparePolicyMismatch,
+    commitPolicyMismatch,
     P({
       name: "stop-prepare-without-handshake",
-      description: "인사가 끝나지 않은 연결에 온 정지 준비",
+      description: "인사가 끝나지 않은 연결에 온 정지 준비. 정책이 어긋난 연결과 달리 인사 없는 연결에서는 정지도 받지 않는다",
       reason: "handshake_required",
       changed: ["context.handshake"],
       edit: (c) => void (c.context.handshake = "none"),
-      signer: null,
-    }),
-    P({
-      name: "stop-prepare-policy-mismatch",
-      description: "정책 revision이 어긋난 연결에 온 정지 준비. 효과는 정책이 맞을 때까지 받지 않는다",
-      reason: "policy_mismatch",
-      changed: ["context.handshake"],
-      edit: (c) => void (c.context.handshake = "policy_mismatch"),
       signer: null,
     }),
     P({
@@ -225,6 +239,22 @@ export function buildStopCases(keys: Keys): V2Case[] {
       reason: "generation_mismatch",
       changed: ["context.generations.stop.prepared"],
       edit: (c) => void (c.context.generations = { ...c.context.generations, stop: known(7, null) }),
+      signer: null,
+    }),
+    RP({
+      name: "release-prepare-policy-mismatch",
+      description: "정책 revision이 어긋난 연결에 온 풀기 준비. 정지와 달리 풀기는 정책이 맞을 때까지 받지 않는다",
+      reason: "policy_mismatch",
+      changed: ["context.handshake"],
+      edit: (c) => void (c.context.handshake = "policy_mismatch"),
+      signer: null,
+    }),
+    RC({
+      name: "release-commit-policy-mismatch",
+      description: "정책 revision이 어긋난 연결에 온 풀기 확정. 받지 않는다",
+      reason: "policy_mismatch",
+      changed: ["context.handshake"],
+      edit: (c) => void (c.context.handshake = "policy_mismatch"),
       signer: null,
     }),
     RP({

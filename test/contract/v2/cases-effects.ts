@@ -29,11 +29,11 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
   const statusOf = (n: number, request: Envelope, inReplyTo: string, status: Record<string, unknown>) => fromFront("job_status", n, { in_reply_to: inReplyTo, ...jobOf(request), status });
 
   // ---- 답 글 ----
-  const replyMsg = fromSupervisor("reply_candidate", 0x60, { job_id: id(0x70), input_id: INPUT, purpose: "answer", candidate_digest: REPLY_DIGEST, ...GEN });
+  const replyMsg = fromSupervisor("reply_candidate", 0x60, { job_id: id(0x70), input_job_id: INPUT, purpose: "answer", candidate_digest: REPLY_DIGEST, ...GEN });
   const reply = accept(
     keys,
     "reply-candidate",
-    "답 글의 후보. 글 대신 감독 쪽 결과 보관소의 digest만 싣고, 보낼 곳은 현관이 입력(input_id)에서 고른다. 정지·실행 세대는 현관의 지금 값(8, 4)",
+    "답 글의 후보. 글 대신 감독 쪽 결과 보관소의 digest만 싣고, 보낼 곳은 현관이 입력(input_job_id)에서 고른다. 정지·실행 세대는 현관의 지금 값(8, 4)",
     "front-door",
     atFront(),
     replyMsg,
@@ -42,7 +42,7 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
   const replyPosted = accept(keys, "reply-candidate-posted", "답 글 후보의 바로 답: 확정 posted(현관이 공개 검사를 거쳐 보냈다)", "supervisor", atSupervisor({ awaiting: awaitingOf(replyMsg) }), statusOf(0x61, replyMsg, replyMsg.header.request_id, { state: "confirmed", result: { outcome: "posted" } }), OK);
 
   // ---- 확인 카드 ----
-  const cardMsg = fromSupervisor("approval_card_request", 0x62, { job_id: id(0x71), input_id: INPUT, candidate_digest: CANDIDATE_DIGEST, ...GEN });
+  const cardMsg = fromSupervisor("approval_card_request", 0x62, { job_id: id(0x71), input_job_id: INPUT, candidate_digest: CANDIDATE_DIGEST, ...GEN });
   const card = accept(keys, "approval-card-request", "보호 경로를 건드린 게시 후보에 확인 카드를 부탁한다. 카드의 문구·발급·만료는 현관이 정한다", "front-door", atFront(), cardMsg, OK);
   const cardShown = accept(
     keys,
@@ -55,7 +55,7 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
   );
 
   // ---- 게시 ----
-  const publicationMsg = fromSupervisor("publication_candidate", 0x64, { job_id: id(0x72), kind: "pull_request", candidate_digest: CANDIDATE_DIGEST, run_id: RUN, input_id: INPUT, ...GEN });
+  const publicationMsg = fromSupervisor("publication_candidate", 0x64, { job_id: id(0x72), kind: "pull_request", candidate_digest: CANDIDATE_DIGEST, run_id: RUN, input_job_id: INPUT, ...GEN });
   const publication = accept(
     keys,
     "publication-candidate",
@@ -96,7 +96,7 @@ export function buildEffectsCases(keys: Keys): V2Case[] {
   );
 
   // ---- 진행 ----
-  const progressMsg = fromSupervisor("progress_update", 0x68, { job_id: id(0x73), input_id: INPUT, stage: "verify", seq: 3, ...GEN });
+  const progressMsg = fromSupervisor("progress_update", 0x68, { job_id: id(0x73), input_job_id: INPUT, stage: "verify", seq: 3, ...GEN });
   const progress = accept(keys, "progress-update", "진행 표시: 고정된 단계 이름(verify = 검증)과 순번뿐이다. 표시 문구는 현관이 단계 이름에서 만든다", "front-door", atFront(), progressMsg, OK);
 
   // ---- 현관의 실행 세대 권위 값 ----

@@ -1,18 +1,16 @@
 {
   "fixture": "olive-control/v2",
-  "name": "reject/stop-prepare-policy-mismatch",
-  "description": "정책 revision이 어긋난 연결에 온 정지 준비. 효과는 정책이 맞을 때까지 받지 않는다",
+  "name": "accept/stop-prepare-policy-mismatch",
+  "description": "정책 revision이 어긋난 연결에 온 정지 준비. 멈추는 쪽은 늘 열어 두므로 받는다(효과 가운데 정지의 준비·확정만 예외)",
   "status": "candidate",
-  "base": "accept/stop-prepare",
-  "changed": [
-    "context.handshake"
-  ],
+  "base": null,
+  "changed": [],
   "expect": {
-    "ok": false,
-    "reason": "policy_mismatch"
+    "ok": true,
+    "handshake_after": null
   },
   "keys": {
-    "front-door": "nsqcO9WoDjdN_HnDZavE0XIlK7pI_FKonvkHE-l5vpo"
+    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
   },
   "context": {
     "now": 1795046400000,
@@ -47,7 +45,7 @@
       "request_id": "00000000-0000-4000-8000-000000000023",
       "nonce": "00000000000000000000000000000023"
     },
-    "signature": "B-RSCwQ6JWGfm8gp_e6ctoQj2cwNZdS8T1jTnz2maacqOI_SwVcazHypRevTFBUZRQuiNSxBTPz2LEnBWVWwDw",
+    "signature": "oAdSZN4ThMR-2ktxZMtNrXgM-Mrg2E2IhNREUyzI2XZboi8O90o7a3W9lQ4LUkjIJauZzraWoiuU3IbXG4DxAg",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000031",
       "stop_generation": 8

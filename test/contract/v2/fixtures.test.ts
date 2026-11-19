@@ -22,11 +22,11 @@ async function replay(f: Pick<V2Case, "keys" | "context" | "message">): Promise<
   return { ok: true, handshake_after: result.class === "handshake" ? afterHandshake(result, f.context.own_policy_revision) : null };
 }
 
-// 공개 면의 표에 효과 동작이 아직 없어서 표본을 만들 수 없는 것. 효과 동작이 생기면 이 면제는 사라지고(아래 시험) 묶음이 사례를 더해야 한다.
+// 공개 면의 표에 효과 동작이 없으면 표본을 만들 수 없는 것. 지금은 효과 동작이 있어 이 면제는 쓰이지 않는다(아래 시험이 표본을 요구한다).
 const publicEffects = Object.values(FRONTDOOR_CONTRACT.actions).filter((spec) => spec.class === "effect");
 const hasEffect = publicEffects.length > 0;
-// intake_closed는 닫힌 접수에서 받지 않는 효과 동작이 있어야 닿는다. 정지 묶음의 효과는 모두 닫힌 접수에서 받으므로(duringClosedIntake)
-// 그런 효과(입력·게시 묶음)가 생길 때까지 면제한다. 생기면 이 면제는 사라진다.
+// intake_closed는 닫힌 접수에서 받지 않는 효과 동작이 있어야 닿는다. 지금은 입력·출력 묶음에 그런 효과가 있어 면제되지 않는다
+// (모든 효과가 닫힌 접수에서 받는 표면 면제된다).
 const hasIntakeGatedEffect = publicEffects.some((spec) => !spec.duringClosedIntake);
 const WITHOUT_EFFECT: { reasons: readonly string[]; actions: readonly string[] } = {
   // 인사 밖의 동작이 필요한 사유(조회와 효과): 조회 본문의 action이 효과 동작이어야 하고, 세대 사유는 효과 동작에만 걸린다.

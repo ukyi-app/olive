@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+    "supervisor": "O5N4cdyrCNVuddEwiP-pvKbTueV2N7PJ3C5KC5gmfV8"
   },
   "context": {
     "now": 1795046400000,
@@ -36,7 +36,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "c9c4ec0dd62bd45f98ba02d3d48cb9b6641440bd63540dd3b76dc4f71cf453c4",
+      "body_digest": "21bba22cbf6293d075566a41cfad869149f8f100f475b48ae2454962824dae8e",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "supervisor",
@@ -45,12 +45,12 @@
       "request_id": "00000000-0000-4000-8000-000000000066",
       "nonce": "00000000000000000000000000000066"
     },
-    "signature": "mxH4oynFv1751dGO_cPmQY7fINIwFN7IrNgEdS8vCEaZYih1wKdaeiruDsX-_wZAemV7eB2k0RIJbRQhjMeUBg",
+    "signature": "GkChFY27HsCCtrOuWTaI4DhBXfjlaqefACfvBiQFyPo2DWhrxEuNOg_nDe69nC8VTFG-GQR40ROf0AIuEvo9Ag",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000072",
       "action": "publication_candidate",
-      "request_digest": "1f9bd03f4ccca65916a67463b8f4049fbd8949c5cdd25259d41c4c07d1049e6f"
+      "request_digest": "e89176618e18b59b4bf97ef5ac0c08684769acd2402a4abe3ec05c143898faf3"
     }
   },
-  "signing_input": "{\"action\":\"job_lookup\",\"body_digest\":\"c9c4ec0dd62bd45f98ba02d3d48cb9b6641440bd63540dd3b76dc4f71cf453c4\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000066\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000066\",\"sender\":\"supervisor\"}"
+  "signing_input": "{\"action\":\"job_lookup\",\"body_digest\":\"21bba22cbf6293d075566a41cfad869149f8f100f475b48ae2454962824dae8e\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000066\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000066\",\"sender\":\"supervisor\"}"
 }

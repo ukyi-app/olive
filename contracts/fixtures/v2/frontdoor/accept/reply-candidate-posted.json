@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "front-door": "WvVETM1uGXxTWhNnPLdRnwg6KI72pg0B9Xm4PZlajTA"
+    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
   },
   "context": {
     "now": 1795046400000,
@@ -32,7 +32,7 @@
         "job": {
           "job_id": "00000000-0000-4000-8000-000000000070",
           "action": "reply_candidate",
-          "request_digest": "cab4d60260c134d8a36f2fcc81625ffda1700ff6e974dbe94f06183d6055ef38"
+          "request_digest": "0812d4f860163ead2fad51a48fc71ab923d3838e577ae5837815a5f36ee649af"
         }
       }
     },
@@ -41,7 +41,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "ebc86738e021260dfdcceffaf22e3b4d512f116f65ce897a4c5b240c0b476cb9",
+      "body_digest": "f77d3ef595a8430b79e7df2a991410b52d748558e3cf66dd31369edee4e72071",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "front-door",
@@ -50,12 +50,12 @@
       "request_id": "00000000-0000-4000-8000-000000000061",
       "nonce": "00000000000000000000000000000061"
     },
-    "signature": "qY_5iF3hTZ8KhfqaGCV6xkBptGrrxsW2Y2pVycFgYY-slE-UB1yD6H246rED_IH4rTB0Fwl9AuQKFYDVqLJBAA",
+    "signature": "S2G08PF1V-Y4Ef52A1ap_zhwu-Ih0QCy7UAE5vsfcwQINEBSkSLn7o_F4H8wSSmsIIOVfet8YsBxXEWWaCVSCA",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000060",
       "job_id": "00000000-0000-4000-8000-000000000070",
       "action": "reply_candidate",
-      "request_digest": "cab4d60260c134d8a36f2fcc81625ffda1700ff6e974dbe94f06183d6055ef38",
+      "request_digest": "0812d4f860163ead2fad51a48fc71ab923d3838e577ae5837815a5f36ee649af",
       "status": {
         "state": "confirmed",
         "result": {
@@ -64,5 +64,5 @@
       }
     }
   },
-  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"ebc86738e021260dfdcceffaf22e3b4d512f116f65ce897a4c5b240c0b476cb9\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000061\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000061\",\"sender\":\"front-door\"}"
+  "signing_input": "{\"action\":\"job_status\",\"body_digest\":\"f77d3ef595a8430b79e7df2a991410b52d748558e3cf66dd31369edee4e72071\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000061\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000061\",\"sender\":\"front-door\"}"
 }

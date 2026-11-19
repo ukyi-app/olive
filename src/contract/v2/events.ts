@@ -5,8 +5,7 @@
 // 모델의 글이 승인 사실로 올라갈 자리가 없다. 감독이 낸 본문의 승인 이름은 공통부가 막는다(SUPERVISOR_FORBIDDEN_FIELD_NAMES).
 import type { Bundle, EffectSpec } from "./actions.ts";
 import { type GenerationRules, generationShape } from "./generations.ts";
-import { sourceRefId } from "./inputs.ts";
-import { effectBody, int, literal, object, oneOf, type Parser, pattern, sha256, uuid } from "./schema.ts";
+import { effectBody, int, literal, object, oneOf, type Parser, pattern, sha256, sourceRefId, uuid } from "./schema.ts";
 
 // 세대 규칙(v2.md "세대를 고른 이유").
 // - approval_changed는 한 정지 세대 안의 사실이라 current다. 정지를 건너온 승인은 받지 않는다(닫힌 쪽). 정지 세대가 바뀌면 처리기는

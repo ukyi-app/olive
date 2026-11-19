@@ -1,6 +1,6 @@
 // 효과 동작의 세대 규칙(등록 때 선언, 받을 때 강제)과 동작마다의 정책 불일치 선언. 효과 동작은 시험 전용 probe 묶음으로 본다.
 import { expect, test } from "bun:test";
-import { type ActionSpec, type Bundle, COMMON_BUNDLE, type EffectSpec } from "../../../src/contract/v2/actions.ts";
+import { type ActionSpec, type Bundle, COMMON_BUNDLE, EFFECTS_DURING_POLICY_MISMATCH, type EffectSpec } from "../../../src/contract/v2/actions.ts";
 import { defineContract, SealError } from "../../../src/contract/v2/contract.ts";
 import { type GenerationAuthorities, generationMismatch, type GenerationRule } from "../../../src/contract/v2/generations.ts";
 import { FRONTDOOR_CONTRACT } from "../../../src/contract/v2/index.ts";
@@ -58,16 +58,30 @@ test("등록: 효과 동작은 정지·실행 세대 규칙을 각각 선언해�
   expect(() => defineContract([COMMON_BUNDLE, bundle({ do_x: { ...base, generations: { stop: "not_applicable", execution: "not_applicable" } } })])).not.toThrow();
 });
 
-test("등록: 동작마다 정책이 어긋난 연결에서 받는지 선언하고, 효과는 받지 않는다", () => {
+test("등록: 동작마다 정책이 어긋난 연결에서 받는지 선언하고, 효과는 정지의 준비·확정만 받을 수 있다", () => {
   const { duringPolicyMismatch: _drop, ...undeclared } = base;
   expect(() => defineContract([COMMON_BUNDLE, bundle({ do_x: undeclared })])).toThrow("정책");
-  expect(() => defineContract([COMMON_BUNDLE, bundle({ do_x: { ...base, duringPolicyMismatch: true } })])).toThrow("정책");
   const { duringPolicyMismatch: _q, ...queryUndeclared } = { ...base, class: "query", duringClosedIntake: true, parseResult: undefined, generations: undefined };
   expect(() => defineContract([COMMON_BUNDLE, bundle({ read_x: queryUndeclared })])).toThrow("정책");
-  // 공개 면: 인사와 조회(작업 조회, 정지 기록 조회)는 정책이 어긋나도 되고(관리자 결정 2026-11-19: 뜻이 고정된 사실), 효과는 받지 않는다.
+  // 예외 목록은 정지의 준비·확정 둘뿐이다(관리자 결정 2026-11-19). 목록 밖의 효과가 true를 선언하면 표를 만들 때 던진다.
+  expect(EFFECTS_DURING_POLICY_MISMATCH).toEqual(["stop_prepare", "stop_commit"]);
+  expect(Object.isFrozen(EFFECTS_DURING_POLICY_MISMATCH)).toBe(true);
+  for (const name of ["do_x", "release_prepare", "release_commit", "input_cancel", "stop_record_lookup", "probe_stop_prepare"]) {
+    expect(() => defineContract([COMMON_BUNDLE, bundle({ [name]: { ...base, duringPolicyMismatch: true } })]), name).toThrow("정책");
+    expect(() => defineContract([COMMON_BUNDLE, bundle({ [name]: { ...base, duringPolicyMismatch: false } })]), name).not.toThrow();
+  }
+  for (const name of EFFECTS_DURING_POLICY_MISMATCH) {
+    expect(() => defineContract([COMMON_BUNDLE, bundle({ [name]: { ...base, duringPolicyMismatch: true } })]), name).not.toThrow();
+  }
+  // 공개 면: 인사와 조회(작업 조회, 정지 기록 조회, 실행 세대 조회)는 정책이 어긋나도 되고(관리자 결정 2026-11-19: 뜻이 고정된 사실),
+  // 효과는 예외 목록의 정지 둘만 받고 나머지는 받지 않는다.
   const effects = Object.entries(FRONTDOOR_CONTRACT.actions).filter(([, spec]) => spec.class === "effect");
   expect(effects.length).toBeGreaterThan(0);
-  for (const [name, spec] of Object.entries(FRONTDOOR_CONTRACT.actions)) expect(spec.duringPolicyMismatch, name).toBe(spec.class !== "effect");
+  for (const [name, spec] of Object.entries(FRONTDOOR_CONTRACT.actions)) {
+    expect(spec.duringPolicyMismatch, name).toBe(spec.class !== "effect" || EFFECTS_DURING_POLICY_MISMATCH.includes(name));
+  }
+  expect(FRONTDOOR_CONTRACT.actions.release_prepare?.duringPolicyMismatch).toBe(false);
+  expect(FRONTDOOR_CONTRACT.actions.release_commit?.duringPolicyMismatch).toBe(false);
 });
 
 test("받기: 필수 세대 칸이 빠진 효과는 서명이 맞아도 generation_missing이고, 만들 수도 없다", async () => {

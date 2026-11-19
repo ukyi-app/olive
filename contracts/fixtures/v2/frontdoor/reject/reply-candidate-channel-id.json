@@ -12,7 +12,7 @@
     "reason": "forbidden_field"
   },
   "keys": {
-    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+    "supervisor": "O5N4cdyrCNVuddEwiP-pvKbTueV2N7PJ3C5KC5gmfV8"
   },
   "context": {
     "now": 1795046400000,
@@ -38,7 +38,7 @@
   "message": {
     "header": {
       "contract": "olive-control/v2",
-      "body_digest": "fadc2c00770686717d5af1c488bda88f2900d62a191d223c477e94f114482088",
+      "body_digest": "4168db40e0e8fbc450235db04a9d566c5f28b321ba974ef1eca9cb6bb8baa8b3",
       "issued_at": 1795046399000,
       "expires_at": 1795046429000,
       "sender": "supervisor",
@@ -47,10 +47,10 @@
       "request_id": "00000000-0000-4000-8000-000000000060",
       "nonce": "00000000000000000000000000000060"
     },
-    "signature": "TuHOSlr8QZo0qlovcc5kDC1mzBZHG8lGN3Zi-XfRUdKX2m08TFWvJz2ucbzYDz7WsNnCgsBoiz1hcKfQcdxKCw",
+    "signature": "4akY27BWbOWt72EP7-XL5oO40dW3n12b_bUS2wkiuqBVIizP5GgpOSAvSG7UmR_m7QsWXBWUzwHsTlGmDY_ABw",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000070",
-      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "input_job_id": "00000000-0000-4000-8000-00000000007a",
       "purpose": "answer",
       "candidate_digest": "1111111111111111111111111111111111111111111111111111111111111111",
       "stop_generation": 8,
@@ -58,5 +58,5 @@
       "channel_id": "1300000000000000000"
     }
   },
-  "signing_input": "{\"action\":\"reply_candidate\",\"body_digest\":\"fadc2c00770686717d5af1c488bda88f2900d62a191d223c477e94f114482088\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000060\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000060\",\"sender\":\"supervisor\"}"
+  "signing_input": "{\"action\":\"reply_candidate\",\"body_digest\":\"4168db40e0e8fbc450235db04a9d566c5f28b321ba974ef1eca9cb6bb8baa8b3\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000060\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000060\",\"sender\":\"supervisor\"}"
 }

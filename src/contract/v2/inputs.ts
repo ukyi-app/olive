@@ -3,7 +3,7 @@
 // 같은 요청의 재전달과 같은 ID 다른 본문의 충돌은 공통부의 작업 ID·request_digest로 보이고, 가르는 일은 장부가 한다.
 import type { Bundle, EffectSpec } from "./actions.ts";
 import { type GenerationRules, generationShape } from "./generations.ts";
-import { effectBody, isPlainObject, literal, object, oneOf, type Parser, pattern, SchemaError, sha256, time, uuid } from "./schema.ts";
+import { byOutcome, effectBody, literal, object, oneOf, type Parser, sha256, sourceRefId, time, uuid } from "./schema.ts";
 
 // 세대 규칙. 받는 쪽(감독)의 권위 값 기준이다(v2.md "입력·취소·이벤트"의 "세대를 고른 이유").
 // - input_submit은 새 일이라 지금 정지 세대에 묶는다. 정지를 건너온 입력은 받지 않는다.
@@ -19,12 +19,7 @@ export const INPUT_GENERATIONS = {
 export const INPUT_SOURCES = ["admin", "alert"] as const;
 export type InputSource = (typeof INPUT_SOURCES)[number];
 
-// 원문 참조: 원문 저장소가 발행한 `<저장소 이름>/<UUID>`. 장부(src/ledger/input.ts)의 SOURCE_REF와 같은 꼴이다(계약 모듈은 장부를
-// import하지 않으므로 다시 두고, 같은지는 시험이 대조한다). 공백·문장이 이 꼴이 될 수 없어 원문이 참조 칸으로 새지 않는다.
-export const SOURCE_REF = /^[a-z][a-z0-9-]{0,31}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-export const sourceRefId: Parser<string> = pattern(SOURCE_REF);
-
-// digest는 원문의 SHA-256(소문자 16진), expires_at은 원문의 만료(밀리초). 만료가 지났는지·168시간(D-22) 안인지는 계약이 보지 않는다:
+// ref는 원문 참조(schema.ts의 SOURCE_REF 꼴). digest는 원문의 SHA-256(소문자 16진), expires_at은 원문의 만료(밀리초). 만료가 지났는지·168시간(D-22) 안인지는 계약이 보지 않는다:
 // 봉투를 만들 때는 받는 시각이 없어 만들기와 받기가 같은 꼴만 보게 둔다. 그 확인은 처리기의 일이다.
 export interface SourceRef {
   ref: string;
@@ -51,16 +46,6 @@ export interface InputCancel {
 export type InputSubmitResult = { outcome: "queued" } | { outcome: "refused" };
 // cancelled: 입력에 취소를 적었다(이미 도는 실행이 멈췄다는 뜻은 아니다). not_found: 감독이 그 입력을 모른다.
 export type InputCancelResult = { outcome: "cancelled" } | { outcome: "not_found" };
-
-// outcome 값으로 갈래를 고르는 닫힌 해석기(stop.ts의 것과 같다. 그 파일은 내보내지 않는다).
-function byOutcome<T>(cases: Readonly<Record<string, Parser<T>>>): Parser<T> {
-  return (value, path) => {
-    if (!isPlainObject(value)) throw new SchemaError("malformed", path);
-    const outcome = value.outcome;
-    if (typeof outcome !== "string" || !Object.hasOwn(cases, outcome)) throw new SchemaError("malformed", `${path}.outcome`);
-    return cases[outcome]!(value, path);
-  };
-}
 
 const parseInputSubmitResult = byOutcome<InputSubmitResult>({
   queued: object({ outcome: literal("queued") }),

@@ -40,7 +40,7 @@ function commonCases(keys: Keys): V2Case[] {
   const handshakePolicy = accept(
     keys,
     "handshake-policy-mismatch",
-    "정책 revision이 다른 인사. 봉투는 받지만 이 연결은 policy_mismatch(효과 동작을 받지 않음)",
+    "정책 revision이 다른 인사. 봉투는 받지만 이 연결은 policy_mismatch(정지의 준비·확정 밖의 효과 동작을 받지 않음)",
     "supervisor",
     supervisorSide,
     handshakeMsg(OTHER_POLICY),

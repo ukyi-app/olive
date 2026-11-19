@@ -1,6 +1,7 @@
 // 효과 동작의 정지 세대·실행 세대 규칙과 그 판정. 세대는 머리가 아니라 본문 맨 위의 정해진 칸에 있고(body_digest로 서명에 묶인다),
 // 받는 쪽이 문맥으로 주는 권위 값과 공통 검증기가 대조한다. 오래된 세대는 서명이 맞아도 거절한다(설계 §9.1).
 // 인사와 조회는 세대를 싣지 않는다: 복원 1단계처럼 받는 쪽이 세대를 아직 모를 때도 오가야 하기 때문이다.
+import type { NoAnswerCause } from "./actions.ts";
 import type { RejectReason } from "./errors.ts";
 import { generation, isPlainObject, type Parser } from "./schema.ts";
 
@@ -86,4 +87,23 @@ function satisfies(rule: Exclude<GenerationRule, "not_applicable">, value: numbe
     case "prepared":
       return known.prepared !== null && value === known.prepared;
   }
+}
+
+// ---- 현관의 실행 세대 권위 값 ----
+
+// 현관이 실행 세대를 얻는 한 번의 물음에서 얻은 것. 답을 받지 못했으면 모름이고 이 갈래는 값을 실을 수 없다.
+export type ExecutionGenerationOutcome = { answered: true; generation: number } | { answered: false; cause: NoAnswerCause };
+
+// 현관의 generations.execution을 감독이 확정해 준 값으로 고친다. 값의 출처는 둘이고 둘 다 이 함수로 넣는다: 실행 세대 조회의 답
+// (execution_generation_reply), 그리고 release_commit이 released로 확정된 본문의 execution_generation({ answered: true, generation }).
+// 실행 세대는 풀 때만 오르므로 받은 값이 아는 값보다 작으면 낮추지 않는다. 작은 값은 늦게 온 옛 답이거나 감독 장부의 되돌림이고,
+// 낮추면 옛 실행의 후보가 다시 통과한다. 그대로 두면 감독의 후보가 generation_mismatch로 닫힌다(regressed로 알린다).
+// 답이 없거나 값의 꼴이 틀리면 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다).
+export function adoptExecutionGeneration(previous: GenerationAuthority, outcome: ExecutionGenerationOutcome): { authority: GenerationAuthority; regressed: boolean } {
+  if (outcome.answered !== true) return { authority: previous, regressed: false };
+  const value: unknown = outcome.generation;
+  if (!isGeneration(value)) return { authority: previous, regressed: false };
+  if (!previous.known) return { authority: { known: true, current: value, prepared: null }, regressed: false };
+  if (value < previous.current) return { authority: previous, regressed: true };
+  return { authority: { known: true, current: value, prepared: previous.prepared }, regressed: false };
 }
