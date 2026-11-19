@@ -540,9 +540,9 @@ export interface InstructionTimes {
   // 판단(nextIntent)이 살아 있는 임대로 쓰는 값: 임대를 준 지시의 발행 시각과 그 임대의 끝.
   // 갱신 지시(run_renew)가 하나라도 있으면 발행 시각은 기록된 갱신 발행 시각의 최댓값이고, 끝은 발급 기록의 끝이 숫자이며 시작 임대부터
   // 그 갱신까지 모든 갱신이 앞 임대의 끝보다 RENEW_MARGIN_MS 이상 앞서 발행됐을 때만 그 끝, 아니면 "unknown"이다.
-  // 실행기 계약 v1에는 갱신의 영수증이 없어 실행기가 그 끝을 적용했는지 장부는 모른다. 실행기는 갱신을 앞 임대가 끝난 뒤(정각 포함)에
-  // 받으면 연장하지 않고 닫는데, 여유를 두고 낸 갱신은 전달 상한 안에 닿으면 그 전에 닿으므로 끝을 믿는다(D-89 후보).
-  // 그 갱신이 전달 중에 사라지면 이 값은 실행기의 끝보다 최대 RUN_LEASE_MAX_MS - RENEW_MARGIN_MS 늦다(ledger.md "남는 한계").
+  // 실행기 계약 v1에는 갱신의 영수증이 없어 실행기가 그 끝을 적용했는지 장부는 모른다. 이 끝은 감독의 추정이다(D-89 후보): 실행기는
+  // 임대를 검사하는 시각이 앞 임대의 끝 이상(정각 포함)이면 연장하지 않고 닫는데, 여유를 두고 낸 갱신은 전달·시계 오차·양끝 처리가
+  // 가정(RENEW_MARGIN_MS) 안이면 그 전에 검사된다. 가정 밖이거나 갱신이 사라지면 장부의 끝은 실행기의 끝보다 늦다(ledger.md "남는 한계").
   // 종료 영수증·끊김 표시는 실행 상태를 옮겨 이 값보다 먼저 판단을 바꾼다. 발행 시각이 시작보다 이르게 기록됐어도 시작 임대로 돌아가지 않는다.
   // 갱신이 없을 때만 시작 지시의 임대다: 시작 지시는 계약이 정한 끝(발행 시각 + RUN_LEASE_MAX_MS), 세션 시작 지시는 "unknown".
   // 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝을 낸다(살아 있지 않은 임대를 살아 있다고 내지 않는 쪽).
@@ -575,12 +575,17 @@ function startLeaseOf(rows: readonly InstructionTime[]): InstructionTimes["lease
   return { issuedAt: startAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
 }
 
+// 갱신의 처리 허용치. 감독 쪽 기본값(관리자 미확정)이고 계약의 상수가 아니다. 장부에 갱신을 적은 시각부터 연결에 싣기까지와,
+// 실행기가 받은 시각부터 임대를 검사하기까지의 합이 이 값 이하라고 가정한다(lifecycle.ts의 RENEW_HANDLING_MS와 같은 값).
+const RENEW_HANDLING_MS = 2_000;
+
 // 갱신을 믿는 여유. 발행 시각 s의 갱신은 s + RENEW_MARGIN_MS <= 앞 임대의 끝일 때만 그 끝을 임대로 믿는다.
-// 실행기는 자기 시계의 받은 시각이 앞 임대의 끝 이상이면 연장하지 않는다. 전달은 DELIVERY_MAX_MS 미만이고, 끝은 감독 시계로 정한 값이라
-// 실행기 시계가 앞서는 만큼(계약이 허용하는 시계 오차 CLOCK_SKEW_MS) 일찍 닿는다. 그래서 받은 시각 < s + DELIVERY_MAX_MS + CLOCK_SKEW_MS
-// <= 앞 임대의 끝이 되어 등호(정각)도 믿는다. 수명 판단(lifecycle.ts의 RENEW_MARGIN_MS)이 같은 식을 쓴다: 장부의 공개 면을 늘리지 않고
-// 두 자리가 같은 값을 쓰는지는 경계 시험(test/ledger/lease-trust.test.ts)이 지킨다. 실행기 안의 처리 지연은 이 여유에 들지 않는다.
-const RENEW_MARGIN_MS = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS;
+// 실행기는 자기 시계로 임대를 검사하는 시각이 앞 임대의 끝 이상이면 연장하지 않는다. 그 시각은 감독 시계로 s + 싣기까지의 처리 + 전달
+// + 받은 뒤의 처리이고, 끝은 감독 시계로 정한 값이라 실행기 시계가 앞서는 만큼 일찍 닿는다. 전달 < DELIVERY_MAX_MS, 시계 차이 <= CLOCK_SKEW_MS,
+// 처리의 합 <= RENEW_HANDLING_MS이면 검사 시각 < s + RENEW_MARGIN_MS <= 앞 임대의 끝이 되어 등호(정각)도 믿는다. 이 가정 밖에서는 믿은 끝이
+// 틀릴 수 있다. 수명 판단(lifecycle.ts의 RENEW_MARGIN_MS)이 같은 식을 쓴다: 장부의 공개 면을 늘리지 않고, 두 자리가 같은 값을 쓰는지는
+// 경계 시험(test/ledger/lease-trust.test.ts)이 지킨다.
+const RENEW_MARGIN_MS = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS + RENEW_HANDLING_MS;
 
 // 갱신 사슬. 갱신을 발행 시각 순서로 시작 임대부터 이어 본다: recordRenewInstruction이 앞 임대 지시보다 늦은 갱신에만
 // 끝을 적으므로, 갱신마다 끝이 있으면 발행 시각 순서가 기록 순서이고 발행 시각이 가장 큰 갱신이 실제로 마지막에 발급한 갱신이다.

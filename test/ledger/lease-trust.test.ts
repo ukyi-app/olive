@@ -3,7 +3,7 @@
 import { expect, test } from "bun:test";
 import { limits, type RunStatus } from "../../src/contract/v1/index.ts";
 import { type Ledger, type RestorePorts, Restorer } from "../../src/ledger/index.ts";
-import { type LifecyclePolicy, type LifecycleView, nextIntent, RENEW_MARGIN_MS } from "../../src/supervisor/scheduler/lifecycle.ts";
+import { type LifecyclePolicy, type LifecycleView, nextIntent, RENEW_HANDLING_MS, RENEW_MARGIN_MS } from "../../src/supervisor/scheduler/lifecycle.ts";
 import { clock, digest, id, must, NOW, open, ready, startedWorker, tempPath, worker } from "./helpers.ts";
 
 const MAX = limits.RUN_LEASE_MAX_MS;
@@ -64,7 +64,7 @@ function renewedThenReopened(renewAts: number[]) {
 }
 
 test("보장 1: 사슬의 모든 갱신이 앞 임대의 끝보다 여유만큼 앞서 발행됐을 때만 발급한 끝이 임대다", () => {
-  expect(RENEW_MARGIN_MS).toBe(limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS);
+  expect(RENEW_MARGIN_MS).toBe(limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS + RENEW_HANDLING_MS);
 
   // 경계: 발행 + 여유 = 앞 임대의 끝이면 믿는다(실행기는 끝 정각부터 거절하고, 전달은 상한 미만이다).
   const edge = renewedThenReopened([LAST_TIMELY]);
@@ -112,6 +112,73 @@ test("보장 1·3의 경계가 같다: 판단이 갱신을 내는 마지막 시�
   expect(times(other, late.runId).lease).toEqual({ issuedAt: LAST_TIMELY + 1, expiresAt: "unknown" });
 });
 
+// 실행기가 갱신을 적용하는가를 실행기의 검사 식으로 계산한다(실행기를 띄우지 않는다). 시각은 감독 시계이고 ahead는 실행기 시계가
+// 감독 시계보다 앞선 양이다. 받을 때 봉투가 not_yet_valid·expired가 아니어야 하고(src/contract/v1/envelope.ts의 "시한"),
+// nonce를 저장한 뒤의 처리 시각에도 봉투가 시한 안이어야 하며(src/executor/store.ts의 consume), 그 처리 시각이 앞 임대의 끝 미만이어야
+// 연장한다(src/executor/worker.ts의 expire: now >= lease_until이면 닫는다).
+interface Delivery {
+  issuedAt: number;
+  prevEnd: number;
+  expiresAt: number;
+  sendHandling: number;
+  delivery: number;
+  ahead: number;
+  receiveHandling: number;
+}
+function executorApplies(p: Delivery): boolean {
+  const received = p.issuedAt + p.sendHandling + p.delivery + p.ahead;
+  const checked = received + p.receiveHandling;
+  if (p.issuedAt > received + limits.CLOCK_SKEW_MS || p.expiresAt <= received) return false;
+  if (p.expiresAt <= checked) return false;
+  return checked < p.prevEnd;
+}
+// 뒤 조각(배정기)이 지킬 송신 규칙(ledger.md "스케줄러"): 싣는 순간 앞 임대의 끝과 봉투 시한 가운데 이른 것까지 여유 이상 남았을 때만 싣는다.
+const maySendRenew = (sendAt: number, prevEnd: number, expiresAt: number) => Math.min(prevEnd, expiresAt) - sendAt >= RENEW_MARGIN_MS;
+
+test("가정의 경계: 장부가 믿는 마지막 갱신은 전달 상한 1ms 전·시계 오차 상한·처리 허용치 끝에서도 실행기가 적용하고, 가정을 1ms 넘으면 어긋난다", () => {
+  const prevEnd = NOW + MAX;
+  const sealed = (issuedAt: number) => issuedAt + limits.MESSAGE_TTL_MAX_MS;
+  // 리뷰의 재현 입력: 전달 9999ms, 실행기 시계 +1000ms, 처리 1ms(싣기 전 또는 받은 뒤). 처리 허용치를 넣지 않은 여유의 마지막 시각
+  // (앞 끝 - 전달 - 오차)에 낸 갱신은 실행기가 앞 임대의 끝 정각에 검사해 닫는다. 장부는 그 시각의 갱신을 믿지 않는다.
+  const oldEdge = prevEnd - limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS;
+  const review = { delivery: limits.DELIVERY_MAX_MS - 1, ahead: limits.CLOCK_SKEW_MS };
+  for (const [sendHandling, receiveHandling] of [[1, 0], [0, 1]]) {
+    expect(executorApplies({ issuedAt: oldEdge, prevEnd, expiresAt: sealed(oldEdge), sendHandling, receiveHandling, ...review })).toBe(false);
+  }
+  expect(renewedThenReopened([oldEdge]).lease).toEqual({ issuedAt: oldEdge, expiresAt: "unknown" });
+
+  // 장부가 믿는 마지막 발행 시각(LAST_TIMELY)에서는 같은 입력을 실행기가 적용한다.
+  expect(renewedThenReopened([LAST_TIMELY]).lease).toEqual({ issuedAt: LAST_TIMELY, expiresAt: LAST_TIMELY + MAX });
+  const at = (p: Partial<Delivery>) => executorApplies({ issuedAt: LAST_TIMELY, prevEnd, expiresAt: sealed(LAST_TIMELY), sendHandling: 0, receiveHandling: 0, ...review, ...p });
+  expect(at({ sendHandling: 1 })).toBe(true);
+  expect(at({ receiveHandling: 1 })).toBe(true);
+  // 가정의 끝(처리의 합이 허용치, 실행기 시계가 오차 상한만큼 앞섬이나 뒤짐)에서도 적용한다.
+  for (const [sendHandling, receiveHandling] of [[RENEW_HANDLING_MS, 0], [0, RENEW_HANDLING_MS], [RENEW_HANDLING_MS / 2, RENEW_HANDLING_MS / 2]]) {
+    expect(at({ sendHandling, receiveHandling })).toBe(true);
+    expect(at({ sendHandling, receiveHandling, ahead: -limits.CLOCK_SKEW_MS })).toBe(true);
+  }
+  // 가정 밖: 처리가 허용치를 1ms 넘거나, 전달이 상한에 닿거나, 시계가 오차 상한보다 1ms 더 앞서면 실행기는 앞 임대의 끝 정각에 검사해 닫는다.
+  // 장부의 끝은 그래도 LAST_TIMELY + MAX다(남는 한계).
+  expect(at({ receiveHandling: RENEW_HANDLING_MS + 1 })).toBe(false);
+  expect(at({ sendHandling: RENEW_HANDLING_MS + 1 })).toBe(false);
+  expect(at({ receiveHandling: RENEW_HANDLING_MS, delivery: limits.DELIVERY_MAX_MS })).toBe(false);
+  expect(at({ receiveHandling: RENEW_HANDLING_MS, ahead: limits.CLOCK_SKEW_MS + 1 })).toBe(false);
+
+  // 봉투 시한: 발행 시각부터 기본 수명 전체로 봉한 봉투는 앞 임대보다 늦게 끝나 걸리지 않는다. 짧게 봉한 봉투(리뷰의 수명 10000)는
+  // 앞 임대가 남아 있어도 받을 때 만료될 수 있고, 송신 규칙이 그 봉투를 싣지 않는다.
+  expect(sealed(LAST_TIMELY)).toBeGreaterThan(prevEnd);
+  expect(maySendRenew(LAST_TIMELY, prevEnd, sealed(LAST_TIMELY))).toBe(true);
+  const short = LAST_TIMELY + 10_000;
+  expect(at({ expiresAt: short, delivery: limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS })).toBe(false);
+  expect(maySendRenew(LAST_TIMELY, prevEnd, short)).toBe(false);
+  // 송신 규칙을 통과한 봉투는 받은 뒤의 처리가 허용치 안이면, 싣기까지 얼마가 걸렸든 실행기가 적용한다.
+  for (const sendHandling of [0, 1, RENEW_HANDLING_MS]) {
+    const issuedAt = LAST_TIMELY - sendHandling;
+    expect(maySendRenew(issuedAt + sendHandling, prevEnd, sealed(issuedAt))).toBe(true);
+    expect(executorApplies({ issuedAt, prevEnd, expiresAt: sealed(issuedAt), sendHandling, receiveHandling: RENEW_HANDLING_MS, ...review })).toBe(true);
+  }
+});
+
 test("보장 2: 기본 간격으로 임대 길이의 두 배를 넘게 연달아 갱신하고 조회로 빠지지 않으며, 다시 열어도 같은 답이다", () => {
   const path = tempPath();
   let ledger = open(path);
@@ -153,7 +220,7 @@ test("보장 3: 판단은 여유 없이 갱신을 내지 않고, 정책 검증�
   expect(() => nextIntent(view, { ...LIFE, renewEveryMs: MAX - RENEW_MARGIN_MS })).not.toThrow();
   expect(() => nextIntent(view, { ...LIFE, renewEveryMs: MAX - RENEW_MARGIN_MS + 1 })).toThrow(TypeError);
 
-  // 다른 호출자가 늦은 갱신을 기록해도 장부는 그 끝을 믿지 않고, 판단은 그 뒤로 같은 ID를 조회한다.
+  // 판단을 거치지 않았거나 판단 뒤 시각을 다시 읽어 늦은 갱신을 기록해도 장부는 그 끝을 믿지 않고, 판단은 그 뒤로 같은 ID를 조회한다.
   const path = tempPath();
   const first = open(path);
   const { runId } = running(first);
