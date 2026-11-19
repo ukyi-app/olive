@@ -321,16 +321,21 @@ test("G05 열기: 이미 있는 빈 파일은 이 설치가 예약했다는 증�
 
 test("G05 열기: 끊긴 첫 설치와 스키마가 같아도 업무 기록이 한 줄 있으면 받지 않는다", () => {
   const path = tempPath();
-  const broken = [
+  const fixed = [
     { version: 1, name: "0001-a.sql", sql: "CREATE TABLE a (x INTEGER) STRICT;" },
-    { version: 2, name: "0002-b.sql", sql: "INSERT INTO nope VALUES (1);" },
+    { version: 2, name: "0002-b.sql", sql: "CREATE TABLE b (x INTEGER) STRICT;" },
   ];
-  expect(openLedger(path, { clock, mode: "create", migrations: broken })).toMatchObject({ ok: false, reason: "migration_failed" });
+  // 둘째 판의 커밋 직전에 끊어 첫 판까지만 적용된 파일을 만든다.
+  const faults = {
+    at(point: string) {
+      if (point === "migration:2") throw new Error("주입한 실패");
+    },
+  };
+  expect(openLedger(path, { clock, mode: "create", migrations: fixed, faults })).toMatchObject({ ok: false, reason: "migration_failed" });
   const raw = new Database(path);
   raw.run("INSERT INTO a VALUES (7)");
   raw.close();
   const before = readFileSync(path);
-  const fixed = [broken[0] as (typeof broken)[number], { version: 2, name: "0002-b.sql", sql: "CREATE TABLE b (x INTEGER) STRICT;" }];
   expect(openLedger(path, { clock, mode: "create", migrations: fixed })).toMatchObject({ ok: false, reason: "foreign_data" });
   expect(readFileSync(path).equals(before)).toBe(true);
 });

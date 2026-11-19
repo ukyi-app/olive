@@ -6,7 +6,7 @@
 // 5단계는 지금의 시도와 정지 상태를 확인한 같은 동기 구간에서 완료 표시, 장부의 허가, 반환값을 정한다.
 // 반환값은 그 순간의 판정이다. 그 뒤의 판단(stopGeneration, intakeOpen)은 단계 결과가 아니라 지금의 장부에서 읽는다.
 import { CONTRACT, parsePrincipal, queriesAfterReconnect, type RunStatus } from "../contract/v1/index.ts";
-import { type Ledger, type PendingInputs, type PendingReport, RESTORE_KEY, type RestoreAttempt, type Run, type SlotHold, type SlotHoldObservation } from "./ledger.ts";
+import { type Ledger, type PendingInputs, type PendingReport, RESTORE_KEY, type RestoreAttempt, type Run, type SlotHold, type SlotHoldObservation, type SnapshotOrigin } from "./ledger.ts";
 import { SLOT_FREE, TERMINAL } from "./states.ts";
 
 // ---- 포트(뒤 작업이 채운다) ----
@@ -106,12 +106,14 @@ export interface Step4 {
   unknown: string[];
 }
 
-export type ClosedBecause = "stopped" | "stop_unknown" | "stop_changed" | "contract_mismatch" | "peer_unconfirmed" | "occupancy_unresolved" | "occupancy_unconfirmed" | "ledger_unwritable";
+export type ClosedBecause = "snapshot_hold" | "stopped" | "stop_unknown" | "stop_changed" | "contract_mismatch" | "peer_unconfirmed" | "occupancy_unresolved" | "occupancy_unconfirmed" | "ledger_unwritable";
 
 export interface Step5 {
   // 이 단계가 끝난 순간의 판정이다. 그 뒤의 판단은 intakeOpen()으로 읽는다.
   intakeMayOpen: boolean;
   closedBecause: ClosedBecause[];
+  // 이 장부가 사본에서 떴으면 그 사실과 사본 시각. held면 관리자 대조 전이라 새 실행이 0건이다. 원본이면 null.
+  snapshotOrigin: SnapshotOrigin | null;
   diagnosisPausedUntil: number | null;
   // 시작 후보: 이 실행 자체를 막는 사유(옛 세대, 점유 관측, 입력 취소·만료, 기한)가 없는 대기 실행이다.
   // 시작을 보장하지 않는다. 접수 허가, 슬롯, 예산·입력 digest(not_startable)는 시작 트랜잭션이 다시 본다.
@@ -214,10 +216,10 @@ export class Restorer {
     }
   }
 
-  // 더 새로운 복원 시도가 시작됐으면 이 시도의 늦은 응답으로 장부를 바꾸지 않는다.
+  // 더 새로운 복원 시도가 시작됐거나 사본 대조가 끝나 이 시도가 끝났으면 늦은 응답으로 장부를 바꾸지 않는다.
   #requireCurrent(step: number): RestoreAttempt {
     const attempt = this.#attempt;
-    if (attempt === null || !this.ledger.isCurrentRestore(attempt)) throw new RestoreStepError(step, "더 새로운 복원 시도가 시작됨");
+    if (attempt === null || !this.ledger.isCurrentRestore(attempt)) throw new RestoreStepError(step, "이 복원 시도는 더는 지금의 시도가 아니다");
     return attempt;
   }
 
@@ -425,10 +427,12 @@ export class Restorer {
       const stop = this.ledger.readStop();
       const pause = this.ledger.readPause();
       const view = this.ledger.queueView();
-      if (!stop.known || !pause.known || !view.known) throw new RestoreStepError(5, "장부를 읽지 못함");
+      const origin = this.ledger.snapshotOrigin();
+      if (!stop.known || !pause.known || !view.known || !origin.known) throw new RestoreStepError(5, "장부를 읽지 못함");
       const step2 = this.#step2;
       if (step2 === null) throw new RestoreStepError(5, "2단계의 판정이 없음");
       const closedBecause: ClosedBecause[] = [];
+      if (origin.value?.held === true) closedBecause.push("snapshot_hold");
       if (stop.value === null) closedBecause.push("stop_unknown");
       else if (stop.value.stopped) closedBecause.push("stopped");
       if (step2.contractMismatches.length > 0) closedBecause.push("contract_mismatch");
@@ -444,6 +448,7 @@ export class Restorer {
       return {
         intakeMayOpen: granted,
         closedBecause,
+        snapshotOrigin: origin.value,
         diagnosisPausedUntil: pause.value,
         queued: barred(null),
         staleQueued: barred("run_generation_stale"),
