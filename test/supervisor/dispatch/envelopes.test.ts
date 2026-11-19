@@ -178,7 +178,7 @@ describe("보장 2: 같은 지시에서 다시 만든 봉투는 같은 요청이
 
   test("시작 지시의 재전송은 장부 발행 시각의 시한 안에서만 된다(시한을 앞으로 옮기지 않는다)", () => {
     const draft = drafts().task_start.draft;
-    const lastSendable = startIssuedAt + limits.MESSAGE_TTL_MS - limits.DELIVERY_MAX_MS;
+    const lastSendable = startIssuedAt + limits.MESSAGE_TTL_MS - limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS;
     expect(sealDraft(draft, lastSendable, ports()).ok).toBe(true);
     expect(sealDraft(draft, lastSendable + 1, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
   });
@@ -233,11 +233,12 @@ describe("보장 4: 만든 봉투는 계약 v1의 검증기를 통과한다", ()
     });
   }
 
-  test("남은 시한이 전달 지연 상한보다 짧으면 too_late_to_send, 같으면 만든다", () => {
+  test("남은 시한이 전달 지연 상한과 시계 오차의 합보다 짧으면 too_late_to_send, 같으면 만든다", () => {
     const draft = drafts().task_cancel.draft;
     const issued = NOW;
-    expect(sealDraft({ ...draft, issuedAt: issued }, issued + limits.MESSAGE_TTL_MS - limits.DELIVERY_MAX_MS, ports()).ok).toBe(true);
-    expect(sealDraft({ ...draft, issuedAt: issued }, issued + limits.MESSAGE_TTL_MS - limits.DELIVERY_MAX_MS + 1, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
+    const last = issued + limits.MESSAGE_TTL_MS - limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS;
+    expect(sealDraft({ ...draft, issuedAt: issued }, last, ports()).ok).toBe(true);
+    expect(sealDraft({ ...draft, issuedAt: issued }, last + 1, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
   });
 
   test("갱신: 임대 끝을 모르면 lease_unknown, 계약 경계 밖이면 lease_out_of_range", () => {
@@ -292,17 +293,70 @@ describe("보장 4: 만든 봉투는 계약 v1의 검증기를 통과한다", ()
 });
 
 describe("보낼 수 있다고 낸 봉투는 전달 상한 안에서 받는 쪽이 받는다", () => {
-  test("작업 기한까지 전달 상한만큼 남지 않은 시작은 봉하지 않는다(deadline_too_close)", async () => {
+  test("작업 기한까지 전달 상한만큼 남지 않은 시작은 봉하지 않는다(deadline_too_close)", () => {
     const base = { run, requestId: REQ_ID, stopGeneration: STOP_GEN, issuedAt: NOW };
     // 기한 T+1을 T에 봉하면 1ms 뒤 받는 쪽이 deadline_passed로 거절한다.
     const oneMs = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + 1 } }));
     expect(sealDraft(oneMs, NOW, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
     const short = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + limits.DELIVERY_MAX_MS - 1 } }));
     expect(sealDraft(short, NOW, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
-    // 정확히 상한만큼 남으면 봉한다. 전달은 상한 미만이라 가장 늦게 받는 시각은 NOW + DELIVERY_MAX_MS - 1이다.
+    // 전달 상한만큼만 남은 기한은 실행기 시계가 앞서면 전달 안에서 지나므로 봉하지 않는다.
     const exact = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + limits.DELIVERY_MAX_MS } }));
-    const envelope = sealed(exact, NOW);
-    expect(await verifyEnvelope(envelope, ctx(WORKER, NOW + limits.DELIVERY_MAX_MS - 1, false))).toMatchObject({ ok: true, action: "task_start" });
+    expect(sealDraft(exact, NOW, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
+  });
+
+  describe("실행기 시계가 CLOCK_SKEW_MS만큼 앞서거나 늦어도 전달 상한 안에서 받는다", () => {
+    const margin = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS;
+    const lastDelivery = limits.DELIVERY_MAX_MS - 1;
+    const skews = [limits.CLOCK_SKEW_MS, -limits.CLOCK_SKEW_MS];
+
+    test("작업 기한: 11000ms 남으면 봉하고 양쪽 시계에서 통과, 10999ms면 deadline_too_close", async () => {
+      const base = { run, requestId: REQ_ID, stopGeneration: STOP_GEN, issuedAt: NOW };
+      const under = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + margin - 1 } }));
+      expect(sealDraft(under, NOW, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
+      const exact = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + margin } }));
+      const envelope = sealed(exact, NOW);
+      for (const skew of skews) {
+        expect(await verifyEnvelope(envelope, ctx(WORKER, NOW + lastDelivery + skew, false))).toMatchObject({ ok: true, action: "task_start" });
+      }
+    });
+
+    test("봉투 시한: 11000ms 남으면 봉하고 양쪽 시계에서 통과, 10999ms면 too_late_to_send", async () => {
+      const draft = drafts().task_cancel.draft;
+      const issued = NOW;
+      const sendAt = issued + limits.MESSAGE_TTL_MS - margin;
+      expect(sealDraft({ ...draft, issuedAt: issued }, sendAt + 1, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
+      const envelope = sealed({ ...draft, issuedAt: issued }, sendAt);
+      expect(envelope.header.expires_at - sendAt).toBe(margin);
+      for (const skew of skews) {
+        expect(await verifyEnvelope(envelope, ctx(WORKER, sendAt + lastDelivery + skew, true))).toMatchObject({ ok: true, action: "task_cancel" });
+      }
+    });
+
+    test("발행 시각이 고정된 시작·갱신의 마지막 재전송은 발행 + 19000ms이고 양쪽 시계에서 통과한다", async () => {
+      const start = ok(startDraft({ run, requestId: REQ_ID, stopGeneration: STOP_GEN, issuedAt: NOW }));
+      const renew = ok(renewDraft({ run: facts, requestId: REQ_ID, stopGeneration: STOP_GEN, now: NOW, leaseUntil: NOW + limits.RUN_LEASE_MAX_MS }));
+      const lastSend = NOW + 19_000;
+      for (const [draft, knows] of [
+        [start, false],
+        [renew, true],
+      ] as const) {
+        expect(sealDraft(draft, lastSend + 1, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
+        const envelope = sealed(draft, lastSend);
+        expect(envelope.header.issued_at).toBe(NOW);
+        for (const skew of skews) {
+          expect(await verifyEnvelope(envelope, ctx(WORKER, lastSend + lastDelivery + skew, knows))).toMatchObject({ ok: true, action: draft.action });
+        }
+      }
+    });
+  });
+
+  test("갱신 생성기에 빈 발행 시각을 주면 봉할 때와 같은 issued_at_unknown이다", () => {
+    const base = { run: facts, requestId: REQ_ID, stopGeneration: STOP_GEN, leaseUntil: NOW + limits.RUN_LEASE_MAX_MS };
+    for (const empty of [null, undefined]) {
+      expect(renewDraft({ ...base, now: empty as unknown as number })).toEqual({ ok: false, reason: "issued_at_unknown" });
+    }
+    expect(renewDraft({ ...base, now: Number.NaN })).toEqual({ ok: false, reason: "bad_time" });
   });
 
   test("발행 시각이 빈 시작·갱신 초안은 봉하는 때의 now로 채우지 않고 거절한다", () => {
@@ -381,6 +435,29 @@ describe("보낼 수 있다고 낸 봉투는 전달 상한 안에서 받는 쪽�
       altered((e) => ({ ...e, body: { run_id: RUN_ID, reason: "budget" } })),
     ];
     for (const s of cases) expect(sealDraft(draft, NOW, ports(1, s))).toEqual({ ok: false, reason: "signer_mismatch" });
+  });
+
+  test("서명 포트가 쥔 입력과 반환값을 봉한 뒤에 고쳐도 돌려준 봉투는 그대로이고 받는 쪽을 통과한다", async () => {
+    // 포트가 입력과 자기 반환값의 참조를 보관했다가 sealDraft가 돌아온 뒤 임대 끝 T+30000을 T+20000으로 고치는 입력이다.
+    const leaseUntil = NOW + limits.RUN_LEASE_MAX_MS;
+    const draft = ok(renewDraft({ run: facts, requestId: REQ_ID, stopGeneration: STOP_GEN, now: NOW, leaseUntil }));
+    const kept: { input?: { body: unknown }; output?: Envelope } = {};
+    const keeper: Signer = {
+      seal: (input) => {
+        kept.input = input;
+        kept.output = sealEnvelope(input, keys.privateKey);
+        return kept.output;
+      },
+    };
+    const envelope = sealed(draft, NOW, ports(1, keeper));
+    const before = structuredClone(envelope);
+    (kept.input?.body as { lease_until: number }).lease_until = NOW + 20_000;
+    (kept.output?.body as { lease_until: number }).lease_until = NOW + 20_000;
+    (kept.output as Envelope).header.expires_at = NOW + 1;
+    (kept.output as Envelope).signature = "x";
+    expect(envelope).toEqual(before);
+    expect(envelope.body).toEqual({ run_id: RUN_ID, lease_until: leaseUntil });
+    expect(await verifyEnvelope(envelope, ctx(WORKER, NOW, true))).toMatchObject({ ok: true, action: "run_renew" });
   });
 
   test("돌려준 봉투의 본문을 고쳐도 보존한 초안은 그대로다", () => {

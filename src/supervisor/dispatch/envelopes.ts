@@ -13,7 +13,6 @@ import {
   type Envelope,
   type Header,
   limits,
-  maySend,
   parsePrincipal,
   type RejectReason,
   ROLES,
@@ -211,6 +210,7 @@ export function renewDraft(input: RenewDraftInput): Drafted<"run_renew"> {
   if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
   if (!isRecord(input.run)) return refuse("input_malformed", { field: "run" });
   if (missing(input.leaseUntil)) return refuse("lease_unknown");
+  if (missing(input.now)) return refuse("issued_at_unknown");
   if (!Number.isSafeInteger(input.now)) return refuse("bad_time");
   const leaseUntil = input.leaseUntil as number;
   // 계약 v1의 받는 쪽 경계: 발급 시각보다 늦고 발급 + RUN_LEASE_MAX_MS 이하.
@@ -307,6 +307,12 @@ export function ackDraft(input: { recipient: string; stopGeneration: number; ids
 
 // ---- 봉하기 ----
 
+// 봉할 때 봉투 시한과 시작의 작업 기한에 남아 있어야 하는 시간. 실행기는 자기 시계로 expires_at·deadline_at에 닿으면 거절하고,
+// v1은 실행기 시계가 감독보다 CLOCK_SKEW_MS까지 앞서는 것을 막지 않는다(not_yet_valid는 반대 방향만 본다). 전달이 DELIVERY_MAX_MS
+// 미만이면 실행기 시계의 받는 시각은 now + DELIVERY_MAX_MS + CLOCK_SKEW_MS보다 이르므로, 정확히 이만큼 남으면 충분하다.
+// 계약의 maySend(DELIVERY_MAX_MS만 봄)보다 넓다. 발행 시각이 고정된 시작·갱신의 마지막 재전송은 issued_at + 19000ms다.
+const SEND_MARGIN_MS = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS;
+
 export interface SealPorts {
   random: Random;
   signer: Signer;
@@ -326,13 +332,11 @@ export function sealDraft(draft: Draft, now: number, ports: SealPorts): Sealed {
   const expiresAt = issuedAt + (spec.lifetimeMs ?? limits.MESSAGE_TTL_MS);
   const deadline = draft.action === "task_start" && isRecord(draft.body) ? draft.body.deadline_at : undefined;
   if (Number.isSafeInteger(deadline)) {
-    // 받는 쪽은 받는 시각이 작업 기한 이후면(정각 포함) deadline_passed로 거절한다. 봉투의 시한과 같은 여유(maySend)를 기한에도 둔다.
-    // 전달은 DELIVERY_MAX_MS 미만이고, v1의 시계 오차(CLOCK_SKEW_MS)는 보낸 쪽 시계가 앞선 경우만 받아 주므로(not_yet_valid)
-    // 받는 쪽 시각은 now + DELIVERY_MAX_MS보다 이르다. 기한까지 그만큼 남지 않았으면 봉투가 살아 있어도 실행기가 띄우지 않는다.
+    // 받는 쪽은 자기 시계로 받는 시각이 작업 기한 이후면(정각 포함) deadline_passed로 거절한다. 봉투 시한과 같은 여유를 기한에도 둔다.
     if ((deadline as number) <= now) return refuse("deadline_passed");
-    if (!maySend({ expires_at: deadline as number }, now).ok) return refuse("deadline_too_close");
+    if ((deadline as number) - now < SEND_MARGIN_MS) return refuse("deadline_too_close");
   }
-  if (!maySend({ expires_at: expiresAt }, now).ok) return refuse("too_late_to_send");
+  if (expiresAt - now < SEND_MARGIN_MS) return refuse("too_late_to_send");
   // 대조의 기준(본문의 정규 바이트)을 서명 포트에 넘기기 전에 따로 만든다. 포트에는 그 바이트에서 다시 만든 사본을 넘기므로
   // 포트가 받은 본문을 고쳐도 초안과 기준은 바뀌지 않고, 돌려준 봉투의 본문도 초안과 객체를 나누지 않는다.
   let bodyJson: string;
@@ -377,14 +381,18 @@ export function sealDraft(draft: Draft, now: number, ports: SealPorts): Sealed {
     if (error instanceof SealError) return refuse("seal_refused", { sealReason: error.reason });
     throw error;
   }
-  return sameAsSent(envelope, expected, bodyJson) ? { ok: true, envelope } : refuse("signer_mismatch");
+  if (!sameAsSent(envelope, expected, bodyJson)) return refuse("signer_mismatch");
+  // 대조한 객체를 그대로 내주지 않는다. 포트가 넘겨받은 입력이나 자기 반환값의 참조를 쥐고 있다가 나중에 고치면 전송할 봉투도 바뀐다.
+  // 이 모듈만 쥔 기준 머리, 보관한 정규 바이트에서 새로 만든 본문, 서명 문자열(값)로 새 봉투를 만든다.
+  return { ok: true, envelope: { header: expected, signature: envelope.signature, body: JSON.parse(bodyJson) } };
 }
 
-// 서명 포트가 돌려준 봉투가 넘긴 값 그대로인가. 봉투의 칸은 셋뿐이고, 머리는 칸 전부(계약 판, 여분 칸 포함)가 기대한 머리와
-// 같은 정규 바이트이고, 본문은 넘기기 전에 만든 정규 바이트와 같다(머리의 body_digest도 그 바이트의 digest다).
+// 서명 포트가 돌려준 봉투가 넘긴 값 그대로인가. 봉투의 칸은 셋뿐이고, 서명은 문자열이며, 머리는 칸 전부(계약 판, 여분 칸 포함)가
+// 기대한 머리와 같은 정규 바이트이고, 본문은 넘기기 전에 만든 정규 바이트와 같다(머리의 body_digest도 그 바이트의 digest다).
 // 한계: 서명 바이트는 공개 키가 없어 대조하지 않는다. 서명이 감독의 키로 머리에 맞는지는 받는 쪽 verifyEnvelope만 안다.
-function sameAsSent(envelope: unknown, expected: Header, bodyJson: string): boolean {
+function sameAsSent(envelope: unknown, expected: Header, bodyJson: string): envelope is Envelope {
   if (!isRecord(envelope) || Object.keys(envelope).sort().join() !== "body,header,signature") return false;
+  if (typeof envelope.signature !== "string") return false;
   try {
     return canonicalJson(envelope.header) === canonicalJson(expected) && canonicalJson(envelope.body) === bodyJson;
   } catch {

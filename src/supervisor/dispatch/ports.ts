@@ -31,7 +31,8 @@ export type SendOutcome = "sent" | "no_connection" | "too_late_to_send";
 
 // 봉투 하나를 그 머리의 recipient가 가리키는 실행기의 연결 하나에 싣는다.
 // - 연결이 살아 있지 않으면(mayIssue) 싣지 않고 no_connection. 쌓아 두었다가 다시 붙은 뒤 보내지 않는다.
-// - 싣는 그 순간 남은 시한이 전달 지연 상한보다 짧으면(maySend) 싣지 않고 too_late_to_send. 만들 때 본 것으로 대신하지 않는다.
+// - 실제로 싣는 시각에 봉투 시한과 (시작이면) 본문의 작업 기한의 여유를 다시 본다. 봉할 때와 같은 여유(DELIVERY_MAX_MS + CLOCK_SKEW_MS)가
+//   남지 않았으면 싣지 않고 too_late_to_send. 봉한 뒤 지난 시간만큼 줄었으므로 만들 때 본 것으로 대신하지 않는다.
 // - 어느 거절이든 봉투를 고치거나 새 요청 ID로 다시 만들지 않는다. 그 실행은 장부에 그대로 두고 상태를 묻는다.
 export interface InstructionSink {
   send(envelope: Envelope): Promise<SendOutcome>;
