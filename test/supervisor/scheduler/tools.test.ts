@@ -42,7 +42,8 @@ interface World {
   startPhase: Phase;
 }
 
-// 장부 쪽 포트의 가짜. 재시도 키가 같으면 소유자와 무관하게 그 줄을 돌려준다(장부 admitRun의 중복 키와 같은 성질).
+// 장부 쪽 포트의 가짜. 일부러 포트의 소유자 전제를 지키지 않는다: 재시도 키가 같으면 소유자와 무관하게 그 줄을 돌려주고
+// (장부 admitRun의 중복 키와 같은 성질), 참조로 읽을 때도 소유자로 거르지 않는다.
 // 그래서 소유 대조를 처리기가 하지 않으면 이 가짜에서 남의 실행이 보인다.
 function fakePorts(world: World, faults: { throwOn?: string; unknownOn?: string } = {}) {
   const calls: string[] = [];
@@ -73,7 +74,7 @@ function fakePorts(world: World, faults: { throwOn?: string; unknownOn?: string 
       },
       inputPinned: (q) =>
         answer("inputPinned", () => world.pinned.some((p) => p.owner === q.owner && p.sourceRef === q.sourceRef && p.inputDigest === q.inputDigest)),
-      findByRetryKey: (key) => answer("findByRetryKey", () => world.works.find((w) => w.retryKey === key) ?? null),
+      findByRetryKey: (q) => answer("findByRetryKey", () => world.works.find((w) => w.retryKey === q.retryKey) ?? null),
       // 소유자로 거르지 않는 가짜다. 처리기가 돌려받은 줄의 소유자를 대조해야 한다.
       readOwnedWork: (q) => answer("readOwnedWork", () => world.works.find((w) => w.ref === q.ref) ?? null),
       readResult: (ref) => answer("readResult", () => world.results[ref] ?? { state: "none" }),
@@ -174,8 +175,9 @@ describe("자기 요청만", () => {
     expect(w.works[0]?.phase).toBe("queued");
   });
 
-  test("소유 검사가 재시도 키의 중복 판정보다 먼저다", () => {
-    // 장부의 중복 키가 다른 요청의 줄을 돌려주는 경우: 성공으로 돌려주지 않고 그 참조도 싣지 않는다.
+  test("재시도 키 조회가 남의 줄을 돌려주면 포트의 전제가 깨진 것이라 unknown이다", () => {
+    // 재시도 키는 요청 ID를 담아 소유자에 묶이므로 포트는 그 소유자의 줄만 돌려줘야 한다. 어긴 줄에는 충돌도 성공도 답하지 않는다:
+    // 충돌로 답하면 빈 키의 새 접수(ok)와 구별돼 그 키에 줄이 있다는 것이 드러난다.
     const foreign: WorkRecord = {
       ref: uuid("ffffffff"),
       owner: REQ_B,
@@ -186,9 +188,18 @@ describe("자기 요청만", () => {
     const w = world({ works: [foreign] });
     const p = fakePorts(w);
     const answer = handleToolCall("start_worker", startArgs(), ctx(), p.ports);
-    expect(answer).toEqual({ outcome: "refused", tool: "start_worker", reason: "retry_conflict", field: null });
+    expect(answer).toEqual({ outcome: "unknown", tool: "start_worker" });
     expect(JSON.stringify(answer)).not.toContain(foreign.ref);
     expect(p.writes).toEqual([]);
+    expect(p.calls).toEqual(["liveSession", "inputPinned", "findByRetryKey"]);
+    // 소유자 칸이 없거나 문자열이 아닌 줄도 대조할 수 없으니 unknown이다.
+    const { owner: _owner, ...ownerless } = foreign;
+    for (const bad of [ownerless, { ...foreign, owner: 7 }]) {
+      const q = fakePorts(world());
+      const ports: ToolPorts = { ...q.ports, ledger: { ...q.ports.ledger, findByRetryKey: () => ({ known: true, value: bad as unknown as WorkRecord }) } };
+      expect(handleToolCall("start_worker", startArgs(), ctx(), ports), JSON.stringify(bad)).toEqual({ outcome: "unknown", tool: "start_worker" });
+      expect(q.writes).toEqual([]);
+    }
 
     // 읽기에서 비었다가 쓰기가 남의 줄을 돌려주는 경합도 같다.
     const raced = world();
@@ -199,7 +210,24 @@ describe("자기 요청만", () => {
       ledger: { ...ledger, recordStart: () => ({ known: true, value: { ok: true, record: { ...foreign, owner: REQ_B } } }) },
     };
     const late = handleToolCall("start_worker", startArgs(), ctx(), racing);
-    expect(late).toEqual({ outcome: "refused", tool: "start_worker", reason: "retry_conflict", field: null });
+    expect(late).toEqual({ outcome: "unknown", tool: "start_worker" });
+  });
+
+  test("읽기 포트가 식별 칸이 빠진 자기 줄을 주면 not_found가 아니라 unknown이다", () => {
+    const w = world();
+    const ref = startedRef(handleToolCall("start_worker", startArgs(), ctx(), fakePorts(w).ports));
+    w.results[ref] = { state: "settled", checksPassed: true, valid: true, cleanupPending: false, result: RESULT };
+    const own = w.works[0] as WorkRecord;
+    const { owner: _owner, ...noOwner } = own;
+    const { ref: _ref, ...noRef } = own;
+    for (const bad of [noOwner, noRef]) {
+      for (const tool of ["worker_status", "worker_result", "cancel_worker"] as const) {
+        const p = fakePorts(w);
+        const ports: ToolPorts = { ...p.ports, ledger: { ...p.ports.ledger, readOwnedWork: () => ({ known: true, value: bad as unknown as WorkRecord }) } };
+        expect(handleToolCall(tool, { ref }, ctx(), ports), `${tool} ${Object.keys(bad).join(",")}`).toEqual({ outcome: "unknown", tool });
+        expect(p.writes).toEqual([]);
+      }
+    }
   });
 });
 
@@ -434,12 +462,51 @@ describe("모름은 빈 성공이 아니다", () => {
     // 확인은 모두 통과인데 결과가 없다.
     w.results[ref] = { state: "settled", checksPassed: true, valid: true, cleanupPending: false, result: null };
     expect(handleToolCall("worker_result", { ref }, ctx(), p.ports)).toEqual({ outcome: "unknown", tool: "worker_result" });
-    // 포트가 내부 칸을 더 실어 와도 응답은 정한 칸만 옮긴다.
-    const leaky = { ...RESULT, executorId: "worker-executor/diagnosis/x", account: "acct", pid: 42 };
-    w.results[ref] = { state: "settled", checksPassed: true, valid: true, cleanupPending: false, result: leaky };
+    // 계약 v1 결과 꼴이 아닌 결과는 검사가 덜 된 것이다. 어느 깊이에 칸이 더 붙었거나 빠졌어도 결과 전체를 unknown으로 닫는다.
+    const item = RESULT.items[0] as (typeof RESULT.items)[number];
+    const source = RESULT.refs[0] as (typeof RESULT.refs)[number];
+    const broken: [string, unknown][] = [
+      ["빈 객체", {}],
+      ["최상위 추가 칸", { ...RESULT, executorId: "worker-executor/diagnosis/x", account: "acct", pid: 42 }],
+      ["항목의 PID", { ...RESULT, items: [{ ...item, pid: 42 }] }],
+      ["참조의 계정", { ...RESULT, refs: [{ ...source, account: "demo" }] }],
+      ["항목·참조의 실행기 ID·경로", { ...RESULT, items: [{ ...item, executorId: "example" }], refs: [{ ...source, path: "/example" }] }],
+      ["역할 없음", { outcome: RESULT.outcome, summary: RESULT.summary, items: RESULT.items, refs: RESULT.refs }],
+      ["요약 없음", { ...RESULT, summary: undefined }],
+      ["빈 요약", { ...RESULT, summary: " " }],
+      ["모르는 결과 상태", { ...RESULT, outcome: "done" }],
+      ["항목이 배열이 아님", { ...RESULT, items: {} }],
+      ["항목 원소가 글", { ...RESULT, items: ["x"] }],
+      ["모르는 항목 종류", { ...RESULT, items: [{ kind: "log", text: "x" }] }],
+      ["항목 수 초과", { ...RESULT, items: Array.from({ length: 21 }, () => item) }],
+      ["참조 digest 꼴", { ...RESULT, refs: [{ ...source, digest: "latest" }] }],
+      ["산출물 참조에 digest 없음", { ...RESULT, refs: [{ kind: "artifact", ref: "a/b", digest: null }] }],
+      ["참조에 공백", { ...RESULT, refs: [{ ...source, ref: "a b" }] }],
+    ];
+    for (const [name, result] of broken) {
+      w.results[ref] = { state: "settled", checksPassed: true, valid: true, cleanupPending: false, result: result as never };
+      const answer = handleToolCall("worker_result", { ref }, ctx(), p.ports);
+      expect(JSON.stringify(answer), name).toBe(JSON.stringify({ outcome: "unknown", tool: "worker_result" }));
+    }
+    // 꼴이 맞으면 공개 칸만 새로 만들어 준다.
+    w.results[ref] = { state: "settled", checksPassed: true, valid: true, cleanupPending: false, result: RESULT };
     const ok = handleToolCall("worker_result", { ref }, ctx(), p.ports);
-    expect(ok).toEqual({ outcome: "ok", tool: "worker_result", ref, result: { outcome: RESULT.outcome, summary: RESULT.summary, items: RESULT.items, refs: RESULT.refs } });
-    expect(JSON.stringify(ok)).not.toMatch(/executor|account|pid/);
+    expect(JSON.stringify(ok)).toBe(JSON.stringify({ outcome: "ok", tool: "worker_result", ref, result: { outcome: RESULT.outcome, summary: RESULT.summary, items: RESULT.items, refs: RESULT.refs } }));
+    if (ok.outcome !== "ok" || ok.tool !== "worker_result") throw new Error(JSON.stringify(ok));
+    expect(ok.result.items[0]).not.toBe(item);
+    expect(ok.result.refs[0]).not.toBe(source);
+  });
+
+  test("정책 포트가 정한 세 답 밖의 값을 내면 목적 불허가 아니라 unknown이다", () => {
+    for (const verdict of [{ known: false }, "maybe", undefined, null]) {
+      const p = fakePorts(world());
+      const ports: ToolPorts = { ...p.ports, policy: { judge: () => verdict as never } };
+      expect(handleToolCall("start_worker", startArgs(), ctx(), ports), String(JSON.stringify(verdict))).toEqual({ outcome: "unknown", tool: "start_worker" });
+      expect(p.calls).toEqual(["liveSession"]);
+    }
+    const p = fakePorts(world());
+    const ports: ToolPorts = { ...p.ports, policy: { judge: () => "purpose_not_allowed" } };
+    expect(refused(handleToolCall("start_worker", startArgs(), ctx(), ports))).toEqual({ reason: "purpose_not_allowed", field: "task.purpose" });
   });
 
   test("결과는 검사 통과·유효·정리 대기 아님이 모두 확인될 때만 준다", () => {
@@ -511,7 +578,10 @@ describe("호출 표본", () => {
       expect(fixture.status, file).toBe("candidate");
       expect(file).toBe(`${FIXTURE_DIR}/${fixture.tool}.${fixture.case}.json`);
       const p = fakePorts(structuredClone(fixture.world));
-      expect(handleToolCall(fixture.tool, fixture.arguments, fixture.context, p.ports), file).toEqual(fixture.expect.answer);
+      const answer = handleToolCall(fixture.tool, fixture.arguments, fixture.context, p.ports);
+      expect(answer, file).toEqual(fixture.expect.answer);
+      // 본체가 받는 것은 직렬화된 JSON이다. undefined 칸이 빠진 뒤의 모양까지 같아야 한다.
+      expect(JSON.parse(JSON.stringify(answer)), file).toEqual(fixture.expect.answer);
       expect(p.writes.length, file).toBe(fixture.expect.writes);
     }
   });

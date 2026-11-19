@@ -5,9 +5,10 @@
 // 상태를 갖지 않는다. 장부 읽기·쓰기와 역할 정책은 주입받은 포트로만 만나고, 시각은 문맥으로 받는다.
 // 틀리는 방향은 늘 닫는 쪽이다.
 // - 권한은 인자 밖의 문맥(인증된 세션·논리 요청·호출 ID)에서만 온다. 그런 칸이 인자에 오면 거절한다.
-// - 남의 실행은 "없음"과 같은 거절로 답한다. 소유 검사가 재시도 키의 중복 판정보다 먼저다.
-// - 포트가 모른다고 답하거나 던지면 unknown이다. 빈 성공으로 바꾸지 않는다.
-import { type Result, type Role, ROLES } from "../../contract/v1/index.ts";
+// - 남의 실행(참조·단계·결과)은 "없음"과 같은 거절로 답한다. 재시도 키 조회는 그 소유자의 줄만 돌려준다는 것이 포트의 전제이고,
+//   남의 줄이 돌아오면 충돌이나 성공이 아니라 unknown이다.
+// - 포트가 모른다고 답하거나 던지거나 정한 꼴 밖의 값을 내면 unknown이다. 빈 성공으로 바꾸지 않는다.
+import { limits, type Result, type Role, ROLES } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type LedgerRunState } from "../../ledger/index.ts";
 
 export const TOOL_NAMES = ["start_worker", "worker_status", "worker_result", "cancel_worker"] as const;
@@ -76,7 +77,8 @@ export const TOOL_REFUSALS = [
 ] as const;
 export type ToolRefusal = (typeof TOOL_REFUSALS)[number];
 
-// 결과로 내주는 것. 계약 v1 결과에서 역할을 뺀 칸만 하나씩 옮긴다(포트가 더 실어 온 칸은 따라 나가지 않는다).
+// 결과로 내주는 것. 계약 v1 결과에서 역할을 뺀 칸이다. 포트가 준 결과가 계약 v1 꼴(어느 깊이에도 더 붙은 칸 없음)일 때만
+// 배열 원소까지 새 객체로 만들어 준다.
 export type ResultSummary = Pick<Result, "outcome" | "summary" | "items" | "refs">;
 
 export type ToolAnswer =
@@ -121,8 +123,8 @@ export interface StartRecordInput {
   readonly now: number;
 }
 
-// 같은 재시도 키가 이미 있으면 새 줄을 만들지 않고 그 줄을 돌려준다(장부 admitRun의 중복 키와 같은 성질).
-// 그 줄의 소유자와 내용은 처리기가 다시 대조한다.
+// 같은 소유자의 같은 재시도 키가 이미 있으면 새 줄을 만들지 않고 그 줄을 돌려준다. 다른 소유자의 줄을 돌려주지 않는다
+// (findByRetryKey의 전제). 처리기는 돌려받은 줄의 소유자와 내용을 다시 대조한다.
 export type StartWrite = { readonly ok: true; readonly record: WorkRecord } | { readonly ok: false; readonly reason: "stopped" | "intake_closed" };
 
 export interface CancelInput {
@@ -134,7 +136,7 @@ export interface CancelInput {
 }
 export type CancelWrite = { readonly ok: true; readonly phase: Phase } | { readonly ok: false; readonly reason: "already_ended" };
 
-// 결과 쪽(S6)이 내준 확인. 이 처리기는 결과를 검증하지 않고, 세 확인이 모두 true일 때만 내준다.
+// 결과 쪽(S6)이 내준 확인. 이 처리기는 결과의 내용을 검증하지 않는다. 세 확인이 모두 true이고 결과가 계약 v1 꼴일 때만 내준다.
 export type ResultView =
   | { readonly state: "none" }
   | {
@@ -152,7 +154,9 @@ export interface ToolLedgerPort {
   liveSession(): Answer<{ readonly id: string; readonly generation: number } | null>;
   // 이 원본 참조와 digest가 이 논리 요청의 고정된 입력인가.
   inputPinned(query: { readonly owner: string; readonly sourceRef: string; readonly inputDigest: string }): Answer<boolean>;
-  findByRetryKey(retryKey: string): Answer<WorkRecord | null>;
+  // 전제: 재시도 키는 소유자(논리 요청)에 묶인다. 이 조회와 recordStart는 owner의 줄만 돌려주고, 다른 소유자의 줄은 없는 것으로 다룬다.
+  // 처리기는 키에 요청 ID를 넣지만 장부가 키만으로 찾으면 이 전제가 깨진다. 깨진 줄이 돌아오면 처리기는 unknown으로 닫고 쓰지 않는다.
+  findByRetryKey(query: { readonly owner: string; readonly retryKey: string }): Answer<WorkRecord | null>;
   // 소유자로 찾는 읽기. 처리기는 돌려받은 줄의 소유자를 다시 대조한다.
   readOwnedWork(query: { readonly owner: string; readonly ref: string }): Answer<WorkRecord | null>;
   readResult(ref: string): Answer<ResultView>;
@@ -189,8 +193,8 @@ export const PATTERNS = {
   sessionId: /^[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}$/,
 } as const;
 
-// 권한·자원·주체를 주장하는 칸의 이름. 엄격한 꼴 검사가 어차피 모르는 칸을 거절하지만, 이 이름은 깊이와 무관하게 먼저 찾아
-// forbidden_field로 따로 거절한다(모델이 무엇을 시도했는지 구별해 남기기 위해). 이름은 소문자로 바꾸고 -·_·공백을 지워 대조한다.
+// 권한·자원·주체를 주장하는 칸의 이름. 엄격한 꼴 검사가 어차피 모르는 칸을 거절하지만, 이 이름은 깊이 MAX_DEPTH까지 먼저 찾아
+// forbidden_field로 따로 거절한다(모델이 무엇을 시도했는지 구별해 남기기 위해). 한도를 먼저 만나면 malformed_argument다. 이름은 소문자로 바꾸고 -·_·공백을 지워 대조한다.
 // 앞부분은 계약 v1의 FORBIDDEN_FIELD_NAMES와 같은 뜻의 이름이고, 뒤는 설계 §4 공통 줄(URL·경로·셸·PodSpec·모델명·계정명·승인)과
 // 이 계약이 더한 것(PID·화면·목적지, 세션·소유자·호출 ID, 우선순위·예산·기한)이다.
 const FORBIDDEN = new Set([
@@ -333,9 +337,10 @@ const sameContent = (a: StartContent, b: StartContent) => a.role === b.role && a
 const retryKeyOf = (requestId: string, purpose: string) => `start_worker:${requestId}:${purpose}`;
 
 // 이미 있는 줄을 이 요청의 같은 부탁으로 받아도 되는가. 소유자를 내용보다 먼저 본다.
+// 남의 줄은 포트가 전제를 어긴 것이다. retry_conflict로 답하면 빈 키의 새 접수(ok)와 구별돼 그 키에 줄이 있다는 것이 드러나므로 unknown이다.
 function acceptExisting(record: unknown, ctx: ToolCallContext, key: string, content: StartContent): Step<WorkRecord> {
   if (!isPlainObject(record)) return new Unknown();
-  if (record.owner !== ctx.requestId) return new Refuse("retry_conflict");
+  if (record.owner !== ctx.requestId) return new Unknown();
   if (!validRecord(record)) return new Unknown();
   if (record.retryKey !== key || !sameContent(record.content, content)) return new Refuse("retry_conflict");
   return record;
@@ -347,6 +352,8 @@ function ownedWork(ports: ToolPorts, ctx: ToolCallContext, ref: string): Step<Wo
   if (stopped(record)) return record;
   if (record === null) return new Refuse("not_found");
   if (!isPlainObject(record)) return new Unknown();
+  // 식별 칸이 없으면 남의 줄인지 가릴 수 없다. not_found로 바꾸지 않는다.
+  if (typeof record.owner !== "string" || typeof record.ref !== "string") return new Unknown();
   if (record.owner !== ctx.requestId || record.ref !== ref) return new Refuse("not_found");
   if (!validRecord(record)) return new Unknown();
   return record;
@@ -362,7 +369,8 @@ function startWorker(args: StartWorkerArgs, ctx: ToolCallContext, ports: ToolPor
     return new Unknown();
   }
   if (verdict === "role_not_allowed") return new Refuse("role_not_allowed", "role");
-  if (verdict !== "allowed") return new Refuse("purpose_not_allowed", "task.purpose");
+  if (verdict === "purpose_not_allowed") return new Refuse("purpose_not_allowed", "task.purpose");
+  if (verdict !== "allowed") return new Unknown();
 
   const content: StartContent = { role: args.role, purpose: args.task.purpose, sourceRef: args.task.source_ref, inputDigest: args.task.input_digest };
   const pinned = ask(() => ports.ledger.inputPinned({ owner: ctx.requestId, sourceRef: content.sourceRef, inputDigest: content.inputDigest }));
@@ -370,7 +378,7 @@ function startWorker(args: StartWorkerArgs, ctx: ToolCallContext, ports: ToolPor
   if (pinned !== true) return pinned === false ? new Refuse("input_not_fixed", "task.input_digest") : new Unknown();
 
   const key = retryKeyOf(ctx.requestId, content.purpose);
-  const existing = ask(() => ports.ledger.findByRetryKey(key));
+  const existing = ask(() => ports.ledger.findByRetryKey({ owner: ctx.requestId, retryKey: key }));
   if (stopped(existing)) return existing;
   let record: Step<WorkRecord>;
   if (existing !== null) {
@@ -411,9 +419,45 @@ function workerResult(args: RunRefArgs, ctx: ToolCallContext, ports: ToolPorts):
   if (!checksPassed) return new Refuse("result_check_failed");
   if (!valid) return new Refuse("result_expired");
   if (cleanupPending) return new Refuse("result_cleanup_pending");
-  if (!isPlainObject(result)) return new Unknown();
-  const r = result as Result;
-  return { outcome: "ok", tool: "worker_result", ref: record.ref, result: { outcome: r.outcome, summary: r.summary, items: r.items, refs: r.refs } };
+  const summary = publicResult(result);
+  if (summary === null) return new Unknown();
+  return { outcome: "ok", tool: "worker_result", ref: record.ref, result: summary };
+}
+
+const RESULT_OUTCOMES: readonly unknown[] = ["completed", "needs_input", "failed"];
+const ITEM_KINDS: readonly unknown[] = ["finding", "next_step", "risk", "question"];
+const REF_KINDS: readonly unknown[] = ["artifact", "commit", "pull_request", "path"];
+const RESULT_REF = /^[\x21-\x7e]{1,256}$/;
+const hasExactly = (value: Record<string, unknown>, keys: readonly string[]) => {
+  const own = Object.keys(value);
+  return own.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+};
+
+// 계약 v1 결과 꼴(src/contract/v1/result.ts)의 칸·값을 다시 확인하고 공개 칸만 새로 만든다. 맞지 않으면 null.
+// 어느 깊이든 계약 밖의 칸이 있으면 결과 전체를 버린다: 그런 칸이 있다는 것은 결과 쪽 검사가 덜 됐다는 뜻이다.
+// 전체 바이트 상한과 내용의 검증은 결과 쪽(S6) 몫이다.
+function publicResult(value: unknown): ResultSummary | null {
+  if (!isPlainObject(value) || !hasExactly(value, ["role", "outcome", "summary", "items", "refs"])) return null;
+  if (!(ROLES as readonly unknown[]).includes(value.role) || !RESULT_OUTCOMES.includes(value.outcome)) return null;
+  if (!isText(value.summary, limits.RESULT_SUMMARY_MAX_CHARS)) return null;
+  const { items, refs } = value;
+  if (!Array.isArray(items) || items.length > limits.RESULT_MAX_ITEMS) return null;
+  if (!Array.isArray(refs) || refs.length > limits.RESULT_MAX_REFS) return null;
+  const outItems: Result["items"][number][] = [];
+  for (const item of items) {
+    if (!isPlainObject(item) || !hasExactly(item, ["kind", "text"])) return null;
+    if (!ITEM_KINDS.includes(item.kind) || !isText(item.text, limits.RESULT_ITEM_MAX_CHARS)) return null;
+    outItems.push({ kind: item.kind as Result["items"][number]["kind"], text: item.text });
+  }
+  const outRefs: Result["refs"][number][] = [];
+  for (const ref of refs) {
+    if (!isPlainObject(ref) || !hasExactly(ref, ["kind", "ref", "digest"])) return null;
+    if (!REF_KINDS.includes(ref.kind) || !matches(ref.ref, RESULT_REF)) return null;
+    if (ref.digest !== null && !matches(ref.digest, PATTERNS.sha256)) return null;
+    if (ref.kind === "artifact" && ref.digest === null) return null;
+    outRefs.push({ kind: ref.kind as Result["refs"][number]["kind"], ref: ref.ref, digest: ref.digest });
+  }
+  return { outcome: value.outcome as Result["outcome"], summary: value.summary, items: outItems, refs: outRefs };
 }
 
 function cancelWorker(args: RunRefArgs, ctx: ToolCallContext, ports: ToolPorts): Step<ToolAnswer> {
