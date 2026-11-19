@@ -1,18 +1,19 @@
 {
   "fixture": "olive-control/v2",
   "name": "reject/delivered-to-front-door",
-  "description": "감독 앞으로 낸 봉투가 현관에 닿음",
+  "description": "감독 앞으로 낸 현관의 봉투가 현관에 닿음. 현관은 감독의 키만 믿으므로 현관 이름의 봉투는 서명 단계에서 거절된다",
   "status": "candidate",
   "base": "accept/handshake",
   "changed": [
-    "context.expected_recipient"
+    "context.expected_recipient",
+    "keys"
   ],
   "expect": {
     "ok": false,
-    "reason": "wrong_recipient"
+    "reason": "unknown_sender"
   },
   "keys": {
-    "front-door": "Vo-BR9UecDua7oJ3m8_uwLk1a95EvsKT82O3IMMpSYc"
+    "supervisor": "WBYIZLRFQFGCdfdx_rVvh3dTMoDBRl0m4dHO_bxK5mc"
   },
   "context": {
     "now": 1795046400000,
@@ -20,6 +21,14 @@
     "own_policy_revision": "policy-7",
     "handshake": "none",
     "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
     "awaiting": {},
     "spent_nonces": []
   },
@@ -35,7 +44,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "sh4fD-tVTjE4lKQ2aurC4eOd23vdm7Y1Y4pr8ZRYDDy6B3eCZ0neRVd2IA4sSAupaKW4GnxXscDLCD83vpZrDA",
+    "signature": "XV100HDp5QqFPX6XyvHMz1Mqa2lGUMvpFZnvZ0iKqDfms1qeg2oi-8_jzkwR7iL37IBtnwv5eoMs-4rdYkhbBg",
     "body": {
       "policy_revision": "policy-7"
     }

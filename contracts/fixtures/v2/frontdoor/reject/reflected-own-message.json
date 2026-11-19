@@ -12,7 +12,7 @@
     "reason": "unknown_sender"
   },
   "keys": {
-    "front-door": "Vo-BR9UecDua7oJ3m8_uwLk1a95EvsKT82O3IMMpSYc"
+    "front-door": "coYpHzweDoT_VEnV-IXI6UqDNuloOpp808fBfUtwV5E"
   },
   "context": {
     "now": 1795046400000,
@@ -20,6 +20,14 @@
     "own_policy_revision": "policy-7",
     "handshake": "none",
     "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
     "awaiting": {},
     "spent_nonces": []
   },
@@ -35,7 +43,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "AB8jK0QL-ZRglY0a1V0OJRAv2vcEHg5o-gZCF7EBXkdINwTJCNauYwvSu09-7Wa_M_ov7D3zBcJx9tDrAvfRBQ",
+    "signature": "N_YKBAriti7FXme_M75fMFylQGkKLr0Qo_7cbiKy5FSDYHl7uay5oZUuYvssUH4sXwvpx3pLMgd16Ukz_EE0Ag",
     "body": {
       "policy_revision": "policy-7"
     }

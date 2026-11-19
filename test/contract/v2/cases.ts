@@ -65,7 +65,8 @@ function variant(keys: Keys, base: V2Case, v: Variant): V2Case {
     base: base.name,
     changed: v.changed,
     expect: { ok: false, reason: v.reason },
-    keys: base.keys,
+    // 믿는 키는 늘 받는 쪽의 상대 키다. 받는 쪽을 바꾼 사례는 키도 바뀐다(changed에 keys를 적는다).
+    keys: trustedRaw(keys, context.expected_recipient),
     context,
     message: signed,
   };
@@ -178,9 +179,9 @@ export function buildCases(keys: Keys): V2Case[] {
     }),
     H({
       name: "delivered-to-front-door",
-      description: "감독 앞으로 낸 봉투가 현관에 닿음",
-      reason: "wrong_recipient",
-      changed: ["context.expected_recipient"],
+      description: "감독 앞으로 낸 현관의 봉투가 현관에 닿음. 현관은 감독의 키만 믿으므로 현관 이름의 봉투는 서명 단계에서 거절된다",
+      reason: "unknown_sender",
+      changed: ["context.expected_recipient", "keys"],
       edit: (c) => void (c.context.expected_recipient = "front-door"),
       signer: null,
     }),

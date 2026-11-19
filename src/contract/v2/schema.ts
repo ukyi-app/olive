@@ -39,6 +39,8 @@ export function int(min: number, max = Number.MAX_SAFE_INTEGER): Parser<number> 
 }
 // 시각은 Unix epoch 밀리초 정수다.
 export const time = int(1);
+// 정지 세대·실행 세대는 0 이상의 정수다(v1 머리의 stop_generation과 같은 꼴).
+export const generation = int(0);
 
 export function literal<const T extends string | number | boolean>(expected: T): Parser<T> {
   return (value, path) => (value === expected ? expected : fail(path));

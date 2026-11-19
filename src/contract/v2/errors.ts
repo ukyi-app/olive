@@ -1,5 +1,6 @@
 // v2의 거절 사유. 거절은 늘 이 가운데 하나만 돌려준다(먼저 걸린 것). 순서는 contract.ts의 검증 순서와 같다.
-// v1과 같은 이름은 같은 뜻이다. v1의 세대·실행·결과 사유는 공통부에 없다. 묶음이 필요하면 여기에 더한다.
+// v1과 같은 이름은 같은 뜻이다. 세대는 v1의 머리 칸 사유(stop_generation_mismatch) 대신 본문 세대 칸의 사유 셋(generation_*)으로
+// 거절한다. v1의 실행·결과 사유는 공통부에 없다. 묶음이 필요하면 여기에 더한다.
 export const REJECT_REASONS = [
   // 1. 봉투와 머리의 모양
   "malformed",
@@ -29,6 +30,12 @@ export const REJECT_REASONS = [
   "body_malformed",
   "digest_mismatch",
   "forbidden_field",
+  // 효과 동작이 등록한 세대 규칙이 요구하는 본문의 세대 칸(stop_generation, execution_generation)이 없다.
+  "generation_missing",
+  // 효과 동작에 필요한 세대를 받는 쪽이 모른다. 모르면 닫는다.
+  "generation_unknown",
+  // 본문의 세대가 받는 쪽의 권위 값과 규칙대로 맞지 않는다(옛 세대 등). 서명이 맞아도 거절한다.
+  "generation_mismatch",
   // 7. 답의 대조: 답이 이 연결에서 기다리는 요청을 가리키지 않거나, 가리킨 요청과 작업(job_id·action·request_digest)이 다르다.
   "reply_mismatch",
   // 8. 재사용

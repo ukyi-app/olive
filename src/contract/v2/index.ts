@@ -12,6 +12,8 @@ export {
   type Awaited,
   type Bundle,
   COMMON_BUNDLE,
+  type EffectSpec,
+  type ExchangeSpec,
   type HandshakeState,
   isSettled,
   type JobRef,
@@ -33,6 +35,17 @@ export {
   type VerifyContext,
 } from "./contract.ts";
 export { REJECT_REASONS, type RejectReason } from "./errors.ts";
+export {
+  GENERATION_FIELDS,
+  GENERATION_KINDS,
+  GENERATION_RULES,
+  type GenerationAuthorities,
+  type GenerationAuthority,
+  type GenerationKind,
+  type GenerationRule,
+  type GenerationRules,
+  generationShape,
+} from "./generations.ts";
 export { type Header, PARTIES, type Party } from "./header.ts";
 export * as limits from "./limits.ts";
 export { CONTRACT } from "./limits.ts";

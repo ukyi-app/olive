@@ -10,21 +10,36 @@ import { list, readText } from "../../files.ts";
 import { buildCases as buildV1Cases, freshKeys as freshV1Keys } from "../cases.ts";
 import { contextOf as v1ContextOf } from "../support.ts";
 import { buildCases, FIXTURE_DIR } from "./cases.ts";
-import { baseContext, type CaseContext, contextOf, envelope, freshKeys, id, type Keys, nonceOf, OTHER_POLICY, POLICY, PROBE, trustedRaw } from "./support.ts";
+import {
+  baseContext,
+  type CaseContext,
+  contextOf,
+  envelope,
+  freshKeys,
+  id,
+  type Keys,
+  KNOWN_GENERATIONS,
+  nonceOf,
+  OTHER_POLICY,
+  POLICY,
+  PROBE,
+  probeBody,
+  trustedRaw,
+} from "./support.ts";
 
 const keys = freshKeys();
 
+// 받는 쪽이 세대를 아는 문맥이 기본이다. 세대를 모를 때의 규칙은 generations.test.ts가 본다.
 function verifyAt(contract: Contract, message: unknown, receiver: "supervisor" | "front-door", over: Partial<CaseContext> = {}) {
-  return contract.verify(message, contextOf(trustedRaw(keys, receiver), baseContext(receiver, over)));
+  return contract.verify(message, contextOf(trustedRaw(keys, receiver), baseContext(receiver, { generations: KNOWN_GENERATIONS, ...over })));
 }
 
 const handshakeFrom = (k: Keys, policy: string, n: number, fields: Record<string, unknown> = {}) =>
   envelope(k, { sender: "front-door", recipient: "supervisor", action: "handshake", request_id: id(0x100 + n), nonce: nonceOf(0x100 + n), ...fields }, { policy_revision: policy });
 
 const JOB = id(0x501);
-const NOTE = "a".repeat(64);
 const probeEffect = (n: number, action = "probe_effect") =>
-  envelope(keys, { sender: "front-door", recipient: "supervisor", action, request_id: id(0x200 + n), nonce: nonceOf(0x200 + n) }, { job_id: JOB, note_digest: NOTE });
+  envelope(keys, { sender: "front-door", recipient: "supervisor", action, request_id: id(0x200 + n), nonce: nonceOf(0x200 + n) }, probeBody(action, JOB));
 
 test("실행기 v1 표본 그대로", async () => {
   // v1 표본 파일은 v1 사례 정의와 이름이 같다(v1의 fixtures.test.ts가 내용과 서명 검증까지 본다). 내용의 해시를 main과 대조하는 일은
@@ -87,7 +102,7 @@ test("틀린 판·정책은 새 효과 0", async () => {
   for (const [action, spec] of effects) {
     const sender = spec.from[0]!;
     const recipient = sender === "supervisor" ? "front-door" : "supervisor";
-    const msg = envelope(keys, { sender, recipient, action, request_id: id(0x300), nonce: nonceOf(0x300) }, { job_id: JOB, note_digest: NOTE });
+    const msg = envelope(keys, { sender, recipient, action, request_id: id(0x300), nonce: nonceOf(0x300) }, probeBody(action, JOB));
     for (const handshake of ["none", "policy_mismatch"] as const) {
       const got = await verifyAt(PROBE, msg, recipient, { handshake, intake_open: true });
       expect(got, `${action} ${handshake}`).toEqual({ ok: false, reason: handshake === "none" ? "handshake_required" : "policy_mismatch" });
@@ -143,7 +158,7 @@ test("현관 키로 실행기 지시 거절", async () => {
   const supervisorSigned = signUnchecked(hello.header, hello.body, keys.supervisor.privateKey);
   expect(await verifyAt(FRONTDOOR_CONTRACT, supervisorSigned, "supervisor")).toEqual({ ok: false, reason: "bad_signature" });
   // 효과 동작도 같다(probe_effect는 현관만 낸다).
-  const effectBySupervisor = envelope(keys, { sender: "supervisor", recipient: "front-door", action: "probe_effect", request_id: id(0x401), nonce: nonceOf(0x401) }, { job_id: JOB, note_digest: NOTE });
+  const effectBySupervisor = envelope(keys, { sender: "supervisor", recipient: "front-door", action: "probe_effect", request_id: id(0x401), nonce: nonceOf(0x401) }, probeBody("probe_effect", JOB));
   expect(await verifyAt(PROBE, effectBySupervisor, "front-door", agreed)).toEqual({ ok: false, reason: "wrong_direction" });
   const effect = probeEffect(7);
   expect(await verifyAt(PROBE, signUnchecked(effect.header, effect.body, keys.supervisor.privateKey), "supervisor", agreed)).toEqual({ ok: false, reason: "bad_signature" });

@@ -12,7 +12,7 @@
     "reason": "wrong_direction"
   },
   "keys": {
-    "supervisor": "-geDQlXfZVFrlrIYsBK61uSyfgu-HI6SVA3p8gvyCjc"
+    "supervisor": "WBYIZLRFQFGCdfdx_rVvh3dTMoDBRl0m4dHO_bxK5mc"
   },
   "context": {
     "now": 1795046400000,
@@ -20,6 +20,14 @@
     "own_policy_revision": "policy-7",
     "handshake": "none",
     "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
     "awaiting": {
       "00000000-0000-4000-8000-000000000010": {
         "action": "handshake",
@@ -40,7 +48,7 @@
       "request_id": "00000000-0000-4000-8000-000000000011",
       "nonce": "00000000000000000000000000000002"
     },
-    "signature": "tSuBDxylcuJtM0jnGa3uDE0biU5-DsdEy2zoDx7bezyOEFBPL92N546QuRyDfJ20xjJkiE_FblsX9oLNOrjBDg",
+    "signature": "dxcDV9SNldzuiozRH88RBjpLtg2uGDAo9u3A_QlPS7_AmigibMbk-TCYfz5-yEJz8bCAIwrAV2kvf1LroHTlDw",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000010",
       "policy_revision": "policy-7"

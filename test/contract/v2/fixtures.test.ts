@@ -5,7 +5,7 @@ import { canonicalJson } from "../../../src/contract/v1/index.ts";
 import { afterHandshake, FRONTDOOR_CONTRACT, REJECT_REASONS } from "../../../src/contract/v2/index.ts";
 import { list, readText } from "../../files.ts";
 import { buildCases, type Expect, FIXTURE_DIR, FIXTURE_TAG, type V2Case } from "./cases.ts";
-import { contextOf, freshKeys, leafDiff } from "./support.ts";
+import { contextOf, freshKeys, leafDiff, other } from "./support.ts";
 
 type Fixture = V2Case & { fixture: string; signing_input: string };
 
@@ -25,10 +25,14 @@ async function replay(f: Pick<V2Case, "keys" | "context" | "message">): Promise<
 // 공개 면의 표에 효과 동작이 아직 없어서 표본을 만들 수 없는 것. 효과 동작이 생기면 이 면제는 사라지고(아래 시험) 묶음이 사례를 더해야 한다.
 const hasEffect = Object.values(FRONTDOOR_CONTRACT.actions).some((spec) => spec.class === "effect");
 const WITHOUT_EFFECT: { reasons: readonly string[]; actions: readonly string[] } = {
-  // 인사 밖의 동작이 필요한 사유(조회와 효과): 조회 본문의 action이 효과 동작이어야 한다.
-  reasons: ["handshake_required", "policy_mismatch", "intake_closed"],
+  // 인사 밖의 동작이 필요한 사유(조회와 효과): 조회 본문의 action이 효과 동작이어야 하고, 세대 사유는 효과 동작에만 걸린다.
+  reasons: ["handshake_required", "policy_mismatch", "intake_closed", "generation_missing", "generation_unknown", "generation_mismatch"],
   actions: ["job_lookup", "job_status"],
 };
+// 실제 신뢰 문맥(받는 쪽은 상대 키 하나만 믿는다)에서는 닿지 않는 사유. 당사자가 둘이라 서명이 맞으면 낸 쪽은 상대이고, 방향 검사가
+// 받는 쪽 ≠ 낸 쪽을 요구하므로 받는 쪽은 늘 자기다. 검증기의 이 검사는 방어용으로 남기고, 두 키를 다 믿는 인위적 문맥의 단위 시험이 본다
+// (table.test.ts). 표본에 두면 올바른 구현이 표본의 키 지도를 흉내 내야 기대 사유가 나오므로 공개 표본에서 뺀다.
+const UNREACHABLE_WITH_PEER_KEY: readonly string[] = ["wrong_recipient"];
 
 test("fixture v2: 파일 이름과 사례 이름이 같고, accept·reject 두 폴더뿐이며 모두 후보다", () => {
   expect(files.length).toBeGreaterThan(0);
@@ -77,9 +81,21 @@ test("fixture v2: 거절 사례는 기준 사례(통과)에서 적어 둔 곳만
   }
 });
 
-test("fixture v2: 거절 사유마다 그것만 틀린 사례가 있고, 동작마다 통과 사례가 있다(효과 동작이 없는 동안의 면제만 뺀다)", () => {
+test("fixture v2: 믿는 키는 늘 받는 쪽의 상대 키 하나이고, 같은 당사자는 모든 사례에서 같은 키다", () => {
+  const keyOf = new Map<string, string>();
+  for (const fixture of fixtures.values()) {
+    const peer = other(fixture.context.expected_recipient);
+    expect(Object.keys(fixture.keys), fixture.name).toEqual([peer]);
+    const raw = fixture.keys[peer]!;
+    expect(keyOf.get(peer) ?? raw, fixture.name).toBe(raw);
+    keyOf.set(peer, raw);
+  }
+  expect([...keyOf.keys()].sort()).toEqual(["front-door", "supervisor"]);
+});
+
+test("fixture v2: 거절 사유마다 그것만 틀린 사례가 있고, 동작마다 통과 사례가 있다(효과 동작이 없는 동안의 면제와 상대 키 문맥에서 닿지 않는 사유만 뺀다)", () => {
   const reasons = new Set<string>([...fixtures.values()].flatMap((f) => (f.expect.ok ? [] : [f.expect.reason])));
-  const exemptReasons = hasEffect ? [] : WITHOUT_EFFECT.reasons;
+  const exemptReasons = [...(hasEffect ? [] : WITHOUT_EFFECT.reasons), ...UNREACHABLE_WITH_PEER_KEY];
   for (const reason of REJECT_REASONS) if (!exemptReasons.includes(reason)) expect(reasons.has(reason), reason).toBe(true);
   for (const reason of exemptReasons) expect(reasons.has(reason), `면제가 낡았다: ${reason}`).toBe(false);
 

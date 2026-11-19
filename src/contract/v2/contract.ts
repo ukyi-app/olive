@@ -16,6 +16,7 @@ import {
   type JobRef,
 } from "./actions.ts";
 import type { RejectReason } from "./errors.ts";
+import { type GenerationAuthorities, generationFieldFault, generationMismatch, isGenerationRules } from "./generations.ts";
 import { type Header, isParty, type Party, parseHeader } from "./header.ts";
 import { CLOCK_SKEW_MS, CONTRACT, MESSAGE_TTL_MAX_MS, MESSAGE_TTL_MS } from "./limits.ts";
 import { ACTION_NAME, FORBIDDEN_FIELD_NAMES, findForbidden, isPlainObject, SchemaError, SUPERVISOR_FORBIDDEN_FIELD_NAMES, UUID } from "./schema.ts";
@@ -40,6 +41,8 @@ export interface VerifyContext {
   handshake: HandshakeState;
   // 받는 쪽의 접수가 열렸는가. 닫혔으면 duringClosedIntake가 아닌 효과 동작을 거절한다.
   intakeOpen: boolean;
+  // 받는 쪽이 아는 정지 세대·실행 세대의 권위 값(모르면 { known: false }). 효과 동작의 본문 세대를 이것과 대조한다.
+  generations: GenerationAuthorities;
   // 이 연결에서 보내고 답을 기다리는 요청(request_id로 찾는다). 없으면 undefined.
   awaiting(requestId: string): Awaited | undefined;
   nonces: NonceStore;
@@ -105,7 +108,13 @@ export function defineContract(bundles: readonly Bundle[]): Contract {
       if ((spec.class === "effect") !== (spec.parseResult !== undefined)) throw new Error(`${where}: 효과 동작만, 그리고 모두 parseResult를 둔다`);
       if (spec.class === "effect" && spec.answers !== undefined) throw new Error(`${where}: 효과 동작은 답이 아니다`);
       if (spec.matches !== undefined && spec.answers === undefined) throw new Error(`${where}: matches는 답 동작만 둔다`);
-      table[name] = Object.freeze({ ...spec, from: Object.freeze([...spec.from]) });
+      if (typeof spec.duringPolicyMismatch !== "boolean") throw new Error(`${where}: 정책이 어긋난 연결에서 받는지(duringPolicyMismatch)를 선언한다`);
+      if (spec.class === "effect" && spec.duringPolicyMismatch) throw new Error(`${where}: 효과 동작은 정책이 어긋난 연결에서 받지 않는다`);
+      if (spec.class === "effect" ? !isGenerationRules(spec.generations) : spec.generations !== undefined) {
+        throw new Error(`${where}: 효과 동작만, 그리고 모두 정지·실행 세대 규칙(generations)을 닫힌 목록에서 하나씩 선언한다`);
+      }
+      const from = Object.freeze([...spec.from]);
+      table[name] = Object.freeze(spec.class === "effect" ? { ...spec, from, generations: Object.freeze({ ...spec.generations }) } : { ...spec, from });
     }
   }
   const actions: ActionTable = Object.freeze(table);
@@ -121,8 +130,11 @@ export function defineContract(bundles: readonly Bundle[]): Contract {
 // 2. 서명. 이 뒤의 확인은 머리를 믿고 하는 것이라 서명이 맞기 전에는 내용으로 판정하지 않는다. 키는 낸 쪽 이름으로 고른다.
 // 3. 방향(그 동작을 낼 수 있는 쪽, 받는 쪽은 그 상대), 그다음 받는 쪽이 정말 나인지.
 // 4. 시한.
-// 5. 연결: 인사 상태, 그다음 접수. 인사가 안 됐거나 정책이 다른 연결의 효과 요청은 본문이 맞든 틀리든 받지 않으므로 본문보다 먼저 본다.
-// 6. 본문: 정규화 → digest → 금지 칸 → (효과면 job_id) → 엄격한 모양. digest를 먼저 보아 서명한 쪽이 보낸 본문인지부터 확인한다.
+// 5. 연결: 인사 상태(정책이 어긋난 연결은 duringPolicyMismatch인 동작만), 그다음 접수. 인사가 안 됐거나 정책이 다른 연결의 효과 요청은
+//    본문이 맞든 틀리든 받지 않으므로 본문보다 먼저 본다.
+// 6. 본문: 정규화 → digest → 금지 칸 → 공통 칸(효과면 job_id, 답이면 in_reply_to) → (효과면 세대: 칸 → 권위 값과 대조) → 엄격한 모양.
+//    digest를 먼저 보아 서명한 쪽이 보낸 본문인지부터 확인한다. 세대는 그 뒤라 서명한 쪽이 실은 값만 대조한다.
+//    공통 칸은 여기서 원본에서 읽어 둔다. 묶음의 해석기가 반환값에서 빼거나 바꿔도 작업 참조와 답 대조는 서명된 값을 쓴다.
 // 7. 답의 대조: 답이면 in_reply_to가 이 연결에서 기다리는 요청을 가리키고 같은 작업인지. 본문을 해석한 뒤라야 볼 수 있다.
 // 8. nonce를 마지막에 쓴다. 다른 이유로 거절될 봉투가 nonce를 태우지 않는다.
 async function verifyWith(table: ActionTable, raw: unknown, ctx: VerifyContext): Promise<Verified | Rejected> {
@@ -167,7 +179,7 @@ async function verifyWith(table: ActionTable, raw: unknown, ctx: VerifyContext):
     if (ctx.handshake !== "none") return reject("handshake_repeated");
   } else if (ctx.handshake === "none") {
     return reject("handshake_required");
-  } else if (spec.class === "effect" && ctx.handshake !== "agreed") {
+  } else if (ctx.handshake !== "agreed" && !spec.duringPolicyMismatch) {
     return reject("policy_mismatch");
   }
   if (!ctx.intakeOpen && !spec.duringClosedIntake) return reject("intake_closed");
@@ -183,8 +195,16 @@ async function verifyWith(table: ActionTable, raw: unknown, ctx: VerifyContext):
   }
   if (bodyDigest !== header.body_digest) return reject("digest_mismatch");
   if (findForbidden(raw.body, header.sender === "supervisor" ? SUPERVISOR_FORBIDDEN : COMMON_FORBIDDEN) !== undefined) return reject("forbidden_field");
-  if (spec.class === "effect" && !hasJobId(raw.body)) return reject("body_malformed");
-  if (spec.answers !== undefined && !(isPlainObject(raw.body) && typeof raw.body.in_reply_to === "string")) return reject("body_malformed");
+  const jobId = spec.class === "effect" ? topUuid(raw.body, "job_id") : null;
+  if (spec.class === "effect" && jobId === null) return reject("body_malformed");
+  const inReplyTo = spec.answers !== undefined ? topUuid(raw.body, "in_reply_to") : null;
+  if (spec.answers !== undefined && inReplyTo === null) return reject("body_malformed");
+  if (spec.class === "effect") {
+    // topUuid가 null이 아니면 본문은 평범한 객체다.
+    const body = raw.body as Record<string, unknown>;
+    const generationFault = generationFieldFault(spec.generations, body) ?? generationMismatch(spec.generations, body, ctx.generations);
+    if (generationFault !== null) return reject(generationFault);
+  }
   const bodyContext: BodyContext = { header, receivedAt: ctx.now, table };
   let body: unknown;
   try {
@@ -196,8 +216,8 @@ async function verifyWith(table: ActionTable, raw: unknown, ctx: VerifyContext):
   }
 
   // 7. 답의 대조
-  if (spec.answers !== undefined) {
-    const awaited = ctx.awaiting((body as { in_reply_to: string }).in_reply_to);
+  if (spec.answers !== undefined && inReplyTo !== null) {
+    const awaited = ctx.awaiting(inReplyTo);
     if (awaited === undefined || !spec.answers(awaited.action, table)) return reject("reply_mismatch");
     if (spec.matches !== undefined && !spec.matches(body, awaited)) return reject("reply_mismatch");
   }
@@ -205,12 +225,15 @@ async function verifyWith(table: ActionTable, raw: unknown, ctx: VerifyContext):
   // 8. nonce
   if (!(await ctx.nonces.consume(header.sender, header.nonce, header.expires_at))) return reject("replayed");
 
-  const job = spec.class === "effect" ? { job_id: (body as { job_id: string }).job_id, action: header.action, request_digest: header.body_digest } : null;
+  const job = jobId !== null ? { job_id: jobId, action: header.action, request_digest: header.body_digest } : null;
   return { ok: true, action: header.action, class: spec.class, header, body, sender: header.sender, recipient: header.recipient, job };
 }
 
-function hasJobId(body: unknown): boolean {
-  return isPlainObject(body) && typeof body.job_id === "string" && UUID.test(body.job_id);
+// 본문 맨 위 칸의 소문자 UUID. 본문이 평범한 객체가 아니거나 칸이 없거나 꼴이 틀리면 null.
+function topUuid(body: unknown, field: string): string | null {
+  if (!isPlainObject(body)) return null;
+  const value = body[field];
+  return typeof value === "string" && UUID.test(value) ? value : null;
 }
 
 // 계약에 맞는 봉투만 만든다. 받는 쪽이 모양·방향·본문 때문에 거절할 봉투는 서명하기 전에 막는다.
@@ -245,7 +268,12 @@ function sealWith(table: ActionTable, input: SealInput, privateKey: KeyObject): 
   }
   if (!spec.from.includes(header.sender) || header.recipient === header.sender) throw new SealError("wrong_direction");
   if (findForbidden(input.body, header.sender === "supervisor" ? SUPERVISOR_FORBIDDEN : COMMON_FORBIDDEN) !== undefined) throw new SealError("forbidden_field");
-  if (spec.class === "effect" && !hasJobId(input.body)) throw new SealError("body_malformed");
+  if (spec.class === "effect" && topUuid(input.body, "job_id") === null) throw new SealError("body_malformed");
+  if (spec.answers !== undefined && topUuid(input.body, "in_reply_to") === null) throw new SealError("body_malformed");
+  if (spec.class === "effect") {
+    const fault = generationFieldFault(spec.generations, input.body as Record<string, unknown>);
+    if (fault !== null) throw new SealError(fault);
+  }
   try {
     spec.parse(input.body, { header, receivedAt: null, table });
   } catch (error) {

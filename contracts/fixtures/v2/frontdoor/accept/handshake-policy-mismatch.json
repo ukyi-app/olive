@@ -10,7 +10,7 @@
     "handshake_after": "policy_mismatch"
   },
   "keys": {
-    "front-door": "Vo-BR9UecDua7oJ3m8_uwLk1a95EvsKT82O3IMMpSYc"
+    "front-door": "coYpHzweDoT_VEnV-IXI6UqDNuloOpp808fBfUtwV5E"
   },
   "context": {
     "now": 1795046400000,
@@ -18,6 +18,14 @@
     "own_policy_revision": "policy-7",
     "handshake": "none",
     "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
     "awaiting": {},
     "spent_nonces": []
   },
@@ -33,7 +41,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "Hnxh2jfDpZbUw7owEUKHUxR-jXvuMRWpsyBhflURr-qdzNa-RGm5ICXgJtn6IA0wDdi3_WKxsj0ioASv0ba2Ag",
+    "signature": "9r1J-tNp4J-S21S0NfkS8csIVwKn-a__Rh_xmoJxSZGTz533XbP5fRZmzBJLc8EErVXhYfw6gftTYUyuO2ZNBw",
     "body": {
       "policy_revision": "policy-8"
     }
