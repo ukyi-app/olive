@@ -42,7 +42,7 @@ export function validateMigrations(migrations: readonly Migration[]): void {
   }
 }
 
-const BOOTSTRAP = `CREATE TABLE IF NOT EXISTS ledger_migrations (
+export const BOOTSTRAP = `CREATE TABLE IF NOT EXISTS ledger_migrations (
   version INTEGER PRIMARY KEY CHECK (version BETWEEN 1 AND 9007199254740991),
   name TEXT NOT NULL,
   applied_at INTEGER NOT NULL CHECK (applied_at BETWEEN 1 AND 9007199254740991)
@@ -61,8 +61,8 @@ export function applyMigration(db: Database, migration: Migration, now: number):
   db.query("INSERT INTO ledger_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(migration.version, migration.name, now);
 }
 
-// migrations는 validateMigrations를 지난 목록이다(openLedger가 파일을 열기 전에 확인한다).
-export function migrate(db: Database, migrations: readonly Migration[], now: number, faults: Faults): { from: number; to: number } {
+// 적용 기록이 코드의 목록과 앞에서부터 같은지 보고 적용된 판의 수를 돌려준다. 장부의 판이 더 높거나 이름이 다르면 던진다.
+export function appliedCount(db: Database, migrations: readonly Migration[]): number {
   const done = applied(db);
   const latest = migrations.length;
   if (done.length > 0 && done[done.length - 1].version > latest) {
@@ -74,7 +74,14 @@ export function migrate(db: Database, migrations: readonly Migration[], now: num
       throw new LedgerUnavailableError("migration_mismatch", `적용 기록 ${row.version} ${row.name} ≠ 코드 ${code?.name ?? "없음"}`);
     }
   });
-  for (const migration of migrations.slice(done.length)) {
+  return done.length;
+}
+
+// migrations는 validateMigrations를 지난 목록이다(openLedger가 파일을 열기 전에 확인한다).
+export function migrate(db: Database, migrations: readonly Migration[], now: number, faults: Faults): { from: number; to: number } {
+  const from = appliedCount(db, migrations);
+  const latest = migrations.length;
+  for (const migration of migrations.slice(from)) {
     try {
       db.transaction(() => {
         applyMigration(db, migration, now);
@@ -85,5 +92,5 @@ export function migrate(db: Database, migrations: readonly Migration[], now: num
       throw new LedgerUnavailableError(reason === "db_error" ? "migration_failed" : reason, `${migration.name}: ${describe(error)}`);
     }
   }
-  return { from: done.length, to: latest };
+  return { from, to: latest };
 }

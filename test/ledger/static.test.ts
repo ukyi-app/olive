@@ -119,16 +119,71 @@ test("정적: 이름 검사가 원문·자격 이름을 실제로 잡는다", ()
   for (const name of ["credential_digest", "credential_revision", "source_ref", "dedupe_key", "budget_left", "body_digest"]) expect(allowed(name), name).toBe(true);
 });
 
-test("정적: 장부 파일을 SQLite 밖에서 여는 곳은 새 파일의 예약 한 곳뿐이다", async () => {
-  // 같은 프로세스가 장부 파일의 다른 FD를 닫으면 작성자의 POSIX 잠금이 풀린다.
-  const files = await list("src/ledger/**/*.ts");
-  const opened = [];
-  for (const file of files) {
-    const source = (await readText(file)).split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
-    for (const call of source.matchAll(/\b(openSync|readSync|createReadStream|createWriteStream|Bun\.file|fsyncSync|ftruncateSync|truncateSync)\s*\(([^\n]*)/g)) opened.push(`${file}: ${call[1]}(${call[2]}`);
+// 같은 프로세스가 장부 파일의 다른 FD를 닫으면 작성자의 POSIX 잠금이 풀린다. 그래서 모듈마다 쓸 수 있는 node:fs 이름을 좁힌다.
+// migrate.ts의 읽기는 이미지 안의 SQL 마이그레이션 폴더만 본다. 파일을 여는 곳은 이 호출이 O_EXCL로 만든 새 파일뿐이다.
+const FS_ALLOWED: Record<string, readonly string[]> = {
+  "src/ledger/ledger.ts": ["closeSync", "constants", "fstatSync", "lstatSync", "openSync", "realpathSync"],
+  "src/ledger/migrate.ts": ["readdirSync", "readFileSync"],
+  "src/ledger/snapshot.ts": ["closeSync", "constants", "fsyncSync", "linkSync", "lstatSync", "openSync", "realpathSync", "unlinkSync", "writeSync"],
+};
+const FS_OPENERS: Record<string, number> = { "src/ledger/ledger.ts": 1, "src/ledger/snapshot.ts": 1 };
+
+function fsViolations(file: string, text: string): string[] {
+  const source = text.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+  const allowed = FS_ALLOWED[file] ?? [];
+  const out: string[] = [];
+  for (const banned of source.matchAll(/\b(Bun\.file|Bun\.write|Bun\.mmap|process\.binding|require)\s*\(|\bfs\.promises\b|\bimport\s*\(/g)) out.push(banned[0]);
+  for (const statement of source.matchAll(/\bimport\s+([^;]*?)\s+from\s+"((?:node:)?fs(?:\/promises)?)"/g)) {
+    const [, clause, module] = statement as unknown as [string, string, string];
+    if (module !== "node:fs") out.push(`모듈 ${module}`);
+    const named = /^\{([\s\S]*)\}$/.exec(clause.trim());
+    if (named === null) {
+      out.push(`이름을 고르지 않은 import: ${clause.trim()}`);
+      continue;
+    }
+    for (const part of (named[1] as string).split(",").map((name) => name.trim()).filter(Boolean)) {
+      if (part.startsWith("type ")) continue;
+      const [name, alias] = part.split(/\s+as\s+/) as [string, string | undefined];
+      if (!allowed.includes(name)) out.push(`허용하지 않는 이름: ${name}`);
+      // 별칭은 호출 자리의 검사를 비켜 간다. 상수 묶음만 별칭을 받는다.
+      if (alias !== undefined && name !== "constants") out.push(`별칭: ${part}`);
+    }
   }
-  expect(opened).toHaveLength(1);
-  expect(opened[0]).toContain("O_EXCL");
+  const opens = [...source.matchAll(/\bopenSync\s*\(([^\n]*)/g)].map((call) => call[1] as string);
+  if (opens.length !== (FS_OPENERS[file] ?? 0)) out.push(`openSync ${opens.length}곳`);
+  for (const call of opens) if (!call.includes("O_EXCL") || !call.includes("O_NOFOLLOW")) out.push(`새 파일이 아닌 열기: ${call}`);
+  return out;
+}
+
+test("정적: 장부 모듈의 파일 API는 모듈별 허용 목록뿐이고 FD를 여는 곳은 O_EXCL 새 파일 두 곳뿐이다", async () => {
+  const files = await list("src/ledger/**/*.ts");
+  for (const file of Object.keys(FS_ALLOWED)) expect(files).toContain(file);
+  for (const file of files) expect(fsViolations(file, await readText(file)), file).toEqual([]);
+});
+
+test("정적: 파일 API 검사가 전체 읽기·쓰기, promises, 별칭, 이름을 고르지 않은 import를 실제로 잡는다", () => {
+  const ledger = "src/ledger/ledger.ts";
+  const base = `openSync(path, fileOpen.O_CREAT | fileOpen.O_EXCL | fileOpen.O_NOFOLLOW, 0o600);\n`;
+  const violations = (source: string) => fsViolations(ledger, base + source);
+  expect(violations(`import { openSync, constants as fileOpen } from "node:fs";`)).toEqual([]);
+  for (const [source, caught] of [
+    [`import { readFileSync } from "node:fs";`, "허용하지 않는 이름: readFileSync"],
+    [`import { writeFileSync } from "node:fs";`, "허용하지 않는 이름: writeFileSync"],
+    [`import { open } from "node:fs/promises";`, "모듈 node:fs/promises"],
+    [`import { readFileSync as read } from "fs";`, "모듈 fs"],
+    [`import { lstatSync as look } from "node:fs";`, "별칭: lstatSync as look"],
+    [`import * as fs from "node:fs";`, "이름을 고르지 않은 import: * as fs"],
+    [`import fs from "node:fs";`, "이름을 고르지 않은 import: fs"],
+    [`await fs.promises.open(path);`, "fs.promises"],
+    [`const fs = require("node:fs");`, "require("],
+    [`await import("node:fs");`, "import("],
+    [`await Bun.file(path).text();`, "Bun.file("],
+    [`openSync(path, 0);`, "openSync 2곳"],
+  ] as const) {
+    expect(violations(source), source).toContain(caught);
+  }
+  expect(fsViolations(ledger, `openSync(path, fileOpen.O_RDWR);`)).toContain("새 파일이 아닌 열기: path, fileOpen.O_RDWR);");
+  expect(fsViolations("src/ledger/migrate.ts", base)).toContain("openSync 1곳");
 });
 
 const transpiler = new Bun.Transpiler({ loader: "ts" });

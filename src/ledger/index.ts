@@ -31,12 +31,17 @@ export {
   type SessionReportEvidence,
   type SlotHold,
   type SlotHoldObservation,
+  SNAPSHOT_STALE_RECORDS,
+  type SnapshotOrigin,
+  type SnapshotRequest,
+  type SnapshotResult,
   type StartBar,
   STOP_PHASES,
   type StopRecord,
   type TakeoverEvidence,
 } from "./ledger.ts";
 export { loadMigrations, type Migration, MIGRATIONS_DIR } from "./migrate.ts";
+export { SNAPSHOT_FAILURES, type SnapshotFailure } from "./snapshot.ts";
 export {
   type ClosedBecause,
   type OccupancyAnswer,

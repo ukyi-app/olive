@@ -10,6 +10,7 @@ export const UNAVAILABLE_REASONS = [
   "not_initialized", // 재개방인데 파일이 없거나 첫 설치 기록이 없거나 받지 않는 종류의 파일이다(빈 볼륨, 빈 대체 파일, 링크)
   "already_initialized", // 첫 설치로 열었는데 이미 만들어진 장부다
   "foreign_data", // 첫 설치로 열었는데 끊긴 첫 설치로 증명되지 않는 것이 그 자리에 있다(낯선 DB, 옛 스키마, 빈 파일, 링크, 본체 없는 WAL·SHM)
+  "interrupted_install", // 첫 설치가 커밋 전에 끊겨 저널이 남았고 본체만으로는 이어 받을 수 있는지 가를 수 없다(ledger.md "끊긴 첫 설치")
   "closed", // 닫은 장부
   "db_error", // 그 밖의 DB 오류
 ] as const;
