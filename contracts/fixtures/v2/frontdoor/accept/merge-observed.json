@@ -1,0 +1,52 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/merge-observed",
+  "description": "게시한 PR의 병합 관측: 게시 요청의 작업 ID와 병합 커밋",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "front-door": "nsqcO9WoDjdN_HnDZavE0XIlK7pI_FKonvkHE-l5vpo"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": false
+      },
+      "execution": {
+        "known": false
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "75f07b11499b095d82bf9b9c54475914e8d39af9bcde87dbfb1cc4be13342d70",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "merge_observed",
+      "request_id": "00000000-0000-4000-8000-000000000068",
+      "nonce": "00000000000000000000000000000068"
+    },
+    "signature": "ufpzTzJi7PXUB8QLfi5wH0Wfd2X0NtdLNXkI4d6E-jHmLGgSfQXQ4Z8XO0XKoE0oXyFCICrWB5waL3FovMHTDg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000075",
+      "publication_job_id": "00000000-0000-4000-8000-00000000007b",
+      "merge_commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  },
+  "signing_input": "{\"action\":\"merge_observed\",\"body_digest\":\"75f07b11499b095d82bf9b9c54475914e8d39af9bcde87dbfb1cc4be13342d70\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"front-door\"}"
+}

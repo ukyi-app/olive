@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "supervisor": "H7DE8XtjskZL8av5Cn-9w3EvrGpgAyuV9w0zhBq7Zx4"
+    "supervisor": "bOQWsEp0WBlXGNmeTmqfj-jSoKsLRfWYBWlfd_AGQ18"
   },
   "context": {
     "now": 1795046400000,
@@ -41,7 +41,7 @@
       "request_id": "00000000-0000-4000-8000-000000000020",
       "nonce": "00000000000000000000000000000020"
     },
-    "signature": "cLDX13HuP14yEi7PqXxiW_ezYuUKmOiFcl5o-3fLUtcGEbqPa4rqq3dvQKb3N7pluC7s2GEKJfvvxL8Or9XzBw",
+    "signature": "t746yg-LF0BecbRjVZgro331gPXeQrSWPMjlh_kPL5FUihWH8wLhwJ3o-56cDDMSg5pz6dg8rKYOkS1RhpvLDA",
     "body": {}
   },
   "signing_input": "{\"action\":\"stop_record_lookup\",\"body_digest\":\"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000020\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000020\",\"sender\":\"supervisor\"}"
