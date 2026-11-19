@@ -8,7 +8,13 @@ export interface FakeProcess {
   ppid?: number;
   // 읽을 때마다 앞에서 하나씩 꺼내 쓰는 PPid(끝나는 중에 잠깐 0으로 보이는 경우).
   ppidReads?: number[];
+  // status에 PPid 칸이 없다(부모를 해석하지 못하는 경우).
+  ppidMissing?: boolean;
+  // 읽을 때마다 앞에서 하나씩 꺼내 쓰는 State.
+  stateReads?: string[];
   threads?: Record<number, string>;
+  // 스레드별 status 읽기의 오류 코드(목록에는 있는데 읽을 때 사라진 스레드).
+  threadErrors?: Record<number, string>;
   survivesTerm?: boolean;
   survivesKill?: boolean;
   statusError?: string;
@@ -42,7 +48,9 @@ export class FakeProc implements ProcReader {
     if (scripted) throw Object.assign(new Error("read"), { code: scripted });
     if (entry.statusError) throw Object.assign(new Error("read"), { code: entry.statusError });
     const ppid = entry.ppidReads?.shift() ?? entry.ppid ?? 1;
-    return `Name:\tx\nState:\t${entry.state ?? "S"} (x)\nPPid:\t${ppid}\nNSpid:\t${(entry.nspid ?? [pid]).join("\t")}\n`;
+    const state = entry.stateReads?.shift() ?? entry.state ?? "S";
+    const parentLine = entry.ppidMissing ? "" : `PPid:\t${ppid}\n`;
+    return `Name:\tx\nState:\t${state} (x)\n${parentLine}NSpid:\t${(entry.nspid ?? [pid]).join("\t")}\n`;
   }
   async threads(pid: number) {
     const error = this.processes.get(pid)?.threadsError;
@@ -50,6 +58,8 @@ export class FakeProc implements ProcReader {
     return Object.keys(this.processes.get(pid)?.threads ?? { [pid]: "Z" }).map(Number);
   }
   async threadStatus(pid: number, thread: number) {
+    const error = this.processes.get(pid)?.threadErrors?.[thread];
+    if (error) throw Object.assign(new Error("thread"), { code: error });
     return `State:\t${this.processes.get(pid)?.threads?.[thread] ?? "Z"} (x)\n`;
   }
   namespaceError: string | undefined;

@@ -2,16 +2,19 @@
 // 규칙: 불확실하면 슬롯을 쥔 채 권한을 주는 동작을 닫고, 이미 맡은 실행을 멈추는 일은 장부 쓰기와 독립적으로 시작한다.
 // 순서는 고정 장벽(쓰기에 실제로 들어갔다는 신호)으로 만든다. 다시 열기는 같은 폴더를 새 저장소로 여는 것으로 재시작을 흉내 낸다.
 import { afterEach, expect, test } from "bun:test";
-import { randomUUID } from "node:crypto";
+import { type KeyObject, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Bodies, limits, resultDigest } from "../../src/contract/v1/index.ts";
+import { type Bodies, type Header, limits, resultDigest } from "../../src/contract/v1/index.ts";
 import type { LaunchHooks } from "../../src/executor/launcher.ts";
 import { ExecutorStore, type StoreError } from "../../src/executor/store.ts";
+import { WorkerExecutor } from "../../src/executor/worker.ts";
 import {
   barrier,
   cancelReceiptWrite,
+  fakeProfile,
   fromSupervisor,
+  gate,
   onDiskEvents,
   onDiskRun,
   outboxWrite,
@@ -23,6 +26,7 @@ import {
   sha256,
   start,
   stopWrite,
+  supervisorKeys,
   syncReply,
   until,
 } from "./support.ts";
@@ -504,4 +508,304 @@ test("F10 nonce 장애가 이미 정상 종료한 프로그램의 결과를 실�
   expect(sha256(JSON.stringify(r.store.outboxFor(runId).find((e) => e.action === "report_result")?.body.result))).toBe(
     sha256(JSON.stringify(JSON.parse(new TextDecoder().decode(goodResult)))),
   );
+});
+
+// ---- G02 후보 상태의 전제 ----
+
+test("G02 복원: 정리 영수증만 있고 종료 영수증이 없는 stopping은 finalized로 맺지 않고 슬롯을 쥔 채 보류한다", async () => {
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  await r.connection.receive(finalize(r, runId));
+  const cleaned = eventOf(r.dir, runId, "receipt_cleaned");
+  rmSync(outboxPath(r.dir, eventOf(r.dir, runId, "receipt_stopped").id));
+  rewriteRun(r.dir, runId, { state: "stopping", last_receipt_id: cleaned.id });
+  const again = await make({ dir: r.dir, clock: r.clock });
+  // 현재 상태(stopping)에는 전제가 없어 기동 감사는 통과한다. 후보 상태에서 걸러야 한다.
+  expect(again.store.inconsistency()).toBeNull();
+  await again.worker.recover();
+  expect(again.store.run(runId)?.state).toBe("unknown_running");
+  expect(onDiskRun(again.dir, runId).state).toBe("unknown_running");
+  expect(again.store.inconsistency()).toBe("receipt_missing");
+  expect(again.cleanup.terminations).toBe(1);
+  expect(await statusOf(again, runId)).toMatchObject({ state: "unknown_running", last_receipt_id: null });
+  await start(again);
+  await again.worker.idle();
+  expect(again.launcher.spawned).toBe(0);
+});
+
+test("G02 정리 예약의 영수증 ID가 자기 종료 영수증의 것이면 지우지도 덮어쓰지도 않는다", async () => {
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  r.space.cleanResult = false;
+  await r.connection.receive(finalize(r, runId));
+  const stopped = eventOf(r.dir, runId, "receipt_stopped");
+  const path = join(r.dir, "runs", `${runId}.json`);
+  const raw = JSON.parse(readFileSync(path, "utf8")) as { cleanup: { receipt_id: string } };
+  raw.cleanup.receipt_id = stopped.id;
+  writeFileSync(path, JSON.stringify(raw));
+  const before = readFileSync(outboxPath(r.dir, stopped.id), "utf8");
+  const again = await make({ dir: r.dir, clock: r.clock });
+  await again.worker.recover();
+  await again.connection.receive(finalize(again, runId));
+  expect(again.space.cleaned).toEqual([]);
+  expect(readFileSync(outboxPath(again.dir, stopped.id), "utf8")).toBe(before);
+  expect(onDiskRun(again.dir, runId).state).toBe("cleanup_pending");
+  expect(again.store.inconsistency()).toBe("receipt_mismatch");
+  expect(again.transport.of("receipt_cleaned")).toHaveLength(0);
+});
+
+test("G02 전이의 한 자리: 전제가 없는 터미널 상태와 다른 사건의 ID는 commit이 쓰지 않고 그 실행을 보류한다", async () => {
+  const r = await make();
+  const record = runRecord(r, "running");
+  expect(await r.store.beginRun(record)).toBe(true);
+  expect((await r.store.commit(record.run_id, { state: "finalized" })).saved).toBe(false);
+  expect(r.store.run(record.run_id)?.state).toBe("running");
+  expect(onDiskRun(r.dir, record.run_id).state).toBe("running");
+  expect(r.store.suspectRun(record.run_id)).toBe(true);
+
+  const other = await make();
+  const { runId } = await start(other);
+  await other.worker.idle();
+  const stopped = other.store.validEvents(runId).find((e) => e.action === "receipt_stopped")!;
+  const before = readFileSync(outboxPath(other.dir, stopped.id), "utf8");
+  const forged = { ...stopped, action: "receipt_cleaned" as const, body: { ...stopped.body, cleaned_at: other.clock.now() } };
+  expect((await other.store.commit(runId, {}, [{ entry: forged }])).saved).toBe(false);
+  expect(readFileSync(outboxPath(other.dir, stopped.id), "utf8")).toBe(before);
+  expect(other.store.inconsistency()).toBe("receipt_mismatch");
+});
+
+// ---- G03 정리 예약의 수명 ----
+
+test("G03 정리 결과의 기록이 멈춰도 다음 비상 취소가 물리적 종료를 다시 시작한다", async () => {
+  const disk = scriptedIo();
+  const r = await make({ io: disk.io, stopWriteWaitMs: 1 });
+  r.cleanup.remaining = 1;
+  const { runId } = await start(r);
+  await r.worker.idle();
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+
+  // 비상 취소는 nonce 검증을 끝낸 뒤 처리 바로 앞에서 세운다. 저장 줄이 멈춘 뒤에는 nonce도 줄을 지나지 못한다.
+  const emergency = randomUUID();
+  const verified = barrier();
+  const handle = r.worker.handle.bind(r.worker);
+  r.worker.handle = async (envelope, epoch) => {
+    if (envelope.header.request_id === emergency) await verified.pass();
+    return handle(envelope, epoch);
+  };
+  const reached = gate();
+  const worker = r.worker as unknown as { onCancel(header: Header, body: unknown, epoch: number): Promise<void> };
+  const onCancel = worker.onCancel.bind(r.worker);
+  worker.onCancel = (header, body, epoch) => {
+    const work = onCancel(header, body, epoch);
+    if (header.request_id === emergency) reached.open();
+    return work;
+  };
+  const second = r.connection.receive(
+    fromSupervisor(r.clock, r.worker.name, "task_cancel", { run_id: runId, reason: "emergency_stop" }, { stop_generation: 1, run_generation: 1, request_id: emergency }),
+  );
+  await verified.entered;
+
+  // 일반 취소의 정리는 양수로 끝나고, 그 상태 쓰기가 멈춘다.
+  const writing = disk.hold(runWrite("unknown_running"));
+  const first = r.connection.receive(cancel(r, runId));
+  await writing.entered;
+  const before = r.cleanup.terminations;
+  verified.open();
+  await reached.wait;
+  expect(r.cleanup.terminations).toBe(before + 1);
+
+  writing.open();
+  await Promise.all([first, second]);
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+  expect(r.transport.of("receipt_stopped")).toHaveLength(0);
+});
+
+test("G03 백엔드의 정리가 끝나지 않은 동안은 다음 취소가 합류하고, 끝난 뒤에야 다시 시도한다", async () => {
+  const r = await make({ exitWaitMs: 20 });
+  r.cleanup.remaining = 1;
+  const { runId } = await start(r);
+  await r.worker.idle();
+  const stuck = gate();
+  r.cleanup.hold = stuck.wait;
+  const base = r.cleanup.terminations;
+  // 첫 정리는 상한으로 먼저 돌아오지만 백엔드의 작업은 아직 끝나지 않았다.
+  await r.connection.receive(cancel(r, runId));
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+  expect(r.cleanup.terminations).toBe(base + 1);
+  await r.connection.receive(cancel(r, runId));
+  expect(r.cleanup.terminations).toBe(base + 1);
+  r.cleanup.hold = undefined;
+  stuck.open();
+  // 마이크로태스크가 모두 돈 뒤(시간이 아니라 이벤트 루프 한 바퀴로 순서를 만든다).
+  await pause(0);
+  await r.connection.receive(cancel(r, runId));
+  expect(r.cleanup.terminations).toBe(base + 2);
+});
+
+// ---- G04 미확인 결과의 마지막 영수증 ----
+
+// 사건은 started까지 적혔고 실행 기록은 preparing·accepted 포인터에 머문 채 꺼진 장부.
+async function behindPointer() {
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  const accepted = eventOf(r.dir, runId, "receipt_accepted");
+  const started = eventOf(r.dir, runId, "receipt_started");
+  rmSync(outboxPath(r.dir, eventOf(r.dir, runId, "receipt_stopped").id));
+  rmSync(outboxPath(r.dir, eventOf(r.dir, runId, "report_result").id));
+  rewriteRun(r.dir, runId, { state: "preparing", exit: null, last_receipt_id: accepted.id });
+  return { r, runId, started };
+}
+
+for (const remaining of [1, null]) {
+  test(`G04 복원: 다시 센 결과가 ${remaining}이어도 마지막 영수증은 지속된 최신 영수증을 가리킨다`, async () => {
+    const { r, runId, started } = await behindPointer();
+    const again = await make({ dir: r.dir, clock: r.clock });
+    again.cleanup.remaining = remaining;
+    await again.worker.recover();
+    expect(onDiskRun(again.dir, runId)).toMatchObject({ state: "unknown_running", last_receipt_id: started.id });
+    const third = await make({ dir: r.dir, clock: r.clock });
+    expect(third.store.inconsistency()).toBeNull();
+    expect(await statusOf(third, runId)).toMatchObject({ state: "unknown_running", last_receipt_id: started.id });
+  });
+}
+
+test("G04 복원: 다시 세어 0이면 그 사이 낸 종료 영수증이 포인터로 남는다", async () => {
+  const { r, runId } = await behindPointer();
+  const again = await make({ dir: r.dir, clock: r.clock });
+  await again.worker.recover();
+  expect(onDiskRun(again.dir, runId)).toMatchObject({ state: "failed_stopped", last_receipt_id: eventOf(again.dir, runId, "receipt_stopped").id });
+});
+
+// ---- G05 최초 쓰기의 재확인 ----
+
+test("G05 최초 쓰기를 다시 써 보다 꺼져 파일이 남아도 접수하지 않은 실행을 복구하지 않는다", async () => {
+  const disk = scriptedIo();
+  let left = "";
+  const heal = disk.fail((path, data) => {
+    if (!preparingWrite(path, data)) return false;
+    left = data;
+    return true;
+  });
+  const r = await make({ io: disk.io });
+  const { runId } = await start(r);
+  await r.worker.idle();
+  heal();
+  expect(await r.worker.flush()).toBe(true);
+  // 다시 써 본 파일을 지우기 전에 꺼진 디스크: 같은 경로에 같은 내용이 남아 있다.
+  writeFileSync(join(r.dir, "runs", `${runId}.json`), left);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  await again.worker.recover();
+  expect(again.store.run(runId)).toBeUndefined();
+  expect(onDiskEvents(again.dir, runId)).toEqual([]);
+  expect(await statusOf(again, runId)).toMatchObject({ state: "not_known" });
+  await start(again, { runId });
+  await again.worker.idle();
+  expect(again.launcher.spawned).toBe(1);
+});
+
+// ---- G06 인사로 다 말할 수 없는 장부 ----
+
+test("G06 감사 뒤 보류한 실행이 인사의 상한을 넘으면 hello를 보내지 않고 전체를 보류한다", async () => {
+  const r = await make();
+  for (let i = 0; i <= limits.STATUS_MAX_RUNS; i++) expect(await r.store.beginRun({ ...runRecord(r, "unknown_running"), state: "finalized" })).toBe(true);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBe("over_capacity");
+  expect(again.transport.of("hello")).toHaveLength(0);
+  expect(again.transport.closed).toBe(true);
+  await again.worker.flush();
+  expect(JSON.parse(readFileSync(join(r.dir, "ledger-hold"), "utf8"))).toEqual({ reason: "over_capacity" });
+});
+
+test("G06 실행 기록을 잃은 사건이 있으면 점유를 다 말할 수 없으므로 hello를 보내지 않는다", async () => {
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  rmSync(join(r.dir, "runs", `${runId}.json`));
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.store.inconsistency()).toBe("run_missing");
+  expect(again.worker.helloWithheld()).toBe(true);
+  expect(again.transport.of("hello")).toHaveLength(0);
+  expect(again.transport.closed).toBe(true);
+});
+
+// ---- G07 쓰는 도중의 보류 ----
+
+test("G07 쓰는 도중 세운 보류 판정은 그 뒤의 파일보다 먼저 지속한다", async () => {
+  const disk = scriptedIo();
+  const writing = disk.hold(outboxWrite("receipt_stopped"));
+  const r = await make({ io: disk.io });
+  const { runId } = await start(r);
+  await writing.entered;
+  const heal = disk.fail((path) => path.endsWith("ledger-hold"));
+  r.store.markInconsistent("outbox_body");
+  writing.open();
+  await r.worker.idle();
+  // 이미 넘긴 쓰기 뒤의 결과 보고와 실행 기록은 표식이 지속되기 전에 쓰지 않는다.
+  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).not.toContain("report_result");
+  expect(onDiskRun(r.dir, runId).state).not.toBe("ready_result");
+  heal();
+  await r.worker.flush();
+  expect(JSON.parse(readFileSync(join(r.dir, "ledger-hold"), "utf8"))).toEqual({ reason: "outbox_body" });
+  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).toContain("report_result");
+});
+
+// ---- G08 서명 실패와 장부 손상 ----
+
+test("G08 서명에 쓸 수 없는 키로 떠도 정상 장부에 손상 표식을 남기지 않는다", async () => {
+  const r = await make();
+  await start(r);
+  await r.worker.idle();
+  const store = await ExecutorStore.open(r.dir, { now: r.clock.now });
+  new WorkerExecutor({
+    instance: "worker-1",
+    profile: fakeProfile("complete", r.cwd),
+    policyRevision: "policy-r1",
+    store,
+    signingKey: supervisorKeys.publicKey,
+    supervisorKey: supervisorKeys.publicKey,
+    credentials: r.credentials,
+    cleanup: r.cleanup,
+    space: r.space,
+    now: r.clock.now,
+  });
+  expect(store.inconsistency()).toBeNull();
+  await store.flush();
+  expect(existsSync(join(r.dir, "ledger-hold"))).toBe(false);
+  const again = await make({ dir: r.dir, clock: r.clock });
+  expect(again.worker.intakeClosed()).toBeNull();
+});
+
+test("G08 송신 때의 서명 실패는 그 송신만 미루고 표식을 세우지 않는다", async () => {
+  const r = await make();
+  await start(r);
+  await r.worker.idle();
+  const options = (r.worker as unknown as { options: { signingKey: KeyObject } }).options;
+  const key = options.signingKey;
+  options.signingKey = supervisorKeys.publicKey;
+  const sent = r.transport.sent.length;
+  r.worker.resendUnacked();
+  expect(r.store.inconsistency()).toBeNull();
+  expect(r.transport.sent.length).toBe(sent);
+  options.signingKey = key;
+  r.worker.resendUnacked();
+  expect(r.transport.sent.length).toBeGreaterThan(sent);
+});
+
+// ---- G09 시작 접수의 권한 ----
+
+test("G09 시작 기록을 적는 사이 연결이 닫히면 새 접수 영수증을 내지 않는다", async () => {
+  const disk = scriptedIo();
+  const writing = disk.hold(preparingWrite);
+  const r = await make({ io: disk.io });
+  const receiving = start(r);
+  await writing.entered;
+  r.connection.close();
+  writing.open();
+  const { runId } = await receiving;
+  await r.worker.idle();
+  expect(r.store.outboxFor(runId).filter((e) => e.action === "receipt_accepted")).toEqual([]);
+  expect(r.launcher.spawned).toBe(0);
 });

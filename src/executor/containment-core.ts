@@ -78,10 +78,12 @@ export interface PidScan {
   nested: number[];
   // 부모가 이 공간 밖인 프로세스(이 공간의 init과 자기 말고). 밖에서 합류한 것이다.
   foreign: number[];
-  // 공간 동일성, 목록, 상태, 합류 여부 가운데 확인하지 못한 것이 하나라도 있으면 false다.
+  // 공간 동일성, 목록, 상태, 부모, 합류 여부 가운데 확인하지 못한 것이 하나라도 있으면 false다.
+  // 부모가 공간 밖으로 보인 프로세스가 남아 있는데 스레드만 읽는 사이 사라져 생존을 가를 수 없는 경우도 여기다.
   // 그때는 0개라고 말할 수 없고 전체 신호도 보내지 않는다.
   complete: boolean;
   // 목록에 있었는데 읽을 때 사라졌다. fork와 exit를 빠르게 되풀이하는 프로세스는 언제나 이렇게 보이므로 끝났다는 증거가 아니다.
+  // 프로세스 자체가 사라졌거나 부모가 공간 안인 프로세스의 스레드가 사라진 경우다.
   // 확인 실패와 달리 전체 신호를 막지 않는다(그런 프로세스를 끝낼 수단이 그 신호다).
   raced: boolean;
 }
@@ -171,12 +173,13 @@ export class PidSweep implements ProcessCleanup {
         continue;
       }
       const state = stateOf(status);
+      const parent = parentOf(status);
       const namespaces = /^NSpid:\s+(.+)$/m.exec(status)?.[1]?.trim().split(/\s+/);
-      if (!state || !namespaces) {
+      if (!state || parent === null || !namespaces) {
         result.complete = false;
         continue;
       }
-      const alive = await this.alive(pid, state);
+      const alive = await this.alive(pid, state, parent);
       if (alive === null) result.complete = false;
       else if (alive === "raced") result.raced = true;
       else if (alive) {
@@ -206,22 +209,26 @@ export class PidSweep implements ProcessCleanup {
     const parent = parentOf(again);
     if (state === null || parent === null) return null;
     if (parent !== "0") return false;
-    return this.alive(pid, state);
+    return this.alive(pid, state, parent);
   }
 
   // 좀비는 도는 코드가 없어 세지 않는다(실행기가 PID 1이면 고아 좀비를 회수하지 않아 남을 수 있다).
   // 단 리더 스레드만 끝난 프로세스도 Z로 보인다. 다른 스레드가 살아 있으면 코드가 돌고 있는 것이다.
   // 스레드 목록·상태가 읽는 사이 사라지면 끝났다는 증거가 아니라 경합이다("raced", 깨끗한 횟수에 넣지 않는다).
-  private async alive(pid: number, state: string): Promise<boolean | null | "raced"> {
+  // 함정: 스레드 하나의 소멸은 프로세스의 소멸이 아니다. 부모가 공간 밖으로 보인 프로세스는 합류자일 수 있으므로
+  // 프로세스 자체가 사라졌을 때만 경합이고, 남아 있으면 생존을 가르지 못한 것이다(null). 빈 스레드 목록도 같다.
+  private async alive(pid: number, state: string, parent: string): Promise<boolean | null | "raced"> {
     if (state === "X" || state === "x") return false;
     if (state !== "Z") return true;
+    const outside = parent === "0";
+    const lost = async () => (outside && !(await this.processGone(pid)) ? null : "raced");
     let threads: number[];
     try {
       threads = await this.reader.threads(pid);
     } catch (error) {
-      return VANISHED.has(errorCode(error)) ? "raced" : null;
+      return VANISHED.has(errorCode(error)) ? lost() : null;
     }
-    let raced = false;
+    let raced = outside && threads.length === 0;
     for (const thread of threads) {
       try {
         const threadState = stateOf(await this.reader.threadStatus(pid, thread));
@@ -232,7 +239,17 @@ export class PidSweep implements ProcessCleanup {
         raced = true;
       }
     }
-    return raced ? "raced" : false;
+    return raced ? lost() : false;
+  }
+
+  // /proc/<pid>은 스레드 그룹이 다 끝나야 사라진다. 그 밖의 읽기 실패는 사라졌다는 증거가 아니다.
+  private async processGone(pid: number): Promise<boolean> {
+    try {
+      await this.reader.status(pid);
+      return false;
+    } catch (error) {
+      return VANISHED.has(errorCode(error));
+    }
   }
 
   // 전체 신호는 바로 앞 스캔의 확인이 완전할 때만 보낸다. 공간 동일성·목록·상태·합류 여부를 확인하지 못했거나 합류자가 보이면 보내지 않는다.

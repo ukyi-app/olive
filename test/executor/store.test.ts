@@ -127,7 +127,7 @@ function sampleRun(): RunRecord {
   return {
     run_id: randomUUID(),
     run_generation: 1,
-    state: "ready_result",
+    state: "running",
     start_stop_generation: 0,
     instruction_request_id: randomUUID(),
     deadline_at: 2_000,

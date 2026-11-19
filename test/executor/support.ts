@@ -294,6 +294,7 @@ export interface RigOptions {
   syncTo?: number | null;
   extraEnv?: Record<string, string>;
   exitWaitMs?: number;
+  stopWriteWaitMs?: number;
 }
 
 export async function rig(options: RigOptions = {}): Promise<Rig> {
@@ -319,6 +320,7 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
     now: clock.now,
     drainMs: 100,
     exitWaitMs: options.exitWaitMs,
+    stopWriteWaitMs: options.stopWriteWaitMs,
   });
   let n = 0;
   const challenges: string[] = [];

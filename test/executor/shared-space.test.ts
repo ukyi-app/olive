@@ -133,3 +133,54 @@ test("F01 대조군: 단순한 PID 소멸 경합은 전체 신호를 막지 않�
   await leader.pod.terminate();
   expect(leader.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
 });
+
+// 프로세스 자체의 소멸과 관측하던 스레드만의 소멸을 가른다. 부모가 공간 밖으로 보인 대상만 스레드 소멸이 신호를 막는다.
+
+test("G01 합류 후보: 스레드 목록이 사라졌는데 프로세스가 남아 있으면 전체 신호를 보내지 않고 0도 말하지 않는다", async () => {
+  const { pod, proc } = await recorded({ 350: { state: "Z", ppid: 0, threadsError: "ENOENT" } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+  expect(await pod.survivors()).toBeNull();
+});
+
+test("G01 합류 후보: 열거한 스레드만 사라지고 새 스레드가 도는 프로세스에 전체 신호를 보내지 않는다", async () => {
+  const { pod, proc } = await recorded({ 351: { state: "Z", ppid: 0, threads: { 351: "Z", 352: "S" }, threadErrors: { 352: "ESRCH" } } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+  expect(await pod.survivors()).toBeNull();
+});
+
+test("G01 합류 후보: 다시 읽을 때 리더가 Z가 되고 스레드가 사라져도 합류 아님으로 바꾸지 않는다", async () => {
+  const { pod, proc } = await recorded({ 353: { ppid: 0, stateReads: ["S", "Z"], threadsError: "ESRCH" } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+});
+
+test("G01 합류 후보: 스레드 목록이 비어 있으면 생존을 가르지 못한 것이다", async () => {
+  const { pod, proc } = await recorded({ 354: { state: "Z", ppid: 0, threads: {} } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+  expect(await pod.survivors()).toBeNull();
+});
+
+test("G01 부모 누락: 처음 읽은 상태에서 PPid를 해석하지 못하면 정상 부모로 치지 않는다", async () => {
+  const { pod, proc } = await recorded({ 355: { ppidMissing: true } });
+  await pod.terminate();
+  expect(proc.signals).toEqual([]);
+  expect(await pod.survivors()).toBeNull();
+});
+
+test("G01 대조군: 합류 후보라도 프로세스 자체가 사라졌으면 단순 경합이라 전체 신호를 막지 않는다", async () => {
+  const { pod, proc } = await recorded({ 356: { state: "Z", ppid: 0, threadsError: "ENOENT", statusReads: [null, "ENOENT"] } });
+  await pod.terminate();
+  expect(proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+});
+
+test("G01 대조군: 정상 부모의 스레드가 읽는 사이 사라져도 전체 신호를 막지 않는다", async () => {
+  const listed = await recorded({ 357: { state: "Z", ppid: SELF, threadsError: "ENOENT" } });
+  await listed.pod.terminate();
+  expect(listed.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+  const single = await recorded({ 358: { state: "Z", ppid: SELF, threads: { 358: "Z", 359: "S" }, threadErrors: { 359: "ESRCH" } } });
+  await single.pod.terminate();
+  expect(single.proc.signals.map((s) => s.signal)).toContain("SIGTERM");
+});

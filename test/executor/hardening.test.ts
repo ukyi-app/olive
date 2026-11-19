@@ -83,13 +83,26 @@ test("R07 같은 요청의 취소 둘이 겹쳐도 영수증 ID는 하나이고,
   const { runId } = await start(r);
   await until(() => r.store.run(runId)?.state === "running");
   const writing = disk.hold(cancelReceiptWrite);
-  const bothLookedUp = handled(r, 2);
+  // 둘째 봉투는 nonce 검증을 끝낸 뒤 조회 바로 앞에서 세운다. 쓰기가 멈춘 뒤에는 nonce도 저장 줄을 지나지 못한다.
+  const secondVerified = barrier();
+  const lookedUp = gate();
+  const handle = r.worker.handle.bind(r.worker);
+  let calls = 0;
+  r.worker.handle = async (verified, epoch) => {
+    if (++calls !== 2) return handle(verified, epoch);
+    await secondVerified.pass();
+    const work = handle(verified, epoch);
+    lookedUp.open();
+    return work;
+  };
   const requestId = randomUUID();
   const first = r.connection.receive(cancel(r, runId, requestId));
   const second = r.connection.receive(cancel(r, runId, requestId));
+  await secondVerified.entered;
   await writing.entered;
-  // 둘째 요청의 조회가 첫 영수증의 쓰기 안에서 끝난 뒤에 쓰기를 푼다.
-  await bothLookedUp;
+  // 둘째 요청의 조회는 첫 영수증의 파일 쓰기 안에서 일어난다.
+  secondVerified.open();
+  await lookedUp.wait;
   expect(cancelReceipts(r, runId)).toHaveLength(1);
   expect(r.transport.of("receipt_accepted").filter((e) => e.body.instruction === "task_cancel")).toHaveLength(0);
   writing.open();
