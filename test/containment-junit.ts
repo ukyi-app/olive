@@ -71,11 +71,15 @@ const isNode = (child: unknown): child is XML.Node => typeof child === "object" 
 const isComment = (child: unknown) => typeof child === "object" && child !== null && "comment" in child;
 
 // 주석은 요소가 아니므로 건너뛴다. 공백 아닌 글자, 처리 명령, 모르는 요소는 형식 문제로 실패시킨다.
+// <properties>는 사례의 상태와 무관한 메타데이터라 그 안을 보지 않고 건너뛴다(안에 testcase가 있어도 세지 않는다).
+// Bun은 CI 환경 변수(GITHUB_RUN_ID·GITHUB_SHA 등)가 있으면 파일 testsuite 아래에 이것을 쓴다.
 function walkSuite(node: XML.Node, where: string) {
   for (const child of node.children) {
     if (typeof child === "string") {
       if (child.trim() !== "") shape.push(`${where} 안에 글자가 있다: ${JSON.stringify(child.trim().slice(0, 60))}`);
     } else if (isComment(child)) {
+      continue;
+    } else if (isNode(child) && child.name === "properties") {
       continue;
     } else if (!isNode(child)) {
       shape.push(`${where} 안에 처리 명령이 있다`);
