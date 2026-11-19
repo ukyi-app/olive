@@ -1,7 +1,10 @@
 # 실행기 격리의 실제 프로세스 사례(test/executor/containment.test.ts)를 GitHub 호스트 러너의 일반 계정으로 돌린다.
 # build.yaml의 test는 이미지 빌드 안에서 돌고 거기엔 bwrap이 없어 이 사례들이 등록되지 않는다.
 # 이 검사는 사례가 실제로 실행돼 모두 통과했다는 JUnit 기록이 있을 때만 성공한다(test/containment-junit.ts).
-# 러너의 보안 설정(sysctl, AppArmor)은 바꾸지 않는다. 기본 설정에서 안 되면 진단 단계의 출력이 그 근거다.
+# 러너의 가상 머신에 bwrap 전용 AppArmor 예외 프로필 하나만 올린다(Ubuntu apparmor-profiles의
+# /usr/share/apparmor/extra-profiles/bwrap-userns-restrict, 배포판이 준 그대로). 머신 전체의 user namespace 제한
+# (kernel.apparmor_restrict_unprivileged_userns)과 다른 프로필은 그대로 둔다. 그래도 안 되면 진단 단계와
+# 마지막 커널 로그 단계의 출력이 그 근거다.
 # uses:는 40자 커밋 SHA로 고정한다(build.yaml의 태그 ref 규칙은 배포 키 때문이고 이 파일엔 해당하지 않는다).
 name: containment
 on:
@@ -55,6 +58,41 @@ jobs:
           test -x /usr/bin/bwrap
           test -x /usr/bin/python3
           test -x /usr/bin/nsenter
+
+      - name: bwrap 예외 프로필 올리기
+        # Ubuntu 24.04는 confine되지 않은 프로그램이 만든 user namespace에서 capability를 막는다. 배포판은 bwrap용
+        # 예외로 bwrap-userns-restrict를 준다: /usr/bin/bwrap에만 붙어 userns와 capability를 허용하고, bwrap이 띄우는
+        # 프로그램은 unpriv_bwrap과 겹쳐 capability를 받지 못한다.
+        # 패키지는 설치하지 않고 내려받아 풀기만 한다. 설치하면 postinst가 /etc/apparmor.d의 다른 프로필을 올린다.
+        run: |
+          sudo apt-get update
+          dir="$RUNNER_TEMP/apparmor-profiles"
+          mkdir -p "$dir"
+          (cd "$dir" && apt-get download apparmor-profiles)
+          shopt -s nullglob
+          debs=("$dir"/apparmor-profiles_*.deb)
+          if [ "${#debs[@]}" -ne 1 ]; then
+            echo "내려받은 apparmor-profiles 패키지가 ${#debs[@]}개다(기대 1개)"
+            exit 1
+          fi
+          deb=${debs[0]}
+          apt-cache policy apparmor-profiles
+          echo "apparmor-profiles $(dpkg-deb -f "$deb" Version), sha256 $(sha256sum "$deb" | cut -d' ' -f1)"
+          dpkg-query -W apparmor
+          dpkg-deb -x "$deb" "$dir/root"
+          profile="$dir/root/usr/share/apparmor/extra-profiles/bwrap-userns-restrict"
+          if [ ! -f "$profile" ]; then
+            echo "패키지에 bwrap-userns-restrict가 없다: $profile"
+            exit 1
+          fi
+          echo "올리는 파일: $profile"
+          sha256sum "$profile"
+          sudo apparmor_parser --replace "$profile"
+          loaded=$(sudo cat /sys/kernel/security/apparmor/profiles)
+          echo "로드된 프로필 중 bwrap 관련:"
+          grep -E '^(bwrap|unpriv_bwrap) ' <<<"$loaded"
+          grep -qx 'bwrap (enforce)' <<<"$loaded"
+          grep -qx 'unpriv_bwrap (enforce)' <<<"$loaded"
 
       - name: 진단(설정을 바꾸지 않고 읽기만)
         env:
@@ -123,9 +161,17 @@ jobs:
 
       - name: 실패 시 커널의 AppArmor 기록(읽기만)
         if: ${{ failure() }}
+        # 거부 줄의 profile=(bwrap, bwrap//&unpriv_bwrap, unprivileged_userns, unconfined)과 comm=(bwrap, sh, sleep,
+        # nsenter 등)이 프로필을 올린 뒤 무엇이 막혔는지 가른다. 부팅 때의 profile_load 줄은 그 뒤에 따로 찍는다.
         run: |
-          if sudo dmesg | grep -iE 'apparmor|bwrap|userns'; then
-            echo "위가 커널 로그의 관련 줄이다."
+          log=$(sudo dmesg)
+          if grep -E 'apparmor="(DENIED|AUDIT)"' <<<"$log"; then
+            echo "위가 커널 로그의 AppArmor 거부·감사 줄이다."
           else
-            echo "커널 로그에 관련 줄 없음"
+            echo "커널 로그에 AppArmor 거부·감사 줄 없음"
+          fi
+          if grep -E 'bwrap|nsenter|userns' <<<"$log" | grep -vE 'apparmor="(DENIED|AUDIT)"'; then
+            echo "위가 그 밖의 bwrap·nsenter·userns 관련 줄이다."
+          else
+            echo "그 밖의 bwrap·nsenter·userns 관련 줄 없음"
           fi
