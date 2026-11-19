@@ -2,7 +2,7 @@
 // 검사 이미지(Dockerfile의 test 단계, bun slim)에 openssl이 있다는 근거가 없어 DER을 직접 짠다.
 // 모양은 차트의 leaf 선언(ECDSA P-256, PKCS8, 용도 digital signature + server/client auth, URI SAN 하나, 감독만 DNS SAN)을 따른다.
 // 개인 키는 메모리에만 있고 파일로 쓰지 않는다.
-import { type KeyObject, generateKeyPairSync, randomBytes, sign } from "node:crypto";
+import { type KeyObject, createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 
 export const EKU_SERVER = "1.3.6.1.5.5.7.3.1";
 export const EKU_CLIENT = "1.3.6.1.5.5.7.3.2";
@@ -74,6 +74,15 @@ export interface Issued {
   readonly keyPem: string;
   readonly privateKey: KeyObject;
   readonly subject: string;
+  // 주체 키 식별자. 이 인증서가 발급한 leaf의 발급자 키 식별자가 이 값을 가리킨다.
+  readonly keyId: Uint8Array;
+}
+
+// RFC 5280 4.2.1.2 (1): subjectPublicKey 비트열(EC는 0x04 || x || y)의 SHA-1.
+function keyIdOf(publicKey: KeyObject): Uint8Array {
+  const jwk = publicKey.export({ format: "jwk" });
+  const point = Buffer.concat([Buffer.of(0x04), Buffer.from(jwk.x!, "base64url"), Buffer.from(jwk.y!, "base64url")]);
+  return new Uint8Array(createHash("sha1").update(point).digest());
 }
 
 export interface CertSpec {
@@ -109,8 +118,12 @@ export function issue(spec: CertSpec): Issued {
   const serial = randomBytes(16);
   serial[0] = serial[0]! & 0x7f;
   const sigAlg = seq(oid("1.2.840.10045.4.3.2"));
+  const keyId = keyIdOf(pair.publicKey);
   const extensions: Uint8Array[] = [];
   extensions.push(extension("2.5.29.19", true, spec.ca ? seq(bool(true)) : seq()));
+  // 발급 기관에는 주체 키 식별자, 발급받은 인증서에는 발급자 키 식별자([0] keyIdentifier). RFC 5280 4.2.1.1–2, openssl -x509_strict가 요구한다.
+  if (spec.ca) extensions.push(extension("2.5.29.14", false, octets(keyId)));
+  if (spec.issuer) extensions.push(extension("2.5.29.35", false, seq(tlv(0x80, spec.issuer.keyId))));
   // keyUsage: CA는 keyCertSign·cRLSign, leaf는 digitalSignature(차트의 usages와 같다).
   extensions.push(extension("2.5.29.15", true, spec.ca ? bits(Uint8Array.of(0x06), 1) : bits(Uint8Array.of(0x80), 7)));
   if (spec.ekus) extensions.push(extension("2.5.29.37", false, seq(...spec.ekus.map(oid))));
@@ -134,7 +147,7 @@ export function issue(spec: CertSpec): Issued {
   const signature = new Uint8Array(sign("sha256", tbs, signer));
   const der = seq(tbs, sigAlg, bits(signature));
   const keyPem = pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-  return { der, pem: pem("CERTIFICATE", der), keyPem, privateKey: pair.privateKey, subject: spec.subject };
+  return { der, pem: pem("CERTIFICATE", der), keyPem, privateKey: pair.privateKey, subject: spec.subject, keyId };
 }
 
 // 차트의 이름 꼴(platform/olive/templates/_helpers.tpl의 olive.pki.uri·olive.pki.dnsName)을 따른 시험 값.

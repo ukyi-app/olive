@@ -310,7 +310,8 @@ function checkShape(facts: CertificateFacts, role: "supervisor" | "executor", no
 
 // ---- 자기 재료(인증서·키·신뢰 묶음) ----
 
-// 진입점이 파일에서 읽어 넘기는 바이트. 셋은 늘 함께 바뀐다.
+// 진입점이 파일에서 읽어 넘기는 바이트.
+// 함정: 이 모듈은 셋이 같은 발급에서 나온 것인지 가르지 못한다. 짝(키↔leaf)과 직접 서명(묶음 안의 어느 발급 기관이든)만 본다.
 export interface RawTlsMaterial {
   readonly certificatePem: string;
   readonly privateKeyPem: string;
@@ -331,11 +332,11 @@ export const MATERIAL_REJECT_REASONS = [
   "trust_not_ca",
   "certificate_unreadable",
   "key_unreadable",
-  // 키가 인증서의 공개 키와 짝이 아니다(인증서와 키 중 하나만 바뀐 상태).
+  // 키가 인증서의 공개 키와 짝이 아니다.
   "key_mismatch",
-  // 자기 leaf가 같은 묶음의 발급 기관에게 서명받지 않았다(신뢰 묶음과 leaf 중 하나만 바뀐 상태).
+  // 자기 leaf가 주어진 묶음의 어느 발급 기관에게도 직접 서명받지 않았다.
   "certificate_not_from_trust",
-  // 자기 leaf의 기간·용도·SAN이 자기 역할의 규칙에 맞지 않는다(상대가 받지 않을 인증서).
+  // 자기 leaf의 기간·용도·SAN(URI와 DNS)이 자기 역할의 규칙에 맞지 않는다(상대가 받지 않을 인증서).
   "certificate_not_valid_now",
   "certificate_shape",
 ] as const;
@@ -349,9 +350,11 @@ export class TlsMaterialError extends Error {
   }
 }
 
-// 셋을 한 묶음으로 검사한다. 하나라도 틀리면 묶음 전체를 받지 않는다.
+// 이 재료로 시작해도 되는가. 셋 가운데 하나라도 틀리면 받지 않는다.
 // 빈 신뢰 묶음을 거절하는 이유: node:tls에 빈 ca를 주면 오류 없이 받는다(Bun 1.4.4 실측). 시스템 기본 신뢰로 대신 검증하는 길을 막는다.
-export function prepareMaterial(raw: RawTlsMaterial, role: "supervisor" | "executor", now: number): MaterialCheck {
+// DNS SAN도 상대 판정(checkPeer)과 같은 규칙으로 본다: 감독 leaf는 정확히 하나, 실행기 leaf는 없음. 상대가 반드시 거절할 재료로 시작하지 않는다.
+// supervisorDnsName: 감독 역할에서 자기 DNS 이름을 아는 쪽이 주면 값까지 본다. 주지 않으면 개수만 본다.
+export function prepareMaterial(raw: RawTlsMaterial, role: "supervisor" | "executor", now: number, supervisorDnsName?: string): MaterialCheck {
   const fail = (reason: MaterialRejectReason): MaterialCheck => ({ ok: false, reason });
   const trustBlocks = pemCertificates(raw.trustBundlePem);
   if (!trustBlocks) return fail("trust_unreadable");
@@ -394,10 +397,14 @@ export function prepareMaterial(raw: RawTlsMaterial, role: "supervisor" | "execu
 
   const shape = checkShape(facts, role, now);
   if (!shape.ok) return fail(shape.reason === "not_yet_valid" || shape.reason === "expired" ? "certificate_not_valid_now" : "certificate_shape");
+  const dns = facts.dnsNames;
+  if (role === "supervisor" ? dns.length !== 1 || (supervisorDnsName !== undefined && dns[0] !== supervisorDnsName) : dns.length !== 0) {
+    return fail("certificate_shape");
+  }
   return { ok: true, material: { ...raw, leafDer, trust, identity: shape.identity, notAfter: facts.notAfter } };
 }
 
-export function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;

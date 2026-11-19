@@ -1,4 +1,4 @@
-// 감독·실행기 상호 TLS의 보장 넷. 루프백(127.0.0.1)의 빈 포트에서만 연다. 인증서는 시험 안에서 만든다(certs.ts).
+// 감독·실행기 상호 TLS의 보장 둘과 자기 재료 검사. 루프백(127.0.0.1)의 빈 포트에서만 연다. 인증서는 시험 안에서 만든다(certs.ts).
 // 우리 끝의 상대가 규칙을 어기는 경우는 맨 node:tls로 상대를 흉내 낸다(우리 끝은 그런 재료로 시작하지 않으므로).
 import { afterEach, describe, expect, test } from "bun:test";
 import * as tls from "node:tls";
@@ -192,112 +192,53 @@ describe("(2) IP로 붙어 감독 DNS·정확한 SAN 확인", () => {
   });
 });
 
-describe("(3) leaf 갱신 후 기존 연결 폐기", () => {
-  test("감독의 재료를 바꾸면 기존 연결이 닫히고 새 연결은 새 서버 인증서로만 맺어진다", async () => {
-    const { handle, surfaced } = await server();
-    const c = client(handle.port);
-    const old = await c.connect();
-    const oldClosed = closedFlag(old.socket);
-    await until(() => surfaced.length === 1);
-    const serverOldClosed = closedFlag(surfaced[0]!.socket);
-    const renewed = pki.supervisor();
-    expect(handle.replaceMaterial(material(renewed)).ok).toBe(true);
-    await until(() => oldClosed() && serverOldClosed());
-    expect(handle.openConnections()).toBe(0);
-    const fresh = await c.connect();
-    expect(Buffer.from(fresh.socket.getPeerCertificate().raw)).toEqual(Buffer.from(renewed.der));
-    await until(() => surfaced.length === 2);
-    expect(surfaced[1]!.generation).toBe(2);
-    expect(Buffer.from((surfaced[1]!.socket.getCertificate() as tls.PeerCertificate).raw)).toEqual(Buffer.from(renewed.der));
-    fresh.socket.destroy();
-  });
-
-  test("실행기의 재료를 바꾸면 기존 연결이 닫히고 새 연결은 새 클라이언트 인증서로만 맺어진다", async () => {
-    const { handle, surfaced } = await server();
-    const c = client(handle.port);
-    const old = await c.connect();
-    const oldClosed = closedFlag(old.socket);
-    await until(() => surfaced.length === 1);
-    const serverOldClosed = closedFlag(surfaced[0]!.socket);
-    const renewed = pki.executor();
-    expect(c.replaceMaterial(material(renewed)).ok).toBe(true);
-    await until(() => oldClosed() && serverOldClosed());
-    expect(c.openConnections()).toBe(0);
-    const fresh = await c.connect();
-    expect(fresh.generation).toBe(2);
-    await until(() => surfaced.length === 2);
-    expect(Buffer.from(surfaced[1]!.socket.getPeerCertificate().raw)).toEqual(Buffer.from(renewed.der));
-    fresh.socket.destroy();
-  });
-});
-
-describe("(4) 일부 파일 교체 중 새 권한 0", () => {
-  const next = makePki("olive-internal-ca-g2");
+// 자기 재료의 검사: 이 재료로 시작해도 되는가. 짝과 꼴만 본다(셋이 같은 발급에서 나왔는지는 가르지 못한다).
+describe("재료: 이 재료로 시작해도 되는가", () => {
+  const other = makePki("olive-internal-ca-other");
   const truncate = (pem: string) => pem.slice(0, pem.length - 40);
   const expired = (make: (o: object) => Issued) => make({ notBefore: new Date(Date.now() - 7_200_000), notAfter: new Date(Date.now() - 3_600_000) });
 
-  test("감독: 셋 가운데 일부만 새것이거나 손상·만료면 교체를 받지 않고, 기존 연결을 닫고, 새 연결을 위로 넘기지 않는다", async () => {
-    const sup1 = pki.supervisor();
-    const sup2 = next.supervisor();
-    const { handle, surfaced } = await server(sup1);
-    const c = client(handle.port);
-    const partial: [RawTlsMaterial, string][] = [
-      [{ certificatePem: sup2.pem, privateKeyPem: sup1.keyPem, trustBundlePem: pki.ca.pem }, "key_mismatch"],
-      [{ certificatePem: sup1.pem, privateKeyPem: sup2.keyPem, trustBundlePem: pki.ca.pem }, "key_mismatch"],
-      [{ certificatePem: sup2.pem, privateKeyPem: sup2.keyPem, trustBundlePem: pki.ca.pem }, "certificate_not_from_trust"],
-      [{ certificatePem: sup1.pem, privateKeyPem: sup1.keyPem, trustBundlePem: next.ca.pem }, "certificate_not_from_trust"],
-      [{ ...material(sup1), trustBundlePem: "" }, "trust_empty"],
-      [{ ...material(sup1), trustBundlePem: truncate(pki.ca.pem) }, "trust_unreadable"],
-      [{ ...material(sup1), certificatePem: truncate(sup1.pem) }, "certificate_unreadable"],
-      [material(expired(pki.supervisor)), "certificate_not_valid_now"],
-    ];
-    for (const [bad, reason] of partial) {
-      expect(handle.replaceMaterial(material(sup1)).ok).toBe(true);
-      const before = surfaced.length;
-      const live = await c.connect();
-      const liveClosed = closedFlag(live.socket);
-      await until(() => surfaced.length === before + 1);
-      expect(handle.replaceMaterial(bad)).toEqual({ ok: false, reason } as never);
-      await until(liveClosed);
-      expect(handle.openConnections()).toBe(0);
-      // 새 시도: TLS 1.3이라 실행기 쪽 핸드셰이크는 옛 컨텍스트로 끝날 수 있지만, 감독은 위로 넘기지 않고 곧 닫는다.
-      try {
-        const attempt = await c.connect();
-        await until(closedFlag(attempt.socket));
-      } catch (error) {
-        expect(error).toBeInstanceOf(TlsConnectError);
-      }
-      expect(surfaced.length).toBe(before + 1);
-      expect(handle.openConnections()).toBe(0);
+  test("짝이 맞지 않거나, 주어진 묶음이 직접 서명하지 않았거나, 묶음이 비거나 손상·만료면 시작하지 않는다", async () => {
+    for (const [role, mine, theirs, make] of [
+      ["supervisor", pki.supervisor(), other.supervisor(), pki.supervisor],
+      ["executor", pki.executor(), other.executor(), pki.executor],
+    ] as const) {
+      const cases: [RawTlsMaterial, string][] = [
+        [{ certificatePem: theirs.pem, privateKeyPem: mine.keyPem, trustBundlePem: pki.ca.pem }, "key_mismatch"],
+        [{ certificatePem: mine.pem, privateKeyPem: theirs.keyPem, trustBundlePem: pki.ca.pem }, "key_mismatch"],
+        [{ certificatePem: theirs.pem, privateKeyPem: theirs.keyPem, trustBundlePem: pki.ca.pem }, "certificate_not_from_trust"],
+        [{ ...material(mine), trustBundlePem: other.ca.pem }, "certificate_not_from_trust"],
+        [{ ...material(mine), trustBundlePem: "" }, "trust_empty"],
+        [{ ...material(mine), trustBundlePem: truncate(pki.ca.pem) }, "trust_unreadable"],
+        [{ ...material(mine), trustBundlePem: `${pki.ca.pem}${mine.pem}` }, "trust_not_ca"],
+        [{ ...material(mine), certificatePem: truncate(mine.pem) }, "certificate_unreadable"],
+        [{ ...material(mine), privateKeyPem: truncate(mine.keyPem) }, "key_unreadable"],
+        [material(expired(make)), "certificate_not_valid_now"],
+      ];
+      for (const [bad, reason] of cases) expect(prepareMaterial(bad, role, now()), `${role} ${reason}`).toEqual({ ok: false, reason } as never);
+      expect(prepareMaterial(material(mine), role, now()).ok).toBe(true);
+      // 묶음에 발급 기관이 둘이어도 그중 하나가 직접 서명했으면 받는다.
+      expect(prepareMaterial({ ...material(mine), trustBundlePem: `${other.ca.pem}${pki.ca.pem}` }, role, now()).ok).toBe(true);
     }
-    // 온전한 묶음으로 바꾸면 다시 받는다.
-    expect(handle.replaceMaterial(material(sup1)).ok).toBe(true);
-    (await c.connect()).socket.destroy();
+    await expect(
+      startTlsServer({ host: HOST, port: 0, material: { ...material(pki.supervisor()), trustBundlePem: "" }, now, onConnection: () => {} }),
+    ).rejects.toThrow(TlsMaterialError);
+    expect(() => client(1, other.executor())).toThrow(TlsMaterialError);
   });
 
-  test("실행기: 셋 가운데 일부만 새것이거나 손상·만료면 교체를 받지 않고, 기존 연결을 닫고, 새 연결을 맺지 않는다", async () => {
-    const { handle } = await server();
-    const exe1 = pki.executor();
-    const exe2 = next.executor();
-    const c = client(handle.port, exe1);
-    const partial: [RawTlsMaterial, string][] = [
-      [{ certificatePem: exe2.pem, privateKeyPem: exe1.keyPem, trustBundlePem: pki.ca.pem }, "key_mismatch"],
-      [{ certificatePem: exe1.pem, privateKeyPem: exe2.keyPem, trustBundlePem: pki.ca.pem }, "key_mismatch"],
-      [{ certificatePem: exe2.pem, privateKeyPem: exe2.keyPem, trustBundlePem: pki.ca.pem }, "certificate_not_from_trust"],
-      [{ certificatePem: exe1.pem, privateKeyPem: exe1.keyPem, trustBundlePem: next.ca.pem }, "certificate_not_from_trust"],
-      [{ ...material(exe1), trustBundlePem: `${pki.ca.pem}${exe1.pem}` }, "trust_not_ca"],
-      [{ ...material(exe1), privateKeyPem: truncate(exe1.keyPem) }, "key_unreadable"],
-      [material(expired(pki.executor)), "certificate_not_valid_now"],
-    ];
-    for (const [bad, reason] of partial) {
-      expect(c.replaceMaterial(material(exe1)).ok).toBe(true);
-      const live = await c.connect();
-      const liveClosed = closedFlag(live.socket);
-      expect(c.replaceMaterial(bad)).toEqual({ ok: false, reason } as never);
-      await until(liveClosed);
-      expect(c.openConnections()).toBe(0);
-      expect(await connectFailure(c)).toBe("no_material");
-    }
+  test("DNS SAN이 자기 역할의 규칙(감독은 정확히 그 이름 하나, 실행기는 없음)에 맞지 않으면 시작하지 않는다", async () => {
+    const shape = { ok: false, reason: "certificate_shape" };
+    expect(prepareMaterial(material(pki.supervisor({ dns: [] })), "supervisor", now())).toEqual(shape as never);
+    expect(prepareMaterial(material(pki.supervisor({ dns: [SUPERVISOR_DNS, "supervisor.olive-other.svc"] })), "supervisor", now())).toEqual(shape as never);
+    expect(prepareMaterial(material(pki.supervisor({ dns: ["supervisor.olive-other.svc"] })), "supervisor", now(), SUPERVISOR_DNS)).toEqual(shape as never);
+    expect(prepareMaterial(material(pki.executor({ dns: ["executor.olive-reader.svc"] })), "executor", now())).toEqual(shape as never);
+    // 대조군: 이름을 알면 값까지, 모르면 개수만 본다.
+    expect(prepareMaterial(material(pki.supervisor()), "supervisor", now(), SUPERVISOR_DNS).ok).toBe(true);
+    expect(prepareMaterial(material(pki.supervisor({ dns: ["supervisor.olive-other.svc"] })), "supervisor", now()).ok).toBe(true);
+    await expect(startTlsServer({ host: HOST, port: 0, material: material(pki.supervisor({ dns: [] })), now, onConnection: () => {} })).rejects.toThrow(
+      TlsMaterialError,
+    );
+    expect(() => client(1, pki.executor({ dns: ["executor.olive-reader.svc"] }))).toThrow(TlsMaterialError);
   });
 });
 

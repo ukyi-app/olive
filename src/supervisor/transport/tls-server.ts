@@ -1,11 +1,11 @@
 // 감독 쪽 상호 TLS 수신. 클라이언트 인증서를 요구하고, ../../transport/tls-policy.ts의 판정을 통과한 연결만 위로 넘긴다.
 // 실행기 쪽 모듈은 이 파일을 import하지 않는다(실행기는 듣지 않는다, D-55).
+// 인증서·키·신뢰 묶음은 시작할 때 바이트로 한 번 받는다. 파일을 읽는 것은 부르는 쪽(진입점)의 일이다.
 //
 // 위로 넘기는 신원은 인증서가 증명한 배포 대상(네임스페이스·대상 id)까지다. 등록된 실행기가 아니다.
 // 등록표 대조, 정지 세대 맞춤, hello, 점유는 뒤 작업이 이 연결 위에서 한다.
 import * as tls from "node:tls";
 import {
-  type MaterialCheck,
   type PeerRejectReason,
   type RawTlsMaterial,
   type TlsDeploymentIdentity,
@@ -14,7 +14,6 @@ import {
   checkPeer,
   prepareMaterial,
   readPeerCertificate,
-  sameBytes,
 } from "../../transport/tls-policy.ts";
 
 export interface TlsServerOptions {
@@ -34,17 +33,12 @@ export interface CertifiedExecutorConnection {
   readonly socket: tls.TLSSocket;
   readonly executor: Extract<TlsDeploymentIdentity, { kind: "executor" }>;
   readonly peerNotAfter: number;
-  readonly generation: number;
 }
 
-export type ServerRejectReason = PeerRejectReason | "no_material" | "material_replaced";
+export type ServerRejectReason = PeerRejectReason | "no_material";
 
 export interface TlsServer {
   readonly port: number;
-  // 인증서·키·신뢰 묶음을 한 묶음으로 바꾼다. 결과와 무관하게 옛 재료로 맺은 연결은 모두 닫는다.
-  // 실패하면 재료가 없는 상태가 되어 새 연결을 위로 넘기지 않는다(다음 성공한 교체까지).
-  replaceMaterial(raw: RawTlsMaterial): MaterialCheck;
-  openConnections(): number;
   close(): Promise<void>;
 }
 
@@ -57,19 +51,24 @@ export async function startTlsServer(options: TlsServerOptions): Promise<TlsServ
 }
 
 class Server implements TlsServer {
-  private material: TlsMaterial | null;
-  private generation = 1;
-  private readonly live = new Set<tls.TLSSocket>();
-  private readonly raw = new Set<tls.TLSSocket>();
+  // 핸드셰이크를 마친 연결 전부(위로 넘긴 것과 판정 중인 것). close()가 모두 닫는다.
+  private readonly sockets = new Set<tls.TLSSocket>();
   private readonly server: tls.Server;
+  private closed = false;
   port = 0;
 
   constructor(
     private readonly options: TlsServerOptions,
-    material: TlsMaterial,
+    private readonly material: TlsMaterial,
   ) {
-    this.material = material;
-    this.server = tls.createServer({ ...contextOf(material), requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3" });
+    this.server = tls.createServer({
+      key: material.privateKeyPem,
+      cert: material.certificatePem,
+      ca: material.trustBundlePem,
+      requestCert: true,
+      rejectUnauthorized: true,
+      minVersion: "TLSv1.3",
+    });
     this.server.on("secureConnection", (socket) => this.admit(socket));
     // 핸드셰이크에서 끊긴 상대(인증서 없음, 다른 발급 기관, 반대 용도)는 여기로 온다. 위로 올라가지 않는다.
     this.server.on("tlsClientError", (_error, socket) => socket.destroy());
@@ -88,24 +87,16 @@ class Server implements TlsServer {
   }
 
   private admit(socket: tls.TLSSocket): void {
-    this.raw.add(socket);
-    socket.once("close", () => {
-      this.raw.delete(socket);
-      this.live.delete(socket);
-    });
+    this.sockets.add(socket);
+    socket.once("close", () => this.sockets.delete(socket));
     socket.on("error", () => socket.destroy());
-    const material = this.material;
     const now = this.options.now();
-    if (!material || material.notAfter <= now) return this.refuse(socket, "no_material");
-    // 이 연결이 지금 재료의 인증서로 맺어졌는가. 교체 직전에 시작된 핸드셰이크는 옛 컨텍스트로 끝날 수 있다.
-    const local = rawOf(socket.getCertificate());
-    if (!local || !sameBytes(local, material.leafDer)) return this.refuse(socket, "material_replaced");
-    const peer = readPeerCertificate(socket.authorized, rawOf(socket.getPeerCertificate()), material.trust);
+    if (this.closed || this.material.notAfter <= now) return this.refuse(socket, "no_material");
+    const peer = readPeerCertificate(socket.authorized, rawOf(socket.getPeerCertificate()), this.material.trust);
     const verdict = checkPeer(peer, { role: "executor" }, now);
     if (!verdict.ok) return this.refuse(socket, verdict.reason);
     if (verdict.identity.kind !== "executor") return this.refuse(socket, "identity_mismatch");
-    this.live.add(socket);
-    this.options.onConnection({ socket, executor: verdict.identity, peerNotAfter: peer.facts!.notAfter, generation: this.generation });
+    this.options.onConnection({ socket, executor: verdict.identity, peerNotAfter: peer.facts!.notAfter });
   }
 
   private refuse(socket: tls.TLSSocket, reason: ServerRejectReason): void {
@@ -113,42 +104,12 @@ class Server implements TlsServer {
     this.options.onRejected?.(reason);
   }
 
-  replaceMaterial(raw: RawTlsMaterial): MaterialCheck {
-    const next = prepareMaterial(raw, "supervisor", this.options.now());
-    let applied: TlsMaterial | null = null;
-    if (next.ok) {
-      try {
-        // 키·인증서·신뢰 묶음을 한 번의 호출로 바꾼다. 새 핸드셰이크부터 적용되고 기존 연결은 그대로라 아래에서 닫는다.
-        this.server.setSecureContext(contextOf(next.material));
-        applied = next.material;
-      } catch {
-        applied = null;
-      }
-    }
-    // 순서: 재료(또는 재료 없음)를 세우고 세대를 올린 뒤 옛 연결을 닫는다.
-    // 적용에 실패하면 컨텍스트는 옛것으로 남지만 material이 null이라 그 컨텍스트로 맺은 연결은 admit에서 버린다.
-    this.material = applied;
-    this.generation++;
-    for (const socket of [...this.raw]) socket.destroy();
-    this.live.clear();
-    if (next.ok && !applied) return { ok: false, reason: "certificate_unreadable" };
-    return next;
-  }
-
-  openConnections(): number {
-    return this.live.size;
-  }
-
   close(): Promise<void> {
-    this.material = null;
-    for (const socket of [...this.raw]) socket.destroy();
-    this.live.clear();
+    this.closed = true;
+    for (const socket of [...this.sockets]) socket.destroy();
+    this.sockets.clear();
     return new Promise((resolve) => this.server.close(() => resolve()));
   }
-}
-
-function contextOf(material: TlsMaterial): tls.SecureContextOptions {
-  return { key: material.privateKeyPem, cert: material.certificatePem, ca: material.trustBundlePem };
 }
 
 function rawOf(cert: tls.PeerCertificate | object | null | undefined): Uint8Array | undefined {
