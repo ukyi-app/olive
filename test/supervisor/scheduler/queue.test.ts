@@ -98,7 +98,7 @@ describe("다음 시작 후보", () => {
     expect(nextIntent({ ...base, run: { runId: "c", kind: "worker", state: "cleanup_pending", deadlineAt: NOW + 1 } }, LIFE).intent).toBe("finalize");
   });
 
-  test("재시도·새 세션은 예산 보충 0", () => {
+  test("같은 입력 ID의 재시도·새 세션 줄은 예산 보충 0", () => {
     // 같은 입력의 앞 실행이 남긴 예산보다 많이 받은 새 실행 줄은 시작 후보가 아니다.
     const prior = run({ state: "finalized", budgetLeft: 1_000 });
     const retry = run({ inputRequestId: prior.inputRequestId, budgetLeft: 50_000 });
@@ -146,7 +146,28 @@ describe("모르거나 꼴이 틀린 입력", () => {
     expect(planNext(view([first, smaller], inputs), POLICY).candidates.map((c) => c.runId)).toEqual([first.runId]);
   });
 
-  test("F4: 읽지 못한 잔액은 모름이고, 다른 실행의 잔액 0을 가리지 않는다", () => {
+  test("시작 전에 닫힌 줄(not_started)의 배정액은 상한이 아니고, 소진과 시작한 줄의 잔액은 그대로 상한이다", () => {
+    // not_started로 들어오는 길이 queued뿐인 동안만 성립한다. 표가 바뀌면 이 단언이 먼저 실패한다.
+    for (const kind of ["worker", "session"] as const) {
+      expect(Object.entries(TRANSITIONS[kind]).filter(([, to]) => to?.includes("not_started")).map(([from]) => from), kind).toEqual(["queued"]);
+    }
+    const current = run({ inputRequestId: "ns", budgetLeft: 10 });
+    const inputs = [inputFor(current, "admin")];
+    // 리뷰의 재현 입력: 뒤 순번 not_started 3, 지금 10 → 후보.
+    const closedLater = run({ inputRequestId: "ns", state: "not_started", budgetLeft: 3 });
+    expect(planNext(view([current, closedLater], inputs), POLICY)).toEqual({ candidates: [{ runId: current.runId, kind: "worker", origin: "admin", budgetLeft: 10 }], held: [] });
+    // 앞 순번이어도 not_started의 배정액은 상한이 아니다.
+    const closedEarlier = { ...closedLater, queueSeq: 0 };
+    expect(planNext(view([closedEarlier, current], inputs), POLICY).candidates.map((c) => c.runId)).toEqual([current.runId]);
+    // 잔액 0으로 닫힌 줄은 여전히 소진이다.
+    expect(planNext(view([current, { ...closedLater, budgetLeft: 0 }], inputs), POLICY).held).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_exhausted" }]);
+    // 시작한 적 있는 줄(시작 뒤에 끝난 상태)의 잔액은 순번과 무관하게 상한이다.
+    for (const state of ["finalized", "failed_stopped", "cleanup_pending"] as const) {
+      expect(planNext(view([current, { ...closedLater, state }], inputs), POLICY).held, state).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
+    }
+  });
+
+  test("F4: 읽지 못한 잔액은 모름이고, 자기 잔액을 읽었으면 다른 실행들 사이의 모름이 잔액 0을 가리지 않는다", () => {
     for (const unread of [undefined, Number.NaN]) {
       const a = run({ inputRequestId: "f4", state: "finalized", budgetLeft: broken<number>(unread) });
       const b = run({ inputRequestId: "f4", state: "finalized", budgetLeft: 0 });
