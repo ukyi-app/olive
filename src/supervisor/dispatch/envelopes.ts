@@ -7,8 +7,11 @@
 import {
   ACTION_SPECS,
   type Bodies,
+  CONTRACT,
+  canonicalJson,
   digestOf,
   type Envelope,
+  type Header,
   limits,
   maySend,
   parsePrincipal,
@@ -27,22 +30,32 @@ export const SUPERVISOR = "supervisor";
 export const DRAFT_ACTIONS = ["task_start", "run_renew", "task_cancel", "session_stop", "result_finalize", "status_query", "ack"] as const;
 export type DraftAction = (typeof DRAFT_ACTIONS)[number];
 
-export interface Draft<A extends DraftAction = DraftAction> {
+// 장부가 정한 발행 시각을 그대로 싣는 동작. 봉하는 때의 now로 채우지 않는다(sealDraft).
+const PINNED_ACTIONS: readonly DraftAction[] = ["task_start", "run_renew"];
+type PinnedAction = "task_start" | "run_renew";
+
+interface DraftOf<A extends DraftAction> {
   action: A;
   // 받는 실행기의 주체 이름(장부의 executorId).
   recipient: string;
   requestId: string;
+  // 계약 v1의 머리 꼴: 정지 세대는 0 이상의 안전 정수. 실행 세대는 실행에 묶인 지시(ACTION_SPECS의 runField)면 1 이상, 조회·ack는 0.
   stopGeneration: number;
   runGeneration: number;
   body: Bodies[A];
-  // 장부가 정한 발행 시각. 시작·갱신은 늘 이 값이고 다시 봉해도 바뀌지 않는다. null이면 봉하는 때의 now를 쓴다.
-  issuedAt: number | null;
+  // 장부가 정한 발행 시각. 시작·갱신은 꼭 있어야 하고(없으면 만들지도 봉하지도 않는다) 다시 봉해도 바뀌지 않는다.
+  // 나머지 동작은 null이면 봉하는 때의 now를 쓴다.
+  issuedAt: A extends PinnedAction ? number : number | null;
 }
+export type Draft<A extends DraftAction = DraftAction> = { [K in A]: DraftOf<K> }[A];
 
 export const REFUSAL_REASONS = [
   // 초안: 장부 기록이나 부르는 쪽의 입력이 모자라거나 꼴이 틀림
+  "input_malformed",
   "missing_field",
   "issued_at_unknown",
+  "stop_generation_invalid",
+  "run_generation_invalid",
   "lease_unknown",
   "not_worker_run",
   "recipient_invalid",
@@ -57,13 +70,14 @@ export const REFUSAL_REASONS = [
   "bad_time",
   "issued_in_future",
   "deadline_passed",
+  "deadline_too_close",
   "too_late_to_send",
   "seal_refused",
   "signer_mismatch",
 ] as const;
 export type RefusalReason = (typeof REFUSAL_REASONS)[number];
 
-// field는 missing_field의 칸 이름, sealReason은 seal_refused의 계약 사유다.
+// field는 missing_field·input_malformed의 칸 이름, sealReason은 seal_refused의 계약 사유다.
 export type Refusal = { ok: false; reason: RefusalReason; field?: string; sealReason?: RejectReason };
 export type Drafted<A extends DraftAction> = { ok: true; draft: Draft<A> } | Refusal;
 export type Sealed = { ok: true; envelope: Envelope } | Refusal;
@@ -98,6 +112,27 @@ function recipientFits(action: DraftAction, recipient: string): boolean {
 }
 
 const missing = (value: unknown): boolean => value === null || value === undefined;
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+const isTime = (value: unknown): boolean => Number.isSafeInteger(value) && (value as number) >= 1;
+
+// 초안의 머리 칸이 계약 v1이 정한 꼴인가. 초안을 만들 때와 봉할 때 같은 검사를 한다(공개 초안을 직접 봉하는 길도 막는다).
+// 실행 세대는 받는 쪽(verifyEnvelope 6단계)의 규칙이다: 실행에 묶인 지시는 아는 실행이면 그 세대와 같아야 하고 모르는 실행을
+// 여는 시작은 1 이상이어야 한다. 장부의 실행 세대는 1 이상이므로 0은 어느 쪽으로도 받아들여지지 않는다. 묶이지 않은 메시지는 0이다.
+function draftRefusal(draft: unknown): Refusal | null {
+  if (!isRecord(draft)) return refuse("input_malformed", { field: "draft" });
+  const action = DRAFT_ACTIONS.find((a) => a === draft.action);
+  if (action === undefined) return refuse("input_malformed", { field: "action" });
+  if (!Number.isSafeInteger(draft.stopGeneration) || (draft.stopGeneration as number) < 0) return refuse("stop_generation_invalid");
+  const runGeneration = draft.runGeneration;
+  const runFits = ACTION_SPECS[action].runField === null ? runGeneration === 0 : Number.isSafeInteger(runGeneration) && (runGeneration as number) >= 1;
+  if (!runFits) return refuse("run_generation_invalid");
+  if (missing(draft.issuedAt)) return PINNED_ACTIONS.includes(action) ? refuse("issued_at_unknown") : null;
+  return isTime(draft.issuedAt) ? null : refuse("bad_time");
+}
+
+function finish<A extends DraftAction>(draft: Draft<A>): Drafted<A> {
+  return draftRefusal(draft) ?? { ok: true, draft };
+}
 
 export interface StartDraftInput {
   // startRun이 돌려준 실행 줄.
@@ -126,7 +161,9 @@ export interface StartDraftInput {
 }
 
 export function startDraft(input: StartDraftInput): Drafted<"task_start"> {
+  if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
   const { run } = input;
+  if (!isRecord(run)) return refuse("input_malformed", { field: "run" });
   if (missing(input.issuedAt)) return refuse("issued_at_unknown");
   if (run.kind !== "worker") return refuse("not_worker_run");
   for (const field of ["role", "snapshotDigest", "inputDigest"] as const) if (missing(run[field])) return refuse("missing_field", { field });
@@ -137,29 +174,26 @@ export function startDraft(input: StartDraftInput): Drafted<"task_start"> {
   if (run.budgetLeft < 1) return refuse("budget_exhausted");
   const issuedAt = input.issuedAt as number;
   if (run.deadlineAt <= issuedAt) return refuse("deadline_not_after_issue");
-  return {
-    ok: true,
-    draft: {
-      action: "task_start",
-      recipient: run.executorId,
-      requestId: input.requestId,
-      stopGeneration: input.stopGeneration,
-      runGeneration: run.runGeneration,
-      issuedAt,
-      body: {
-        run_id: run.runId,
-        role,
-        profile_revision: run.profileRevision,
-        policy_revision: run.policyRevision,
-        snapshot_digest: run.snapshotDigest as string,
-        input_digest: run.inputDigest as string,
-        deadline_at: run.deadlineAt,
-        budget_tokens: run.budgetLeft,
-        // method는 장부에서 문자열이다. 계약 밖의 값이면 봉할 때 계약이 body_malformed로 거절한다.
-        credential: { ...run.credential } as Bodies["task_start"]["credential"],
-      },
+  return finish({
+    action: "task_start",
+    recipient: run.executorId,
+    requestId: input.requestId,
+    stopGeneration: input.stopGeneration,
+    runGeneration: run.runGeneration,
+    issuedAt,
+    body: {
+      run_id: run.runId,
+      role,
+      profile_revision: run.profileRevision,
+      policy_revision: run.policyRevision,
+      snapshot_digest: run.snapshotDigest as string,
+      input_digest: run.inputDigest as string,
+      deadline_at: run.deadlineAt,
+      budget_tokens: run.budgetLeft,
+      // method는 장부에서 문자열이다. 계약 밖의 값이면 봉할 때 계약이 body_malformed로 거절한다.
+      credential: { ...run.credential } as Bodies["task_start"]["credential"],
     },
-  };
+  });
 }
 
 type RunFacts = Pick<Run, "runId" | "runGeneration" | "executorId">;
@@ -174,24 +208,23 @@ export interface RenewDraftInput {
 }
 
 export function renewDraft(input: RenewDraftInput): Drafted<"run_renew"> {
+  if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
+  if (!isRecord(input.run)) return refuse("input_malformed", { field: "run" });
   if (missing(input.leaseUntil)) return refuse("lease_unknown");
   if (!Number.isSafeInteger(input.now)) return refuse("bad_time");
   const leaseUntil = input.leaseUntil as number;
   // 계약 v1의 받는 쪽 경계: 발급 시각보다 늦고 발급 + RUN_LEASE_MAX_MS 이하.
   if (!Number.isSafeInteger(leaseUntil) || leaseUntil <= input.now || leaseUntil > input.now + limits.RUN_LEASE_MAX_MS) return refuse("lease_out_of_range");
   if (!recipientFits("run_renew", input.run.executorId)) return refuse("recipient_invalid");
-  return {
-    ok: true,
-    draft: {
-      action: "run_renew",
-      recipient: input.run.executorId,
-      requestId: input.requestId,
-      stopGeneration: input.stopGeneration,
-      runGeneration: input.run.runGeneration,
-      issuedAt: input.now,
-      body: { run_id: input.run.runId, lease_until: leaseUntil },
-    },
-  };
+  return finish({
+    action: "run_renew",
+    recipient: input.run.executorId,
+    requestId: input.requestId,
+    stopGeneration: input.stopGeneration,
+    runGeneration: input.run.runGeneration,
+    issuedAt: input.now,
+    body: { run_id: input.run.runId, lease_until: leaseUntil },
+  });
 }
 
 export type StopDraftInput =
@@ -202,20 +235,20 @@ export type StopDraftInput =
 // 발행 시각은 봉하는 때의 now다: 처음 봉할 때는 기록에 넘긴 now를 넣는다. 다시 봉하면 늦은 시각이 실리지만 종료는 닫기만 하므로
 // 늦게 닿아도 새로 열리는 것이 없다.
 export function stopDraft(input: StopDraftInput): Drafted<"task_cancel" | "session_stop"> {
+  if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
+  if (input.action !== "task_cancel" && input.action !== "session_stop") return refuse("input_malformed", { field: "action" });
+  if (!isRecord(input.run)) return refuse("input_malformed", { field: "run" });
   if (missing(input.reason)) return refuse("missing_field", { field: "reason" });
   if (!recipientFits(input.action, input.run.executorId)) return refuse("recipient_invalid");
-  return {
-    ok: true,
-    draft: {
-      action: input.action,
-      recipient: input.run.executorId,
-      requestId: input.requestId,
-      stopGeneration: input.stopGeneration,
-      runGeneration: input.run.runGeneration,
-      issuedAt: null,
-      body: { run_id: input.run.runId, reason: input.reason } as Bodies["task_cancel"] | Bodies["session_stop"],
-    } as Draft<"task_cancel" | "session_stop">,
-  };
+  return finish({
+    action: input.action,
+    recipient: input.run.executorId,
+    requestId: input.requestId,
+    stopGeneration: input.stopGeneration,
+    runGeneration: input.run.runGeneration,
+    issuedAt: null,
+    body: { run_id: input.run.runId, reason: input.reason } as Bodies["task_cancel"] | Bodies["session_stop"],
+  } as Draft<"task_cancel" | "session_stop">);
 }
 
 export interface FinalizeDraftInput {
@@ -230,22 +263,21 @@ export interface FinalizeDraftInput {
 }
 
 export function finalizeDraft(input: FinalizeDraftInput): Drafted<"result_finalize"> {
+  if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
+  if (!isRecord(input.run)) return refuse("input_malformed", { field: "run" });
   if (missing(input.outcome)) return refuse("missing_field", { field: "outcome" });
   if (missing(input.storedAt)) return refuse("missing_field", { field: "storedAt" });
   if (input.resultDigest === undefined) return refuse("missing_field", { field: "resultDigest" });
   if (!recipientFits("result_finalize", input.run.executorId)) return refuse("recipient_invalid");
-  return {
-    ok: true,
-    draft: {
-      action: "result_finalize",
-      recipient: input.run.executorId,
-      requestId: input.requestId,
-      stopGeneration: input.stopGeneration,
-      runGeneration: input.run.runGeneration,
-      issuedAt: null,
-      body: { run_id: input.run.runId, outcome: input.outcome, result_digest: input.resultDigest, stored_at: input.storedAt },
-    },
-  };
+  return finish({
+    action: "result_finalize",
+    recipient: input.run.executorId,
+    requestId: input.requestId,
+    stopGeneration: input.stopGeneration,
+    runGeneration: input.run.runGeneration,
+    issuedAt: null,
+    body: { run_id: input.run.runId, outcome: input.outcome, result_digest: input.resultDigest, stored_at: input.storedAt },
+  });
 }
 
 function distinctList(ids: readonly string[], max: number): boolean {
@@ -255,26 +287,22 @@ function distinctList(ids: readonly string[], max: number): boolean {
 // 상태 조회. 장부에 적지 않으므로 요청 ID를 여기서 새로 만든다. 부르는 쪽은 그 초안(요청 ID)을 보존해 status_report의
 // in_reply_to와 대조하고, 다시 보낼 때 같은 초안을 다시 봉한다.
 export function statusQueryDraft(input: { recipient: string; stopGeneration: number; runIds: readonly string[] }, random: Random): Drafted<"status_query"> {
+  if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
   if (!distinctList(input.runIds, limits.STATUS_MAX_RUNS)) return refuse("run_ids_invalid");
   if (!recipientFits("status_query", input.recipient)) return refuse("recipient_invalid");
   const requestId = newUuid(random);
   if (requestId === null) return refuse("random_unavailable");
-  return {
-    ok: true,
-    draft: { action: "status_query", recipient: input.recipient, requestId, stopGeneration: input.stopGeneration, runGeneration: 0, issuedAt: null, body: { run_ids: [...input.runIds] } },
-  };
+  return finish({ action: "status_query", recipient: input.recipient, requestId, stopGeneration: input.stopGeneration, runGeneration: 0, issuedAt: null, body: { run_ids: [...input.runIds] } });
 }
 
 // 받음 확인. 장부가 ok·duplicate를 돌려준 영수증·보고의 id만 넣는다(거절이면 ack하지 않아 실행기가 다시 보낸다).
 export function ackDraft(input: { recipient: string; stopGeneration: number; ids: readonly string[] }, random: Random): Drafted<"ack"> {
+  if (!isRecord(input)) return refuse("input_malformed", { field: "input" });
   if (!distinctList(input.ids, limits.ACK_MAX_IDS)) return refuse("ids_invalid");
   if (!recipientFits("ack", input.recipient)) return refuse("recipient_invalid");
   const requestId = newUuid(random);
   if (requestId === null) return refuse("random_unavailable");
-  return {
-    ok: true,
-    draft: { action: "ack", recipient: input.recipient, requestId, stopGeneration: input.stopGeneration, runGeneration: 0, issuedAt: null, body: { ids: [...input.ids] } },
-  };
+  return finish({ action: "ack", recipient: input.recipient, requestId, stopGeneration: input.stopGeneration, runGeneration: 0, issuedAt: null, body: { ids: [...input.ids] } });
 }
 
 // ---- 봉하기 ----
@@ -287,20 +315,50 @@ export interface SealPorts {
 // now는 봉하는 때의 지금 시각(장부와 같은 시계). 시한은 계약의 내는 쪽 기본 수명이라 expires_at = issued_at + 수명이다.
 // 시작·갱신은 장부의 발행 시각을 그대로 실으므로 다시 봉해도 issued_at·expires_at이 같고 nonce만 바뀐다. 그 시한이 남은 동안만
 // 다시 보낼 수 있다(그 뒤로는 too_late_to_send). 발행 시각을 앞으로 옮기면 실행기가 정하는 임대 끝이 장부의 계산보다 늦어지고,
-// 시한이 지난 시작 지시가 다시 살아나므로 옮기지 않는다.
+// 시한이 지난 시작 지시가 다시 살아나므로 옮기지 않는다. 시작·갱신 초안에 발행 시각이 없으면 now로 채우지 않고 거절한다.
 export function sealDraft(draft: Draft, now: number, ports: SealPorts): Sealed {
+  const malformed = draftRefusal(draft);
+  if (malformed !== null) return malformed;
   if (!Number.isSafeInteger(now)) return refuse("bad_time");
   const issuedAt = draft.issuedAt ?? now;
-  if (!Number.isSafeInteger(issuedAt)) return refuse("bad_time");
   if (issuedAt > now) return refuse("issued_in_future");
   const spec = ACTION_SPECS[draft.action];
   const expiresAt = issuedAt + (spec.lifetimeMs ?? limits.MESSAGE_TTL_MS);
-  // 받는 쪽은 받는 시각이 기한 이후면 거절한다(deadline_passed). 지금 이미 지났으면 보낼 이유가 없다.
-  if (draft.action === "task_start" && (draft.body as Bodies["task_start"]).deadline_at <= now) return refuse("deadline_passed");
+  const deadline = draft.action === "task_start" && isRecord(draft.body) ? draft.body.deadline_at : undefined;
+  if (Number.isSafeInteger(deadline)) {
+    // 받는 쪽은 받는 시각이 작업 기한 이후면(정각 포함) deadline_passed로 거절한다. 봉투의 시한과 같은 여유(maySend)를 기한에도 둔다.
+    // 전달은 DELIVERY_MAX_MS 미만이고, v1의 시계 오차(CLOCK_SKEW_MS)는 보낸 쪽 시계가 앞선 경우만 받아 주므로(not_yet_valid)
+    // 받는 쪽 시각은 now + DELIVERY_MAX_MS보다 이르다. 기한까지 그만큼 남지 않았으면 봉투가 살아 있어도 실행기가 띄우지 않는다.
+    if ((deadline as number) <= now) return refuse("deadline_passed");
+    if (!maySend({ expires_at: deadline as number }, now).ok) return refuse("deadline_too_close");
+  }
   if (!maySend({ expires_at: expiresAt }, now).ok) return refuse("too_late_to_send");
+  // 대조의 기준(본문의 정규 바이트)을 서명 포트에 넘기기 전에 따로 만든다. 포트에는 그 바이트에서 다시 만든 사본을 넘기므로
+  // 포트가 받은 본문을 고쳐도 초안과 기준은 바뀌지 않고, 돌려준 봉투의 본문도 초안과 객체를 나누지 않는다.
+  let bodyJson: string;
+  let bodyDigest: string;
+  try {
+    bodyJson = canonicalJson(draft.body);
+    bodyDigest = digestOf(draft.body);
+  } catch {
+    return refuse("seal_refused", { sealReason: "body_malformed" });
+  }
   const nonceBytes = takeBytes(ports.random, 16);
   if (nonceBytes === null) return refuse("random_unavailable");
   const nonce = hex(nonceBytes);
+  const expected: Header = {
+    contract: CONTRACT,
+    sender: SUPERVISOR,
+    recipient: draft.recipient,
+    action: draft.action,
+    request_id: draft.requestId,
+    stop_generation: draft.stopGeneration,
+    run_generation: draft.runGeneration,
+    body_digest: bodyDigest,
+    issued_at: issuedAt,
+    expires_at: expiresAt,
+    nonce,
+  };
   const input: SealInput<DraftAction> = {
     sender: SUPERVISOR,
     recipient: draft.recipient,
@@ -310,7 +368,7 @@ export function sealDraft(draft: Draft, now: number, ports: SealPorts): Sealed {
     run_generation: draft.runGeneration,
     issued_at: issuedAt,
     nonce,
-    body: draft.body,
+    body: JSON.parse(bodyJson),
   };
   let envelope: Envelope;
   try {
@@ -319,19 +377,17 @@ export function sealDraft(draft: Draft, now: number, ports: SealPorts): Sealed {
     if (error instanceof SealError) return refuse("seal_refused", { sealReason: error.reason });
     throw error;
   }
-  // 서명 포트가 다른 시각·요청 ID·본문을 실었으면 내보내지 않는다. 봉투의 값은 이 초안과 이번 now·nonce에서만 온다.
-  const h = envelope.header;
-  const same =
-    h.sender === SUPERVISOR &&
-    h.recipient === draft.recipient &&
-    h.action === draft.action &&
-    h.request_id === draft.requestId &&
-    h.stop_generation === draft.stopGeneration &&
-    h.run_generation === draft.runGeneration &&
-    h.issued_at === issuedAt &&
-    h.expires_at === expiresAt &&
-    h.nonce === nonce &&
-    h.body_digest === digestOf(draft.body) &&
-    digestOf(envelope.body) === h.body_digest;
-  return same ? { ok: true, envelope } : refuse("signer_mismatch");
+  return sameAsSent(envelope, expected, bodyJson) ? { ok: true, envelope } : refuse("signer_mismatch");
+}
+
+// 서명 포트가 돌려준 봉투가 넘긴 값 그대로인가. 봉투의 칸은 셋뿐이고, 머리는 칸 전부(계약 판, 여분 칸 포함)가 기대한 머리와
+// 같은 정규 바이트이고, 본문은 넘기기 전에 만든 정규 바이트와 같다(머리의 body_digest도 그 바이트의 digest다).
+// 한계: 서명 바이트는 공개 키가 없어 대조하지 않는다. 서명이 감독의 키로 머리에 맞는지는 받는 쪽 verifyEnvelope만 안다.
+function sameAsSent(envelope: unknown, expected: Header, bodyJson: string): boolean {
+  if (!isRecord(envelope) || Object.keys(envelope).sort().join() !== "body,header,signature") return false;
+  try {
+    return canonicalJson(envelope.header) === canonicalJson(expected) && canonicalJson(envelope.body) === bodyJson;
+  } catch {
+    return false;
+  }
 }

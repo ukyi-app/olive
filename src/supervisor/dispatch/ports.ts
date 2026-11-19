@@ -19,7 +19,8 @@ export interface Random {
 
 // 감독의 서명 키로 봉투를 봉한다. 키 재료는 이 포트의 구현만 쥔다(배정기 모듈은 키를 보지 않는다).
 // 구현은 계약 v1의 sealEnvelope(input, 감독 개인 키) 그대로여야 한다: 모양·방향·본문 검사와 수명(expires_at)을 계약이 정한다.
-// 계약에 맞지 않으면 SealError를 던진다. envelopes.ts는 돌려받은 머리가 넘긴 값과 같은지 다시 본다.
+// 계약에 맞지 않으면 SealError를 던진다. envelopes.ts는 본문의 사본을 넘기고, 돌려받은 봉투의 머리 전부와 본문을 넘기기 전에
+// 만든 기준과 대조한다. 서명 바이트는 공개 키가 없어 대조하지 못하므로 감독의 키로 머리에 서명하는 것은 이 구현의 책임이다.
 export interface Signer {
   seal<A extends Action>(input: SealInput<A>): Envelope;
 }

@@ -261,7 +261,7 @@ describe("보장 4: 만든 봉투는 계약 v1의 검증기를 통과한다", ()
     expect(startDraft({ ...base, run: { ...run, deadlineAt: startIssuedAt } })).toEqual({ ok: false, reason: "deadline_not_after_issue" });
     const late = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW } }));
     expect(sealDraft(late, NOW, ports())).toEqual({ ok: false, reason: "deadline_passed" });
-    expect(sealDraft(late, NOW - 1, ports()).ok).toBe(true);
+    expect(sealDraft(late, NOW - 1, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
   });
 
   test("발행 시각이 지금보다 늦으면 issued_in_future, 시각이 정수가 아니면 bad_time", () => {
@@ -288,5 +288,119 @@ describe("보장 4: 만든 봉투는 계약 v1의 검증기를 통과한다", ()
       ok: false,
       reason: "recipient_invalid",
     });
+  });
+});
+
+describe("보낼 수 있다고 낸 봉투는 전달 상한 안에서 받는 쪽이 받는다", () => {
+  test("작업 기한까지 전달 상한만큼 남지 않은 시작은 봉하지 않는다(deadline_too_close)", async () => {
+    const base = { run, requestId: REQ_ID, stopGeneration: STOP_GEN, issuedAt: NOW };
+    // 기한 T+1을 T에 봉하면 1ms 뒤 받는 쪽이 deadline_passed로 거절한다.
+    const oneMs = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + 1 } }));
+    expect(sealDraft(oneMs, NOW, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
+    const short = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + limits.DELIVERY_MAX_MS - 1 } }));
+    expect(sealDraft(short, NOW, ports())).toEqual({ ok: false, reason: "deadline_too_close" });
+    // 정확히 상한만큼 남으면 봉한다. 전달은 상한 미만이라 가장 늦게 받는 시각은 NOW + DELIVERY_MAX_MS - 1이다.
+    const exact = ok(startDraft({ ...base, run: { ...run, deadlineAt: NOW + limits.DELIVERY_MAX_MS } }));
+    const envelope = sealed(exact, NOW);
+    expect(await verifyEnvelope(envelope, ctx(WORKER, NOW + limits.DELIVERY_MAX_MS - 1, false))).toMatchObject({ ok: true, action: "task_start" });
+  });
+
+  test("발행 시각이 빈 시작·갱신 초안은 봉하는 때의 now로 채우지 않고 거절한다", () => {
+    // T에 발행하고 기한이 T+900000인 시작 초안의 issuedAt을 비워 T+31000에 봉하면 새 발행 시각의 시작이 되던 입력이다.
+    const start = ok(startDraft({ run: { ...run, deadlineAt: NOW + 900_000 }, requestId: REQ_ID, stopGeneration: STOP_GEN, issuedAt: NOW }));
+    for (const empty of [null, undefined]) {
+      expect(sealDraft({ ...start, issuedAt: empty } as unknown as Draft, NOW + 31_000, ports())).toEqual({ ok: false, reason: "issued_at_unknown" });
+    }
+    // 발행 시각을 지킨 초안은 시한이 지나 다시 봉해지지 않는다.
+    expect(sealDraft(start, NOW + 31_000, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
+    const renew = ok(renewDraft({ run: facts, requestId: REQ_ID, stopGeneration: STOP_GEN, now: NOW, leaseUntil: NOW + limits.RUN_LEASE_MAX_MS }));
+    expect(sealDraft({ ...renew, issuedAt: null } as unknown as Draft, NOW + 1_000, ports())).toEqual({ ok: false, reason: "issued_at_unknown" });
+    expect(sealDraft(renew, NOW + 31_000, ports())).toEqual({ ok: false, reason: "too_late_to_send" });
+  });
+
+  test("타입도 시작·갱신 초안의 발행 시각을 요구한다", () => {
+    const start = drafts().task_start.draft as Draft<"task_start">;
+    const renew = drafts().run_renew.draft as Draft<"run_renew">;
+    // @ts-expect-error 시작 초안의 issuedAt은 number다.
+    const startEmpty: Draft<"task_start"> = { ...start, issuedAt: null };
+    // @ts-expect-error 갱신 초안의 issuedAt은 number다.
+    const renewEmpty: Draft<"run_renew"> = { ...renew, issuedAt: null };
+    expect(sealDraft(startEmpty, NOW, ports())).toEqual({ ok: false, reason: "issued_at_unknown" });
+    expect(sealDraft(renewEmpty, NOW, ports())).toEqual({ ok: false, reason: "issued_at_unknown" });
+  });
+
+  test("실행 지시의 실행 세대 0은 초안에서 거절한다(run_generation_invalid)", () => {
+    // 실행 세대 0인 시작은 받는 쪽이 처음 보는 실행이어도 run_generation_mismatch로 거절한다.
+    const refused = { ok: false, reason: "run_generation_invalid" } as const;
+    const zero = { ...facts, runGeneration: 0 };
+    const base = { requestId: REQ_ID, stopGeneration: STOP_GEN };
+    expect(startDraft({ ...base, run: { ...run, runGeneration: 0 }, issuedAt: startIssuedAt })).toEqual(refused);
+    expect(renewDraft({ ...base, run: zero, now: NOW, leaseUntil: NOW + 1 })).toEqual(refused);
+    expect(stopDraft({ ...base, action: "task_cancel", run: zero, reason: "requested" })).toEqual(refused);
+    expect(stopDraft({ ...base, action: "session_stop", run: { ...zero, executorId: SESSION }, reason: "daily_rotation" })).toEqual(refused);
+    expect(finalizeDraft({ ...base, run: zero, outcome: "succeeded", resultDigest: DIGEST, storedAt: NOW })).toEqual(refused);
+  });
+
+  test("공개 초안을 직접 봉해도 세대의 꼴을 본다", () => {
+    const all = drafts();
+    const refused = { ok: false, reason: "run_generation_invalid" } as const;
+    for (const action of ["task_start", "run_renew", "task_cancel", "session_stop", "result_finalize"] as const) {
+      expect(sealDraft({ ...all[action].draft, runGeneration: 0 }, NOW, ports())).toEqual(refused);
+    }
+    // 실행에 묶이지 않은 조회·ack는 0이어야 한다.
+    expect(sealDraft({ ...all.status_query.draft, runGeneration: 1 }, NOW, ports())).toEqual(refused);
+    expect(sealDraft({ ...all.ack.draft, runGeneration: 1 }, NOW, ports())).toEqual(refused);
+    for (const bad of [-1, 0.5, 2 ** 53, "3"]) {
+      expect(sealDraft({ ...all.task_cancel.draft, stopGeneration: bad as number }, NOW, ports())).toEqual({ ok: false, reason: "stop_generation_invalid" });
+    }
+    expect(sealDraft({ ...all.task_cancel.draft, stopGeneration: 0 }, NOW, ports()).ok).toBe(true);
+  });
+
+  test("서명 포트가 받은 본문을 고쳐 서명해도 대조의 기준과 초안은 바뀌지 않는다(signer_mismatch)", () => {
+    // 갱신의 발급 끝 T+30000을 포트가 T+20000으로 고쳐 같은 키로 서명하는 입력이다.
+    const leaseUntil = NOW + limits.RUN_LEASE_MAX_MS;
+    const draft = ok(renewDraft({ run: facts, requestId: REQ_ID, stopGeneration: STOP_GEN, now: NOW, leaseUntil }));
+    const tamper: Signer = {
+      seal: (input) => {
+        (input.body as unknown as { lease_until: number }).lease_until = NOW + 20_000;
+        return sealEnvelope(input, keys.privateKey);
+      },
+    };
+    expect(sealDraft(draft, NOW, ports(1, tamper))).toEqual({ ok: false, reason: "signer_mismatch" });
+    expect(draft.body).toEqual({ run_id: RUN_ID, lease_until: leaseUntil });
+    expect(sealed(draft, NOW).body).toEqual({ run_id: RUN_ID, lease_until: leaseUntil });
+  });
+
+  test("서명 포트가 돌려준 머리의 계약 판·여분 칸, 봉투의 여분 칸, 본문도 대조한다", () => {
+    const draft = drafts().task_cancel.draft;
+    const altered = (change: (e: Envelope) => unknown): Signer => ({ seal: (input) => change(sealEnvelope(input, keys.privateKey)) as Envelope });
+    const cases = [
+      altered((e) => ({ ...e, header: { ...e.header, contract: "olive-control/v0" } })),
+      altered((e) => ({ ...e, header: { ...e.header, extra: 1 } })),
+      altered((e) => ({ ...e, extra: 1 })),
+      altered((e) => ({ ...e, body: { run_id: RUN_ID, reason: "budget" } })),
+    ];
+    for (const s of cases) expect(sealDraft(draft, NOW, ports(1, s))).toEqual({ ok: false, reason: "signer_mismatch" });
+  });
+
+  test("돌려준 봉투의 본문을 고쳐도 보존한 초안은 그대로다", () => {
+    const draft = drafts().task_cancel.draft;
+    const first = sealed(draft, NOW);
+    (first.body as { reason: string }).reason = "budget";
+    const second = sealed(draft, NOW + 1_000, ports(50));
+    expect(second.header.body_digest).toBe(first.header.body_digest);
+    expect(second.body).toEqual({ run_id: RUN_ID, reason: "requested" });
+  });
+
+  test("모양이 틀린 입력은 예외 대신 input_malformed로 거절한다", () => {
+    const base = { requestId: REQ_ID, stopGeneration: STOP_GEN };
+    expect(startDraft({ ...base, run: null, issuedAt: NOW } as never)).toEqual({ ok: false, reason: "input_malformed", field: "run" });
+    expect(stopDraft({ ...base, action: "none", run: facts, reason: "requested" } as never)).toEqual({ ok: false, reason: "input_malformed", field: "action" });
+    expect(renewDraft(null as never)).toEqual({ ok: false, reason: "input_malformed", field: "input" });
+    expect(finalizeDraft({ ...base, run: null } as never)).toEqual({ ok: false, reason: "input_malformed", field: "run" });
+    expect(statusQueryDraft(null as never, fakeRandom())).toEqual({ ok: false, reason: "input_malformed", field: "input" });
+    expect(ackDraft(null as never, fakeRandom())).toEqual({ ok: false, reason: "input_malformed", field: "input" });
+    expect(sealDraft(null as never, NOW, ports())).toEqual({ ok: false, reason: "input_malformed", field: "draft" });
+    expect(sealDraft({ ...drafts().task_cancel.draft, action: "none" } as never, NOW, ports())).toEqual({ ok: false, reason: "input_malformed", field: "action" });
   });
 });
