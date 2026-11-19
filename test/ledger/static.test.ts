@@ -121,12 +121,20 @@ test("정적: 이름 검사가 원문·자격 이름을 실제로 잡는다", ()
 
 // 같은 프로세스가 장부 파일의 다른 FD를 닫으면 작성자의 POSIX 잠금이 풀린다. 그래서 모듈마다 쓸 수 있는 node:fs 이름을 좁힌다.
 // migrate.ts의 읽기는 이미지 안의 SQL 마이그레이션 폴더만 본다. 파일을 여는 곳은 이 호출이 O_EXCL로 만든 새 파일뿐이다.
+// 예외는 ledger.ts의 판정 한 곳이다: /proc/locks로 이 프로세스가 그 장부 파일의 잠금을 쥐지 않았음을 확인한 뒤에만 머리 100바이트를 읽기 전용(O_NOFOLLOW) FD로 읽는다.
 const FS_ALLOWED: Record<string, readonly string[]> = {
-  "src/ledger/ledger.ts": ["closeSync", "constants", "fstatSync", "lstatSync", "openSync", "realpathSync"],
+  "src/ledger/ledger.ts": ["closeSync", "constants", "fstatSync", "lstatSync", "openSync", "readFileSync", "readSync", "realpathSync"],
   "src/ledger/migrate.ts": ["readdirSync", "readFileSync"],
   "src/ledger/snapshot.ts": ["closeSync", "constants", "fsyncSync", "linkSync", "lstatSync", "openSync", "realpathSync", "unlinkSync", "writeSync"],
 };
-const FS_OPENERS: Record<string, number> = { "src/ledger/ledger.ts": 1, "src/ledger/snapshot.ts": 1 };
+const FS_OPENERS: Record<string, number> = { "src/ledger/ledger.ts": 2, "src/ledger/snapshot.ts": 1 };
+// FS_OPENERS 가운데 O_EXCL 새 파일이 아닌 읽기 전용 열기의 수, 그리고 readFileSync가 읽어도 되는 유일한 경로.
+const FS_READ_ONLY_OPENERS: Record<string, number> = { "src/ledger/ledger.ts": 1 };
+const FS_READ_ONLY_PATHS: Record<string, string> = { "src/ledger/ledger.ts": "/proc/locks" };
+
+function readOnlyOpen(call: string): boolean {
+  return call.includes("O_RDONLY") && call.includes("O_NOFOLLOW") && !/O_(WRONLY|RDWR|CREAT|TRUNC|APPEND|EXCL)/.test(call);
+}
 
 function fsViolations(file: string, text: string): string[] {
   const source = text.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
@@ -151,11 +159,17 @@ function fsViolations(file: string, text: string): string[] {
   }
   const opens = [...source.matchAll(/\bopenSync\s*\(([^\n]*)/g)].map((call) => call[1] as string);
   if (opens.length !== (FS_OPENERS[file] ?? 0)) out.push(`openSync ${opens.length}곳`);
-  for (const call of opens) if (!call.includes("O_EXCL") || !call.includes("O_NOFOLLOW")) out.push(`새 파일이 아닌 열기: ${call}`);
+  const readOnly = opens.filter(readOnlyOpen);
+  if (readOnly.length > (FS_READ_ONLY_OPENERS[file] ?? 0)) out.push(`읽기 전용 열기 ${readOnly.length}곳`);
+  for (const call of opens) if (!readOnlyOpen(call) && (!call.includes("O_EXCL") || !call.includes("O_NOFOLLOW"))) out.push(`새 파일이 아닌 열기: ${call}`);
+  const readPath = FS_READ_ONLY_PATHS[file];
+  if (readPath !== undefined) {
+    for (const call of source.matchAll(/\breadFileSync\s*\(([^\n]*)/g)) if (!(call[1] as string).startsWith(JSON.stringify(readPath))) out.push(`${readPath} 밖의 읽기: ${call[1]}`);
+  }
   return out;
 }
 
-test("정적: 장부 모듈의 파일 API는 모듈별 허용 목록뿐이고 FD를 여는 곳은 O_EXCL 새 파일 두 곳뿐이다", async () => {
+test("정적: 장부 모듈의 파일 API는 모듈별 허용 목록뿐이고 FD를 여는 곳은 O_EXCL 새 파일 두 곳과 판정의 읽기 전용 머리 열기 한 곳뿐이다", async () => {
   const files = await list("src/ledger/**/*.ts");
   for (const file of Object.keys(FS_ALLOWED)) expect(files).toContain(file);
   for (const file of files) expect(fsViolations(file, await readText(file)), file).toEqual([]);
@@ -163,13 +177,29 @@ test("정적: 장부 모듈의 파일 API는 모듈별 허용 목록뿐이고 FD
 
 test("정적: 파일 API 검사가 전체 읽기·쓰기, promises, 별칭, 이름을 고르지 않은 import를 실제로 잡는다", () => {
   const ledger = "src/ledger/ledger.ts";
+  const snapshot = "src/ledger/snapshot.ts";
   const base = `openSync(path, fileOpen.O_CREAT | fileOpen.O_EXCL | fileOpen.O_NOFOLLOW, 0o600);\n`;
-  const violations = (source: string) => fsViolations(ledger, base + source);
+  const header = `openSync(path, fileOpen.O_RDONLY | fileOpen.O_NOFOLLOW);\n`;
+  const violations = (source: string) => fsViolations(ledger, base + header + source);
   expect(violations(`import { openSync, constants as fileOpen } from "node:fs";`)).toEqual([]);
+  expect(violations(`import { readFileSync, readSync } from "node:fs";\nreadFileSync("/proc/locks", "utf8");`)).toEqual([]);
+  // readFileSync는 ledger.ts에서 /proc/locks만 읽는다. 다른 모듈에서는 이름부터 막는다.
+  for (const source of [`import { readFileSync } from "node:fs";`, `import { readFileSync } from 'node:fs';`]) {
+    expect(fsViolations(snapshot, base + source), source).toContain("허용하지 않는 이름: readFileSync");
+  }
+  expect(fsViolations(snapshot, `${base}import { readSync } from "node:fs";`)).toContain("허용하지 않는 이름: readSync");
   for (const [source, caught] of [
-    [`import { readFileSync } from "node:fs";`, "허용하지 않는 이름: readFileSync"],
+    [`readFileSync(path);`, "/proc/locks 밖의 읽기: path);"],
+    [`readFileSync("/proc/self/fd/3");`, `/proc/locks 밖의 읽기: "/proc/self/fd/3");`],
+    [`openSync(path, fileOpen.O_RDONLY | fileOpen.O_NOFOLLOW);`, "읽기 전용 열기 2곳"],
+    [`openSync(path, fileOpen.O_RDONLY | fileOpen.O_NOFOLLOW);`, "openSync 3곳"],
+  ] as const) {
+    expect(violations(source), source).toContain(caught);
+  }
+  expect(fsViolations(ledger, `${base}openSync(path, fileOpen.O_RDONLY);`)).toContain("새 파일이 아닌 열기: path, fileOpen.O_RDONLY);");
+  expect(fsViolations(snapshot, `${base}openSync(path, fileOpen.O_RDONLY | fileOpen.O_NOFOLLOW);`)).toContain("읽기 전용 열기 1곳");
+  for (const [source, caught] of [
     [`import { writeFileSync } from "node:fs";`, "허용하지 않는 이름: writeFileSync"],
-    [`import { readFileSync } from 'node:fs';`, "허용하지 않는 이름: readFileSync"],
     [`import { readSync as read } from 'fs';`, "모듈 fs"],
     [`import { open } from 'node:fs/promises';`, "모듈 node:fs/promises"],
     [`import * as fs from 'node:fs';`, "이름을 고르지 않은 import: * as fs"],
@@ -182,7 +212,7 @@ test("정적: 파일 API 검사가 전체 읽기·쓰기, promises, 별칭, 이�
     [`const fs = require("node:fs");`, "require("],
     [`await import("node:fs");`, "import("],
     [`await Bun.file(path).text();`, "Bun.file("],
-    [`openSync(path, 0);`, "openSync 2곳"],
+    [`openSync(path, 0);`, "openSync 3곳"],
   ] as const) {
     expect(violations(source), source).toContain(caught);
   }
