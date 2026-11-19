@@ -396,7 +396,7 @@ test("기록의 입력: 소유자는 접수한 입력이어야 하고, 칸마다
   for (const phase of TOOL_REQUEST_PHASES) expect(PHASES as readonly string[]).toContain(phase);
 });
 
-test("실행에 이은 부탁: 잇는 연산은 이 판에 없고, 이어진 줄을 만나면 단계를 지어내지 않고 읽지 못한 것으로 닫는다", () => {
+test("실행에 이은 부탁: 취소된 부탁과 두 번째 잇기는 제약이 막고, 이어진 줄의 단계는 이은 실행 줄의 상태다", () => {
   const path = tempPath();
   const ledger = ready(open(path));
   owners(ledger);
@@ -405,7 +405,8 @@ test("실행에 이은 부탁: 잇는 연산은 이 판에 없고, 이어진 줄
   must(ledger.cancelToolRequest({ owner: B, ref: cancelled.ref, sessionId: SESSION.id, callId: id(), now: NOW }));
   const runId = must(ledger.admitRun(worker())).run.runId;
   ledger.close();
-  // 배정기가 할 일을 장부 밖에서 흉내 낸다. 취소된 부탁은 잇지 못하고, 한 실행에 두 부탁을 잇지 못한다.
+  // 잇기를 장부 밖의 SQL로 해도 제약은 같다: 취소된 부탁은 잇지 못하고, 이은 부탁을 다른 실행으로 바꿔 잇지 못한다.
+  // 잇는 연산(assignToolRequest)은 test/ledger/tool-request-assign.test.ts가 본다.
   const raw = new Database(path);
   try {
     expect(() => raw.run(`UPDATE tool_requests SET run_id = '${runId}' WHERE ref = '${cancelled.ref}'`)).toThrow();
@@ -415,8 +416,8 @@ test("실행에 이은 부탁: 잇는 연산은 이 판에 없고, 이어진 줄
     raw.close();
   }
   const reopened = ready(open(path));
-  expect(reopened.readToolRequest({ owner: A, ref: request.ref })).toEqual({ known: false, reason: "corrupt" });
-  expect(reopened.health()).toEqual({ writable: false, reason: "corrupt" });
+  expect(reopened.readToolRequest({ owner: A, ref: request.ref })).toEqual({ known: true, value: { ...request, phase: "queued" } });
+  expect(reopened.health()).toEqual({ writable: true });
 });
 
 test("표: 원문·자격·모델 이름·실행기 ID·경로 칸이 없고, 실행에 잇는 자리는 비어 있는 칸 하나다", () => {

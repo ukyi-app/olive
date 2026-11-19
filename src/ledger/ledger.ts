@@ -59,7 +59,7 @@ import {
 } from "./input.ts";
 import { appliedCount, applyMigration, BOOTSTRAP, loadMigrations, migrate, type Migration, validateMigrations } from "./migrate.ts";
 import { latestOpenRecord, publishSnapshot, removeQuietly, sealSnapshot, SIDECARS, SNAPSHOT_UNOPENED, type SnapshotFailure, SnapshotRefused, snapshotTarget } from "./snapshot.ts";
-import { type LedgerRunState, mayTransition, type RunKind, SLOT_FREE, TERMINAL } from "./states.ts";
+import { LEDGER_RUN_STATES, type LedgerRunState, mayTransition, type RunKind, SLOT_FREE, TERMINAL } from "./states.ts";
 
 // ---- 결과의 모양 ----
 
@@ -416,10 +416,27 @@ export interface InputEntry {
   cancelled: boolean;
 }
 
-// 작업 부탁(start_worker)이 배정 전에 가질 수 있는 단계. 처리기의 단계 이름(src/supervisor/scheduler/tools.ts의 PHASES) 안에 있다.
-// not_started는 배정 전에 취소돼 시작하지 않은 부탁이다. 배정한 뒤의 단계는 이 기록이 아니라 이은 실행 줄의 상태다(배정기의 몫).
+// 작업 부탁(start_worker) 줄에 적는 단계: 배정 전의 둘. 처리기의 단계 이름(src/supervisor/scheduler/tools.ts의 PHASES) 안에 있다.
+// not_started는 배정 전에 취소돼 시작하지 않은 부탁이다. 이은 부탁의 줄은 waiting_assignment로 남고(CHECK), 읽기는 그 단계를
+// 이은 실행 줄의 지금 상태에서 낸다(TOOL_REQUEST_RUN_PHASES).
 export const TOOL_REQUEST_PHASES = ["waiting_assignment", "not_started"] as const;
-export type ToolRequestPhase = (typeof TOOL_REQUEST_PHASES)[number];
+export type ToolRequestPhase = (typeof TOOL_REQUEST_PHASES)[number] | LedgerRunState;
+
+// 이은 부탁의 단계: 실행 상태 → 처리기의 단계 이름. 옮기는 자리는 여기 하나다. 처리기의 PHASES는 배정 전 대기에 장부의 실행 상태
+// 이름을 그대로 더한 것이라 지금은 같은 이름으로 옮긴다. 상태가 더해지면 Record 타입과 시험이 이 표를 채우게 한다.
+export const TOOL_REQUEST_RUN_PHASES: Readonly<Record<LedgerRunState, ToolRequestPhase>> = {
+  queued: "queued",
+  preparing: "preparing",
+  running: "running",
+  stopping: "stopping",
+  checking: "checking",
+  ready_result: "ready_result",
+  finalized: "finalized",
+  not_started: "not_started",
+  failed_stopped: "failed_stopped",
+  unknown_running: "unknown_running",
+  cleanup_pending: "cleanup_pending",
+};
 
 // 목적의 분류 코드. 처리기가 인자에서 받는 꼴과 같다(시험이 대조한다).
 export const PURPOSE = /^[a-z][a-z0-9_]{0,63}$/;
@@ -451,6 +468,21 @@ export interface ToolRequestInput {
   now: number;
 }
 
+// 배정(assignToolRequest): 대기 부탁을 새 실행 줄에 잇는다. 실행기·자격·기한·예산·snapshot·revision은 부르는 쪽(배정기)이 고른 값이고
+// admitRun의 같은 칸과 같은 검사를 거친다. 역할·입력 digest·소유자(입력)는 부탁의 값이라 받지 않는다.
+export interface AssignToolRequestInput {
+  ref: string;
+  runId: string;
+  snapshotDigest: string;
+  profileRevision: string;
+  policyRevision: string;
+  executorId: string;
+  credential: CredentialRef;
+  deadlineAt: number;
+  budgetLeft: number;
+  now: number;
+}
+
 interface ToolRequestRow {
   ref: string;
   owner: string;
@@ -461,15 +493,34 @@ interface ToolRequestRow {
   input_digest: string;
   phase: string;
   run_id: string | null;
+  // 이은 실행 줄의 지금 상태. 이어지지 않았으면 null.
+  run_state: string | null;
 }
 
-// 읽은 줄을 값으로 바꾼다. 이 판의 코드는 부탁을 실행에 잇지 않으므로, 이어진 줄을 만나면 그 단계(실행 줄의 상태)를 지어내거나
-// 대기로 답하지 않고 읽지 못한 것(corrupt)으로 닫는다. 꼴이 어긋난 줄(스키마 CHECK를 지나친 파일)도 같다.
+// 부탁과 이은 실행의 상태를 한 문장으로 읽는다. 두 번 나눠 읽으면 그 사이의 쓰기가 섞일 수 있다.
+const TOOL_REQUEST_SELECT = `SELECT t.ref, t.owner, t.dedupe_key, t.role, t.purpose, t.source_ref, t.input_digest, t.phase, t.run_id, r.state AS run_state
+  FROM tool_requests t LEFT JOIN runs r ON r.run_id = t.run_id`;
+
+// 실행 줄의 중복 키. runs.dedupe_key는 소유자와 무관하게 전역 유일이라 부탁의 재시도 키를 그대로 쓰면 다른 소유자의 같은 키와
+// 부딪혀 남의 실행이 돌아온다. 참조는 표 전체에서 유일하므로 참조에서 만든 키는 부탁마다 하나다.
+const assignedRunKey = (ref: string) => `tool_request:${ref}`;
+
+// 읽은 줄을 값으로 바꾼다. 이은 부탁의 단계는 이은 실행 줄의 지금 상태를 표(TOOL_REQUEST_RUN_PHASES)로 옮긴 값이다.
+// 이은 실행 줄이 없거나(외래 키와 runs_permanent 트리거가 막으므로 제약을 지나친 파일에서만 생긴다) 그 상태가 장부의 상태가
+// 아니면 단계를 지어내지 않고 읽지 못한 것(corrupt)으로 닫는다. 대기로 답하면 본체가 오지 않을 진행을 기다리고, not_started로
+// 답하면 실행 중일 수 있는 일을 끝났다고 말하게 된다. 꼴이 어긋난 줄(스키마 CHECK를 지나친 파일)도 같다.
 function toToolRequest(row: ToolRequestRow): ToolRequest {
-  if (row.run_id !== null) throw new LedgerUnavailableError("corrupt", "tool_requests: 실행에 이은 부탁은 이 판의 코드가 읽지 않는다");
   const fits =
     UUID.test(row.ref) && UUID.test(row.owner) && (ROLES as readonly string[]).includes(row.role) && (TOOL_REQUEST_PHASES as readonly string[]).includes(row.phase);
   if (!fits) throw new LedgerUnavailableError("corrupt", "tool_requests: 꼴이 맞지 않는 줄");
+  let phase = row.phase as ToolRequestPhase;
+  if (row.run_id !== null) {
+    const state = row.run_state;
+    if (row.phase !== "waiting_assignment" || state === null || !(LEDGER_RUN_STATES as readonly string[]).includes(state)) {
+      throw new LedgerUnavailableError("corrupt", "tool_requests: 이은 실행 줄을 읽을 수 없는 부탁");
+    }
+    phase = TOOL_REQUEST_RUN_PHASES[state as LedgerRunState];
+  }
   return {
     ref: row.ref,
     owner: row.owner,
@@ -478,7 +529,7 @@ function toToolRequest(row: ToolRequestRow): ToolRequest {
     purpose: row.purpose,
     sourceRef: row.source_ref,
     inputDigest: row.input_digest,
-    phase: row.phase as ToolRequestPhase,
+    phase,
   };
 }
 
@@ -1049,6 +1100,26 @@ export function openLedger(path: string, options: OpenOptions): OpenResult {
 // 끊김 판정·재시작에서 끝났는지 모르게 되는 상태. checking은 종료 확인이 이미 적힌 뒤라 여기 없다.
 const IN_FLIGHT: readonly LedgerRunState[] = ["preparing", "running", "stopping"];
 
+// 꼴 검사를 마친 실행 줄 입력(#admitInput → #admit).
+interface AdmitChecked {
+  row: {
+    run_id: string;
+    kind: RunKind;
+    role: string | null;
+    dedupe_key: string | null;
+    input_request_id: string | null;
+    snapshot_digest: string | null;
+    input_digest: string | null;
+    profile_revision: string;
+    policy_revision: string;
+    executor_id: string;
+    deadline_at: number;
+    budget_left: number;
+    now: number;
+  };
+  credential: CredentialRef;
+}
+
 type WriteMode = "start" | "new" | "continue";
 
 export class Ledger {
@@ -1536,10 +1607,9 @@ export class Ledger {
 
   // ---- 작업 부탁(start_worker) ----
 
-  // 두 조회는 소유자가 같은 줄만 본다. 다른 소유자의 같은 키·같은 참조는 없는 줄과 같은 답(null)이다.
+  // 두 조회는 소유자가 같은 줄만 본다. 다른 소유자의 같은 키·같은 참조는 이어졌든 아니든 없는 줄과 같은 답(null)이다.
   #toolRequestRow(column: "dedupe_key" | "ref", owner: string, value: string): ToolRequestRow | null {
-    const sql = `SELECT ref, owner, dedupe_key, role, purpose, source_ref, input_digest, phase, run_id FROM tool_requests WHERE owner = ? AND ${column} = ?`;
-    return (this.#db.query(sql).get(owner, value) as ToolRequestRow | null) ?? null;
+    return (this.#db.query(`${TOOL_REQUEST_SELECT} WHERE t.owner = ? AND t.${column} = ?`).get(owner, value) as ToolRequestRow | null) ?? null;
   }
 
   findToolRequest(query: { owner: string; dedupeKey: string }): Read<ToolRequest | null> {
@@ -1598,9 +1668,57 @@ export class Ledger {
     });
   }
 
-  // 취소 접수. 자기 대기 부탁만 not_started로 적는다. 소유는 이 트랜잭션에서 다시 보고, 남의 부탁과 없는 부탁은 같은 거절(unknown_run)이다.
-  // 이미 not_started면 transition_denied. 닫는 기록이라 정지 중에도, 접수가 닫혀도 적는다(쓰기 모드 continue).
-  cancelToolRequest(input: { owner: string; ref: string; sessionId: string; callId: string; now: number }): { ok: true; phase: ToolRequestPhase } | Refused {
+  // 배정: 대기 부탁을 새 실행 줄에 한 트랜잭션으로 잇는다. 새 업무라 같은 트랜잭션에서 정지와 접수 허가를 다시 본다(쓰기 모드 start).
+  // 실행 줄은 admitRun과 같은 검사·기록(#admitInput, #admit)으로 적고, 그 거절이면 부탁은 대기 그대로다. 부탁이 지금도 대기이고
+  // 이어지지 않았는지 이 트랜잭션에서 다시 본다: 이미 이어졌으면 새 실행 줄 없이 그 실행(already_assigned), 취소됐으면
+  // transition_denied, 없으면 unknown_run. 부르는 쪽은 배정기 하나라 소유자를 받지 않는다(참조는 표 전체에서 유일하다).
+  assignToolRequest(input: AssignToolRequestInput): { ok: true; outcome: "assigned" | "already_assigned"; run: Run } | Refused {
+    const v = exact(input, ["ref", "runId", "snapshotDigest", "profileRevision", "policyRevision", "executorId", "credential", "deadlineAt", "budgetLeft", "now"], "assignToolRequest");
+    const ref = str(v.ref, UUID, "ref");
+    return this.#write("tool_request_assign", "start", () => {
+      const row = (this.#db.query(`${TOOL_REQUEST_SELECT} WHERE t.ref = ?`).get(ref) as ToolRequestRow | null) ?? null;
+      if (row === null) throw new Refuse("unknown_run");
+      const request = toToolRequest(row);
+      if (row.run_id !== null) return { ok: true as const, outcome: "already_assigned" as const, run: toRun(this.#runRow(row.run_id) as RunRow) };
+      if (request.phase !== "waiting_assignment") throw new Refuse("transition_denied");
+      // 입력의 꼴과 실행기·역할의 맞음은 admitRun과 같은 함수가 본다. 역할은 부탁의 것이라 이 트랜잭션 안에서만 알 수 있다.
+      const admitted = this.#admit(
+        this.#admitInput({
+          kind: "worker",
+          runId: v.runId,
+          dedupeKey: assignedRunKey(ref),
+          inputRequestId: request.owner,
+          role: request.role,
+          snapshotDigest: v.snapshotDigest,
+          inputDigest: request.inputDigest,
+          profileRevision: v.profileRevision,
+          policyRevision: v.policyRevision,
+          executorId: v.executorId,
+          credential: v.credential,
+          deadlineAt: v.deadlineAt,
+          budgetLeft: v.budgetLeft,
+          now: v.now,
+        } as AdmitRunInput),
+      );
+      // 이 부탁의 키를 가진 실행이 이미 있다면 잇는 연산 밖에서 만든 줄이다. 남이 만든 실행을 이 부탁에 잇지 않는다.
+      if (!admitted.created) throw new Refuse("invariant_violation");
+      const linked = this.#db.query("UPDATE tool_requests SET run_id = ? WHERE ref = ? AND run_id IS NULL AND phase = 'waiting_assignment'").run(admitted.run.runId, ref).changes;
+      if (linked !== 1) throw new Refuse("invariant_violation");
+      return { ok: true as const, outcome: "assigned" as const, run: admitted.run };
+    });
+  }
+
+  // 취소 접수. 소유는 이 트랜잭션에서 다시 보고, 남의 부탁과 없는 부탁은 이어졌든 아니든 같은 거절(unknown_run)이다.
+  // 닫는 기록이라 정지 중에도, 접수가 닫혀도 적는다(쓰기 모드 continue).
+  // - 대기 부탁: not_started로 적는다. 이미 not_started면 transition_denied.
+  // - 이은 부탁: 부탁 줄은 그대로 두고 그 실행의 취소를 종료 지시의 기록(recordStopInstruction과 같은 #recordStop)으로 남긴다.
+  //   시작 전(queued)이면 not_started, 시작 뒤면 task_cancel 지시를 적고 stopping이다. 취소의 접수는 종료가 아니라 자리를 놓지 않는다.
+  //   지시의 요청 ID는 이 취소 호출의 ID이고(장부는 난수를 부르지 않는다) 정지 세대는 장부의 지금 값이다. 그 지시를 보내는 것은
+  //   부르는 쪽이고, 그래서 지시를 적었으면 instruction으로 돌려준다. 종료가 확인됐거나 끝난 실행이면 취소가 바꿀 것이 없어
+  //   transition_denied다.
+  cancelToolRequest(input: { owner: string; ref: string; sessionId: string; callId: string; now: number }):
+    | { ok: true; phase: ToolRequestPhase; instruction?: { runId: string; requestId: string; stopGeneration: number } }
+    | Refused {
     const v = exact(input, ["owner", "ref", "sessionId", "callId", "now"], "cancelToolRequest");
     const owner = str(v.owner, UUID, "owner");
     const ref = str(v.ref, UUID, "ref");
@@ -1610,7 +1728,17 @@ export class Ledger {
     return this.#write("tool_request_cancel", "continue", () => {
       const row = this.#toolRequestRow("ref", owner, ref);
       if (row === null) throw new Refuse("unknown_run");
-      if (toToolRequest(row).phase !== "waiting_assignment") throw new Refuse("transition_denied");
+      const request = toToolRequest(row);
+      if (row.run_id !== null) {
+        const run = this.#runRow(row.run_id) as RunRow;
+        if (run.stop_receipt_id !== null || TERMINAL.includes(run.state)) throw new Refuse("transition_denied");
+        const stop = this.#stopRow();
+        const after = this.#recordStop(run, callId, "task_cancel", stop?.generation ?? null, now);
+        const phase = TOOL_REQUEST_RUN_PHASES[after.state];
+        if (run.state === "queued" || stop === null) return { ok: true as const, phase };
+        return { ok: true as const, phase, instruction: { runId: run.run_id, requestId: callId, stopGeneration: stop.generation } };
+      }
+      if (request.phase !== "waiting_assignment") throw new Refuse("transition_denied");
       this.#db
         .query("UPDATE tool_requests SET phase = 'not_started', cancelled_at = ?, cancel_session_id = ?, cancel_call_id = ? WHERE ref = ? AND owner = ?")
         .run(now, sessionId, callId, ref, owner);
@@ -1622,6 +1750,12 @@ export class Ledger {
 
   // 실행 줄을 대기(queued)로 적는다. 같은 중복 키는 같은 실행을 돌려준다(새 줄을 만들지 않는다).
   admitRun(input: AdmitRunInput): { ok: true; run: Run; created: boolean } | Refused {
+    const admit = this.#admitInput(input);
+    return this.#write("admit", "start", () => this.#admit(admit));
+  }
+
+  // 실행 줄 입력의 꼴 검사. admitRun과 배정(assignToolRequest)이 함께 쓴다.
+  #admitInput(input: AdmitRunInput): AdmitChecked {
     const v = exact(
       input,
       ["kind", "runId", "dedupeKey", "inputRequestId", "role", "snapshotDigest", "inputDigest", "profileRevision", "policyRevision", "executorId", "credential", "deadlineAt", "budgetLeft", "now"],
@@ -1654,35 +1788,38 @@ export class Ledger {
     const fits = kind === "worker" ? principal?.kind === "worker_executor" && principal.role === row.role : principal?.kind === "session_executor";
     if (!fits) throw new LedgerInputError("executorId: 이 실행을 맡을 수 있는 실행기 주체가 아니다");
     const credential = credentialRef(v.credential, "credential");
-    return this.#write("admit", "start", () => {
-      if (row.dedupe_key !== null) {
-        const same = this.#db.query("SELECT * FROM runs WHERE dedupe_key = ?").get(row.dedupe_key) as RunRow | null;
-        if (same) return { ok: true as const, run: toRun(same), created: false };
-      }
-      const generation = this.#epoch();
-      const seq = (this.#db.query("SELECT COALESCE(MAX(queue_seq), 0) + 1 AS seq FROM runs").get() as { seq: number }).seq;
-      this.#db
-        .query(
-          `INSERT INTO runs (run_id, run_generation, kind, role, queue_seq, dedupe_key, input_request_id, profile_revision, policy_revision,
-             snapshot_digest, input_digest, executor_id, account, auth_method, credential_revision, credential_digest, deadline_at, budget_left,
-             state, created_at, updated_at)
-           VALUES ($run_id, $generation, $kind, $role, $seq, $dedupe_key, $input_request_id, $profile_revision, $policy_revision,
-             $snapshot_digest, $input_digest, $executor_id, $account, $auth_method, $credential_revision, $credential_digest, $deadline_at, $budget_left,
-             'queued', $now, $now)`,
-        )
-        .run({
-          ...row,
-          generation,
-          seq,
-          account: credential.account,
-          auth_method: credential.method,
-          credential_revision: credential.revision,
-          credential_digest: credential.digest,
-        });
-      const created = this.#runRow(row.run_id);
-      if (created === null) throw new Refuse("invariant_violation");
-      return { ok: true as const, run: toRun(created), created: true };
-    });
+    return { row, credential };
+  }
+
+  // 실행 줄의 기록. 쓰기 트랜잭션 안에서만 부른다(admitRun, assignToolRequest).
+  #admit({ row, credential }: AdmitChecked): { ok: true; run: Run; created: boolean } {
+    if (row.dedupe_key !== null) {
+      const same = this.#db.query("SELECT * FROM runs WHERE dedupe_key = ?").get(row.dedupe_key) as RunRow | null;
+      if (same) return { ok: true as const, run: toRun(same), created: false };
+    }
+    const generation = this.#epoch();
+    const seq = (this.#db.query("SELECT COALESCE(MAX(queue_seq), 0) + 1 AS seq FROM runs").get() as { seq: number }).seq;
+    this.#db
+      .query(
+        `INSERT INTO runs (run_id, run_generation, kind, role, queue_seq, dedupe_key, input_request_id, profile_revision, policy_revision,
+           snapshot_digest, input_digest, executor_id, account, auth_method, credential_revision, credential_digest, deadline_at, budget_left,
+           state, created_at, updated_at)
+         VALUES ($run_id, $generation, $kind, $role, $seq, $dedupe_key, $input_request_id, $profile_revision, $policy_revision,
+           $snapshot_digest, $input_digest, $executor_id, $account, $auth_method, $credential_revision, $credential_digest, $deadline_at, $budget_left,
+           'queued', $now, $now)`,
+      )
+      .run({
+        ...row,
+        generation,
+        seq,
+        account: credential.account,
+        auth_method: credential.method,
+        credential_revision: credential.revision,
+        credential_digest: credential.digest,
+      });
+    const created = this.#runRow(row.run_id);
+    if (created === null) throw new Refuse("invariant_violation");
+    return { ok: true as const, run: toRun(created), created: true };
   }
 
   // 작업 시작 지시를 내기 직전에 부른다. 자리(작업자 슬롯)를 잡고 지시를 적은 커밋이 끝난 뒤에만 지시를 보낸다.
@@ -1745,16 +1882,23 @@ export class Ledger {
     return this.#write("stop_instruction", "continue", () => {
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
-      if ((action === "task_cancel") !== (row.kind === "worker")) throw new Refuse("invariant_violation");
-      if (row.state === "queued") {
-        this.#setState(row, "not_started", now);
-        return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow) };
-      }
-      this.#requireStopGeneration(stopGeneration);
-      if (["preparing", "running", "unknown_running"].includes(row.state)) this.#setState(row, "stopping", now);
-      this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, ?, ?, ?)").run(requestId, runId, action, stopGeneration, now);
-      return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow) };
+      return { ok: true as const, run: toRun(this.#recordStop(row, requestId, action, stopGeneration, now)) };
     });
+  }
+
+  // 종료 지시의 기록. 쓰기 트랜잭션 안에서만 부른다(recordStopInstruction, 이은 부탁의 cancelToolRequest).
+  // 대기 실행은 지시 없이 not_started로 닫고, 그 밖은 지금 정지 세대의 지시를 적는다(정지 기록이 없으면 stop_unknown).
+  #recordStop(row: RunRow, requestId: string, action: "task_cancel" | "session_stop", stopGeneration: number | null, now: number): RunRow {
+    if ((action === "task_cancel") !== (row.kind === "worker")) throw new Refuse("invariant_violation");
+    if (row.state === "queued") {
+      this.#setState(row, "not_started", now);
+      return this.#runRow(row.run_id) as RunRow;
+    }
+    if (stopGeneration === null) throw new Refuse("stop_unknown");
+    this.#requireStopGeneration(stopGeneration);
+    if (["preparing", "running", "unknown_running"].includes(row.state)) this.#setState(row, "stopping", now);
+    this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, ?, ?, ?)").run(requestId, row.run_id, action, stopGeneration, now);
+    return this.#runRow(row.run_id) as RunRow;
   }
 
   // 결과 확정 지시. 결과 쪽 상태(종료 확인이 있는)에서만 적는다. 정리 영수증은 이 지시만 가리킬 수 있다.
