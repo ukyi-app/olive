@@ -64,8 +64,10 @@ test("등록: 동작마다 정책이 어긋난 연결에서 받는지 선언하�
   expect(() => defineContract([COMMON_BUNDLE, bundle({ do_x: { ...base, duringPolicyMismatch: true } })])).toThrow("정책");
   const { duringPolicyMismatch: _q, ...queryUndeclared } = { ...base, class: "query", duringClosedIntake: true, parseResult: undefined, generations: undefined };
   expect(() => defineContract([COMMON_BUNDLE, bundle({ read_x: queryUndeclared })])).toThrow("정책");
-  // 공통부의 네 동작: 인사와 조회는 정책이 어긋나도 된다(관리자 결정 전의 값, actions.ts의 한 줄).
-  for (const [name, spec] of Object.entries(FRONTDOOR_CONTRACT.actions)) expect(spec.duringPolicyMismatch, name).toBe(true);
+  // 공개 면: 인사와 조회(작업 조회, 정지 기록 조회)는 정책이 어긋나도 되고(관리자 결정 2026-11-19: 뜻이 고정된 사실), 효과는 받지 않는다.
+  const effects = Object.entries(FRONTDOOR_CONTRACT.actions).filter(([, spec]) => spec.class === "effect");
+  expect(effects.length).toBeGreaterThan(0);
+  for (const [name, spec] of Object.entries(FRONTDOOR_CONTRACT.actions)) expect(spec.duringPolicyMismatch, name).toBe(spec.class !== "effect");
 });
 
 test("받기: 필수 세대 칸이 빠진 효과는 서명이 맞아도 generation_missing이고, 만들 수도 없다", async () => {

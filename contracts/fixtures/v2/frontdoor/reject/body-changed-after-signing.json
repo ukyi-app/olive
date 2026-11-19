@@ -12,7 +12,7 @@
     "reason": "digest_mismatch"
   },
   "keys": {
-    "front-door": "coYpHzweDoT_VEnV-IXI6UqDNuloOpp808fBfUtwV5E"
+    "front-door": "Mo6SYJtj-yNnXVRp_flIeyAOLLjfM-GVn7H0_lZeDQs"
   },
   "context": {
     "now": 1795046400000,
@@ -43,7 +43,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "XV100HDp5QqFPX6XyvHMz1Mqa2lGUMvpFZnvZ0iKqDfms1qeg2oi-8_jzkwR7iL37IBtnwv5eoMs-4rdYkhbBg",
+    "signature": "Rghze8d8OcGy11x-VZyW-yUNZoV9o0Z2GOyZQnMGzK5d5xjDWbAYiESU-ceHavCDH66RDjZ_vdbkd8ML7YXPBA",
     "body": {
       "policy_revision": "policy-8"
     }

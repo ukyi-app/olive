@@ -1,0 +1,57 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "reject/stop-prepare-policy-mismatch",
+  "description": "정책 revision이 어긋난 연결에 온 정지 준비. 효과는 정책이 맞을 때까지 받지 않는다",
+  "status": "candidate",
+  "base": "accept/stop-prepare",
+  "changed": [
+    "context.handshake"
+  ],
+  "expect": {
+    "ok": false,
+    "reason": "policy_mismatch"
+  },
+  "keys": {
+    "front-door": "Mo6SYJtj-yNnXVRp_flIeyAOLLjfM-GVn7H0_lZeDQs"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "supervisor",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 7,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 3,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "front-door",
+      "recipient": "supervisor",
+      "action": "stop_prepare",
+      "request_id": "00000000-0000-4000-8000-000000000023",
+      "nonce": "00000000000000000000000000000023"
+    },
+    "signature": "yjjVRAjGNLyz7DRxCxSXUzF-0pRACnn3JjU2kRlaVPzQovu5e7hCjFPhejwuJZpkYT6-CeGdWTzsf36pPjsPDQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000031",
+      "stop_generation": 8
+    }
+  },
+  "signing_input": "{\"action\":\"stop_prepare\",\"body_digest\":\"4fe5dacfdaca08af6531e5b8a71a0a1d2e9461d01d6d93039ef99f07e1b102e1\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000023\",\"recipient\":\"supervisor\",\"request_id\":\"00000000-0000-4000-8000-000000000023\",\"sender\":\"front-door\"}"
+}

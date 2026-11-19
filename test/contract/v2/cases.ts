@@ -1,78 +1,25 @@
 // v2 표본(contracts/fixtures/v2/frontdoor/)의 사례 정의. 시험과 표본 생성(generate-fixtures.ts)이 같은 정의를 쓴다.
 // 사례는 공개 면의 동작 표(FRONTDOOR_CONTRACT)만 쓴다. 거절 사례는 받아들이는 기준 사례 하나에서 적어 둔 곳만 바꿔 만든다.
 // 키는 부를 때마다 새로 만든다. 개인 키는 이 프로세스 밖으로 나가지 않는다.
-import { digestOf } from "../../../src/contract/v1/index.ts";
-import type { HandshakeState } from "../../../src/contract/v2/actions.ts";
-import { type Envelope, signUnchecked } from "../../../src/contract/v2/contract.ts";
-import type { RejectReason } from "../../../src/contract/v2/errors.ts";
-import type { Party } from "../../../src/contract/v2/header.ts";
-import { baseContext, type CaseContext, envelope, id, type Keys, NOW, nonceOf, OTHER_POLICY, POLICY, trustedRaw } from "./support.ts";
+// 이 파일은 공통부의 사례를 두고, 묶음의 사례는 묶음마다 자기 파일의 함수 하나(cases-<묶음>.ts)에 두어 buildCases 끝에서 모은다.
+import { accept, type V2Case, type Variant, variant } from "./case-kit.ts";
+import { buildStopCases } from "./cases-stop.ts";
+import { baseContext, envelope, id, type Keys, NOW, nonceOf, OTHER_POLICY, POLICY } from "./support.ts";
+
+export type { Expect, V2Case } from "./case-kit.ts";
 
 // 표본 폴더. 생성기는 이 폴더 밖에 쓰지 않는다(acceptance.test.ts가 지킨다).
 export const FIXTURE_DIR = "contracts/fixtures/v2/frontdoor";
 export const FIXTURE_TAG = "olive-control/v2";
 
-export type Expect = { ok: true; handshake_after: Exclude<HandshakeState, "none"> | null } | { ok: false; reason: RejectReason };
-
-export interface V2Case {
-  name: string;
-  description: string;
-  status: "candidate";
-  base: string | null;
-  changed: string[];
-  expect: Expect;
-  // 받는 쪽이 믿는 공개 키(상대의 것 하나). 32바이트 원시 값의 base64url.
-  keys: Record<string, string>;
-  context: CaseContext;
-  message: Envelope;
-}
-
 const HANDSHAKE_REQ = id(0x10);
 const HANDSHAKE_REPLY_REQ = id(0x11);
 
-function accept(keys: Keys, name: string, description: string, receiver: Party, context: CaseContext, message: Envelope, after: Expect & { ok: true }): V2Case {
-  return { name: `accept/${name}`, description, status: "candidate", base: null, changed: [], expect: after, keys: trustedRaw(keys, receiver), context, message };
-}
-
-interface Variant {
-  name: string;
-  description: string;
-  reason: RejectReason;
-  changed: string[];
-  edit(c: { message: { header: Record<string, unknown>; body: Record<string, unknown> }; context: CaseContext }): void;
-  // recompute: 본문을 바꾼 뒤 body_digest를 다시 맞춘다. keep: 머리를 그대로 둔다(서명 뒤 본문을 바꾼 사례).
-  digest?: "recompute" | "keep";
-  // 이 쪽의 키로 다시 서명한다. 없으면 머리의 sender(당사자가 아니면 현관)의 키다. null이면 처음 서명을 그대로 둔다.
-  signer?: Party | null;
-}
-
-function variant(keys: Keys, base: V2Case, v: Variant): V2Case {
-  const message = structuredClone(base.message) as unknown as { header: Record<string, unknown>; body: Record<string, unknown>; signature: string };
-  const context = structuredClone(base.context);
-  v.edit({ message, context });
-  if ((v.digest ?? "recompute") === "recompute") message.header.body_digest = digestOf(message.body);
-  let signed: Envelope;
-  if (v.signer === null) signed = { header: message.header, signature: base.message.signature, body: message.body } as unknown as Envelope;
-  else {
-    const sender = message.header.sender;
-    const by: Party = v.signer ?? (sender === "supervisor" || sender === "front-door" ? sender : "front-door");
-    signed = signUnchecked(message.header as never, message.body, keys[by].privateKey);
-  }
-  return {
-    name: `reject/${v.name}`,
-    description: v.description,
-    status: "candidate",
-    base: base.name,
-    changed: v.changed,
-    expect: { ok: false, reason: v.reason },
-    // 믿는 키는 늘 받는 쪽의 상대 키다. 받는 쪽을 바꾼 사례는 키도 바뀐다(changed에 keys를 적는다).
-    keys: trustedRaw(keys, context.expected_recipient),
-    context,
-    message: signed,
-  };
-}
-
 export function buildCases(keys: Keys): V2Case[] {
+  return [...commonCases(keys), ...buildStopCases(keys)];
+}
+
+function commonCases(keys: Keys): V2Case[] {
   const handshakeMsg = (policy: string) =>
     envelope(keys, { sender: "front-door", recipient: "supervisor", action: "handshake", request_id: HANDSHAKE_REQ, nonce: nonceOf(1) }, { policy_revision: policy });
   const replyMsg = (policy: string) =>

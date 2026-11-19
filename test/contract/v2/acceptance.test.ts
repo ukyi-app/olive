@@ -116,8 +116,19 @@ test("틀린 판·정책은 새 효과 0", async () => {
   );
   expect((await verifyAt(PROBE, lookup, "supervisor", { handshake: mismatched })).ok).toBe(true);
 
-  // 공개 면의 표에는 아직 효과 동작이 없다. 생기면 위와 같이 인사 없는 연결과 정책이 다른 연결에서 모두 거절되어야 한다.
-  for (const [action, spec] of Object.entries(FRONTDOOR_CONTRACT.actions)) expect(spec.class === "effect", action).toBe(false);
+  // 공개 면의 효과 동작마다: 그 통과 표본(표본 시험이 동작마다 요구한다)을 인사 없는 연결과 정책이 다른 연결로 옮기면 거절된다.
+  const publicCases = buildCases(keys);
+  const publicEffects = Object.entries(FRONTDOOR_CONTRACT.actions).filter(([, spec]) => spec.class === "effect");
+  expect(publicEffects.length).toBeGreaterThan(0);
+  for (const [action] of publicEffects) {
+    const base = publicCases.find((c) => c.expect.ok && c.message.header.action === action);
+    expect(base, action).toBeDefined();
+    if (base === undefined) continue;
+    const replay = (handshake: HandshakeState) => FRONTDOOR_CONTRACT.verify(base.message, contextOf(base.keys, { ...base.context, handshake }));
+    expect(await replay("none"), action).toEqual({ ok: false, reason: "handshake_required" });
+    expect(await replay("policy_mismatch"), action).toEqual({ ok: false, reason: "policy_mismatch" });
+    expect((await replay("agreed")).ok, action).toBe(true);
+  }
 
   // 접수가 닫혀도 인사와 조회는 되고, 닫힌 접수에서 받지 않는 효과는 intake_closed다(인사가 끝난 연결에서도).
   expect((await verifyAt(PROBE, handshakeFrom(keys, POLICY, 4), "supervisor", { intake_open: false })).ok).toBe(true);

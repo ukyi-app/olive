@@ -154,8 +154,8 @@ const sameJob = (body: unknown, awaited: Awaited): boolean => {
 
 // ---- 공통부의 동작 표 ----
 
-// 정책 revision이 어긋난 연결에서 작업 조회(job_lookup·job_status)를 받는가. 복원(§8의 1·4)과 풀기(§7.6)가 정책이 어긋나도 현관에
-// 물어야 해서 true다. 어긋난 연결에서 받은 답을 어디까지 사실로 쓸지는 관리자가 아직 정하지 않았다(리뷰 R6). 막기로 하면 이 값만 바꾼다.
+// 정책 revision이 어긋난 연결에서 작업 조회(job_lookup·job_status)를 받는가. 관리자 결정(2026-11-19): 어긋난 연결에서는 계약 판이
+// 뜻을 고정한 사실(정지 기록, 이미 보낸 작업의 결과)의 조회만 되고 새 일과 풀기는 막힌다. 작업 조회는 이미 보낸 작업의 결과라 true다.
 const QUERIES_DURING_POLICY_MISMATCH = true;
 
 export const COMMON_BUNDLE: Bundle = {

@@ -13,7 +13,7 @@
     "reason": "expired"
   },
   "keys": {
-    "front-door": "coYpHzweDoT_VEnV-IXI6UqDNuloOpp808fBfUtwV5E"
+    "front-door": "Mo6SYJtj-yNnXVRp_flIeyAOLLjfM-GVn7H0_lZeDQs"
   },
   "context": {
     "now": 1795046400000,
@@ -44,7 +44,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "cD5ltfBlESuYDuPgdM-S00bxe3ySNYZ1XxpVHNG33sakiHvJuOaWwzynnBPTy1y1TGr65lBfF2FZZdD6NCjhBg",
+    "signature": "hOpQVe_tezgUUVKvW9KIT88rjMFxTqGS9BgmropLO3-T-NwqPIr7IZ717YBoXAs3secmlVkroFT3ayotFPE0DA",
     "body": {
       "policy_revision": "policy-7"
     }

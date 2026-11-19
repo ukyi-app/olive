@@ -10,13 +10,19 @@ const effect: ActionSpec = { ...PROBE_BUNDLE.actions.probe_effect! };
 // 일부러 규칙을 어긴 명세도 넣으므로 타입을 풀어 받는다(규칙은 defineContract가 실행 시점에 다시 본다).
 const bundle = (actions: Record<string, unknown>): Bundle => ({ name: "x", actions: actions as Record<string, ActionSpec> });
 
-test("표: 공통부의 동작은 넷이고, 인사와 조회는 모두 접수가 닫혀도·정책이 어긋나도 받고 세대 규칙이 없다", () => {
+test("표: 공개 면은 공통부 넷과 정지 묶음 여섯이다. 인사와 조회는 접수가 닫혀도·정책이 어긋나도 받고 세대 규칙이 없으며, 효과는 정책이 어긋나면 받지 않는다", () => {
   const rows = Object.entries(FRONTDOOR_CONTRACT.actions).map(([name, s]) => [name, s.class, [...s.from].sort().join(","), s.duringClosedIntake, s.duringPolicyMismatch, s.generations]);
   expect(rows).toEqual([
     ["handshake", "handshake", "front-door", true, true, undefined],
     ["handshake_reply", "handshake", "supervisor", true, true, undefined],
     ["job_lookup", "query", "front-door,supervisor", true, true, undefined],
     ["job_status", "query", "front-door,supervisor", true, true, undefined],
+    ["stop_record_lookup", "query", "supervisor", true, true, undefined],
+    ["stop_record", "query", "front-door", true, true, undefined],
+    ["stop_prepare", "effect", "front-door", true, false, { stop: "newer", execution: "not_applicable" }],
+    ["stop_commit", "effect", "front-door", true, false, { stop: "prepared", execution: "not_applicable" }],
+    ["release_prepare", "effect", "front-door", true, false, { stop: "current", execution: "not_applicable" }],
+    ["release_commit", "effect", "front-door", true, false, { stop: "prepared", execution: "next" }],
   ]);
   expect(Object.isFrozen(FRONTDOOR_CONTRACT.actions)).toBe(true);
 });
