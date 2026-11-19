@@ -47,7 +47,8 @@ interface Settings {
 export type Phase = "awaiting_sync" | "requested" | "answered" | "greeted" | "closed";
 
 export const CLOSE_REASONS = [
-  // 그 단계에서 받을 수 없는 동작(맞춤 전의 hello·영수증·보고, 두 번째 맞춤 요청, 두 번째 hello, 감독이 내는 동작)
+  // 그 단계에서 받을 수 없는 동작(맞춤 전의 hello·영수증·보고, 두 번째 맞춤 요청, 두 번째 hello, 감독이 내는 동작),
+  // 답을 실은 시각보다 먼저 받은 hello
   "out_of_order",
   // 계약 v1의 검증이 거절했다(사유는 reject에 싣는다)
   "rejected",
@@ -191,7 +192,8 @@ interface Inner {
   readonly settings: Settings;
   readonly nextId: number;
   readonly byId: ReadonlyMap<number, ConnectionState>;
-  // 주체 이름 → 그 주체로 맞춤을 시작한 가장 나중 연결.
+  // 주체 이름 → 그 주체로 맞춤 답을 서명한 가장 나중 연결의 번호. 그 연결이 닫혀도 지우지 않는다: 더 먼저 연 연결의 늦은 맞춤을
+  // 가려내는 기록이다. 키는 등록표가 믿은 주체뿐이라 등록 수로 묶인다.
   readonly holder: ReadonlyMap<string, number>;
   // peer.uri → 받아들인 새 연결의 시각(재접속 제한의 창 안의 것만).
   readonly opens: ReadonlyMap<string, readonly number[]>;
@@ -217,25 +219,28 @@ export class Connections {
     return new Connections({ settings: readSettings(settings), nextId: 1, byId: new Map(), holder: new Map(), opens: new Map() });
   }
 
+  // 연결의 값 그대로다. 배정 후보인지는 phase가 아니라 candidates(지금의 복원기)로 본다.
   get(id: number): ConnectionState | undefined {
     return this.#inner.byId.get(id);
   }
 
-  // 배정 후보 전부. 닫힌 연결과 hello 전의 연결은 없다.
-  candidates(): Candidate[] {
-    const out: Candidate[] = [];
-    for (const conn of this.#inner.byId.values()) if (conn.phase === "greeted") out.push(candidateOf(conn));
-    return out;
+  // 배정 후보 전부. occupancy와 같은 연결만 낸다(#greetedNow).
+  candidates(source: StopGenerationSource): Candidate[] {
+    return this.#greetedNow(source).map(candidateOf);
   }
 
-  // OccupancyPort가 내는 full 행. 이 복원기(source)로 답한 맞춤 뒤에 hello를 받았고 아직 열린 연결만이다.
-  // hello가 없는 연결은 행이 없다(빈 목록으로 지어내지 않는다: 빈 runs는 "쥔 것이 없다", 행 없음은 "모른다"다).
+  // OccupancyPort가 내는 full 행. hello가 없는 연결은 행이 없다(빈 목록으로 지어내지 않는다: 빈 runs는 "쥔 것이 없다",
+  // 행 없음은 "모른다"다).
   occupancy(source: StopGenerationSource): OccupancyAnswer[] {
-    const out: OccupancyAnswer[] = [];
-    for (const conn of this.#inner.byId.values()) {
-      if (conn.phase === "greeted" && conn.sync?.source === source && conn.greeting) out.push(fullAnswer(conn));
-    }
-    return out;
+    return this.#greetedNow(source).map(fullAnswer);
+  }
+
+  // 부르는 순간의 복원기(source)로 답한 맞춤 뒤에 hello를 받았고, 그 복원기가 지금 세대를 알며, 아직 열린 연결.
+  // 복원기를 바꾸거나 세대를 모르게 된 뒤 tick이 옛 연결을 닫기 전에도 옛 복원의 인사를 내지 않도록 조회 때마다 본다.
+  // 인사 뒤 새 정지로 세대가 오른 것은 막지 않는다(그 연결로 비상 종료를 보내야 한다).
+  #greetedNow(source: StopGenerationSource): ConnectionState[] {
+    if (source.stopGeneration() === null) return [];
+    return [...this.#inner.byId.values()].filter((conn) => conn.phase === "greeted" && conn.sync?.source === source && conn.greeting !== null);
   }
 
   // 연결이 열림. 상한·재접속 제한에 걸리면 연 즉시 닫힌 연결로 둔다.
@@ -340,10 +345,9 @@ class Draft {
     this.outputs.push(reject === undefined ? { kind: "close", connection: conn.id, reason } : { kind: "close", connection: conn.id, reason, reject });
   }
 
-  // 그 연결이 쥔 것만 놓는다: 주체의 자리(그 연결이 쥔 때만)와 배정 후보 표시.
+  // 그 연결이 쥔 배정 후보 표시만 놓는다. 주체의 가장 나중 연결 번호(holder)는 남긴다.
   private leave(conn: ConnectionState): void {
     const principal = conn.sync?.principal;
-    if (principal !== undefined && this.holder.get(principal) === conn.id) this.holder.delete(principal);
     if (conn.phase === "greeted" && principal !== undefined) this.outputs.push({ kind: "withdrawn", connection: conn.id, principal });
   }
 
@@ -389,9 +393,9 @@ class Draft {
     const principal = result.header.sender;
     const parsed = parsePrincipal(principal);
     if (parsed?.kind !== "worker_executor") return this.close(conn, "principal_mismatch");
-    // 같은 주체의 더 나중 연결이 이미 맞춤을 시작했으면 이 연결이 옛 연결이다.
+    // 같은 주체의 더 나중 연결이 이미 맞춤 답을 받았으면(그 연결이 그 뒤 닫혔어도) 이 연결이 옛 연결이다.
     const holderId = this.holder.get(principal);
-    if (holderId !== undefined && holderId > conn.id && this.byId.get(holderId)?.phase !== "closed") return this.close(conn, "superseded");
+    if (holderId !== undefined && holderId > conn.id) return this.close(conn, "superseded");
     if (!within(ctx.now - receivedAt, limits.STOP_SYNC_ANSWER_MAX_MS)) return this.close(conn, "answer_late");
     // 서명하는 순간의 권위 세대. 요청을 검증한 때 알았어도 지금 모르면 답하지 않는다.
     const generation = ctx.stop.stopGeneration();
@@ -443,13 +447,16 @@ class Draft {
   // 받은 시각과 판단하는 시각이 모두 대기 한도 안이어야 한다(검증이 오래 걸려 한도를 넘긴 것도 늦은 것이다).
   private hello(conn: ConnectionState, sync: SyncRecord, body: Bodies["hello"], at: number, now: number): void {
     if (conn.phase !== "answered") return this.close(conn, "out_of_order");
+    // 답을 실은 시각보다 먼저 받은 프레임은 이 연결의 답을 보고 쓴 hello가 아니다. 같은 시각이면 부르는 쪽이 지킨 소켓 사건
+    // 순서(reply_sent를 알린 뒤 받은 프레임만 이 단계에서 check에 넘긴다)를 따른다.
+    if (sync.answeredAt === null || at < sync.answeredAt) return this.close(conn, "out_of_order");
     const limit = this.inner.settings.helloWaitMs;
     if (!within(at - sync.receivedAt, limit) || !within(now - sync.receivedAt, limit)) return this.close(conn, "hello_late");
     const greeting: Greeting = Object.freeze({
       at,
       profile_revision: body.profile_revision,
       policy_revision: body.policy_revision,
-      runs: copyRuns(body.runs),
+      runs: frozenRuns(body.runs),
     });
     const next = this.put(conn, { phase: "greeted", greeting });
     this.outputs.push({ kind: "occupancy", connection: conn.id, answer: fullAnswer(next) });
@@ -493,6 +500,11 @@ function within(elapsed: number, limit: number): boolean {
 
 function copyRuns(runs: readonly RunStatus[]): RunStatus[] {
   return runs.map((run) => ({ ...run }));
+}
+
+// 보관하는 인사의 실행 목록. get()이 이 값을 그대로 내주므로 배열과 항목까지 동결한다(RunStatus는 평평한 객체다).
+function frozenRuns(runs: readonly RunStatus[]): readonly RunStatus[] {
+  return Object.freeze(runs.map((run) => Object.freeze({ ...run })));
 }
 
 function fullAnswer(conn: ConnectionState): OccupancyAnswer {

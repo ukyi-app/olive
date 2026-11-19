@@ -12,6 +12,7 @@ import {
   type ReplyTools,
   type StopGenerationSource,
 } from "../../../src/supervisor/transport/connections.ts";
+import { type AssignmentContext, eligibleConnections } from "../../../src/supervisor/roles/assign.ts";
 import { type ExecutorPeer, type RegistrySettings, RegistryState } from "../../../src/supervisor/transport/registry.ts";
 
 // 키·등록행·대상 표는 이 시험이 지어 넣는 자료다. 키는 실행마다 새로 만든다. 시각은 모두 인자로 준다.
@@ -342,7 +343,7 @@ describe("맞춤 생략·중복·옛 연결 거절", () => {
       const w = new World();
       const { id } = await w.sync(READER, K1, R1, T);
       expect(await w.receive(id, make(), T + 1)).toEqual([{ kind: "close", connection: id, reason: "out_of_order" }]);
-      expect(w.table.candidates()).toEqual([]);
+      expect(w.table.candidates(w.stop)).toEqual([]);
     }
   });
 
@@ -373,7 +374,7 @@ describe("맞춤 생략·중복·옛 연결 거절", () => {
     const b = w.open(READER, T + 1);
     expect(await w.receive(b, hello(K1, R1, 0, T + 1), T + 1)).toEqual([{ kind: "close", connection: b, reason: "out_of_order" }]);
     expect(w.table.get(a)?.phase).toBe("answered");
-    expect(w.table.candidates()).toEqual([]);
+    expect(w.table.candidates(w.stop)).toEqual([]);
   });
 
   test("같은 주체의 새 연결이 맞추면 옛 연결은 닫히고 옛 연결에서 온 것은 버린다", async () => {
@@ -386,10 +387,10 @@ describe("맞춤 생략·중복·옛 연결 거절", () => {
     expect(closes(out)).toEqual([[a, "superseded", null]]);
     expect(w.step({ kind: "envelope", checked: late }, T + 3)).toEqual([]);
     expect(await w.receive(a, statusReport(K1, R1, 0, T + 4, [running]), T + 4)).toEqual([]);
-    expect(w.table.candidates()).toEqual([]);
+    expect(w.table.candidates(w.stop)).toEqual([]);
     w.step({ kind: "reply_sent", connection: b, at: T + 3 }, T + 3);
     await w.receive(b, hello(K1, R1, 0, T + 4), T + 4);
-    expect(w.table.candidates().map((c) => c.connection)).toEqual([b]);
+    expect(w.table.candidates(w.stop).map((c) => c.connection)).toEqual([b]);
   });
 
   test("먼저 연 연결의 늦은 맞춤 요청은 나중 연결을 밀어내지 못한다", async () => {
@@ -399,6 +400,34 @@ describe("맞춤 생략·중복·옛 연결 거절", () => {
     expect(kinds(await w.receive(b, syncRequest(K1, R1, T), T))).toEqual(["send_reply"]);
     expect(await w.receive(a, syncRequest(K1, R1, T), T)).toEqual([{ kind: "close", connection: a, reason: "superseded" }]);
     expect(w.table.get(b)?.phase).toBe("requested");
+  });
+
+  test("나중 연결이 인사하고 끊긴 뒤에도 먼저 연 연결의 늦은 맞춤은 superseded다", async () => {
+    const w = new World();
+    const a = w.open(READER, T);
+    const b = await w.greet(READER, K1, R1, T);
+    expect(w.step({ kind: "closed", connection: b }, T + 2)).toEqual([{ kind: "withdrawn", connection: b, principal: R1 }]);
+    expect(await w.receive(a, syncRequest(K1, R1, T + 2), T + 2)).toEqual([{ kind: "close", connection: a, reason: "superseded" }]);
+    expect(w.table.candidates(w.stop)).toEqual([]);
+    expect(w.table.occupancy(w.stop)).toEqual([]);
+    // 새 연결은 다시 맞출 수 있다.
+    const c = await w.greet(READER, K1, R1, T + 3);
+    expect(w.table.candidates(w.stop).map((x) => x.connection)).toEqual([c]);
+  });
+
+  test("답을 실은 시각보다 먼저 받은 hello는 인정하지 않고, 같은 시각은 사건 순서를 따른다", async () => {
+    const w = new World();
+    const a = w.open(READER, T);
+    await w.receive(a, syncRequest(K1, R1, T), T);
+    expect(w.step({ kind: "reply_sent", connection: a, at: T + 10 }, T + 10)).toEqual([]);
+    expect(await w.receive(a, hello(K1, R1, 0, T + 9), T + 9, T + 10)).toEqual([{ kind: "close", connection: a, reason: "out_of_order" }]);
+    expect(w.table.candidates(w.stop)).toEqual([]);
+    expect(w.table.occupancy(w.stop)).toEqual([]);
+
+    const b = w.open(READER, T);
+    await w.receive(b, syncRequest(K2, R2, T), T);
+    w.step({ kind: "reply_sent", connection: b, at: T + 10 }, T + 10);
+    expect(kinds(await w.receive(b, hello(K2, R2, 0, T + 10), T + 10))).toEqual(["occupancy", "candidate"]);
   });
 
   test("닫혀 지운 연결의 늦은 검증 결과는 버린다", async () => {
@@ -417,7 +446,7 @@ describe("hello 누락 때 full 행 0", () => {
     const w = new World();
     await w.sync(READER, K1, R1, T);
     expect(w.table.occupancy(w.stop)).toEqual([]);
-    expect(w.table.candidates()).toEqual([]);
+    expect(w.table.candidates(w.stop)).toEqual([]);
     expect(w.all.filter((o) => o.kind === "occupancy" || o.kind === "candidate")).toEqual([]);
   });
 
@@ -482,13 +511,83 @@ describe("hello 누락 때 full 행 0", () => {
   });
 });
 
+describe("이번 복원에서 인사한 연결만 후보다", () => {
+  const job = { role: "isolated_reader" } as const;
+  const assignment = (keyId: string): AssignmentContext => ({
+    allowed: [{ target: "reader", roles: ["isolated_reader"] }],
+    registrations: [{ target: "reader", role: "isolated_reader", instance: "r1", storage: "s1", keyId, active: true }],
+    expected: { profile_revision: "profile-1", policy_revision: "policy-1" },
+  });
+
+  test("복원기를 바꾼 직후 첫 tick 전에도 앞 복원의 인사는 후보·full 행·배정 후보가 아니다", async () => {
+    const w = new World();
+    const old = w.stop;
+    const a = await w.greet(READER, K1, R1, T, [running]);
+    const d = await w.greet(DIAGNOSIS, KD, D1, T);
+    const reader = w.table.candidates(old).find((c) => c.target === "reader");
+    const ctx = assignment(reader!.keyId);
+    expect(eligibleConnections(job, w.table.candidates(old), ctx)).toHaveLength(1);
+
+    w.stop = restorer(0);
+    expect(w.table.candidates(w.stop)).toEqual([]);
+    expect(w.table.occupancy(w.stop)).toEqual([]);
+    expect(eligibleConnections(job, w.table.candidates(w.stop), ctx)).toEqual([]);
+
+    // 새 복원에서 맞춤과 인사를 다시 한 연결만 후보다. 다시 인사하지 않은 d는 후보가 아니고 tick에서 닫힌다.
+    const b = await w.greet(READER, K1, R1, T + 2, [running]);
+    expect(closes(w.all)).toEqual([[a, "superseded", null]]);
+    expect(w.table.candidates(w.stop).map((c) => c.connection)).toEqual([b]);
+    expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
+    expect(eligibleConnections(job, w.table.candidates(w.stop), ctx)).toHaveLength(1);
+    expect(w.step({ kind: "tick" }, T + 4)).toEqual([
+      { kind: "withdrawn", connection: d, principal: D1 },
+      { kind: "close", connection: d, reason: "restore_changed" },
+    ]);
+  });
+
+  test("같은 복원기가 세대를 모르게 되면 첫 tick 전에도 후보·full 행이 없다", async () => {
+    const w = new World();
+    const id = await w.greet(READER, K1, R1, T, [running]);
+    w.stop.generation = null;
+    expect(w.table.candidates(w.stop)).toEqual([]);
+    expect(w.table.occupancy(w.stop)).toEqual([]);
+    expect(w.step({ kind: "tick" }, T + 2)).toEqual([
+      { kind: "withdrawn", connection: id, principal: R1 },
+      { kind: "close", connection: id, reason: "restore_changed" },
+    ]);
+  });
+
+  test("인사한 뒤 새 정지로 세대가 오른 연결은 후보와 full 행으로 남는다", async () => {
+    const w = new World();
+    const id = await w.greet(READER, K1, R1, T, [running]);
+    w.stop.generation = 1;
+    expect(w.table.candidates(w.stop).map((c) => c.connection)).toEqual([id]);
+    expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
+  });
+});
+
+describe("공개 조회는 보관한 값을 바꾸게 두지 않는다", () => {
+  test("인사의 실행 목록과 각 항목은 동결되어 있다", async () => {
+    const w = new World();
+    const id = await w.greet(READER, K1, R1, T, [running]);
+    const greeting = w.table.get(id)!.greeting!;
+    expect(Object.isFrozen(greeting.runs)).toBe(true);
+    expect(Object.isFrozen(greeting.runs[0])).toBe(true);
+    expect(() => {
+      (greeting.runs[0] as { state: string }).state = "finished";
+    }).toThrow(TypeError);
+    expect(() => (greeting.runs as RunStatus[]).push(running)).toThrow(TypeError);
+    expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
+  });
+});
+
 describe("연결 하나가 닫히는 것은 그 주체에 대한 사실일 뿐이다", () => {
   test("닫힌 연결의 주체만 후보에서 빠지고 다른 주체·다른 연결은 그대로다", async () => {
     const w = new World();
     const a = await w.greet(READER, K1, R1, T, [running]);
     const d = await w.greet(DIAGNOSIS, KD, D1, T);
     expect(w.step({ kind: "closed", connection: a }, T + 5)).toEqual([{ kind: "withdrawn", connection: a, principal: R1 }]);
-    expect(w.table.candidates().map((c) => [c.connection, c.target])).toEqual([[d, "diagnosis"]]);
+    expect(w.table.candidates(w.stop).map((c) => [c.connection, c.target])).toEqual([[d, "diagnosis"]]);
     expect(w.table.occupancy(w.stop)).toEqual([{ executorId: D1, coverage: "full", runs: [] }]);
   });
 });
@@ -516,7 +615,7 @@ describe("역할 바꿈과 신원 대조", () => {
   test("후보는 TLS 대상·검증한 주체·키 식별·hello의 revision만 싣는다", async () => {
     const w = new World();
     await w.greet(READER, K1, R1, T);
-    const [candidate] = w.table.candidates();
+    const [candidate] = w.table.candidates(w.stop);
     expect(Object.keys(candidate!).sort()).toEqual(["connection", "hello", "keyId", "principal", "target"]);
     expect(candidate!.principal).toEqual({ kind: "worker_executor", role: "isolated_reader", instance: "r1", storage: "s1" });
     expect(candidate!.hello).toEqual({ profile_revision: "profile-1", policy_revision: "policy-1" });
@@ -533,7 +632,7 @@ describe("등록표 교체 뒤의 무효", () => {
       { kind: "withdrawn", connection: a, principal: R1 },
       { kind: "close", connection: a, reason: "registry" },
     ]);
-    expect(w.table.candidates().map((c) => c.connection)).toEqual([d]);
+    expect(w.table.candidates(w.stop).map((c) => c.connection)).toEqual([d]);
   });
 
   test("키가 바뀐 판도 옛 키로 맞춘 연결을 무효로 한다", async () => {
@@ -567,7 +666,7 @@ describe("등록표 교체 뒤의 무효", () => {
     await w.greet(READER, K1, R1, T);
     w.registry = applyDoc(w.registry, 2, ROWS);
     expect(w.step({ kind: "registry" }, T + 5)).toEqual([]);
-    expect(w.table.candidates()).toHaveLength(1);
+    expect(w.table.candidates(w.stop)).toHaveLength(1);
   });
 });
 
