@@ -1,0 +1,131 @@
+# 실행기 격리의 실제 프로세스 사례(test/executor/containment.test.ts)를 GitHub 호스트 러너의 일반 계정으로 돌린다.
+# build.yaml의 test는 이미지 빌드 안에서 돌고 거기엔 bwrap이 없어 이 사례들이 등록되지 않는다.
+# 이 검사는 사례가 실제로 실행돼 모두 통과했다는 JUnit 기록이 있을 때만 성공한다(test/containment-junit.ts).
+# 러너의 보안 설정(sysctl, AppArmor)은 바꾸지 않는다. 기본 설정에서 안 되면 진단 단계의 출력이 그 근거다.
+# uses:는 40자 커밋 SHA로 고정한다(build.yaml의 태그 ref 규칙은 배포 키 때문이고 이 파일엔 해당하지 않는다).
+name: containment
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions: {}
+concurrency:
+  # PR은 새 커밋이 오면 앞 실행을 취소한다. main push는 커밋마다 따로 끝까지 돈다.
+  group: containment-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+defaults:
+  run:
+    shell: bash
+jobs:
+  containment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: bun 설치
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+          no-cache: true
+
+      - name: bun 판 대조
+        run: |
+          echo "bun $(bun --version), .bun-version $(cat .bun-version)"
+          test "$(bun --version)" = "$(cat .bun-version)"
+
+      - name: 도구 확인
+        # 시험은 이 고정 경로를 직접 부른다. PATH 위의 다른 판으로는 대신하지 않는다.
+        run: |
+          missing=()
+          [ -x /usr/bin/bwrap ] || missing+=(bubblewrap)
+          [ -x /usr/bin/python3 ] || missing+=(python3)
+          [ -x /usr/bin/nsenter ] || missing+=(util-linux)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "설치할 패키지: ${missing[*]}"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
+          dpkg-query -W bubblewrap python3 util-linux
+          test -x /usr/bin/bwrap
+          test -x /usr/bin/python3
+          test -x /usr/bin/nsenter
+
+      - name: 진단(설정을 바꾸지 않고 읽기만)
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "::group::커밋과 러너"
+          echo "checkout HEAD $(git rev-parse HEAD), GITHUB_SHA $GITHUB_SHA, PR head ${PR_HEAD_SHA:-(push)}"
+          echo "ImageOS ${ImageOS:-?}, ImageVersion ${ImageVersion:-?}"
+          grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release
+          uname -srvm
+          id
+          echo "::endgroup::"
+
+          echo "::group::user namespace와 AppArmor 설정"
+          for key in kernel/apparmor_restrict_unprivileged_userns kernel/apparmor_restrict_unprivileged_unconfined kernel/unprivileged_userns_clone user/max_user_namespaces user/max_pid_namespaces; do
+            if [ -r "/proc/sys/$key" ]; then echo "$key = $(cat "/proc/sys/$key")"; else echo "$key = (없음)"; fi
+          done
+          if [ -r /sys/module/apparmor/parameters/enabled ]; then echo "apparmor enabled = $(cat /sys/module/apparmor/parameters/enabled)"; fi
+          # 로드된 프로필 목록은 root만 읽는다. 읽기만 한다.
+          if sudo grep -E 'bwrap|unprivileged_userns' /sys/kernel/security/apparmor/profiles; then
+            echo "위가 로드된 bwrap·userns 관련 프로필이다."
+          else
+            echo "로드된 bwrap·userns 관련 프로필 없음(grep exit $?)"
+          fi
+          for profile in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns /usr/share/apparmor/extra-profiles/bwrap-userns-restrict; do
+            if [ -e "$profile" ]; then echo "파일 있음: $profile"; else echo "파일 없음: $profile"; fi
+          done
+          echo "::endgroup::"
+
+          echo "::group::도구 판"
+          echo "bun $(bun --version) ($(command -v bun))"
+          if [ -x /usr/bin/bwrap ]; then /usr/bin/bwrap --version; ls -l /usr/bin/bwrap; else echo "/usr/bin/bwrap 없음"; fi
+          if [ -x /usr/bin/python3 ]; then /usr/bin/python3 --version; else echo "/usr/bin/python3 없음"; fi
+          if [ -x /usr/bin/nsenter ]; then /usr/bin/nsenter --version; else echo "/usr/bin/nsenter 없음"; fi
+          echo "::endgroup::"
+
+          # 신호를 쓰지 않는 probe. 첫째가 시험의 probe와 같은 인자이고(기대: exit 0, stdout 2), 둘째·셋째는 실패 지점을 좁힌다.
+          probe() {
+            local label=$1 out rc
+            shift
+            if out=$("$@" 2>"$RUNNER_TEMP/probe.err"); then rc=0; else rc=$?; fi
+            echo "probe[$label] exit=$rc stdout=${out:-(없음)}"
+            echo "probe[$label] stderr: $(cat "$RUNNER_TEMP/probe.err")"
+          }
+          if [ -x /usr/bin/bwrap ]; then
+            probe test-args /usr/bin/bwrap --unshare-pid --unshare-user --new-session --die-with-parent --dev-bind / / --proc /proc -- /bin/sh -c 'echo $$'
+            probe userns-only /usr/bin/bwrap --unshare-user --dev-bind / / -- /bin/sh -c 'echo $$'
+            probe pid-no-proc /usr/bin/bwrap --unshare-pid --unshare-user --dev-bind / / -- /bin/sh -c 'echo $$'
+          else
+            echo "probe 생략: /usr/bin/bwrap 없음"
+          fi
+
+      - name: 격리 사례 실행(일반 계정, sudo 없음)
+        # -t는 "실제 프로세스"로 시작하는 이름만 고른다. bwrap을 못 쓸 때 등록되는 실패 사례
+        # "실제 프로세스: bwrap을 써야 한다(OLIVE_REQUIRE_BWRAP=1)"도 이 꼴이라 함께 골라진다.
+        env:
+          OLIVE_REQUIRE_BWRAP: "1"
+        run: bun test ./test/executor/containment.test.ts -t '^실제 프로세스' --reporter=junit --reporter-outfile="$RUNNER_TEMP/containment.xml"
+
+      - name: 성공 증거(23개 통과 기록)
+        # 앞 단계가 실패해도 돈다. 무엇이 빠졌는지 찍고 job을 실패로 끝낸다.
+        if: ${{ !cancelled() }}
+        run: |
+          echo "checkout HEAD $(git rev-parse HEAD)"
+          bun test/containment-junit.ts "$RUNNER_TEMP/containment.xml"
+
+      - name: 실패 시 커널의 AppArmor 기록(읽기만)
+        if: ${{ failure() }}
+        run: |
+          if sudo dmesg | grep -iE 'apparmor|bwrap|userns'; then
+            echo "위가 커널 로그의 관련 줄이다."
+          else
+            echo "커널 로그에 관련 줄 없음"
+          fi
