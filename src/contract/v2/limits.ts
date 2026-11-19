@@ -14,3 +14,11 @@ export const CLOCK_SKEW_MS = 1_000;
 export const NONCE_RETENTION_MS = 2 * (MESSAGE_TTL_MAX_MS + CLOCK_SKEW_MS);
 // 봉투 하나의 바이트 틀 상한. 이 모듈은 집행하지 않는다(바이트 틀이 해석 전에 자른다). 후보(v1과 같음).
 export const MAX_MESSAGE_BYTES = 64 * 1024;
+
+// 후보 내용 조회(candidate_fetch·candidate_chunk)의 크기. 설계에 값이 없다. 둘 다 받는 쪽이 본문 해석에서 강제한다.
+// 조각 하나의 바이트 상한. base64url로 4/3배가 된 뒤 머리·서명·다른 칸을 더해도 MAX_MESSAGE_BYTES 안에 드는 2의 거듭제곱 가운데
+// 가장 큰 값이다(48KiB는 base64url만으로 64KiB). 틀이 바뀌면 이 값도 다시 고른다(시험이 가장 큰 조각의 봉투를 잰다). 후보.
+export const CANDIDATE_CHUNK_MAX_BYTES = 32 * 1024;
+// 후보 하나의 전체 바이트 상한. 같은 뜻의 v1 값이 없어 새 숫자를 만들지 않고 봉투 하나의 틀과 같은 값을 쓴다: 내용을 효과 본문에
+// 싣는 길(봉투 하나 안)과 같은 크기까지만 이 조회로 옮긴다. 이보다 큰 후보(긴 PR 패치 등)는 이 판으로 옮길 수 없다. 후보.
+export const CANDIDATE_MAX_BYTES = MAX_MESSAGE_BYTES;

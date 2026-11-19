@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
+    "front-door": "-WEa04o6_5EG_zynKyhV0_9HBpf0NfyjrE8jxLOQBPE"
   },
   "context": {
     "now": 1795046400000,
@@ -41,7 +41,7 @@
       "request_id": "00000000-0000-4000-8000-000000000068",
       "nonce": "00000000000000000000000000000068"
     },
-    "signature": "4QJ-7AiP18c_wmBIYMPd_5bgIYgFPnPDvDSCK0VDX8V4uqdlU2zFe7myWXL5qyV_vpUoDtnVvvg2OO6NukQoAw",
+    "signature": "sXgDRC20PqQvx-0fEetT-yLNEHlJgMb0_m477gjTQE2N7ZRI-rYVj93gFfbn5ATtTgJJOFQcWytQDV36Ja2KBQ",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000075",
       "publication_job_id": "00000000-0000-4000-8000-00000000007b",

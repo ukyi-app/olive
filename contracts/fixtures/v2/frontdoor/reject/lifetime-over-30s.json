@@ -12,7 +12,7 @@
     "reason": "lifetime_invalid"
   },
   "keys": {
-    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
+    "front-door": "-WEa04o6_5EG_zynKyhV0_9HBpf0NfyjrE8jxLOQBPE"
   },
   "context": {
     "now": 1795046400000,
@@ -43,7 +43,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "uqCjCtxdS0D_fEeJQdh81mSn4sU9rrU6uo8J-VzSUOQr2SIPgqWLOzklSiH7MJZ7ymjJBuguWsBqTcPS-3rECQ",
+    "signature": "pOZsRB_LuZLh1JkdtBw5uRcu6uIvUb-u3_ty7ZYnpnstbck1O7rYW0N62Nh5rLWFYffhqipr0XCUinb7Jfx1Cg",
     "body": {
       "policy_revision": "policy-7"
     }

@@ -10,7 +10,7 @@
     "handshake_after": null
   },
   "keys": {
-    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
+    "front-door": "-WEa04o6_5EG_zynKyhV0_9HBpf0NfyjrE8jxLOQBPE"
   },
   "context": {
     "now": 1795046400000,
@@ -46,7 +46,7 @@
       "request_id": "00000000-0000-4000-8000-000000000022",
       "nonce": "00000000000000000000000000000022"
     },
-    "signature": "E4DloPoRtdB4Wz5D4LluExC_pBk6O4aO2cmuB7_Q_PMJjTiA0ty_KSb0BvvTyJNmvFtkdFNu_z5ZKOMD_seLDw",
+    "signature": "NEkIduhSID7HfK4X1wi3uj1k8QiMejnfIPerNOPa3RPx9TlqPqxArnimK8YckcO-6EwvWSC8HUkN4jKOO45QDQ",
     "body": {
       "in_reply_to": "00000000-0000-4000-8000-000000000020",
       "record": {

@@ -10,7 +10,7 @@ const effect: ActionSpec = { ...PROBE_BUNDLE.actions.probe_effect! };
 // 일부러 규칙을 어긴 명세도 넣으므로 타입을 풀어 받는다(규칙은 defineContract가 실행 시점에 다시 본다).
 const bundle = (actions: Record<string, unknown>): Bundle => ({ name: "x", actions: actions as Record<string, ActionSpec> });
 
-test("표: 공개 면은 공통부 넷, 정지 묶음 여섯, 입력·이벤트 묶음 여섯, 출력 묶음 여섯이다. 인사와 조회는 접수가 닫혀도·정책이 어긋나도 받고 세대 규칙이 없으며, 효과는 정책이 어긋나면 정지의 준비·확정만 받는다", () => {
+test("표: 공개 면은 공통부 넷, 정지 묶음 여섯, 입력·이벤트 묶음 여섯, 출력 묶음 여섯, 후보 내용 묶음 둘이다. 인사와 조회는 접수가 닫혀도 받고 세대 규칙이 없으며 정책이 어긋나도 받는다(후보 내용 조회 둘만 빼고), 효과는 정책이 어긋나면 정지의 준비·확정만 받는다", () => {
   const rows = Object.entries(FRONTDOOR_CONTRACT.actions).map(([name, s]) => [name, s.class, [...s.from].sort().join(","), s.duringClosedIntake, s.duringPolicyMismatch, s.generations]);
   expect(rows).toEqual([
     ["handshake", "handshake", "front-door", true, true, undefined],
@@ -35,6 +35,8 @@ test("표: 공개 면은 공통부 넷, 정지 묶음 여섯, 입력·이벤트 
     ["progress_update", "effect", "supervisor", false, false, { stop: "current", execution: "current" }],
     ["execution_generation_lookup", "query", "front-door", true, true, undefined],
     ["execution_generation_reply", "query", "supervisor", true, true, undefined],
+    ["candidate_fetch", "query", "front-door", true, false, undefined],
+    ["candidate_chunk", "query", "supervisor", true, false, undefined],
   ]);
   expect(Object.isFrozen(FRONTDOOR_CONTRACT.actions)).toBe(true);
 });

@@ -12,7 +12,7 @@
     "reason": "intake_closed"
   },
   "keys": {
-    "front-door": "dHipBHrDnFvyCodHePXOwDQoS8qkjcAR56LnKhsmfLc"
+    "front-door": "-WEa04o6_5EG_zynKyhV0_9HBpf0NfyjrE8jxLOQBPE"
   },
   "context": {
     "now": 1795046400000,
@@ -47,7 +47,7 @@
       "request_id": "00000000-0000-4000-8000-000000000060",
       "nonce": "00000000000000000000000000000060"
     },
-    "signature": "CgywDlZeGIQsu7aO3uETmbmaXa7OY0drDZZkgVmwyqwkGx7_hBRFYEwlTXxNShXOHLNSW8SLpFzTvLkPPWbLAA",
+    "signature": "3cU1zcNhxZTUx9NZe71XDMg3_mIg8Xtx1T1_ssuXxheA4ng0eqoKM9BSJAeJdT_SO675YC4lRFa35F4RE6UpCg",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000070",
       "stop_generation": 7,

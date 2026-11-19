@@ -1,5 +1,6 @@
 // olive-control/v2(후보)의 공개 면. 감독 구현은 이 파일만 import한다. 현관과 감독 사이의 계약이고, 실행기 연결은 v1이다.
 import { COMMON_BUNDLE } from "./actions.ts";
+import { CANDIDATE_BUNDLE } from "./candidates.ts";
 import { defineContract } from "./contract.ts";
 import { EFFECTS_BUNDLE } from "./effects.ts";
 import { EVENT_BUNDLE } from "./events.ts";
@@ -7,7 +8,7 @@ import { INPUT_BUNDLE } from "./inputs.ts";
 import { STOP_BUNDLE } from "./stop.ts";
 
 // 동작 표. 본문 묶음은 이 목록에 더한다(첫 자리는 늘 공통부). 표는 여기서 한 번 만들어 얼린다.
-export const FRONTDOOR_CONTRACT = defineContract([COMMON_BUNDLE, STOP_BUNDLE, INPUT_BUNDLE, EVENT_BUNDLE, EFFECTS_BUNDLE]);
+export const FRONTDOOR_CONTRACT = defineContract([COMMON_BUNDLE, STOP_BUNDLE, INPUT_BUNDLE, EVENT_BUNDLE, EFFECTS_BUNDLE, CANDIDATE_BUNDLE]);
 
 export {
   type ActionClass,
@@ -27,6 +28,21 @@ export {
   type LookupOutcome,
   type NoAnswerCause,
 } from "./actions.ts";
+export {
+  ASSEMBLY_FAULTS,
+  type AssemblyFault,
+  assembleCandidate,
+  CANDIDATE_BUNDLE,
+  CANDIDATE_CONTENT_FIELD,
+  CANDIDATE_FIELD_NAMES,
+  type CandidateAssembly,
+  type CandidateChunkReply,
+  type CandidateFetch,
+  type CandidateFetchOutcome,
+  type CandidatePiece,
+  candidateDigestOf,
+  candidatePieceOf,
+} from "./candidates.ts";
 export {
   afterHandshake,
   type Contract,

@@ -12,7 +12,7 @@
     "reason": "forbidden_field"
   },
   "keys": {
-    "supervisor": "O5N4cdyrCNVuddEwiP-pvKbTueV2N7PJ3C5KC5gmfV8"
+    "supervisor": "74Voj_EV_knTAYLTkoQBXwJZ3STqjhKK0WEG0ZlCpyc"
   },
   "context": {
     "now": 1795046400000,
@@ -47,7 +47,7 @@
       "request_id": "00000000-0000-4000-8000-000000000064",
       "nonce": "00000000000000000000000000000064"
     },
-    "signature": "ThIz5aCkrHM0RdhWwJhkg5b00YpKbVyTb_3BJCB3i_X_YedD_G-AnCm0dFWrxcIZ9Wb87P6PPAkRw7ungrYgAw",
+    "signature": "Qj9OHAJarxGEHBNgfsUXp-AVPQdJxRP6OGy7wMopf-ZbmxaYDI_qcPdqnVA_IbdsRwCqBxmMyW6u_y6HwYhLAA",
     "body": {
       "job_id": "00000000-0000-4000-8000-000000000072",
       "kind": "pull_request",

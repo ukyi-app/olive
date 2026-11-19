@@ -74,11 +74,14 @@ test("등록: 동작마다 정책이 어긋난 연결에서 받는지 선언하�
     expect(() => defineContract([COMMON_BUNDLE, bundle({ [name]: { ...base, duringPolicyMismatch: true } })]), name).not.toThrow();
   }
   // 공개 면: 인사와 조회(작업 조회, 정지 기록 조회, 실행 세대 조회)는 정책이 어긋나도 되고(관리자 결정 2026-11-19: 뜻이 고정된 사실),
-  // 효과는 예외 목록의 정지 둘만 받고 나머지는 받지 않는다.
+  // 후보 내용 조회 둘은 뜻이 고정된 사실이 아니라 받지 않는다. 효과는 예외 목록의 정지 둘만 받고 나머지는 받지 않는다.
+  const queriesClosedOnMismatch = ["candidate_fetch", "candidate_chunk"];
   const effects = Object.entries(FRONTDOOR_CONTRACT.actions).filter(([, spec]) => spec.class === "effect");
   expect(effects.length).toBeGreaterThan(0);
+  for (const name of queriesClosedOnMismatch) expect(FRONTDOOR_CONTRACT.actions[name]?.class, name).toBe("query");
   for (const [name, spec] of Object.entries(FRONTDOOR_CONTRACT.actions)) {
-    expect(spec.duringPolicyMismatch, name).toBe(spec.class !== "effect" || EFFECTS_DURING_POLICY_MISMATCH.includes(name));
+    const expected = spec.class === "effect" ? EFFECTS_DURING_POLICY_MISMATCH.includes(name) : !queriesClosedOnMismatch.includes(name);
+    expect(spec.duringPolicyMismatch, name).toBe(expected);
   }
   expect(FRONTDOOR_CONTRACT.actions.release_prepare?.duringPolicyMismatch).toBe(false);
   expect(FRONTDOOR_CONTRACT.actions.release_commit?.duringPolicyMismatch).toBe(false);
