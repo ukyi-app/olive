@@ -4,6 +4,7 @@ export { classify, type Faults, LedgerUnavailableError, UNAVAILABLE_REASONS, typ
 export { type CredentialRef, LedgerInputError, type SourceRef } from "./input.ts";
 export {
   type AdmitRunInput,
+  type AssignToolRequestInput,
   type Delivery,
   type EnvelopeFrom,
   type InputEntry,
@@ -42,6 +43,7 @@ export {
   type StopRecord,
   type TakeoverEvidence,
   TOOL_REQUEST_PHASES,
+  TOOL_REQUEST_RUN_PHASES,
   type ToolRequest,
   type ToolRequestInput,
   type ToolRequestPhase,
