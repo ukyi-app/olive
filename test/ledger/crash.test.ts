@@ -3,7 +3,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { openLedger, Restorer } from "../../src/ledger/index.ts";
+import { loadMigrations, openLedger, Restorer } from "../../src/ledger/index.ts";
 import { clock, NOW, open, tempPath } from "./helpers.ts";
 
 async function crashAt(path: string, scenario: string): Promise<Record<string, string>> {
@@ -80,7 +80,8 @@ test("끊김: 첫 설치가 트랜잭션 도중에 끊긴 파일은 남은 저�
   const path = tempPath();
   await crashAt(path, "migration");
   const resumed = openLedger(path, { clock, mode: "create" });
-  expect(resumed).toMatchObject({ ok: true, migrated: { from: 0, to: 1 } });
+  // 첫 판에서 끊겼으므로 적용된 판이 없고, 이어 받으면 코드의 판을 처음부터 모두 적용한다.
+  expect(resumed).toMatchObject({ ok: true, migrated: { from: 0, to: loadMigrations().length } });
   if (!resumed.ok) return;
   expect(resumed.ledger.readStop()).toEqual({ known: true, value: null });
   resumed.ledger.close();

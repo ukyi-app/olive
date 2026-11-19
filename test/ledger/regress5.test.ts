@@ -13,6 +13,13 @@ import { WAL_PAIR_GENERATION, WAL_PAIR_NONCES, WAL_PAIR_SENDER, walPairNonce } f
 const MAX = 10_000_000;
 const PEERS = ["front-door"];
 
+// 코드의 판 목록과, 그 뒤에 판 하나를 덧붙인 목록. 덧붙인 판의 번호는 코드의 마지막 판 다음이다.
+const CODE = loadMigrations();
+const NEXT = CODE.length + 1;
+function withNext(label: string, sql: string) {
+  return [...CODE, { version: NEXT, name: `${String(NEXT).padStart(4, "0")}-${label}.sql`, sql }];
+}
+
 const ports: RestorePorts = {
   stopAuthority: { latestStop: async () => null },
   peers: { contracts: async () => PEERS.map((peer) => ({ peer, contract: "olive-control/v1" })) },
@@ -208,7 +215,7 @@ test("F02 사본 표식: 기록이 비었거나 대조 끝난 기록만 있거�
 });
 
 test("F02 사본 만들기: 사본 기록이 0행으로 끝나면 사본을 내지 않는다", () => {
-  const swallow = [...loadMigrations(), { version: 2, name: "0002-swallow.sql", sql: "CREATE TRIGGER swallow_snapshot BEFORE INSERT ON ledger_snapshots BEGIN SELECT RAISE(IGNORE); END;" }];
+  const swallow = withNext("swallow", "CREATE TRIGGER swallow_snapshot BEFORE INSERT ON ledger_snapshots BEGIN SELECT RAISE(IGNORE); END;");
   const dir = tempDir();
   const ledger = ready(open(join(dir, "ledger.db"), { migrations: swallow }));
   const target = join(dir, "copy.db");
@@ -260,7 +267,7 @@ test("F03 재개방: 커밋을 담을 수 없는 WAL 곁의 잘린 본체와 처
 // ---- 다시 열 수 없는 판 ----
 
 test("F04 판 올리기: 기존 데이터에 기대는 판은 적용하기 전에 거절하고 장부는 그대로 다시 열린다", () => {
-  const seeded = [...loadMigrations(), { version: 2, name: "0002-seeded.sql", sql: "CREATE TABLE seeded (ledger_id TEXT NOT NULL) STRICT; INSERT INTO seeded SELECT ledger_id FROM ledger_identity;" }];
+  const seeded = withNext("seeded", "CREATE TABLE seeded (ledger_id TEXT NOT NULL) STRICT; INSERT INTO seeded SELECT ledger_id FROM ledger_identity;");
   const path = tempPath();
   const ledger = ready(open(path));
   must(ledger.applyStop({ generation: 4, stopped: true, now: NOW }));
@@ -274,7 +281,7 @@ test("F04 판 올리기: 기존 데이터에 기대는 판은 적용하기 전�
   expect(again.readStop()).toMatchObject({ value: { generation: 4, stopped: true } });
   again.close();
   const raw = new Database(path, { readonly: true });
-  expect(raw.query("SELECT version FROM ledger_migrations").all()).toEqual([{ version: 1 }]);
+  expect(raw.query("SELECT version FROM ledger_migrations ORDER BY version").all()).toEqual(CODE.map((m) => ({ version: m.version })));
   expect(raw.query("SELECT name FROM sqlite_master WHERE name = 'seeded'").get()).toBeNull();
   raw.close();
 });
@@ -284,21 +291,21 @@ test("F04 첫 설치: 빈 목록과 빈 DB에서 재생할 수 없는 판은 파
   expect(openLedger(empty, { clock, mode: "create", migrations: [] })).toMatchObject({ ok: false, reason: "migration_mismatch" });
   expect(existsSync(empty)).toBe(false);
 
-  const seeded = [...loadMigrations(), { version: 2, name: "0002-seeded.sql", sql: "INSERT INTO seeded SELECT 1;" }];
+  const seeded = withNext("seeded", "INSERT INTO seeded SELECT 1;");
   const broken = tempPath();
   expect(openLedger(broken, { clock, mode: "create", migrations: seeded })).toMatchObject({ ok: false, reason: "migration_failed" });
   expect(existsSync(broken)).toBe(false);
 });
 
 test("F04 판 올리기: 빈 DB에서 재생할 수 있는 판은 그대로 올라가고 다음 재개방도 열린다", () => {
-  const added = [...loadMigrations(), { version: 2, name: "0002-added.sql", sql: "CREATE TABLE added (x INTEGER) STRICT;" }];
+  const added = withNext("added", "CREATE TABLE added (x INTEGER) STRICT;");
   const path = tempPath();
   open(path).close();
   const upgraded = openLedger(path, { clock, mode: "reopen", migrations: added });
-  expect(upgraded).toMatchObject({ ok: true, migrated: { from: 1, to: 2 } });
+  expect(upgraded).toMatchObject({ ok: true, migrated: { from: CODE.length, to: NEXT } });
   opened(upgraded).close();
   const next = openLedger(path, { clock, mode: "reopen", migrations: added });
-  expect(next).toMatchObject({ ok: true, migrated: { from: 2, to: 2 } });
+  expect(next).toMatchObject({ ok: true, migrated: { from: NEXT, to: NEXT } });
   opened(next).close();
 });
 
@@ -324,7 +331,8 @@ test("F05 재개방: 스키마가 다른 목록으로 거절해도 본체와 WAL
   const path = await walPair();
   const body = readFileSync(path);
   const wal = readFileSync(`${path}-wal`);
-  const other = [{ version: 1, name: "0001-core.sql", sql: "CREATE TABLE other (x INTEGER) STRICT;" }];
+  // 판의 번호와 이름은 장부와 같고 스키마만 다른 목록(판이 낮은 목록은 too_new라 이 길을 지나지 않는다).
+  const other = CODE.map((m) => ({ ...m, sql: `CREATE TABLE other_${m.version} (x INTEGER) STRICT;` }));
   expect(openLedger(path, { clock, mode: "reopen", migrations: other })).toMatchObject({ ok: false, reason: "not_initialized" });
   expect(readFileSync(path).equals(body)).toBe(true);
   expect(readFileSync(`${path}-wal`).equals(wal)).toBe(true);
@@ -382,7 +390,7 @@ test("F07 사본: 임시 이름을 확보하지 못한 호출은 그 자리의 �
 });
 
 test("F08 사본: 판이 user_version을 쓰는 장부는 사본을 내지 않고 그 값을 그대로 둔다", () => {
-  const versioned = [...loadMigrations(), { version: 2, name: "0002-versioned.sql", sql: "PRAGMA user_version = 17;" }];
+  const versioned = withNext("versioned", "PRAGMA user_version = 17;");
   const dir = tempDir();
   const path = join(dir, "ledger.db");
   const ledger = ready(open(path, { migrations: versioned }));
