@@ -1,0 +1,59 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/reply-candidate",
+  "description": "답 글의 후보. 글 대신 감독 쪽 결과 보관소의 digest만 싣고, 보낼 곳은 현관이 입력(input_id)에서 고른다. 정지·실행 세대는 현관의 지금 값(8, 4)",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "cab4d60260c134d8a36f2fcc81625ffda1700ff6e974dbe94f06183d6055ef38",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "reply_candidate",
+      "request_id": "00000000-0000-4000-8000-000000000060",
+      "nonce": "00000000000000000000000000000060"
+    },
+    "signature": "znl5SjGn4CEQnbsQ0stWjBO9uhba7ghaJbdq-tHqs0FtH8r_zVxfOm7T1yxOMGtVBZpVQvJqI_RDzzrRPEnbCw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000070",
+      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "purpose": "answer",
+      "candidate_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"reply_candidate\",\"body_digest\":\"cab4d60260c134d8a36f2fcc81625ffda1700ff6e974dbe94f06183d6055ef38\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000060\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000060\",\"sender\":\"supervisor\"}"
+}

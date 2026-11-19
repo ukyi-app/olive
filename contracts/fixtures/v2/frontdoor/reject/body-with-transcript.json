@@ -12,7 +12,7 @@
     "reason": "forbidden_field"
   },
   "keys": {
-    "front-door": "Mo6SYJtj-yNnXVRp_flIeyAOLLjfM-GVn7H0_lZeDQs"
+    "front-door": "WvVETM1uGXxTWhNnPLdRnwg6KI72pg0B9Xm4PZlajTA"
   },
   "context": {
     "now": 1795046400000,
@@ -43,7 +43,7 @@
       "request_id": "00000000-0000-4000-8000-000000000010",
       "nonce": "00000000000000000000000000000001"
     },
-    "signature": "bR_c2TepUASnO8WhJjfKeN_Z8ogpfWO5UKOZ63-oe7vGs3jMB7r9GlIojm8fMHCwpVdY5FTIcXNQ82AlBWivBg",
+    "signature": "RcCJmZI5QsBkdnVdXtYysPl9-At6Gf6In6np3Jizp2HhN9W0odWwC4mJh0I0uAyCjJReHQefFgWHe4cQ238hDA",
     "body": {
       "policy_revision": "policy-7",
       "transcript": "…"

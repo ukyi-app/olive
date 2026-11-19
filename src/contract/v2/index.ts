@@ -1,10 +1,11 @@
 // olive-control/v2(후보)의 공개 면. 감독 구현은 이 파일만 import한다. 현관과 감독 사이의 계약이고, 실행기 연결은 v1이다.
 import { COMMON_BUNDLE } from "./actions.ts";
 import { defineContract } from "./contract.ts";
+import { EFFECTS_BUNDLE } from "./effects.ts";
 import { STOP_BUNDLE } from "./stop.ts";
 
 // 동작 표. 본문 묶음은 이 목록에 더한다(첫 자리는 늘 공통부). 표는 여기서 한 번 만들어 얼린다.
-export const FRONTDOOR_CONTRACT = defineContract([COMMON_BUNDLE, STOP_BUNDLE]);
+export const FRONTDOOR_CONTRACT = defineContract([COMMON_BUNDLE, STOP_BUNDLE, EFFECTS_BUNDLE]);
 
 export {
   type ActionClass,
@@ -35,6 +36,30 @@ export {
   type Verified,
   type VerifyContext,
 } from "./contract.ts";
+export {
+  adoptExecutionGeneration,
+  type ApprovalCardRequest,
+  type CardResult,
+  EFFECTS_BUNDLE,
+  EFFECTS_FIELD_NAMES,
+  type ExecutionGenerationOutcome,
+  type ExecutionGenerationReply,
+  OUTBOUND_GENERATIONS,
+  PROGRESS_STAGES,
+  type ProgressResult,
+  type ProgressStage,
+  type ProgressUpdate,
+  PUBLICATION_KINDS,
+  type PublicationCandidate,
+  type PublicationLookup,
+  type PublicationResult,
+  PublicationUnknown,
+  publicationLinkOf,
+  publicationLookupOf,
+  REPLY_PURPOSES,
+  type ReplyCandidate,
+  type ReplyResult,
+} from "./effects.ts";
 export { REJECT_REASONS, type RejectReason } from "./errors.ts";
 export {
   GENERATION_FIELDS,

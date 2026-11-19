@@ -1,0 +1,59 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/progress-update",
+  "description": "진행 표시: 고정된 단계 이름(verify = 검증)과 순번뿐이다. 표시 문구는 현관이 단계 이름에서 만든다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "033bc13fdc926899d9f6150f15156fb8caeea03aec465040dd2aed2b478d05f6",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "progress_update",
+      "request_id": "00000000-0000-4000-8000-000000000068",
+      "nonce": "00000000000000000000000000000068"
+    },
+    "signature": "PjJ8ufPtbNLou0SjmNLHkvIjs8GoMt_qDC_z_q5GEP9c8xbttsWAW1l94MY3KFjVkF417jJjBUslzbpLSyhQDw",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000073",
+      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "stage": "verify",
+      "seq": 3,
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"progress_update\",\"body_digest\":\"033bc13fdc926899d9f6150f15156fb8caeea03aec465040dd2aed2b478d05f6\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000068\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000068\",\"sender\":\"supervisor\"}"
+}

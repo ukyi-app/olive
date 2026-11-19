@@ -1,0 +1,56 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/publication-lookup",
+  "description": "게시의 답을 잃은 감독이 같은 작업 ID·동작·요청 digest로 묻는다. 정책이 어긋난 연결, 닫힌 접수에서도 받는다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "policy_mismatch",
+    "intake_open": false,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "c9c4ec0dd62bd45f98ba02d3d48cb9b6641440bd63540dd3b76dc4f71cf453c4",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "job_lookup",
+      "request_id": "00000000-0000-4000-8000-000000000066",
+      "nonce": "00000000000000000000000000000066"
+    },
+    "signature": "mxH4oynFv1751dGO_cPmQY7fINIwFN7IrNgEdS8vCEaZYih1wKdaeiruDsX-_wZAemV7eB2k0RIJbRQhjMeUBg",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000072",
+      "action": "publication_candidate",
+      "request_digest": "1f9bd03f4ccca65916a67463b8f4049fbd8949c5cdd25259d41c4c07d1049e6f"
+    }
+  },
+  "signing_input": "{\"action\":\"job_lookup\",\"body_digest\":\"c9c4ec0dd62bd45f98ba02d3d48cb9b6641440bd63540dd3b76dc4f71cf453c4\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000066\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000066\",\"sender\":\"supervisor\"}"
+}

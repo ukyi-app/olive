@@ -3,6 +3,7 @@
 // 키는 부를 때마다 새로 만든다. 개인 키는 이 프로세스 밖으로 나가지 않는다.
 // 이 파일은 공통부의 사례를 두고, 묶음의 사례는 묶음마다 자기 파일의 함수 하나(cases-<묶음>.ts)에 두어 buildCases 끝에서 모은다.
 import { accept, type V2Case, type Variant, variant } from "./case-kit.ts";
+import { buildEffectsCases } from "./cases-effects.ts";
 import { buildStopCases } from "./cases-stop.ts";
 import { baseContext, envelope, id, type Keys, NOW, nonceOf, OTHER_POLICY, POLICY } from "./support.ts";
 
@@ -16,7 +17,7 @@ const HANDSHAKE_REQ = id(0x10);
 const HANDSHAKE_REPLY_REQ = id(0x11);
 
 export function buildCases(keys: Keys): V2Case[] {
-  return [...commonCases(keys), ...buildStopCases(keys)];
+  return [...commonCases(keys), ...buildStopCases(keys), ...buildEffectsCases(keys)];
 }
 
 function commonCases(keys: Keys): V2Case[] {
