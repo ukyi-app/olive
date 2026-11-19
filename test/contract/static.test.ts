@@ -6,13 +6,26 @@ import { list, readText } from "../files.ts";
 const transpiler = new Bun.Transpiler({ loader: "ts" });
 const files = await list("src/contract/**/*.ts");
 
-test("정적: 계약 모듈은 src/contract/v1 안과 node:crypto만 import한다", async () => {
-  expect(files.length).toBeGreaterThan(5);
+test("정적: 계약 모듈은 자기 판 폴더 안과 node:crypto만 import한다(v2는 v1 공개 면도)", async () => {
+  expect(files.filter((file) => file.startsWith("src/contract/v1/")).length).toBeGreaterThan(5);
   for (const file of files) {
     const source = await readText(file);
     for (const { path } of transpiler.scanImports(source)) {
-      const ok = path === "node:crypto" || (path.startsWith("./") && !path.includes("..") && file.startsWith("src/contract/v1/"));
+      // v2(후보)는 자기 폴더 안과 v1의 공개 면(index.ts) 하나만 더 읽는다. v1 파일의 규칙은 그대로다.
+      const inV2 = file.startsWith("src/contract/v2/") && (path === "../v1/index.ts" || (path.startsWith("./") && !path.includes("..")));
+      const ok = path === "node:crypto" || (path.startsWith("./") && !path.includes("..") && file.startsWith("src/contract/v1/")) || inV2;
       expect(ok, `${file} → ${path}`).toBe(true);
+    }
+  }
+});
+
+test("정적: v2는 v1을 공개 면으로만 읽고, v1은 v2를 읽지 않는다", async () => {
+  const v2Files = files.filter((file) => file.startsWith("src/contract/v2/"));
+  expect(v2Files.length).toBeGreaterThan(3);
+  for (const file of files) {
+    for (const { path } of transpiler.scanImports(await readText(file))) {
+      if (file.startsWith("src/contract/v1/")) expect(path.includes("v2"), `${file} → ${path}`).toBe(false);
+      if (file.startsWith("src/contract/v2/") && path.includes("v1")) expect(path, file).toBe("../v1/index.ts");
     }
   }
 });
