@@ -1,0 +1,35 @@
+{
+  "status": "candidate",
+  "tool": "start_worker",
+  "case": "waiting-assignment",
+  "description": "맞는 실행기나 계정이 아직 없는 역할. 실행기 ID를 만들지 않고 배정 전 대기로 답한다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000002",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": { "pr_review": ["review_pr"] },
+    "pinned": [{ "owner": "aaaaaaaa-0000-4000-8000-000000000001", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" }],
+    "works": [],
+    "results": {},
+    "newRefs": ["cccccccc-0000-4000-8000-000000000002"],
+    "startPhase": "waiting_assignment"
+  },
+  "arguments": {
+    "role": "pr_review",
+    "task": {
+      "purpose": "review_pr",
+      "brief": "고정된 PR head의 변경을 리뷰한다",
+      "source_ref": "inputs/aaaaaaaa-1111-4000-8000-000000000001",
+      "input_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  "expect": {
+    "answer": { "outcome": "ok", "tool": "start_worker", "ref": "cccccccc-0000-4000-8000-000000000002", "phase": "waiting_assignment" },
+    "writes": 1
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "status": "candidate",
+  "tool": "worker_status",
+  "case": "foreign",
+  "description": "다른 논리 요청의 실행 참조. 없는 실행과 같은 거절로 답한다(존재 여부를 흘리지 않는다).",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "bbbbbbbb-0000-4000-8000-000000000002",
+    "callId": "dddddddd-0000-4000-8000-000000000012",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": {},
+    "pinned": [],
+    "works": [
+      {
+        "ref": "cccccccc-0000-4000-8000-000000000001",
+        "owner": "aaaaaaaa-0000-4000-8000-000000000001",
+        "retryKey": "start_worker:aaaaaaaa-0000-4000-8000-000000000001:diagnose",
+        "content": { "role": "diagnosis", "purpose": "diagnose", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" },
+        "phase": "running"
+      }
+    ],
+    "results": {},
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": { "ref": "cccccccc-0000-4000-8000-000000000001" },
+  "expect": {
+    "answer": { "outcome": "refused", "tool": "worker_status", "reason": "not_found", "field": null },
+    "writes": 0
+  }
+}
