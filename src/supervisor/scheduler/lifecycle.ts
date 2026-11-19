@@ -17,7 +17,8 @@ export const RENEW_HANDLING_MS = 2_000;
 
 // 갱신을 내도 되는 여유. 지금 시각 + 이 값이 임대의 끝 이하일 때만 갱신을 낸다. 실행기는 임대를 검사하는 시각(자기 시계)이 앞 임대의
 // 끝 이상이면 갱신을 거절하고 닫는다. 전달 < DELIVERY_MAX_MS, 두 시계의 차이 <= CLOCK_SKEW_MS, 양끝 처리의 합 <= RENEW_HANDLING_MS이면
-// 그 검사 시각 < 발행 시각 + 이 값이다. 가정 밖이면 여유를 지킨 갱신도 거절될 수 있다(src/ledger/ledger.md "갱신 뒤의 임대").
+// 그 검사 시각 < 발행 시각 + 이 값이다. 이 가정은 시간 검사의 통과까지만 보장한다. 가정 밖이거나 업무 기한·시작 접수 같은 다른 전제가
+// 어긋나면 여유를 지킨 갱신도 적용되지 않는다(src/ledger/ledger.md "갱신 뒤의 임대").
 // 장부(ledger.ts)는 같은 식으로 그 갱신의 끝을 임대로 믿는다. 두 값이 같은지는 test/ledger/lease-trust.test.ts의 경계 시험이 지킨다.
 export const RENEW_MARGIN_MS = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS + RENEW_HANDLING_MS;
 

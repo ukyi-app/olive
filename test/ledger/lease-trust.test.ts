@@ -112,10 +112,12 @@ test("보장 1·3의 경계가 같다: 판단이 갱신을 내는 마지막 시�
   expect(times(other, late.runId).lease).toEqual({ issuedAt: LAST_TIMELY + 1, expiresAt: "unknown" });
 });
 
-// 실행기가 갱신을 적용하는가를 실행기의 검사 식으로 계산한다(실행기를 띄우지 않는다). 시각은 감독 시계이고 ahead는 실행기 시계가
-// 감독 시계보다 앞선 양이다. 받을 때 봉투가 not_yet_valid·expired가 아니어야 하고(src/contract/v1/envelope.ts의 "시한"),
-// nonce를 저장한 뒤의 처리 시각에도 봉투가 시한 안이어야 하며(src/executor/store.ts의 consume), 그 처리 시각이 앞 임대의 끝 미만이어야
-// 연장한다(src/executor/worker.ts의 expire: now >= lease_until이면 닫는다).
+// 갱신이 실행기의 시간 검사(봉투 시한과 앞 임대의 끝)를 통과하기에 충분한 조건의 계산이다. 실행기의 검사를 그대로 옮긴 것이 아니고
+// 실행기를 띄우지 않는다. 시각은 감독 시계이고 ahead는 실행기 시계가 감독 시계보다 앞선 양이다. 받을 때 봉투가 not_yet_valid·expired가
+// 아니어야 하고(src/contract/v1/envelope.ts의 "시한"), 임대를 검사하는 시각(checked)에도 봉투가 시한 안이어야 하며, 그 시각이 앞 임대의
+// 끝 미만이어야 통과로 센다(src/executor/worker.ts의 expire: now >= lease_until이면 닫는다). 실제 실행기는 봉투의 시한을 nonce를
+// 저장하기 전에 읽고(src/executor/store.ts의 consume), 저장한 뒤에 업무 기한과 앞 임대를 읽으므로 이 계산이 거절해도 실행기는 통과시킬
+// 수 있다. 업무 기한·시작 접수·세대 같은 시간 밖의 전제는 계산하지 않는다(통과해도 적용된다는 뜻이 아니다).
 interface Delivery {
   issuedAt: number;
   prevEnd: number;
@@ -125,7 +127,7 @@ interface Delivery {
   ahead: number;
   receiveHandling: number;
 }
-function executorApplies(p: Delivery): boolean {
+function passesTimeChecks(p: Delivery): boolean {
   const received = p.issuedAt + p.sendHandling + p.delivery + p.ahead;
   const checked = received + p.receiveHandling;
   if (p.issuedAt > received + limits.CLOCK_SKEW_MS || p.expiresAt <= received) return false;
@@ -135,7 +137,7 @@ function executorApplies(p: Delivery): boolean {
 // 뒤 조각(배정기)이 지킬 송신 규칙(ledger.md "스케줄러"): 싣는 순간 앞 임대의 끝과 봉투 시한 가운데 이른 것까지 여유 이상 남았을 때만 싣는다.
 const maySendRenew = (sendAt: number, prevEnd: number, expiresAt: number) => Math.min(prevEnd, expiresAt) - sendAt >= RENEW_MARGIN_MS;
 
-test("가정의 경계: 장부가 믿는 마지막 갱신은 전달 상한 1ms 전·시계 오차 상한·처리 허용치 끝에서도 실행기가 적용하고, 가정을 1ms 넘으면 어긋난다", () => {
+test("가정의 경계(충분조건 계산): 장부가 믿는 마지막 갱신은 전달 상한 1ms 전·시계 오차 상한·처리 허용치 끝에서도 실행기의 시간 검사를 통과하고, 가정을 1ms 넘으면 통과하지 않는다", () => {
   const prevEnd = NOW + MAX;
   const sealed = (issuedAt: number) => issuedAt + limits.MESSAGE_TTL_MAX_MS;
   // 리뷰의 재현 입력: 전달 9999ms, 실행기 시계 +1000ms, 처리 1ms(싣기 전 또는 받은 뒤). 처리 허용치를 넣지 않은 여유의 마지막 시각
@@ -143,23 +145,33 @@ test("가정의 경계: 장부가 믿는 마지막 갱신은 전달 상한 1ms �
   const oldEdge = prevEnd - limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS;
   const review = { delivery: limits.DELIVERY_MAX_MS - 1, ahead: limits.CLOCK_SKEW_MS };
   for (const [sendHandling, receiveHandling] of [[1, 0], [0, 1]]) {
-    expect(executorApplies({ issuedAt: oldEdge, prevEnd, expiresAt: sealed(oldEdge), sendHandling, receiveHandling, ...review })).toBe(false);
+    expect(passesTimeChecks({ issuedAt: oldEdge, prevEnd, expiresAt: sealed(oldEdge), sendHandling, receiveHandling, ...review })).toBe(false);
   }
   expect(renewedThenReopened([oldEdge]).lease).toEqual({ issuedAt: oldEdge, expiresAt: "unknown" });
 
-  // 장부가 믿는 마지막 발행 시각(LAST_TIMELY)에서는 같은 입력을 실행기가 적용한다.
+  // 장부가 믿는 마지막 발행 시각(LAST_TIMELY)에서는 같은 입력이 실행기의 시간 검사를 통과한다.
   expect(renewedThenReopened([LAST_TIMELY]).lease).toEqual({ issuedAt: LAST_TIMELY, expiresAt: LAST_TIMELY + MAX });
-  const at = (p: Partial<Delivery>) => executorApplies({ issuedAt: LAST_TIMELY, prevEnd, expiresAt: sealed(LAST_TIMELY), sendHandling: 0, receiveHandling: 0, ...review, ...p });
-  expect(at({ sendHandling: 1 })).toBe(true);
+  const at = (p: Partial<Delivery>) => passesTimeChecks({ issuedAt: LAST_TIMELY, prevEnd, expiresAt: sealed(LAST_TIMELY), sendHandling: 0, receiveHandling: 0, ...review, ...p });
   expect(at({ receiveHandling: 1 })).toBe(true);
-  // 가정의 끝(처리의 합이 허용치, 실행기 시계가 오차 상한만큼 앞섬이나 뒤짐)에서도 적용한다.
+  // 송신 전 처리는 송신 규칙(싣는 순간의 여유)을 거친다. LAST_TIMELY에 발행하고 싣기까지 1ms라도 걸리면 여유가 RENEW_MARGIN_MS보다
+  // 모자라 싣지 않는다. 송신 전 처리가 있는 사례는 발행을 그만큼 앞당겨 싣는 순간을 LAST_TIMELY에 맞추고 두 경계를 함께 확인한다.
+  for (const sendHandling of [1, RENEW_HANDLING_MS]) expect(maySendRenew(LAST_TIMELY + sendHandling, prevEnd, sealed(LAST_TIMELY))).toBe(false);
+  const sentAtEdge = (sendHandling: number, p: Partial<Delivery> = {}) => {
+    const issuedAt = LAST_TIMELY - sendHandling;
+    expect(maySendRenew(issuedAt + sendHandling, prevEnd, sealed(issuedAt))).toBe(true);
+    return passesTimeChecks({ issuedAt, prevEnd, expiresAt: sealed(issuedAt), sendHandling, receiveHandling: 0, ...review, ...p });
+  };
+  expect(sentAtEdge(1)).toBe(true);
+  // 가정의 끝(처리의 합이 허용치, 실행기 시계가 오차 상한만큼 앞섬이나 뒤짐)에서도 통과한다.
   for (const [sendHandling, receiveHandling] of [[RENEW_HANDLING_MS, 0], [0, RENEW_HANDLING_MS], [RENEW_HANDLING_MS / 2, RENEW_HANDLING_MS / 2]]) {
-    expect(at({ sendHandling, receiveHandling })).toBe(true);
-    expect(at({ sendHandling, receiveHandling, ahead: -limits.CLOCK_SKEW_MS })).toBe(true);
+    expect(sentAtEdge(sendHandling, { receiveHandling })).toBe(true);
+    expect(sentAtEdge(sendHandling, { receiveHandling, ahead: -limits.CLOCK_SKEW_MS })).toBe(true);
   }
-  // 가정 밖: 처리가 허용치를 1ms 넘거나, 전달이 상한에 닿거나, 시계가 오차 상한보다 1ms 더 앞서면 실행기는 앞 임대의 끝 정각에 검사해 닫는다.
-  // 장부의 끝은 그래도 LAST_TIMELY + MAX다(남는 한계).
+  // 가정 밖: 받은 뒤의 처리가 허용치를 1ms 넘거나, 전달이 상한에 닿거나, 시계가 오차 상한보다 1ms 더 앞서면 실행기는 앞 임대의 끝
+  // 정각에 검사해 닫는다. 장부의 끝은 그래도 LAST_TIMELY + MAX다(남는 한계).
   expect(at({ receiveHandling: RENEW_HANDLING_MS + 1 })).toBe(false);
+  // 싣기까지 허용치를 넘긴 갱신은 송신 규칙이 싣지 않는다. 그래도 실으면 앞 임대의 끝 정각에 검사된다.
+  expect(maySendRenew(LAST_TIMELY + RENEW_HANDLING_MS + 1, prevEnd, sealed(LAST_TIMELY))).toBe(false);
   expect(at({ sendHandling: RENEW_HANDLING_MS + 1 })).toBe(false);
   expect(at({ receiveHandling: RENEW_HANDLING_MS, delivery: limits.DELIVERY_MAX_MS })).toBe(false);
   expect(at({ receiveHandling: RENEW_HANDLING_MS, ahead: limits.CLOCK_SKEW_MS + 1 })).toBe(false);
@@ -171,11 +183,11 @@ test("가정의 경계: 장부가 믿는 마지막 갱신은 전달 상한 1ms �
   const short = LAST_TIMELY + 10_000;
   expect(at({ expiresAt: short, delivery: limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS })).toBe(false);
   expect(maySendRenew(LAST_TIMELY, prevEnd, short)).toBe(false);
-  // 송신 규칙을 통과한 봉투는 받은 뒤의 처리가 허용치 안이면, 싣기까지 얼마가 걸렸든 실행기가 적용한다.
+  // 송신 규칙을 통과한 봉투는 받은 뒤의 처리가 허용치 안이면, 싣기까지 얼마가 걸렸든 실행기의 시간 검사를 통과한다.
   for (const sendHandling of [0, 1, RENEW_HANDLING_MS]) {
     const issuedAt = LAST_TIMELY - sendHandling;
     expect(maySendRenew(issuedAt + sendHandling, prevEnd, sealed(issuedAt))).toBe(true);
-    expect(executorApplies({ issuedAt, prevEnd, expiresAt: sealed(issuedAt), sendHandling, receiveHandling: RENEW_HANDLING_MS, ...review })).toBe(true);
+    expect(passesTimeChecks({ issuedAt, prevEnd, expiresAt: sealed(issuedAt), sendHandling, receiveHandling: RENEW_HANDLING_MS, ...review })).toBe(true);
   }
 });
 
