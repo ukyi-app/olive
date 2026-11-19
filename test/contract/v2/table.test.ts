@@ -23,6 +23,12 @@ test("표: 공개 면은 공통부 넷과 정지 묶음 여섯이다. 인사와 
     ["stop_commit", "effect", "front-door", true, false, { stop: "prepared", execution: "not_applicable" }],
     ["release_prepare", "effect", "front-door", true, false, { stop: "current", execution: "not_applicable" }],
     ["release_commit", "effect", "front-door", true, false, { stop: "prepared", execution: "next" }],
+    ["input_submit", "effect", "front-door", false, false, { stop: "current", execution: "not_applicable" }],
+    ["input_cancel", "effect", "front-door", true, false, { stop: "not_applicable", execution: "not_applicable" }],
+    ["approval_changed", "effect", "front-door", true, false, { stop: "current", execution: "not_applicable" }],
+    ["publication_changed", "effect", "front-door", true, false, { stop: "not_applicable", execution: "not_applicable" }],
+    ["merge_observed", "effect", "front-door", true, false, { stop: "not_applicable", execution: "not_applicable" }],
+    ["source_forgotten", "effect", "front-door", true, false, { stop: "not_applicable", execution: "not_applicable" }],
   ]);
   expect(Object.isFrozen(FRONTDOOR_CONTRACT.actions)).toBe(true);
 });

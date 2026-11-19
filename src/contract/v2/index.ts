@@ -2,9 +2,11 @@
 import { COMMON_BUNDLE } from "./actions.ts";
 import { defineContract } from "./contract.ts";
 import { STOP_BUNDLE } from "./stop.ts";
+import { INPUT_BUNDLE } from "./inputs.ts";
+import { EVENT_BUNDLE } from "./events.ts";
 
 // 동작 표. 본문 묶음은 이 목록에 더한다(첫 자리는 늘 공통부). 표는 여기서 한 번 만들어 얼린다.
-export const FRONTDOOR_CONTRACT = defineContract([COMMON_BUNDLE, STOP_BUNDLE]);
+export const FRONTDOOR_CONTRACT = defineContract([COMMON_BUNDLE, STOP_BUNDLE, INPUT_BUNDLE, EVENT_BUNDLE]);
 
 export {
   type ActionClass,
@@ -66,3 +68,29 @@ export {
   StopRecordUnknown,
   type StopStep,
 } from "./stop.ts";
+export {
+  INPUT_BUNDLE,
+  INPUT_GENERATIONS,
+  INPUT_SOURCES,
+  type InputCancel,
+  type InputCancelResult,
+  type InputSource,
+  type InputSubmit,
+  type InputSubmitResult,
+  SOURCE_REF,
+  type SourceRef,
+} from "./inputs.ts";
+export {
+  APPROVAL_STATES,
+  type ApprovalChanged,
+  EVENT_ACTIONS,
+  EVENT_BUNDLE,
+  EVENT_GENERATIONS,
+  type EventAction,
+  type EventResult,
+  MERGE_COMMIT,
+  type MergeObserved,
+  PUBLICATION_STATES,
+  type PublicationChanged,
+  type SourceForgotten,
+} from "./events.ts";
