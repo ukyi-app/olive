@@ -16,7 +16,8 @@ const OLV1 = 0x4f4c5631;
 function ports(answers: OccupancyAnswer[] = []): RestorePorts {
   return {
     stopAuthority: { latestStop: async () => null },
-    peers: { contracts: async () => PEERS.map((peer) => ({ peer, contract: "olive-control/v1" })) },
+    // PEERS는 현관 하나다. 현관은 v2와 맞은 정책으로 답해야 맞은 응답이다.
+    peers: { contracts: async () => PEERS.map((peer) => ({ peer, contract: "olive-control/v2", policy: "match" as const })) },
     occupancy: { occupancy: async () => answers },
     publications: { lookup: async () => ({ kind: "pending" as const }) },
   };

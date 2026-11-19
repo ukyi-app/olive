@@ -9,11 +9,13 @@ import { clock, digest, id, must, NOW, open, ready, session, tempPath, worker } 
 
 const EXECUTOR = "executor/diagnosis/0/store-a";
 const PEERS = ["front-door", "observer"];
+// 맞는 응답: 현관은 v2와 맞은 정책, 그 밖의 이웃은 v1이다(복원기가 이웃마다 기대하는 판).
+const answerOf = (peer: string) => (peer === "front-door" ? { peer, contract: "olive-control/v2", policy: "match" as const } : { peer, contract: "olive-control/v1" });
 
 function ports(overrides: Partial<{ [K in keyof RestorePorts]: Partial<RestorePorts[K]> }> = {}): RestorePorts {
   return {
     stopAuthority: { latestStop: async () => null, ...overrides.stopAuthority },
-    peers: { contracts: async () => PEERS.map((peer) => ({ peer, contract: "olive-control/v1" })), ...overrides.peers },
+    peers: { contracts: async () => PEERS.map(answerOf), ...overrides.peers },
     occupancy: { occupancy: async () => [], ...overrides.occupancy },
     publications: { lookup: async () => ({ kind: "pending" as const }), ...overrides.publications },
   };
@@ -82,7 +84,7 @@ test("F02 복원: 끝난 뒤의 맞춤 세대·접수 판단은 지금의 장부
 
 test("F02 복원: 돌려준 단계 결과를 호출자가 바꿔도 다음 단계의 판단은 그대로다", async () => {
   const ledger = open(tempPath());
-  const r = restorer(ledger, ports({ peers: { contracts: async () => [...PEERS.map((peer) => ({ peer, contract: "olive-control/v1" })), { peer: "relay", contract: "olive-control/v2" }] } }));
+  const r = restorer(ledger, ports({ peers: { contracts: async () => [...PEERS.map(answerOf), { peer: "relay", contract: "olive-control/v2" }] } }));
   await r.step1();
   const s2 = await r.step2();
   expect(s2.contractMismatches).toHaveLength(1);
@@ -137,7 +139,7 @@ test("F04 열기: 재개방인데 파일이 없거나 빈 대체 파일이면 �
 });
 
 test("F05 복원: 필수 이웃의 응답이 빠지거나 겹치면 접수를 열지 않는다", async () => {
-  for (const answer of [[], [{ peer: "front-door", contract: "olive-control/v1" }], [{ peer: "front-door", contract: "olive-control/v1" }, { peer: "front-door", contract: "olive-control/v1" }]]) {
+  for (const answer of [[], [answerOf("front-door")], [answerOf("front-door"), answerOf("front-door")]]) {
     const r = restorer(open(tempPath()), ports({ peers: { contracts: async () => answer } }));
     const { s5 } = await restore(r);
     expect(s5.intakeMayOpen, JSON.stringify(answer)).toBe(false);
@@ -147,7 +149,7 @@ test("F05 복원: 필수 이웃의 응답이 빠지거나 겹치면 접수를 �
 });
 
 test("F05 복원: 필수 이웃이 모두 한 번씩 답한 뒤 하나가 더 겹쳐도 접수를 열지 않는다", async () => {
-  const answer = [...PEERS, "front-door"].map((peer) => ({ peer, contract: "olive-control/v1" }));
+  const answer = [...PEERS, "front-door"].map(answerOf);
   const r = restorer(open(tempPath()), ports({ peers: { contracts: async () => answer } }));
   const { s2, s5 } = await restore(r);
   expect(s2.missingPeers).toEqual([]);

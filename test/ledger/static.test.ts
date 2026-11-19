@@ -229,11 +229,14 @@ test("정적: src/contract/가 src/ledger/를 import하지 않는다", async () 
 });
 
 test("정적: src/ledger/는 계약의 index.ts와 자기 폴더, bun:sqlite·node:fs·node:path만 import한다", async () => {
+  const importAllowed = (path: string) =>
+    ["../contract/v1/index.ts", "../contract/v2/index.ts"].includes(path) || (path.startsWith("./") && !path.includes("..")) || ["bun:sqlite", "node:fs", "node:path"].includes(path);
+  expect(importAllowed("../contract/v2/limits.ts")).toBe(false);
   const files = await list("src/ledger/**/*.ts");
   expect(files.length).toBeGreaterThan(5);
   for (const file of files) {
     for (const { path } of transpiler.scanImports(await readText(file))) {
-      const ok = path === "../contract/v1/index.ts" || (path.startsWith("./") && !path.includes("..")) || ["bun:sqlite", "node:fs", "node:path"].includes(path);
+      const ok = importAllowed(path);
       expect(ok, `${file} → ${path}`).toBe(true);
       expect(/executor|main\//.test(path), `${file} → ${path}`).toBe(false);
     }
