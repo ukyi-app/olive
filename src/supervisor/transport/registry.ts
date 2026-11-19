@@ -13,7 +13,7 @@
 // [후보] 문서의 꼴과 칸 이름은 PR에서 검토하는 후보다(D-70이 정하지 않았다). 직렬화는 JSON 한 문서다:
 //   {
 //     "environment": "<클러스터 이름>",
-//     "revision": <판 번호, 1 이상의 안전 정수>,
+//     "revision": <판 번호, 1 이상의 안전 정수를 소수점·지수 없이 쓴 숫자>,
 //     "executors": [
 //       { "target": "<배포 대상 id>", "role": "<계약 v1 작업자 역할>", "instance": "<인스턴스 ID>",
 //         "storage": "<실제 저장소 ID>", "public_key": "<Ed25519 32바이트의 base64url>", "active": true }
@@ -72,9 +72,9 @@ export const REGISTRY_REJECT_REASONS = [
   "duplicate_member",
   "unknown_field",
   "missing_field",
-  // 칸의 타입·꼴이 틀렸다(인스턴스·저장소 ID는 계약 v1 주체 이름의 문법).
+  // 칸의 타입·꼴이 틀렸다(인스턴스·저장소 ID는 계약 v1 주체 이름의 문법, 판 번호는 원문이 정수의 십진 표기 그대로).
   "bad_field",
-  // Ed25519 공개 키의 꼴이 아니다(32바이트의 정규 base64url 43자).
+  // Ed25519 공개 키로 쓸 수 없다(32바이트의 정규 base64url 43자가 아니거나, 그 32바이트가 주 부분군의 점이 아니다).
   "bad_public_key",
   "too_many_rows",
   "wrong_environment",
@@ -298,6 +298,9 @@ function parseDocument(content: unknown, settings: Settings): Parsed {
   if (typeof environment !== "string" || !Number.isSafeInteger(revision) || (revision as number) < 1 || !Array.isArray(executors)) {
     return fail("bad_field");
   }
+  // JSON.parse는 7.9999999999999999를 8로, 8.0·8e0을 8로 만든다. 그러면 원문에 없던 판 번호가 실제 판의 자리를 차지한다.
+  // 원문의 숫자 토큰이 그 정수의 십진 표기 그대로일 때만 받는다(소수점·지수·음수 0을 거른다).
+  if (topLevelToken(read.text, "revision") !== String(revision)) return fail("bad_field");
   if (environment !== settings.environment) return fail("wrong_environment");
   if (executors.length > settings.maxRows) return fail("too_many_rows");
 
@@ -344,7 +347,7 @@ function parseDocument(content: unknown, settings: Settings): Parsed {
   return { ok: true, table: Object.freeze({ revision: revision as number, digest, rows: Object.freeze(rows), byPrincipal }) };
 }
 
-type Decoded = { ok: true; value: unknown } | { ok: false; reason: RegistryRejectReason; row: null };
+type Decoded = { ok: true; value: unknown; text: string } | { ok: false; reason: RegistryRejectReason; row: null };
 
 // 해석은 연결의 바이트 틀 디코더를 그대로 쓴다: 해석 전 크기 상한, 깨진 UTF-8·BOM 거절, RFC 8259 문법, 객체마다 중복 키 거절,
 // 깊이 상한을 JSON.parse가 같은 키를 덮기 전에 본다. 해석기를 하나 더 두지 않으려는 것이다.
@@ -366,7 +369,67 @@ function decodeJson(content: unknown, maxBytes: number): Decoded {
   if (step.rejected) return { ok: false, reason: frameReason(step.rejected), row: null };
   const end = decoder.end();
   if (end.rejected || step.envelopes.length !== 1) return { ok: false, reason: "not_json", row: null };
-  return { ok: true, value: step.envelopes[0]!.value };
+  // 디코더가 이미 fatal로 푼 바이트라 여기서 던지지 않는다.
+  const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  return { ok: true, value: step.envelopes[0]!.value, text };
+}
+
+// 최상위 객체의 name 칸 값의 원문 토큰. 바이트 틀 디코더가 RFC 8259 문법과 객체마다 중복 키를 이미 확인한 글에만 쓴다.
+// 글 전체에서 "revision"을 찾으면 문자열 안의 글자나 안쪽 객체의 같은 이름 칸에 속으므로, 최상위 칸을 차례로 건너며 찾는다.
+// 칸 이름은 JSON 이스케이프를 푼 값으로 비교한다(글자 하나를 유니코드 이스케이프로 쓴 이름도 같은 칸이다).
+function topLevelToken(text: string, name: string): string | undefined {
+  let pos = 0;
+  const space = () => {
+    while (pos < text.length && " \t\n\r".includes(text[pos]!)) pos++;
+  };
+  // pos가 여는 따옴표에 있을 때 문자열 하나를 건너고 푼 값을 돌려준다.
+  const readString = (): string => {
+    const start = pos++;
+    while (pos < text.length && text[pos] !== '"') pos += text[pos] === "\\" ? 2 : 1;
+    pos++;
+    return JSON.parse(text.slice(start, pos)) as string;
+  };
+  const skipValue = () => {
+    const c = text[pos];
+    if (c === '"') {
+      readString();
+      return;
+    }
+    if (c === "{" || c === "[") {
+      let depth = 0;
+      do {
+        const d = text[pos];
+        if (d === '"') {
+          readString();
+          continue;
+        }
+        if (d === "{" || d === "[") depth++;
+        else if (d === "}" || d === "]") depth--;
+        pos++;
+      } while (depth > 0 && pos < text.length);
+      return;
+    }
+    while (pos < text.length && !",}] \t\n\r".includes(text[pos]!)) pos++;
+  };
+  space();
+  if (text[pos] !== "{") return undefined;
+  pos++;
+  while (pos < text.length) {
+    space();
+    if (text[pos] !== '"') return undefined;
+    const key = readString();
+    space();
+    if (text[pos] !== ":") return undefined;
+    pos++;
+    space();
+    const start = pos;
+    skipValue();
+    if (key === name) return text.slice(start, pos);
+    space();
+    if (text[pos] !== ",") return undefined;
+    pos++;
+  }
+  return undefined;
 }
 
 function frameReason(reason: FrameRejectReason): RegistryRejectReason {
@@ -386,11 +449,104 @@ function checkFields(value: unknown, fields: readonly string[], row: number | nu
 }
 
 function readKey(raw: string): KeyObject | undefined {
+  let key: KeyObject;
   try {
-    return publicKeyFromRaw(raw);
+    key = publicKeyFromRaw(raw);
   } catch {
     return undefined;
   }
+  // publicKeyFromRaw는 정규 base64url인 32바이트면 점인지 보지 않고 키 객체를 만든다. 곡선 위에 없는 값으로는 서명을 확인할 수 없고,
+  // 작은 위수의 점이면 개인 키 없이 만든 서명이 통할 수 있다. 그런 행이 든 판을 적용 성공으로 내지 않게 여기서 거른다.
+  return isUsablePoint(Buffer.from(raw, "base64url")) ? key : undefined;
+}
+
+// ---- Ed25519 공개 키의 점 검사 ----
+// 정규 인코딩(y < p)이고, 곡선 위의 점으로 풀리고, 작은 위수의 여덟 점이 아니고, 위수 L의 주 부분군에 드는 점만 받는다.
+// 디코딩은 RFC 8032 5.1.3, 덧셈은 5.1.4(https://www.rfc-editor.org/rfc/rfc8032#section-5.1)를 그대로 따른다.
+const P = 2n ** 255n - 19n;
+const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+const D = mod(-121665n * modPow(121666n, P - 2n));
+const SQRT_M1 = modPow(2n, (P - 1n) / 4n);
+
+// 작은 위수(1·2·4·8)의 여덟 점의 정규 인코딩. 출처: libsodium 1.0.18의 ge25519_has_small_order 목록
+// (https://github.com/jedisct1/libsodium/blob/1.0.18/src/libsodium/crypto_core/ed25519/ref10/ed25519_ref10.c).
+// 그 목록은 부호 비트를 가린 일곱 값이고 그중 p·p+1은 y가 p 이상이라 디코딩에서 먼저 걸린다. 남은 다섯 값에 부호 비트를
+// 펼치되 x가 0인 1·p-1은 부호 비트 1이 디코딩 실패라 하나씩만 남는다.
+const SMALL_ORDER = new Set([
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000080",
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+]);
+
+function isUsablePoint(bytes: Uint8Array): boolean {
+  if (bytes.length !== 32 || SMALL_ORDER.has(Buffer.from(bytes).toString("hex"))) return false;
+  // 리틀 엔디언 정수. 255번 비트는 x의 홀짝(x_0)이고 그 비트를 지운 값이 y다.
+  const sign = bytes[31]! >> 7;
+  let y = 0n;
+  for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(i === 31 ? bytes[i]! & 0x7f : bytes[i]!);
+  if (y >= P) return false;
+  // x^2 = u / v. 후보 x = u v^3 (u v^7)^((p-5)/8).
+  const y2 = mod(y * y);
+  const u = mod(y2 - 1n);
+  const v = mod(D * y2 + 1n);
+  const v3 = mod(v * v * v);
+  let x = mod(u * v3 * modPow(mod(u * v3 * v3 * v), (P - 5n) / 8n));
+  const vx2 = mod(v * x * x);
+  if (vx2 !== u) {
+    if (vx2 !== mod(-u)) return false;
+    x = mod(x * SQRT_M1);
+  }
+  if (x === 0n && sign === 1) return false;
+  if (Number(x & 1n) !== sign) x = P - x;
+  return inPrimeSubgroup(x, y);
+}
+
+type Point = readonly [x: bigint, y: bigint, z: bigint, t: bigint];
+
+// [L](x, y)가 항등원인가. 작은 위수 점과 혼합 위수 점(주 부분군의 점 + 작은 위수 점)은 [L]배가 항등원이 아니다.
+// L은 공개 상수라 실행 시간이 비밀에 따라 달라지지 않는다.
+function inPrimeSubgroup(x: bigint, y: bigint): boolean {
+  let result: Point = [0n, 1n, 1n, 0n];
+  let base: Point = [x, y, 1n, mod(x * y)];
+  for (let k = L; k > 0n; k >>= 1n) {
+    if (k & 1n) result = addPoints(result, base);
+    base = addPoints(base, base);
+  }
+  // 확장 좌표의 항등원은 (0, Z, Z, 0)이다.
+  return result[0] === 0n && result[1] === result[2];
+}
+
+// RFC 8032 5.1.4의 확장 좌표 덧셈. 완전한 공식이라 같은 점끼리(두 배)에도 그대로 쓴다.
+function addPoints([x1, y1, z1, t1]: Point, [x2, y2, z2, t2]: Point): Point {
+  const a = mod((y1 - x1) * (y2 - x2));
+  const b = mod((y1 + x1) * (y2 + x2));
+  const c = mod(t1 * 2n * D * t2);
+  const d = mod(z1 * 2n * z2);
+  const e = b - a;
+  const f = d - c;
+  const g = d + c;
+  const h = b + a;
+  return [mod(e * f), mod(g * h), mod(f * g), mod(e * h)];
+}
+
+function mod(a: bigint): bigint {
+  const r = a % P;
+  return r < 0n ? r + P : r;
+}
+
+function modPow(base: bigint, exponent: bigint): bigint {
+  let result = 1n;
+  let b = mod(base);
+  for (let e = exponent; e > 0n; e >>= 1n) {
+    if (e & 1n) result = mod(result * b);
+    b = mod(b * b);
+  }
+  return result;
 }
 
 function keyIdOf(raw: string): string {

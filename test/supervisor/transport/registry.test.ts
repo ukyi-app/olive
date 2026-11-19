@@ -329,6 +329,119 @@ describe("엄격한 해석", () => {
   });
 });
 
+describe("판 번호의 원문", () => {
+  const a = newKeys();
+  const withRevision = (token: string) => doc(1, [row(a)]).replace('"revision":1', `"revision":${token}`);
+
+  test("7판 뒤 원문 7.9999999999999999는 거절이고 마지막 성공판은 7, 뒤이은 실제 8판은 적용된다", async () => {
+    const b = newKeys();
+    const v7 = applied(RegistryState.start(settings), doc(7, [row(a)]));
+    const rounded = v7.apply(content(doc(7, [row(a)]).replace('"revision":7', '"revision":7.9999999999999999')));
+    expect(rejected(rounded)).toEqual({ reason: "bad_field", row: null });
+    expect(rounded.state.readout()).toEqual({
+      revision: null,
+      rows: 0,
+      activeRows: 0,
+      lastAppliedRevision: 7,
+      lastAttempt: { outcome: "rejected", reason: "bad_field", row: null },
+    });
+    expect(rounded.state.keyFor(READER, R1)).toBeUndefined();
+    const real = rounded.state.apply(content(doc(8, [row(b)])));
+    expect(real).toMatchObject({ kind: "applied", from: null, to: 8 });
+    expect(await verifyFrom(real.state, READER, R1, b.privateKey)).toBe("ok");
+  });
+
+  for (const token of ["8.0", "8e0", "8E0", "80e-1", "0.8e1", "-0", "8.5", "7.9999999999999999", "9007199254740992"]) {
+    test(`판 번호 원문 ${token}`, () => {
+      expect(rejected(RegistryState.start(settings).apply(content(withRevision(token))))).toEqual({ reason: "bad_field", row: null });
+    });
+  }
+
+  test("앞의 0은 JSON 문법 오류다", () => {
+    expect(rejected(RegistryState.start(settings).apply(content(withRevision("08"))))).toEqual({ reason: "not_json", row: null });
+  });
+
+  test("정수 원문은 공백·칸 순서·이름의 이스케이프와 무관하게 받는다", () => {
+    const good = JSON.stringify(row(a));
+    for (const text of [
+      withRevision("9007199254740991"),
+      `{ "revision" : 8 , "environment":"home","executors":[${good}]}`,
+      `{"executors":[${good}],"environment":"home","rev\\u0069sion":8}`,
+    ]) {
+      const outcome = RegistryState.start(settings).apply(content(text));
+      expect(outcome.kind, text).toBe("applied");
+      expect(outcome.state.keyFor(READER, R1), text).toBeDefined();
+    }
+  });
+
+  // 글 전체에서 "revision"을 찾으면 앞쪽의 안쪽 칸이나 문자열 속 글자를 판 번호로 읽는다. 최상위 칸만 봐야 문서 단위의 bad_field가 난다.
+  test("원문 검색이 속는 입력", () => {
+    const good = JSON.stringify(row(a));
+    // 원문에는 "r1\"revision\":1"로 실린다.
+    const quoted = JSON.stringify(row(a, { instance: 'r1"revision":1' }));
+    for (const text of [
+      `{"executors":[{"revision":1}],"environment":"home","revision":1.0}`,
+      `{"executors":[${quoted}],"environment":"home","revision":1.0}`,
+      `{"environment":"home","executors":[${good}],"rev\\u0069sion":1.0}`,
+    ]) {
+      expect(rejected(RegistryState.start(settings).apply(content(text))), text).toEqual({ reason: "bad_field", row: null });
+    }
+  });
+});
+
+describe("Ed25519 공개 키의 점", () => {
+  const a = newKeys();
+  const keyOf = (hex: string) => Buffer.from(hex, "hex").toString("base64url");
+  // 작은 위수(1·2·4·8)의 여덟 점의 정규 인코딩. 구현의 목록과 따로 적는다.
+  const smallOrder = [
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000080",
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  ];
+  const unusable: [string, string][] = [
+    ["ff 32바이트", "ff".repeat(32)],
+    ["00 32바이트", "00".repeat(32)],
+    ["y = p", `ed${"ff".repeat(30)}7f`],
+    ["y = p + 1", `ee${"ff".repeat(30)}7f`],
+    ["y = 2^255 - 1", `${"ff".repeat(31)}7f`],
+    ["곡선 위에 없는 y = 2", `02${"00".repeat(31)}`],
+    ["x = 0에 부호 비트 1", `01${"00".repeat(30)}80`],
+    ...smallOrder.map((hex, i): [string, string] => [`작은 위수 점 ${i}`, hex]),
+    // 기준점 B의 1·7·5배에 위수 8·4·2의 점을 더한 혼합 위수 점. 곡선 위에 있고 작은 위수가 아니지만 주 부분군 밖이다.
+    ["혼합 위수 점(B + 위수 8)", "da99e28ba529cdde35a25fba9059e78ecaee239f99755b9b1aa4f65df00803e2"],
+    ["혼합 위수 점(7B + 위수 4)", "d7fcf1f00e29dd947529006e74d779973e3c1a1bad96b7807ab8644b5604ee50"],
+    ["혼합 위수 점(5B + 위수 2)", "003789297ce02defa2f4bc7635d1d7ce99b96d76eb91d31f905101674ddab720"],
+  ];
+
+  test("시험에서 새로 만든 정상 키 64개는 한 판에서 모두 적용되고 각자 서명이 통한다", async () => {
+    const keys = Array.from({ length: 64 }, () => newKeys());
+    const state = applied(
+      RegistryState.start(settings),
+      doc(
+        1,
+        keys.map((k, i) => row(k, { instance: `r${i}`, storage: `s${i}` })),
+      ),
+    );
+    for (const [i, k] of keys.entries()) expect(await verifyFrom(state, READER, `executor/isolated_reader/r${i}/s${i}`, k.privateKey)).toBe("ok");
+  });
+
+  for (const [name, hex] of unusable) {
+    test(`정상 행과 함께 든 ${name}은 문서 전체를 거절한다`, () => {
+      const v7 = applied(RegistryState.start(settings), doc(7, [row(a)]));
+      const outcome = v7.apply(content(doc(8, [row(a), row(newKeys(), { instance: "r2", storage: "s2", public_key: keyOf(hex) })])));
+      expect(rejected(outcome)).toEqual({ reason: "bad_public_key", row: 1 });
+      expect(outcome.state.keyFor(READER, R1)).toBeUndefined();
+      expect(outcome.state.keyFor(READER, "executor/isolated_reader/r2/s2")).toBeUndefined();
+      expect(outcome.state.readout()).toMatchObject({ revision: null, lastAppliedRevision: 7 });
+    });
+  }
+});
+
 describe("값과 공개 면", () => {
   test("명단을 채우는 길은 apply 하나다(hello·인증서 지문으로 채우는 함수가 없다)", () => {
     expect(Object.keys(registry).sort()).toEqual(["DEFAULT_MAX_BYTES", "REGISTRY_FIELDS", "REGISTRY_REJECT_REASONS", "ROW_FIELDS", "RegistryState"]);
