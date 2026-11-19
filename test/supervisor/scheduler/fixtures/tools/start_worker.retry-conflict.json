@@ -1,0 +1,43 @@
+{
+  "status": "candidate",
+  "tool": "start_worker",
+  "case": "retry-conflict",
+  "description": "같은 논리 요청·같은 목적의 재시도인데 입력 digest가 다르다. 기존 실행을 돌려주지도, 새로 만들지도 않는다.",
+  "context": {
+    "session": { "id": "session-2", "generation": 2 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000004",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-2", "generation": 2 },
+    "policy": { "diagnosis": ["diagnose"] },
+    "pinned": [{ "owner": "aaaaaaaa-0000-4000-8000-000000000001", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "2222222222222222222222222222222222222222222222222222222222222222" }],
+    "works": [
+      {
+        "ref": "cccccccc-0000-4000-8000-000000000001",
+        "owner": "aaaaaaaa-0000-4000-8000-000000000001",
+        "retryKey": "start_worker:aaaaaaaa-0000-4000-8000-000000000001:diagnose",
+        "content": { "role": "diagnosis", "purpose": "diagnose", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" },
+        "phase": "running"
+      }
+    ],
+    "results": {},
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": {
+    "role": "diagnosis",
+    "task": {
+      "purpose": "diagnose",
+      "brief": "원인을 다시 찾는다",
+      "source_ref": "inputs/aaaaaaaa-1111-4000-8000-000000000001",
+      "input_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "expect": {
+    "answer": { "outcome": "refused", "tool": "start_worker", "reason": "retry_conflict", "field": null },
+    "writes": 0
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "status": "candidate",
+  "tool": "worker_result",
+  "case": "ok",
+  "description": "결과 쪽이 검사 통과·유효·정리 대기 아님을 확인한 결과. 요약과 참조만 준다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000021",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": {},
+    "pinned": [],
+    "works": [
+      {
+        "ref": "cccccccc-0000-4000-8000-000000000001",
+        "owner": "aaaaaaaa-0000-4000-8000-000000000001",
+        "retryKey": "start_worker:aaaaaaaa-0000-4000-8000-000000000001:diagnose",
+        "content": { "role": "diagnosis", "purpose": "diagnose", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" },
+        "phase": "ready_result"
+      }
+    ],
+    "results": {
+      "cccccccc-0000-4000-8000-000000000001": {
+        "state": "settled",
+        "checksPassed": true,
+        "valid": true,
+        "cleanupPending": false,
+        "result": {
+          "role": "diagnosis",
+          "outcome": "completed",
+          "summary": "이미지 태그가 잘못돼 기동에 실패한다",
+          "items": [{ "kind": "finding", "text": "이미지를 받지 못했다는 사건이 세 번 있다" }],
+          "refs": [{ "kind": "path", "ref": "apps/sample/deployment.yaml", "digest": null }]
+        }
+      }
+    },
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": { "ref": "cccccccc-0000-4000-8000-000000000001" },
+  "expect": {
+    "answer": {
+      "outcome": "ok",
+      "tool": "worker_result",
+      "ref": "cccccccc-0000-4000-8000-000000000001",
+      "result": {
+        "outcome": "completed",
+        "summary": "이미지 태그가 잘못돼 기동에 실패한다",
+        "items": [{ "kind": "finding", "text": "이미지를 받지 못했다는 사건이 세 번 있다" }],
+        "refs": [{ "kind": "path", "ref": "apps/sample/deployment.yaml", "digest": null }]
+      }
+    },
+    "writes": 0
+  }
+}

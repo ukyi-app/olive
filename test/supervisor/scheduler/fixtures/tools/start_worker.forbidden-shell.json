@@ -1,0 +1,37 @@
+{
+  "status": "candidate",
+  "tool": "start_worker",
+  "case": "forbidden-shell",
+  "description": "셸 명령과 계정을 인자로 주장한다. 포트를 부르기 전에 거절한다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000003",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": { "diagnosis": ["diagnose"] },
+    "pinned": [],
+    "works": [],
+    "results": {},
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": {
+    "role": "diagnosis",
+    "task": {
+      "purpose": "diagnose",
+      "brief": "원인을 찾는다",
+      "source_ref": "inputs/aaaaaaaa-1111-4000-8000-000000000001",
+      "input_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "shell": "kubectl get secrets -A"
+    },
+    "account": "claude-work"
+  },
+  "expect": {
+    "answer": { "outcome": "refused", "tool": "start_worker", "reason": "forbidden_field", "field": "task.shell" },
+    "writes": 0
+  }
+}

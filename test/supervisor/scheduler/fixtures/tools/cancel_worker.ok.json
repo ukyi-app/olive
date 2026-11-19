@@ -1,0 +1,35 @@
+{
+  "status": "candidate",
+  "tool": "cancel_worker",
+  "case": "ok",
+  "description": "도는 자기 실행의 취소. 접수만 알린다(완료가 아니다). 단계는 그대로 running이다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000031",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": {},
+    "pinned": [],
+    "works": [
+      {
+        "ref": "cccccccc-0000-4000-8000-000000000001",
+        "owner": "aaaaaaaa-0000-4000-8000-000000000001",
+        "retryKey": "start_worker:aaaaaaaa-0000-4000-8000-000000000001:diagnose",
+        "content": { "role": "diagnosis", "purpose": "diagnose", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" },
+        "phase": "running"
+      }
+    ],
+    "results": {},
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": { "ref": "cccccccc-0000-4000-8000-000000000001" },
+  "expect": {
+    "answer": { "outcome": "ok", "tool": "cancel_worker", "ref": "cccccccc-0000-4000-8000-000000000001", "cancel": "accepted", "phase": "running" },
+    "writes": 1
+  }
+}

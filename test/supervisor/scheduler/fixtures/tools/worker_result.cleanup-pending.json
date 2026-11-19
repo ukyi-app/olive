@@ -1,0 +1,43 @@
+{
+  "status": "candidate",
+  "tool": "worker_result",
+  "case": "cleanup-pending",
+  "description": "검사는 통과했지만 정리 대기다. 결과를 주지 않는다.",
+  "context": {
+    "session": { "id": "session-1", "generation": 1 },
+    "requestId": "aaaaaaaa-0000-4000-8000-000000000001",
+    "callId": "dddddddd-0000-4000-8000-000000000022",
+    "now": 1800000000000,
+    "stop": { "known": true, "stopped": false }
+  },
+  "world": {
+    "liveSession": { "id": "session-1", "generation": 1 },
+    "policy": {},
+    "pinned": [],
+    "works": [
+      {
+        "ref": "cccccccc-0000-4000-8000-000000000001",
+        "owner": "aaaaaaaa-0000-4000-8000-000000000001",
+        "retryKey": "start_worker:aaaaaaaa-0000-4000-8000-000000000001:diagnose",
+        "content": { "role": "diagnosis", "purpose": "diagnose", "sourceRef": "inputs/aaaaaaaa-1111-4000-8000-000000000001", "inputDigest": "1111111111111111111111111111111111111111111111111111111111111111" },
+        "phase": "cleanup_pending"
+      }
+    ],
+    "results": {
+      "cccccccc-0000-4000-8000-000000000001": {
+        "state": "settled",
+        "checksPassed": true,
+        "valid": true,
+        "cleanupPending": true,
+        "result": { "role": "diagnosis", "outcome": "completed", "summary": "원인 요약", "items": [], "refs": [] }
+      }
+    },
+    "newRefs": [],
+    "startPhase": "queued"
+  },
+  "arguments": { "ref": "cccccccc-0000-4000-8000-000000000001" },
+  "expect": {
+    "answer": { "outcome": "refused", "tool": "worker_result", "reason": "result_cleanup_pending", "field": null },
+    "writes": 0
+  }
+}
