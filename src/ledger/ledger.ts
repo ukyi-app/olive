@@ -418,11 +418,13 @@ export interface InputEntry {
 // 읽지 못한 것은 이 값이 아니라 Read의 known: false다.
 export interface InstructionTimes {
   runId: string;
-  // 마지막 시작·갱신 지시의 발행 시각과 그 지시가 준 임대의 끝. 시작 지시의 임대 끝은 계약이 정한다(발행 시각 + RUN_LEASE_MAX_MS).
-  // 갱신 지시와 세션 시작 지시의 임대 끝은 장부가 적지 않아 "unknown"이다. 발행 시각이 같은 지시가 여럿이면 하나라도 모르면 모름,
-  // 아니면 이른 끝을 낸다(살아 있지 않은 임대를 살아 있다고 내지 않는 쪽).
+  // 임대를 준 지시의 발행 시각과 그 임대의 끝. 갱신 지시(run_renew)가 하나라도 있으면 기록된 갱신 발행 시각의 최댓값과
+  // "unknown"이다(갱신의 임대 끝은 장부가 적지 않는다. 발행 시각이 시작보다 이르게 기록됐어도 시작 임대로 돌아가지 않는다).
+  // 갱신이 없을 때만 시작 지시의 임대다: 시작 지시는 계약이 정한 끝(발행 시각 + RUN_LEASE_MAX_MS), 세션 시작 지시는 "unknown".
+  // 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝을 낸다(살아 있지 않은 임대를 살아 있다고 내지 않는 쪽).
   lease: { issuedAt: number; expiresAt: number | "unknown" } | null;
-  // 마지막 종료 지시(task_cancel·session_stop)와 마지막 확정 지시(result_finalize)의 발행 시각. 지금 상태에 들어온 뒤의 것으로
+  // 종료 지시(task_cancel·session_stop)와 확정 지시(result_finalize) 각각의 기록된 발행 시각의 최댓값. 마지막으로 기록한 행이
+  // 아니다(더 이른 시각으로 나중에 기록한 지시는 앞 지시의 시각에 가려진다). 지금 상태에 들어온 뒤의 것으로
   // 좁히지 않는다(장부가 상태에 들어온 시각을 따로 적지 않는다).
   lastStopAt: number | null;
   lastFinalizeAt: number | null;
@@ -1688,14 +1690,21 @@ export class Ledger {
         const times = rows.filter((row) => actions.includes(row.action)).map((row) => safe(row.issued_at, "instructions.issued_at"));
         return times.length === 0 ? null : Math.max(...times);
       };
-      const issuedAt = latest(["task_start", "session_start", "run_renew"]);
+      // 갱신은 시작 뒤에만 기록되지만 발행 시각은 부르는 쪽이 넘긴 값이라 시작보다 이를 수 있다. 시각의 최댓값으로 고르면
+      // 그런 갱신이 가려져 시작 임대를 아는 것처럼 내므로, 갱신이 하나라도 있으면 시각과 무관하게 임대 끝을 모름으로 낸다.
+      const renewedAt = latest(["run_renew"]);
       let lease: InstructionTimes["lease"] = null;
-      if (issuedAt !== null) {
-        const ends = rows
-          .filter((row) => ["task_start", "session_start", "run_renew"].includes(row.action) && row.issued_at === issuedAt)
-          .map((row) => (row.action === "task_start" ? issuedAt + limits.RUN_LEASE_MAX_MS : null));
-        const known = ends.every((end) => end !== null && Number.isSafeInteger(end));
-        lease = { issuedAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
+      if (renewedAt !== null) {
+        lease = { issuedAt: renewedAt, expiresAt: "unknown" };
+      } else {
+        const issuedAt = latest(["task_start", "session_start"]);
+        if (issuedAt !== null) {
+          const ends = rows
+            .filter((row) => ["task_start", "session_start"].includes(row.action) && row.issued_at === issuedAt)
+            .map((row) => (row.action === "task_start" ? issuedAt + limits.RUN_LEASE_MAX_MS : null));
+          const known = ends.every((end) => end !== null && Number.isSafeInteger(end));
+          lease = { issuedAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
+        }
       }
       return { runId, lease, lastStopAt: latest(["task_cancel", "session_stop"]), lastFinalizeAt: latest(["result_finalize"]) };
     });

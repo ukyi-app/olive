@@ -98,7 +98,7 @@ describe("다음 시작 후보", () => {
     expect(nextIntent({ ...base, run: { runId: "c", kind: "worker", state: "cleanup_pending", deadlineAt: NOW + 1 } }, LIFE).intent).toBe("finalize");
   });
 
-  test("같은 입력 ID의 재시도·새 세션 줄은 예산 보충 0", () => {
+  test("같은 입력 ID의 재시도는 시작한 실행(finalized)이 남긴 잔액을 넘으면 보류", () => {
     // 같은 입력의 앞 실행이 남긴 예산보다 많이 받은 새 실행 줄은 시작 후보가 아니다.
     const prior = run({ state: "finalized", budgetLeft: 1_000 });
     const retry = run({ inputRequestId: prior.inputRequestId, budgetLeft: 50_000 });
@@ -126,6 +126,21 @@ describe("다음 시작 후보", () => {
   });
 });
 
+// 시작 지시 뒤의 상태(preparing에서 닿는 모든 상태)에서 여러 걸음을 거쳐서라도 not_started에 닿는지.
+function startedReachesNotStarted(table: Partial<Record<LedgerRunState, readonly LedgerRunState[]>>): boolean {
+  const seen = new Set<LedgerRunState>(["preparing"]);
+  const stack: LedgerRunState[] = ["preparing"];
+  while (stack.length > 0) {
+    for (const to of table[stack.pop() as LedgerRunState] ?? []) {
+      if (!seen.has(to)) {
+        seen.add(to);
+        stack.push(to);
+      }
+    }
+  }
+  return seen.has("not_started");
+}
+
 // 장부 밖에서 조립한 값이 빠지거나 꼴이 틀린 경우. 모르면 시작 후보도 갱신도 내지 않는다.
 // 시험이 일부러 틀린 꼴을 넣으므로 타입을 우회한다.
 const broken = <T>(value: unknown) => value as T;
@@ -147,9 +162,14 @@ describe("모르거나 꼴이 틀린 입력", () => {
   });
 
   test("시작 전에 닫힌 줄(not_started)의 배정액은 상한이 아니고, 소진과 시작한 줄의 잔액은 그대로 상한이다", () => {
-    // not_started로 들어오는 길이 queued뿐인 동안만 성립한다. 표가 바뀌면 이 단언이 먼저 실패한다.
+    // not_started로 들어오는 길이 queued뿐이고 시작한 줄이 여러 걸음으로도 not_started에 닿지 않는 동안만 성립한다.
+    // 표가 바뀌면 이 단언이 먼저 실패한다.
     for (const kind of ["worker", "session"] as const) {
       expect(Object.entries(TRANSITIONS[kind]).filter(([, to]) => to?.includes("not_started")).map(([from]) => from), kind).toEqual(["queued"]);
+      expect(startedReachesNotStarted(TRANSITIONS[kind]), kind).toBe(false);
+      // 시작한 줄이 대기로 돌아가는 간선(running → queued)을 표의 사본에 더하면 이 검사가 잡는다.
+      const requeue = { ...TRANSITIONS[kind], running: [...(TRANSITIONS[kind].running ?? []), "queued" as const] };
+      expect(startedReachesNotStarted(requeue), kind).toBe(true);
     }
     const current = run({ inputRequestId: "ns", budgetLeft: 10 });
     const inputs = [inputFor(current, "admin")];

@@ -3,7 +3,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { limits } from "../../src/contract/v1/index.ts";
-import { type Ledger, TRANSITIONS } from "../../src/ledger/index.ts";
+import { type Ledger, type LedgerRunState, TRANSITIONS } from "../../src/ledger/index.ts";
 import { type LifecyclePolicy, type LifecycleView, nextIntent } from "../../src/supervisor/scheduler/lifecycle.ts";
 import { type Origin, planNext, type SchedulerInput, type SchedulerPolicy, type SchedulerRun, type SchedulerView } from "../../src/supervisor/scheduler/queue.ts";
 import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, tempPath, worker } from "./helpers.ts";
@@ -46,7 +46,10 @@ function lifecycle(ledger: Ledger, runId: string, now: number): LifecycleView {
   const run = got.value;
   const times = ledger.instructionTimes(runId);
   const inputs = ledger.listInputs();
-  const input = inputs.known ? inputs.value.find((i) => i.requestId === run.inputRequestId) : undefined;
+  // 연결된 입력의 취소 여부를 모르면 판단을 조립하지 않는다. "취소 없음"으로 채우면 취소된 실행의 임대를 갱신하게 된다.
+  if (!inputs.known) throw new Error("입력을 읽지 못함");
+  const input = inputs.value.find((i) => i.requestId === run.inputRequestId);
+  if (run.inputRequestId !== null && input === undefined) throw new Error("연결된 입력이 없다");
   const lease = times.known && times.value !== null ? times.value.lease : null;
   return {
     run: { runId, kind: run.kind, state: run.state, deadlineAt: run.deadlineAt },
@@ -158,13 +161,65 @@ test("미발행과 모름이 다른 값", () => {
   expect(nextIntent({ ...view, lastInstructionAt: "unknown" }, LIFE).intent).toBe("wait");
 });
 
+test("갱신을 시작보다 이른 시각으로 기록해도 재개방 뒤 임대 끝은 모름이고 조회한다", () => {
+  const path = tempPath();
+  const first = ready(open(path));
+  const requestId = enqueue(first, "admin-dm", NOW);
+  const runId = must(first.admitRun(worker({ inputRequestId: requestId }))).run.runId;
+  must(first.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+  must(first.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW - 1 }));
+  first.close();
+
+  const ledger = ready(open(path));
+  expect(ledger.instructionTimes(runId)).toMatchObject({ known: true, value: { lease: { issuedAt: NOW - 1, expiresAt: "unknown" } } });
+  expect(nextIntent(lifecycle(ledger, runId, NOW + 10_000), LIFE).intent).toBe("query");
+});
+
+test("입력을 읽지 못하면 수명 판단을 조립하지 않는다", () => {
+  const ledger = ready(open(tempPath()));
+  const requestId = enqueue(ledger, "admin-dm", NOW);
+  const runId = must(ledger.admitRun(worker({ inputRequestId: requestId }))).run.runId;
+  must(ledger.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+  must(ledger.cancelInput(requestId, NOW + 5));
+  expect(nextIntent(lifecycle(ledger, runId, NOW + 10_000), LIFE).intent).toBe("stop");
+  // 실행·지시 읽기는 성공하고 입력 읽기만 실패하는 장부.
+  const inputsFail = new Proxy(ledger, {
+    get(target, key) {
+      if (key === "listInputs") return () => ({ known: false, reason: "io" });
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  expect(() => lifecycle(inputsFail, runId, NOW + 10_000)).toThrow("입력을 읽지 못함");
+});
+
+// 시작 지시 뒤의 상태(preparing에서 닿는 모든 상태)에서 여러 걸음을 거쳐서라도 not_started에 닿는지.
+function startedReachesNotStarted(table: Partial<Record<LedgerRunState, readonly LedgerRunState[]>>): boolean {
+  const seen = new Set<LedgerRunState>(["preparing"]);
+  const stack: LedgerRunState[] = ["preparing"];
+  while (stack.length > 0) {
+    for (const to of table[stack.pop() as LedgerRunState] ?? []) {
+      if (!seen.has(to)) {
+        seen.add(to);
+        stack.push(to);
+      }
+    }
+  }
+  return seen.has("not_started");
+}
+
 test("시작 전에 닫힌 줄은 상한이 아님", () => {
-  // 장부에서 not_started로 들어오는 길은 queued에서뿐이다. 그 줄은 시작한 적이 없어 숫자가 쓰고 남긴 잔액이 아니다.
+  // 장부에서 not_started로 들어오는 길은 queued에서뿐이고, 시작한 줄은 대기로 돌아가지 않는다. 그 줄은 시작한 적이 없어
+  // 숫자가 쓰고 남긴 잔액이 아니다.
   for (const kind of ["worker", "session"] as const) {
     const into = Object.entries(TRANSITIONS[kind])
       .filter(([, to]) => to?.includes("not_started"))
       .map(([from]) => from);
     expect(into, kind).toEqual(["queued"]);
+    expect(startedReachesNotStarted(TRANSITIONS[kind]), kind).toBe(false);
+    // 시작한 줄이 대기로 돌아가는 간선(running → queued)을 표의 사본에 더하면 이 검사가 잡는다.
+    const requeue = { ...TRANSITIONS[kind], running: [...(TRANSITIONS[kind].running ?? []), "queued" as const] };
+    expect(startedReachesNotStarted(requeue), kind).toBe(true);
   }
 
   const path = tempPath();

@@ -23,7 +23,8 @@ export type SchedulerRun = Pick<Run, "runId" | "kind" | "role" | "state" | "queu
 };
 
 // 실행 줄에 연결된 입력. 장부의 inputs 표에 있는 칸만 둔다(원문은 없다. 본문으로 우선순위를 정하지 않기 위해 타입에 없다).
-// origin과 receivedAt은 장부 표에 있지만 지금의 queueView()가 내주지 않는다. 부르는 쪽이 채우지 못하면 이 항목을 넣지 않는다
+// queueView()는 출처와 접수 시각을 내주지 않는다. 장부의 listInputs()가 출처 이름(source)과 receivedAt을 내고, 출처 이름을
+// origin으로 나누는 것은 접수 정책의 몫이다. 부르는 쪽이 채우지 못하면 이 항목을 넣지 않는다
 // (그러면 그 실행은 input_unknown으로 보류된다). 넣었더라도 칸이 빠졌거나 꼴이 틀리면 같은 보류다.
 export interface SchedulerInput {
   requestId: string;
