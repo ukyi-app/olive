@@ -1,0 +1,58 @@
+{
+  "fixture": "olive-control/v2",
+  "name": "accept/approval-card-request",
+  "description": "보호 경로를 건드린 게시 후보에 확인 카드를 부탁한다. 카드의 문구·발급·만료는 현관이 정한다",
+  "status": "candidate",
+  "base": null,
+  "changed": [],
+  "expect": {
+    "ok": true,
+    "handshake_after": null
+  },
+  "keys": {
+    "supervisor": "x4pEw065D79W9oP7HuGZXic24bUwRrd1B4NqHGaGfmU"
+  },
+  "context": {
+    "now": 1795046400000,
+    "expected_recipient": "front-door",
+    "own_policy_revision": "policy-7",
+    "handshake": "agreed",
+    "intake_open": true,
+    "generations": {
+      "stop": {
+        "known": true,
+        "current": 8,
+        "prepared": null
+      },
+      "execution": {
+        "known": true,
+        "current": 4,
+        "prepared": null
+      }
+    },
+    "awaiting": {},
+    "spent_nonces": []
+  },
+  "message": {
+    "header": {
+      "contract": "olive-control/v2",
+      "body_digest": "6ba8666d9325583bccf59914f1130b8d54f4d2b2996e49d3c95e4f18b746baf7",
+      "issued_at": 1795046399000,
+      "expires_at": 1795046429000,
+      "sender": "supervisor",
+      "recipient": "front-door",
+      "action": "approval_card_request",
+      "request_id": "00000000-0000-4000-8000-000000000062",
+      "nonce": "00000000000000000000000000000062"
+    },
+    "signature": "TiQOG0pgYNTymCLe1QRVRacDBtILEdKPLzHY1PM0ijAoVfec4iSCwGUbbAM5j4WUg36sN4IQ5vKX8-g7zOxVCQ",
+    "body": {
+      "job_id": "00000000-0000-4000-8000-000000000071",
+      "input_id": "00000000-0000-4000-8000-00000000007a",
+      "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "stop_generation": 8,
+      "execution_generation": 4
+    }
+  },
+  "signing_input": "{\"action\":\"approval_card_request\",\"body_digest\":\"6ba8666d9325583bccf59914f1130b8d54f4d2b2996e49d3c95e4f18b746baf7\",\"contract\":\"olive-control/v2\",\"expires_at\":1795046429000,\"issued_at\":1795046399000,\"nonce\":\"00000000000000000000000000000062\",\"recipient\":\"front-door\",\"request_id\":\"00000000-0000-4000-8000-000000000062\",\"sender\":\"supervisor\"}"
+}

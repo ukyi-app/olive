@@ -1,0 +1,188 @@
+// 출력 묶음(후보): 감독이 현관에 부탁하는 답 글·확인 카드·게시·진행 표시와, 현관이 실행 세대의 권위 값을 얻는 조회 쌍.
+// 감독이 내는 것은 모두 후보다. 최종 목적지, 승인 여부, 실제로 보낼 바이트의 공개 검사, 카드의 발급·문구·유효 시간은 현관이
+// 정한다(설계 supervisor.md §4·§9.1). 그래서 본문에 승인·목적지·권한·보낼 글의 칸을 두지 않고, 후보의 바이트는 감독 쪽 결과
+// 보관소에 두어 digest로만 가리킨다. 선로 형식과 검증뿐이고 장부·Discord를 다루지 않는다. 표와 이유는 v2.md "답·카드·게시·진행".
+import type { Bundle, EffectSpec, ExchangeSpec, LookupOutcome, NoAnswerCause } from "./actions.ts";
+import { type GenerationAuthority, type GenerationRules, generationShape } from "./generations.ts";
+import { effectBody, generation, int, isPlainObject, object, oneOf, type Parser, sha256, uuid } from "./schema.ts";
+
+// 넷 모두 받는 쪽(현관)의 지금 정지·실행 세대와 같아야 한다. 정지 준비가 현관 원장에 적힌 뒤의 옛 정지 세대 후보, 풀기 전 실행
+// 세대의 늦은 후보(정지 중에 만들어져 풀린 뒤 닿은 것)를 서명이 맞아도 거절하려면 둘 다 필요하다.
+export const OUTBOUND_GENERATIONS = { stop: "current", execution: "current" } as const satisfies GenerationRules;
+
+// 진행의 고정된 단계(discord.md §5): 원인 확인, 패치 작성, 검증, PR, 끝났어요, 멈췄어요. 표시 문구는 현관이 이 이름에서 만든다.
+export const PROGRESS_STAGES = ["cause", "patch", "verify", "pull_request", "done", "stopped"] as const;
+export type ProgressStage = (typeof PROGRESS_STAGES)[number];
+// start: 일을 시작할 때의 한 줄(진행이 고칠 글). answer: 그 밖의 답. 경보 자동 진단의 시작(👀만)·두 번째 시작 글을 현관이 가른다.
+export const REPLY_PURPOSES = ["start", "answer"] as const;
+export const PUBLICATION_KINDS = ["pull_request", "pull_request_review", "knowledge_pull_request"] as const;
+
+const uuidOrNull: Parser<string | null> = (value, path) => (value === null ? null : uuid(value, path));
+
+// 업무 칸. input_id는 현관이 그 입력을 접수시킨 효과의 job_id다. 보낼 곳은 현관이 이 입력에서 고른다.
+const REPLY_FIELDS = { input_id: uuid, purpose: oneOf(REPLY_PURPOSES), candidate_digest: sha256 };
+const CARD_FIELDS = { input_id: uuid, candidate_digest: sha256 };
+// job_id·candidate_digest·run_id는 장부 recordPublication의 frontJobId·candidateDigest·runId와 같은 식별이다.
+const PUBLICATION_FIELDS = { kind: oneOf(PUBLICATION_KINDS), candidate_digest: sha256, run_id: uuidOrNull, input_id: uuidOrNull };
+const PROGRESS_FIELDS = { input_id: uuid, stage: oneOf(PROGRESS_STAGES), seq: int(0) };
+
+export interface ReplyCandidate {
+  job_id: string;
+  input_id: string;
+  purpose: (typeof REPLY_PURPOSES)[number];
+  candidate_digest: string;
+  stop_generation: number;
+  execution_generation: number;
+}
+export interface ApprovalCardRequest {
+  job_id: string;
+  input_id: string;
+  candidate_digest: string;
+  stop_generation: number;
+  execution_generation: number;
+}
+export interface PublicationCandidate {
+  job_id: string;
+  kind: (typeof PUBLICATION_KINDS)[number];
+  candidate_digest: string;
+  run_id: string | null;
+  input_id: string | null;
+  stop_generation: number;
+  execution_generation: number;
+}
+export interface ProgressUpdate {
+  job_id: string;
+  input_id: string;
+  stage: ProgressStage;
+  seq: number;
+  stop_generation: number;
+  execution_generation: number;
+}
+
+// 확정 결과(job_status의 confirmed.result). 카드 요청의 결과에 승인은 없다: 승인은 현관의 이벤트로만 온다.
+// 게시의 결과는 복원 포트(PublicationPort)의 확정 두 값과 같다.
+export type ReplyResult = { outcome: "posted" } | { outcome: "refused" };
+export type CardResult = { outcome: "shown" } | { outcome: "refused" };
+export type PublicationResult = { outcome: "posted" } | { outcome: "not_posted" };
+// superseded: 같은 입력에서 이 순번 이상을 이미 보여 무시했다.
+export type ProgressResult = { outcome: "shown" } | { outcome: "superseded" } | { outcome: "refused" };
+
+const outcomes = <const T extends string>(values: readonly T[]): Parser<{ outcome: T }> => object({ outcome: oneOf(values) });
+
+// 감독만 내고, 현관의 접수가 닫혀 있으면(정지 중 게시·승인 닫힘, §7.3의 1) 받지 않는다.
+function outboundEffect(fields: Record<string, Parser<unknown>>, parseResult: Parser<unknown>): EffectSpec {
+  const parseBody = effectBody({ ...fields, ...generationShape(OUTBOUND_GENERATIONS) });
+  return {
+    class: "effect",
+    from: ["supervisor"],
+    duringClosedIntake: false,
+    duringPolicyMismatch: false,
+    generations: OUTBOUND_GENERATIONS,
+    parse: (body) => parseBody(body, "body"),
+    parseResult,
+  };
+}
+
+// ---- 현관의 실행 세대 권위 값 ----
+
+export interface ExecutionGenerationReply {
+  in_reply_to: string;
+  generation: number;
+}
+
+// 현관이 묻고 감독이 장부의 지금 실행 세대(run_epoch)로 답한다. 효과가 없고 세대를 싣지 않으므로 감독의 접수가 닫혀도,
+// 정책이 어긋난 연결에서도 오간다(계약 판이 뜻을 고정한 사실). 감독이 자기 값을 모르면 답하지 않는다: 모름 상태의 답은 없다.
+const executionGenerationLookup: ExchangeSpec = {
+  class: "query",
+  from: ["front-door"],
+  duringClosedIntake: true,
+  duringPolicyMismatch: true,
+  parse: (body) => object({})(body, "body"),
+};
+const executionGenerationReply: ExchangeSpec = {
+  class: "query",
+  from: ["supervisor"],
+  duringClosedIntake: true,
+  duringPolicyMismatch: true,
+  parse: (body) => object({ in_reply_to: uuid, generation })(body, "body"),
+  answers: (awaitedAction) => awaitedAction === "execution_generation_lookup",
+};
+
+// 현관이 한 번 물어 얻은 것. 답을 받지 못했으면 모름이고 이 갈래는 값을 실을 수 없다.
+export type ExecutionGenerationOutcome = { answered: true; generation: number } | { answered: false; cause: NoAnswerCause };
+
+// 현관의 generations.execution을 감독이 확정해 준 값으로 고친다. 값의 출처는 둘이다: 이 조회의 답, 그리고 release_commit이
+// released로 확정된 본문의 execution_generation(그 값도 { answered: true, generation }으로 넣는다).
+// 실행 세대는 풀 때만 오르므로 받은 값이 아는 값보다 작으면 낮추지 않는다. 작은 값은 늦게 온 옛 답이거나 감독 장부의 되돌림이고,
+// 낮추면 옛 실행의 후보가 다시 통과한다. 그대로 두면 감독의 후보가 generation_mismatch로 닫힌다(regressed로 알린다).
+// 답이 없거나 값의 꼴이 틀리면 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다).
+export function adoptExecutionGeneration(previous: GenerationAuthority, outcome: ExecutionGenerationOutcome): { authority: GenerationAuthority; regressed: boolean } {
+  if (outcome.answered !== true) return { authority: previous, regressed: false };
+  const value: unknown = outcome.generation;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return { authority: previous, regressed: false };
+  if (!previous.known) return { authority: { known: true, current: value, prepared: null }, regressed: false };
+  if (value < previous.current) return { authority: previous, regressed: true };
+  return { authority: { known: true, current: value, prepared: previous.prepared }, regressed: false };
+}
+
+// ---- 게시 조회의 결론 ----
+
+// main의 PublicationPort.lookup이 돌려주는 두 갈래와 같은 꼴. 모름은 값이 아니라 예외다(PublicationUnknown).
+export type PublicationLookup = { kind: "confirmed"; outcome: "posted" | "not_posted" } | { kind: "pending" };
+
+// unknown: 현관이 답했지만 모른다고 했다. 나머지는 답을 받지 못했거나(timeout·disconnected) 받은 답을 쓸 수 없다(reply_rejected).
+export class PublicationUnknown extends Error {
+  constructor(readonly reason: NoAnswerCause | "unknown") {
+    super(`게시 결과를 모름(${reason})`);
+    this.name = "PublicationUnknown";
+  }
+}
+
+// 게시 후보 작업(publication_candidate)에 대한 한 번의 물음(바로 답이나 같은 job_id의 job_lookup)의 결론을 포트의 뜻으로 옮긴다.
+// 가장 큰 함정은 시간 초과나 모름을 not_posted로 바꾸는 것이다(복원기가 다시 게시할 수 있다고 본다). 그래서 not_posted는 검증을
+// 통과한 confirmed의 결과 한 가지에서만 나오고, 타입을 어긴 입력도 런타임에 다시 보아 모름으로 던진다.
+export function publicationLookupOf(outcome: LookupOutcome): PublicationLookup {
+  if (outcome.answered !== true) throw new PublicationUnknown(outcome.cause);
+  const status: unknown = outcome.status;
+  if (!isPlainObject(status)) throw new PublicationUnknown("reply_rejected");
+  if (status.state === "pending") return { kind: "pending" };
+  if (status.state === "unknown") throw new PublicationUnknown("unknown");
+  if (status.state === "confirmed" && isPlainObject(status.result)) {
+    const result = status.result.outcome;
+    if (result === "posted" || result === "not_posted") return { kind: "confirmed", outcome: result };
+  }
+  throw new PublicationUnknown("reply_rejected");
+}
+
+// 검증한 게시 후보를 장부 recordPublication의 입력 이름으로 옮긴다(송신 전 기록과 같은 식별).
+export function publicationLinkOf(body: PublicationCandidate): { frontJobId: string; candidateDigest: string; runId: string | null } {
+  return { frontJobId: body.job_id, candidateDigest: body.candidate_digest, runId: body.run_id };
+}
+
+// 이 묶음의 본문과 확정 결과가 가질 수 있는 칸 이름 전부. 금지 이름과 부딪히지 않는다는 것을 시험이 본다.
+export const EFFECTS_FIELD_NAMES: readonly string[] = Object.freeze([
+  ...new Set([
+    "job_id",
+    "stop_generation",
+    "execution_generation",
+    ...Object.keys(REPLY_FIELDS),
+    ...Object.keys(CARD_FIELDS),
+    ...Object.keys(PUBLICATION_FIELDS),
+    ...Object.keys(PROGRESS_FIELDS),
+    "outcome",
+    "in_reply_to",
+    "generation",
+  ]),
+]);
+
+export const EFFECTS_BUNDLE: Bundle = {
+  name: "effects",
+  actions: {
+    reply_candidate: outboundEffect(REPLY_FIELDS, outcomes(["posted", "refused"])),
+    approval_card_request: outboundEffect(CARD_FIELDS, outcomes(["shown", "refused"])),
+    publication_candidate: outboundEffect(PUBLICATION_FIELDS, outcomes(["posted", "not_posted"])),
+    progress_update: outboundEffect(PROGRESS_FIELDS, outcomes(["shown", "superseded", "refused"])),
+    execution_generation_lookup: executionGenerationLookup,
+    execution_generation_reply: executionGenerationReply,
+  },
+};
