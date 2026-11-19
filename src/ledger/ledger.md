@@ -141,7 +141,7 @@
 
 `tool_requests.run_id`가 부탁을 실행 줄에 잇는 자리다(실행 하나에 부탁 하나, 대기 부탁만, 한 번만 채운다: CHECK와 트리거). 이 칸을 채우는 연산은 `assignToolRequest` 하나다.
 
-- **입력:** `{ ref, runId, snapshotDigest, profileRevision, policyRevision, executorId, credential, deadlineAt, budgetLeft, now }`. 실행기·자격 참조·기한·예산은 배정기가 고른 실제 값이고 `admitRun`의 같은 칸과 같은 검사(`#admitInput`)를 거친다. 역할·입력 digest·실행의 입력(`inputRequestId` = 소유자)은 부탁의 값이라 받지 않는다(받으면 모르는 칸으로 `LedgerInputError`). 실행기가 부탁의 역할을 맡을 수 없으면 `admitRun`과 같이 `LedgerInputError`다. 소유자는 받지 않는다: 부르는 쪽은 배정기 하나이고 참조는 표 전체에서 유일하다.
+- **입력:** `{ ref, runId, snapshotDigest, profileRevision, policyRevision, executorId, credential, deadlineAt, budgetLeft, now }`. 실행기·자격 참조·기한·예산은 배정기가 고른 실제 값이고 `admitRun`의 같은 칸과 같은 검사(`#admitInput`)를 거친다. 역할·입력 digest·실행의 입력(`inputRequestId` = 소유자)은 부탁의 값이라 받지 않는다(받으면 모르는 칸으로 `LedgerInputError`). 대기 부탁을 새로 이을 때 실행기가 부탁의 역할을 맡을 수 없으면 `admitRun`과 같이 `LedgerInputError`다. 이미 이어진 부탁에는 이 검사보다 `already_assigned`가 먼저라, 역할이 맞지 않는 실행기와 새 실행 ID를 넘겨도 이은 그 실행이 돌아온다. 재시도는 돌려받은 실행의 실행기·실행 ID를 쓴다. 소유자는 받지 않는다: 부르는 쪽은 배정기 하나이고 참조는 표 전체에서 유일하다.
 - **한 트랜잭션:** 새 업무의 전제(위 "새 업무를 열어도 되는 조건") → 그 참조의 부탁을 다시 읽음 → 실행 줄 기록(`admitRun`과 같은 `#admit`) → `run_id` 채움이 한 트랜잭션이다. 커밋 전에 끊기면 실행 줄과 잇기가 함께 되돌려진다.
 - **답:** 처음 이으면 `{ ok: true, outcome: "assigned", run }`(`run.state`는 `queued`). 이미 이어진 부탁이면 새 실행 줄 없이 `{ ok: true, outcome: "already_assigned", run }`(이은 그 실행의 지금 값, 넘긴 `runId`는 쓰이지 않는다). 취소된 부탁(`not_started`)은 `transition_denied`, 없는 참조는 `unknown_run`이고 실행 줄이 생기지 않는다. 실행 줄의 접수가 장부의 기존 사유로 거절되면(정지, 접수 허가 없음, 사본 보류, 이미 쓰인 실행 ID의 `invariant_violation` 등) 부탁은 `waiting_assignment` 그대로다.
 - **실행의 중복 키:** 실행 줄의 `dedupe_key`는 `tool_request:<참조>`다. `runs.dedupe_key`는 소유자와 무관하게 전역 유일이라 부탁의 재시도 키를 그대로 쓰면 다른 소유자의 같은 키와 부딪혀 남의 실행이 돌아온다. 참조는 표 전체에서 유일하므로 이 키는 부탁마다 하나다. 이 키의 실행이 이미 있으면(잇는 연산 밖에서 만든 줄) 그 실행을 잇지 않고 `invariant_violation`이다.
@@ -170,15 +170,15 @@
 - **취소의 접수는 종료가 아니다:** 자리를 놓지 않는다. `stopping`은 슬롯을 쥐고, 그 뒤의 전이는 영수증과 기존 연산의 일이다.
 - 종료가 확인됐거나(`stop_receipt_id`가 있음: `checking`·`ready_result`·`failed_stopped`·`cleanup_pending`) 끝난(`finalized`·`not_started`) 실행이면 취소가 바꿀 것이 없어 `transition_denied`다(처리기의 `already_ended`).
 - 정지 중에도, 접수가 닫혀도 적는다(쓰기 모드 `continue`).
-- 같은 호출 ID로 시작 뒤의 취소를 다시 부르면 같은 요청 ID의 지시가 이미 있어 `invariant_violation`이다(같은 호출 ID의 응답 재생은 없다).
+- 같은 호출 ID로 다시 부른 답은 그때의 실행 상태를 따른다(같은 호출 ID의 응답 재생은 없다). 시작 뒤의 취소를 종료가 아직 확인되지 않았을 때 다시 부르면 같은 요청 ID의 지시가 이미 있어 `invariant_violation`이다. 종료 확인 영수증 뒤에 다시 부르면 `transition_denied`(처리기의 `already_ended`)다. `queued`에서 취소한 뒤 다시 부르면 `transition_denied`다.
 
-**넣지 않는 것:** 목적의 자유 글(`brief`), 원문, 실행기 ID, 계정·자격, 모델 이름, 경로. 세션 ID와 호출 ID는 부탁을 기록·취소한 호출의 기록이고 판단(소유·중복·충돌)에 쓰지 않는다. 이은 부탁의 취소는 부탁 줄에 남지 않고 실행의 지시(요청 ID = 호출 ID)로 남는다. 입력이 그 소유자의 고정된 입력인지(`inputPinned`), 지금 호출권을 가진 세션인지(`liveSession`), 결과(`readResult`)는 이 표가 답하지 않는다.
+**넣지 않는 것:** 목적의 자유 글(`brief`), 원문, 실행기 ID, 계정·자격, 모델 이름, 경로. 세션 ID와 호출 ID는 부탁을 기록·취소한 호출의 기록이고 판단(소유·중복·충돌)에 쓰지 않는다. 이은 부탁의 취소는 부탁 줄에 남지 않는다. 시작 뒤 지시를 적었을 때만 실행의 지시(요청 ID = 호출 ID)로 남고, `queued`에서의 취소는 지시가 없어 그 세션 ID·호출 ID가 지시에도 부탁의 취소 칸에도 남지 않는다. 입력이 그 소유자의 고정된 입력인지(`inputPinned`), 지금 호출권을 가진 세션인지(`liveSession`), 결과(`readResult`)는 이 표가 답하지 않는다.
 
 **배정기와 조립 코드가 지킬 것:**
 
 1. 실행기·자격·기한·예산은 실제로 고른 값만 넘긴다. 맞는 실행기가 없으면 부르지 않고 부탁을 대기로 둔다. 대기 부탁의 목록을 읽는 연산은 아직 없다.
 2. 배정한 실행의 시작(`startRun`)과 지시의 전송은 배정과 따로다. `assigned`의 실행은 `queued`이고 시작 보장이 아니다.
-3. 이은 부탁의 취소가 돌려준 `instruction`을 그 값(요청 ID, 정지 세대) 그대로 실은 `task_cancel`로 보낸다. 장부에는 보내지 않은 지시를 찾는 읽기가 없어, 보내기 전에 끊기면 그 실행은 `stopping`으로 남고 스케줄러(`nextIntent`)는 답을 기다린 뒤 조회를 낸다.
+3. 이은 부탁의 취소가 돌려준 `instruction`을 그 값(요청 ID, 정지 세대) 그대로 실은 `task_cancel`로 보낸다. 장부에는 보내지 않은 지시를 찾는 읽기가 없다. 보내기 전에 끊긴 실행은 장부를 단순히 다시 열면 `stopping`으로 남고 스케줄러(`nextIntent`)는 답을 기다린 뒤 조회를 낸다. 재시작 복원의 3단계(`markLost`)를 거치면 `unknown_running`이 되고 그 실행의 상태 조회(`statusQueries`)가 바로 나온다. 어느 쪽이든 슬롯은 쥔 채다. 장부의 기록만으로는 지시가 전달됐는지 알 수 없으므로, 조립 코드는 장부가 돌려준 식별값을 보존하고 중단 뒤 같은 실행의 전달·종료 여부를 대조해 필요하면 다시 보낼 방법을 정한다.
 4. 호출 ID는 호출마다 새 UUID여야 한다. 이은 부탁의 취소에서 지시의 요청 ID로 쓰인다.
 
 ## 세션 증거
