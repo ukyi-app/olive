@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { CONTRACT as CONTRACT_V2 } from "../../../src/contract/v2/index.ts";
 import { type PeersPort, type OccupancyPort, type RestorePorts, RestoreOrderError, Restorer, RestoreStepError } from "../../../src/ledger/index.ts";
 import {
   FrontDoorUnknownError,
@@ -30,7 +31,7 @@ function fakeFrontDoor(stop: () => unknown, publication: (jobId: string) => unkn
 }
 
 // 복원기의 나머지 두 포트는 이 PR의 범위가 아니다. 시험에서만 "판이 맞고 점유 없음"으로 채운다.
-const peers: PeersPort = { contracts: async () => [{ peer: "front-door", contract: "olive-control/v1" }] };
+const peers: PeersPort = { contracts: async () => [{ peer: "front-door", contract: CONTRACT_V2, policy: "match" }] };
 const occupancy: OccupancyPort = { occupancy: async () => [] };
 function restorePorts(queries: FrontDoorRecoveryQueries): RestorePorts {
   return { ...recoveryPorts(queries), peers, occupancy };

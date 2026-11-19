@@ -6,11 +6,11 @@ import { clock, digest, id, must, NOW, open, ready, session, startedWorker, temp
 
 const OPTS = { requiredPeers: ["front-door"] };
 
-// 시험용 가짜 포트. 기본은 "기록 없음, 모두 v1, 점유 없음, 게시는 대기".
+// 시험용 가짜 포트. 기본은 "기록 없음, 현관은 v2와 맞은 정책, 점유 없음, 게시는 대기".
 function ports(overrides: Partial<{ [K in keyof RestorePorts]: Partial<RestorePorts[K]> }> = {}): RestorePorts {
   return {
     stopAuthority: { latestStop: async () => null, ...overrides.stopAuthority },
-    peers: { contracts: async () => [{ peer: "front-door", contract: "olive-control/v1" }], ...overrides.peers },
+    peers: { contracts: async () => [{ peer: "front-door", contract: "olive-control/v2", policy: "match" }], ...overrides.peers },
     occupancy: { occupancy: async () => [], ...overrides.occupancy },
     publications: { lookup: async () => ({ kind: "pending" as const }), ...overrides.publications },
   };
@@ -148,7 +148,7 @@ test("복원: 정지 중이면 접수를 열지 않는다", async () => {
 });
 
 test("복원: 이웃의 계약 판이 다르면 접수를 열지 않는다", async () => {
-  const restorer = new Restorer(open(tempPath()), ports({ peers: { contracts: async () => [{ peer: "front-door", contract: "olive-control/v2" }] } }), clock, OPTS);
+  const restorer = new Restorer(open(tempPath()), ports({ peers: { contracts: async () => [{ peer: "front-door", contract: "olive-control/v1", policy: "match" }] } }), clock, OPTS);
   const { s5 } = await all(restorer);
   expect(s5).toMatchObject({ intakeMayOpen: false, closedBecause: ["contract_mismatch"] });
 });

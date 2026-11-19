@@ -62,11 +62,19 @@ test("정적: 계약 모듈은 입출력·프로세스·시계·무작위 API를
   }
 });
 
+// 계약 폴더 밖이 읽을 수 있는 것은 각 판의 공개 면(v1·v2의 index.ts)뿐이다. 판의 내부 모듈은 막는다.
+const CONTRACT_FACE = /contract\/v[12]\/index\.ts$/;
+
 test("정적: 그 밖의 src/는 계약을 index.ts로만 import한다", async () => {
   for (const file of await list("src/**/*.ts")) {
     if (file.startsWith("src/contract/")) continue;
     for (const { path } of transpiler.scanImports(await readText(file))) {
-      if (path.includes("contract/")) expect(path, file).toMatch(/contract\/v1\/index\.ts$/);
+      if (path.includes("contract/")) expect(path, file).toMatch(CONTRACT_FACE);
     }
+  }
+  // 규칙이 실제로 가르는지 본다: 두 판의 공개 면만 받고, 내부 모듈과 없는 판은 걸린다.
+  for (const ok of ["../contract/v1/index.ts", "../contract/v2/index.ts", "../../contract/v2/index.ts"]) expect(ok).toMatch(CONTRACT_FACE);
+  for (const bad of ["../contract/v2/limits.ts", "../contract/v2/actions.ts", "../contract/v1/limits.ts", "../contract/v3/index.ts", "../contract/v2/sub/index.ts", "../contract/v2/index.tsx"]) {
+    expect(bad).not.toMatch(CONTRACT_FACE);
   }
 });

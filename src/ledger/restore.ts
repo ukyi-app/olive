@@ -5,7 +5,8 @@
 // 1단계를 시작할 때마다 장부에 새 복원 시도를 연다. 앞 시도의 접수 허가는 그때 끝나고, 앞 시도의 늦은 응답은 장부를 바꾸지 못한다.
 // 5단계는 지금의 시도와 정지 상태를 확인한 같은 동기 구간에서 완료 표시, 장부의 허가, 반환값을 정한다.
 // 반환값은 그 순간의 판정이다. 그 뒤의 판단(stopGeneration, intakeOpen)은 단계 결과가 아니라 지금의 장부에서 읽는다.
-import { CONTRACT, parsePrincipal, queriesAfterReconnect, type RunStatus } from "../contract/v1/index.ts";
+import { CONTRACT as CONTRACT_V1, parsePrincipal, queriesAfterReconnect, type RunStatus } from "../contract/v1/index.ts";
+import { CONTRACT as CONTRACT_V2 } from "../contract/v2/index.ts";
 import { type Ledger, type PendingInputs, type PendingReport, RESTORE_KEY, type RestoreAttempt, type Run, type SlotHold, type SlotHoldObservation, type SnapshotOrigin } from "./ledger.ts";
 import { SLOT_FREE, TERMINAL } from "./states.ts";
 
@@ -16,9 +17,20 @@ export interface StopAuthorityPort {
   latestStop(): Promise<{ generation: number; stopped: boolean } | null>;
 }
 
+// 그 이웃과의 인사에서 확인한 정책 revision의 대조 결과. 인사를 마치지 못했거나 확인하지 못했으면 "unknown"이다.
+export type PeerPolicy = "match" | "mismatch" | "unknown";
+
+// 이웃 하나의 응답. contract는 그 연결이 실제로 쓰는 계약 식별자 그대로다(다른 판의 이름으로 바꿔 싣지 않는다).
+// policy는 인사에서 확인한 값만 싣는다. 현관의 행에서 칸이 없으면 모름으로 읽는다.
+export interface PeerContractAnswer {
+  peer: string;
+  contract: string;
+  policy?: PeerPolicy;
+}
+
 // 이웃(현관, 관측 중계, 실행기)이 쓰는 계약 판. 던지면 모름. 설정된 필수 이웃이 정확히 한 번씩 답해야 맞은 것으로 센다.
 export interface PeersPort {
-  contracts(): Promise<{ peer: string; contract: string }[]>;
+  contracts(): Promise<PeerContractAnswer[]>;
 }
 
 // 실행기 하나의 점유 응답. 검증을 통과한 hello·status_report의 낸 쪽 주체 이름과 runs만 넘긴다.
@@ -83,6 +95,8 @@ export interface Step2 {
   // 장부에는 종료 확인이 있는데 실행기는 아직 돌고 있다고 답한 실행. 3단계가 상태를 다시 묻는다.
   recheck: string[];
   contractMismatches: { peer: string; contract: string }[];
+  // 정책이 맞다고 확인되지 않은 이웃. 아는 값이 아니거나 현관 행에 칸이 없으면 "unknown"이다.
+  policyMismatches: { peer: string; policy: "mismatch" | "unknown" }[];
   missingPeers: string[];
   duplicatePeers: string[];
 }
@@ -106,7 +120,7 @@ export interface Step4 {
   unknown: string[];
 }
 
-export type ClosedBecause = "snapshot_hold" | "stopped" | "stop_unknown" | "stop_changed" | "contract_mismatch" | "peer_unconfirmed" | "occupancy_unresolved" | "occupancy_unconfirmed" | "ledger_unwritable";
+export type ClosedBecause = "snapshot_hold" | "stopped" | "stop_unknown" | "stop_changed" | "contract_mismatch" | "policy_mismatch" | "peer_unconfirmed" | "occupancy_unresolved" | "occupancy_unconfirmed" | "ledger_unwritable";
 
 export interface Step5 {
   // 이 단계가 끝난 순간의 판정이다. 그 뒤의 판단은 intakeOpen()으로 읽는다.
@@ -159,6 +173,14 @@ function slotKind(executorId: string): "worker" | "session" | undefined {
   if (principal?.kind === "worker_executor") return "worker";
   if (principal?.kind === "session_executor") return "session";
   return undefined;
+}
+
+// 이웃마다 기대하는 계약 판(D-65)을 가르는 종류. 복원기가 이웃의 이름으로 가른다: 현관(`front-door`)은 v2, 그 밖은 v1이다.
+// 실행기는 v1 그대로이고, 관측 중계처럼 이름이 계약의 주체가 아닌 이웃도 v1을 기대한다(관측 중계의 계약은 아직 정하지 않았다).
+// 응답 행이 밝힌 판으로 기대를 고르지 않는다: 그러면 현관이 v1이라고 답해도 v1 이웃으로 통과한다.
+// v2는 후보다(README "계약 olive-control/v2"). 이 대조를 통과했다는 것은 v2로 실제 연결을 켜도 된다는 뜻이 아니다.
+function isFrontDoor(peer: string): boolean {
+  return parsePrincipal(peer)?.kind === "front_door";
 }
 
 const ACTIVE_REPORTED = (state: RunStatus["state"]) => !["finalized", "not_started", "not_known"].includes(state);
@@ -245,14 +267,14 @@ export class Restorer {
     });
   }
 
-  // 2. 계약 판을 맞추고 장부의 실행과 실행기의 점유를 실행 ID·세대·지정 실행기·양쪽 상태로 대조한다.
+  // 2. 이웃마다 그 이웃의 계약 판과 정책을 맞추고 장부의 실행과 실행기의 점유를 실행 ID·세대·지정 실행기·양쪽 상태로 대조한다.
   // 장부 밖 실행은 종료 대상이고 장부에 실행으로 올리지 않는다. 남긴 관측은 그 실행 ID의 시작을 영영 막고, 활동 중이면 그 종류의 슬롯도 막는다.
   // 관측으로 남기지 않는 불일치: 이미 시작한 실행 줄이 슬롯을 쥔 채 끝났다고 답한 경우와 끝난 상태끼리 이름만 다른 경우다(장부의 줄이 이미 막는다).
   step2(): Promise<Step2> {
     return this.#step(
       2,
       async () => {
-        let contracts: { peer: string; contract: string }[];
+        let contracts: PeerContractAnswer[];
         let occupancy: OccupancyAnswer[];
         try {
           contracts = await this.ports.peers.contracts();
@@ -272,14 +294,23 @@ export class Restorer {
           occupancyUnconfirmed: [],
           recheck: [],
           contractMismatches: [],
+          policyMismatches: [],
           missingPeers: [],
           duplicatePeers: [],
         };
 
         const seen = new Map<string, number>();
+        // 기대 집합 밖의 이웃 행도 판과 정책을 대조한다(어긋나면 닫는다). 누락·중복은 기대 집합의 이웃만 센다.
         for (const answer of contracts) {
           seen.set(answer.peer, (seen.get(answer.peer) ?? 0) + 1);
-          if (answer.contract !== CONTRACT) out.contractMismatches.push({ peer: answer.peer, contract: answer.contract });
+          const frontDoor = isFrontDoor(answer.peer);
+          if (answer.contract !== (frontDoor ? CONTRACT_V2 : CONTRACT_V1)) out.contractMismatches.push({ peer: answer.peer, contract: answer.contract });
+          // 정책(D-72): 현관 행은 맞음을 밝혀야 하고 칸이 없으면 모름이다. 다른 이웃은 칸을 실었을 때만 본다. 실행기 v1의 정책
+          // revision은 이 행이 아니라 hello에서 배정이 대조한다(src/supervisor/roles/assign.ts의 policy_revision_mismatch).
+          const policy = answer.policy;
+          if (policy !== "match" && (frontDoor || policy !== undefined)) {
+            out.policyMismatches.push({ peer: answer.peer, policy: policy === "mismatch" ? "mismatch" : "unknown" });
+          }
         }
         for (const peer of this.#requiredPeers) {
           const n = seen.get(peer) ?? 0;
@@ -436,6 +467,7 @@ export class Restorer {
       if (stop.value === null) closedBecause.push("stop_unknown");
       else if (stop.value.stopped) closedBecause.push("stopped");
       if (step2.contractMismatches.length > 0) closedBecause.push("contract_mismatch");
+      if (step2.policyMismatches.length > 0) closedBecause.push("policy_mismatch");
       if (step2.missingPeers.length > 0 || step2.duplicatePeers.length > 0) closedBecause.push("peer_unconfirmed");
       if (step2.unresolvedExecutors.length > 0) closedBecause.push("occupancy_unresolved");
       if (step2.occupancyUnconfirmed.length > 0) closedBecause.push("occupancy_unconfirmed");
