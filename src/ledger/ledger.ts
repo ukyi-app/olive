@@ -538,14 +538,17 @@ function toToolRequest(row: ToolRequestRow): ToolRequest {
 export interface InstructionTimes {
   runId: string;
   // 판단(nextIntent)이 살아 있는 임대로 쓰는 값: 임대를 준 지시의 발행 시각과 그 임대의 끝.
-  // 갱신 지시(run_renew)가 하나라도 있으면 기록된 갱신 발행 시각의 최댓값과 "unknown"이다. 장부는 감독이 발급한 끝(renewIssued)을
-  // 갖지만 실행기가 그 끝을 적용했는지는 모른다: 실행기는 갱신을 앞 임대가 끝난 뒤에 받으면 연장하지 않고 닫으므로, 앞 임대 안에
-  // 발급한 갱신이라도 늦게 닿으면 발급한 끝은 살아 있지 않은 임대다. 발행 시각이 시작보다 이르게 기록됐어도 시작 임대로 돌아가지 않는다.
+  // 갱신 지시(run_renew)가 하나라도 있으면 발행 시각은 기록된 갱신 발행 시각의 최댓값이고, 끝은 발급 기록의 끝이 숫자이며 시작 임대부터
+  // 그 갱신까지 모든 갱신이 앞 임대의 끝보다 RENEW_MARGIN_MS 이상 앞서 발행됐을 때만 그 끝, 아니면 "unknown"이다.
+  // 실행기 계약 v1에는 갱신의 영수증이 없어 실행기가 그 끝을 적용했는지 장부는 모른다. 실행기는 갱신을 앞 임대가 끝난 뒤(정각 포함)에
+  // 받으면 연장하지 않고 닫는데, 여유를 두고 낸 갱신은 전달 상한 안에 닿으면 그 전에 닿으므로 끝을 믿는다(D-89 후보).
+  // 그 갱신이 전달 중에 사라지면 이 값은 실행기의 끝보다 최대 RUN_LEASE_MAX_MS - RENEW_MARGIN_MS 늦다(ledger.md "남는 한계").
+  // 종료 영수증·끊김 표시는 실행 상태를 옮겨 이 값보다 먼저 판단을 바꾼다. 발행 시각이 시작보다 이르게 기록됐어도 시작 임대로 돌아가지 않는다.
   // 갱신이 없을 때만 시작 지시의 임대다: 시작 지시는 계약이 정한 끝(발행 시각 + RUN_LEASE_MAX_MS), 세션 시작 지시는 "unknown".
   // 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝을 낸다(살아 있지 않은 임대를 살아 있다고 내지 않는 쪽).
   lease: { issuedAt: number; expiresAt: number | "unknown" } | null;
   // 감독이 발급한 마지막 갱신의 기록(발급 기록): 발행 시각이 가장 큰 갱신의 시각과 그 지시 본문에 실은 끝. 갱신이 없으면 null.
-  // 실행기가 이 끝을 적용했다는 근거가 아니다. 살아 있는 임대로 판단에 넘기지 않는다(그 값은 lease다).
+  // 여유 없이 낸 갱신의 끝도 담는다. 판단에는 이 칸이 아니라 lease를 넘긴다.
   // 끝은 갱신마다 끝이 있고, 시각이 시작 뒤로 엄격히 늘고, 각 갱신이 앞 임대(시작 임대, 그 뒤로는 앞 갱신이 발급한 끝)가 끝나기 전에
   // 발행됐을 때만 낸다. 아니면(이 판 전의 줄, 순서가 어긋나 끝을 적지 않은 갱신, 끝난 임대 뒤의 갱신) "unknown"이다.
   renewIssued: { issuedAt: number; leaseUntil: number | "unknown" } | null;
@@ -572,17 +575,26 @@ function startLeaseOf(rows: readonly InstructionTime[]): InstructionTimes["lease
   return { issuedAt: startAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
 }
 
-// 발급 기록(renewIssued). 갱신을 발행 시각 순서로 시작 임대부터 이어 본다: recordRenewInstruction이 앞 임대 지시보다 늦은 갱신에만
+// 갱신을 믿는 여유. 발행 시각 s의 갱신은 s + RENEW_MARGIN_MS <= 앞 임대의 끝일 때만 그 끝을 임대로 믿는다.
+// 실행기는 자기 시계의 받은 시각이 앞 임대의 끝 이상이면 연장하지 않는다. 전달은 DELIVERY_MAX_MS 미만이고, 끝은 감독 시계로 정한 값이라
+// 실행기 시계가 앞서는 만큼(계약이 허용하는 시계 오차 CLOCK_SKEW_MS) 일찍 닿는다. 그래서 받은 시각 < s + DELIVERY_MAX_MS + CLOCK_SKEW_MS
+// <= 앞 임대의 끝이 되어 등호(정각)도 믿는다. 수명 판단(lifecycle.ts의 RENEW_MARGIN_MS)이 같은 식을 쓴다: 장부의 공개 면을 늘리지 않고
+// 두 자리가 같은 값을 쓰는지는 경계 시험(test/ledger/lease-trust.test.ts)이 지킨다. 실행기 안의 처리 지연은 이 여유에 들지 않는다.
+const RENEW_MARGIN_MS = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS;
+
+// 갱신 사슬. 갱신을 발행 시각 순서로 시작 임대부터 이어 본다: recordRenewInstruction이 앞 임대 지시보다 늦은 갱신에만
 // 끝을 적으므로, 갱신마다 끝이 있으면 발행 시각 순서가 기록 순서이고 발행 시각이 가장 큰 갱신이 실제로 마지막에 발급한 갱신이다.
 // 이어 보는 중에 하나라도 맞지 않으면 끝은 모름이다: 끝이 없는 갱신, 앞 임대 지시보다 늦지 않은 갱신(시각이 기록 순서와 어긋났다),
 // 앞 임대가 끝난 시각 이후의 갱신(실행기는 이미 닫았고 지난 임대를 되살리지 않는다), 계약의 상한 밖의 끝.
-// 이 검사는 발행 시각만 본다. 실행기가 받은 시각은 장부에 없어, 다 맞아도 실행기가 그 끝을 적용했다는 뜻은 아니다.
-function renewIssuedOf(rows: readonly InstructionTime[], start: InstructionTimes["lease"]): InstructionTimes["renewIssued"] {
+// timely는 끝을 낸 사슬의 모든 갱신이 앞 임대의 끝보다 RENEW_MARGIN_MS 이상 앞서 발행됐는가다. 하나라도 늦으면 그 뒤가 다 제때여도 false다:
+// 늦은 갱신을 실행기가 거절했으면 실행기는 그 앞 임대의 끝에서 이미 닫았다.
+function renewChainOf(rows: readonly InstructionTime[], start: InstructionTimes["lease"]): { issuedAt: number; leaseUntil: number | "unknown"; timely: boolean } | null {
   const renews = rows.filter((row) => row.action === "run_renew").sort((a, b) => a.issuedAt - b.issuedAt);
   if (renews.length === 0) return null;
   const lastAt = renews[renews.length - 1].issuedAt;
   let issuedAt = start?.issuedAt ?? null;
   let end = start?.expiresAt ?? "unknown";
+  let timely = true;
   for (const renew of renews) {
     const fits =
       issuedAt !== null &&
@@ -592,11 +604,12 @@ function renewIssuedOf(rows: readonly InstructionTime[], start: InstructionTimes
       renew.issuedAt < end &&
       renew.issuedAt < renew.leaseUntil &&
       renew.leaseUntil <= renew.issuedAt + limits.RUN_LEASE_MAX_MS;
-    if (!fits) return { issuedAt: lastAt, leaseUntil: "unknown" };
+    if (!fits) return { issuedAt: lastAt, leaseUntil: "unknown", timely: false };
+    timely &&= renew.issuedAt + RENEW_MARGIN_MS <= (end as number);
     issuedAt = renew.issuedAt;
     end = renew.leaseUntil as number;
   }
-  return { issuedAt: lastAt, leaseUntil: end };
+  return { issuedAt: lastAt, leaseUntil: end, timely };
 }
 
 // 세션에 아직 전하지 않은 입력. 처리 위치는 세션들이 적은 위치의 최댓값이고 그 뒤의 입력만 센다.
@@ -1922,7 +1935,8 @@ export class Ledger {
   // 돌려주는 leaseUntil(now + RUN_LEASE_MAX_MS)을 이 지시 본문의 lease_until에, now를 머리의 issued_at에 그대로 싣는다. 계약이 허락하는
   // 가장 긴 갱신이다(parseRunRenew). 실행기는 앞 임대가 끝나기 전에 받았을 때만 그 값을 임대 끝으로 삼고, 받은 시각이 앞 임대의 끝
   // 이상이면 연장하지 않고 닫는다(worker.ts의 onRenew). 그래서 장부가 적는 끝은 감독이 발급한 끝이고, instructionTimes는 그것을
-  // 발급 기록(renewIssued)으로만 낸다. 장부는 그 끝을 lease_until에 적되, 같은 실행의 앞 임대 지시(시작·갱신) 가운데 발행 시각이
+  // 발급 기록(renewIssued)으로 내고, 앞 임대의 끝보다 RENEW_MARGIN_MS 이상 앞서 낸 갱신의 사슬일 때만 lease로도 낸다. 기록 자체는
+  // 앞 임대의 끝과 여유를 보지 않는다(늦은 갱신도 적히고 그 끝은 믿지 않는다). 장부는 그 끝을 lease_until에 적되, 같은 실행의 앞 임대 지시(시작·갱신) 가운데 발행 시각이
   // now 이상인 것이 있으면 적지 않는다(NULL). 장부에는 지시의 기록 순서가 없어 발급 기록은 발행 시각으로 마지막 갱신을 고른다.
   // 끝을 적은 갱신들의 시각이 기록 순서대로 엄격히 느는 것을 여기서만 지킬 수 있다.
   recordRenewInstruction(input: InstructionInput): { ok: true; leaseUntil: number } | Refused {
@@ -2062,9 +2076,10 @@ export class Ledger {
         return times.length === 0 ? null : Math.max(...times);
       };
       const start = startLeaseOf(rows);
-      const renewIssued = renewIssuedOf(rows, start);
-      // 갱신 뒤의 lease는 발급 기록의 끝이 숫자여도 모름이다(InstructionTimes.lease).
-      const lease: InstructionTimes["lease"] = renewIssued === null ? start : { issuedAt: renewIssued.issuedAt, expiresAt: "unknown" };
+      const chain = renewChainOf(rows, start);
+      const renewIssued: InstructionTimes["renewIssued"] = chain === null ? null : { issuedAt: chain.issuedAt, leaseUntil: chain.leaseUntil };
+      // 갱신 뒤의 lease는 사슬의 모든 갱신이 여유를 두고 발행됐을 때만 발급한 끝이다(InstructionTimes.lease).
+      const lease: InstructionTimes["lease"] = chain === null ? start : { issuedAt: chain.issuedAt, expiresAt: chain.timely ? chain.leaseUntil : "unknown" };
       return { runId, lease, renewIssued, lastStopAt: latest(["task_cancel", "session_stop"]), lastFinalizeAt: latest(["result_finalize"]) };
     });
   }
