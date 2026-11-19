@@ -100,6 +100,7 @@ src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다.
 ├── launcher.ts     # 역할 프로그램 띄우기(띄우는 곳은 여기 하나)
 ├── containment.ts  # 실제 전체 신호 능력을 만드는 제품 입구(PidSpace.record 한 자리)
 └── containment-core.ts # PID 공간의 스캔·종료·세기 알고리즘(신호 능력을 스스로 만들지 않는다)
+src/ledger/         # 감독 장부(SQLite)와 재시작 복원, 요약은 src/ledger/ledger.md
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
 test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/는 계약 시험과 fixture 생성, test/executor/는 실행기 시험과 가짜 역할 프로그램
 ```
