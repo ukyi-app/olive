@@ -403,6 +403,33 @@ export interface QueuedInput {
   sourceRef: SourceRef;
 }
 
+// 접수한 입력 한 줄(listInputs). source는 접수 때 받은 출처 이름 그대로다. 관리자 요청인지 경보인지 나누는 규칙은 접수 정책의
+// 몫이라 장부가 정하지 않는다. 처리 위치와 무관하게 모든 입력을 낸다.
+export interface InputEntry {
+  requestId: string;
+  seq: number;
+  source: string;
+  receivedAt: number;
+  expiresAt: number;
+  cancelled: boolean;
+}
+
+// 실행 하나의 지시 이력에서 판단이 쓰는 시각(instructionTimes). null은 그런 지시를 낸 적이 없음을 장부에서 확인한 값이다.
+// 읽지 못한 것은 이 값이 아니라 Read의 known: false다.
+export interface InstructionTimes {
+  runId: string;
+  // 임대를 준 지시의 발행 시각과 그 임대의 끝. 갱신 지시(run_renew)가 하나라도 있으면 기록된 갱신 발행 시각의 최댓값과
+  // "unknown"이다(갱신의 임대 끝은 장부가 적지 않는다. 발행 시각이 시작보다 이르게 기록됐어도 시작 임대로 돌아가지 않는다).
+  // 갱신이 없을 때만 시작 지시의 임대다: 시작 지시는 계약이 정한 끝(발행 시각 + RUN_LEASE_MAX_MS), 세션 시작 지시는 "unknown".
+  // 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝을 낸다(살아 있지 않은 임대를 살아 있다고 내지 않는 쪽).
+  lease: { issuedAt: number; expiresAt: number | "unknown" } | null;
+  // 종료 지시(task_cancel·session_stop)와 확정 지시(result_finalize) 각각의 기록된 발행 시각의 최댓값. 마지막으로 기록한 행이
+  // 아니다(더 이른 시각으로 나중에 기록한 지시는 앞 지시의 시각에 가려진다). 지금 상태에 들어온 뒤의 것으로
+  // 좁히지 않는다(장부가 상태에 들어온 시각을 따로 적지 않는다).
+  lastStopAt: number | null;
+  lastFinalizeAt: number | null;
+}
+
 // 세션에 아직 전하지 않은 입력. 처리 위치는 세션들이 적은 위치의 최댓값이고 그 뒤의 입력만 센다.
 export interface PendingInputs {
   processedSeq: number;
@@ -1350,6 +1377,30 @@ export class Ledger {
     });
   }
 
+  // 접수한 입력 전부를 순번대로 낸다. 대기열(queueView)과 달리 처리 위치를 지난 입력도 낸다: 시작한 실행의 입력이 나중에
+  // 취소되면 그 취소를 실행 쪽 판단에 전해야 한다. 원문 참조는 싣지 않는다.
+  listInputs(): Read<InputEntry[]> {
+    return this.#read(() =>
+      (
+        this.#db.query("SELECT request_id, seq, source, received_at, source_expires_at, cancelled_at FROM inputs ORDER BY seq").all() as {
+          request_id: string;
+          seq: number;
+          source: string;
+          received_at: number;
+          source_expires_at: number;
+          cancelled_at: number | null;
+        }[]
+      ).map((row) => ({
+        requestId: row.request_id,
+        seq: safe(row.seq, "inputs.seq"),
+        source: row.source,
+        receivedAt: safe(row.received_at, "inputs.received_at"),
+        expiresAt: safe(row.source_expires_at, "inputs.source_expires_at"),
+        cancelled: row.cancelled_at !== null,
+      })),
+    );
+  }
+
   // 재시작 뒤 새 세션이 이어받을 입력. 처리 위치 뒤의 입력을 순번대로 내고, 취소·만료는 따로 낸다(전하지 않는다).
   #pendingInputs(now: number): PendingInputs {
     const processedSeq = safe((this.#db.query("SELECT COALESCE(MAX(processed_seq), 0) AS n FROM sessions").get() as { n: number }).n, "processed_seq");
@@ -1628,6 +1679,35 @@ export class Ledger {
 
   listRuns(): Read<Run[]> {
     return this.#read(() => (this.#db.query("SELECT * FROM runs ORDER BY queue_seq").all() as RunRow[]).map(toRun));
+  }
+
+  // 실행의 지시 이력 시각. 없는 실행이면 null이다. 장부를 바꾸지 않는다.
+  instructionTimes(runId: string): Read<InstructionTimes | null> {
+    return this.#read(() => {
+      if (this.#runRow(runId) === null) return null;
+      const rows = this.#db.query("SELECT action, issued_at FROM instructions WHERE run_id = ?").all(runId) as { action: InstructionAction; issued_at: number }[];
+      const latest = (actions: readonly InstructionAction[]): number | null => {
+        const times = rows.filter((row) => actions.includes(row.action)).map((row) => safe(row.issued_at, "instructions.issued_at"));
+        return times.length === 0 ? null : Math.max(...times);
+      };
+      // 갱신은 시작 뒤에만 기록되지만 발행 시각은 부르는 쪽이 넘긴 값이라 시작보다 이를 수 있다. 시각의 최댓값으로 고르면
+      // 그런 갱신이 가려져 시작 임대를 아는 것처럼 내므로, 갱신이 하나라도 있으면 시각과 무관하게 임대 끝을 모름으로 낸다.
+      const renewedAt = latest(["run_renew"]);
+      let lease: InstructionTimes["lease"] = null;
+      if (renewedAt !== null) {
+        lease = { issuedAt: renewedAt, expiresAt: "unknown" };
+      } else {
+        const issuedAt = latest(["task_start", "session_start"]);
+        if (issuedAt !== null) {
+          const ends = rows
+            .filter((row) => ["task_start", "session_start"].includes(row.action) && row.issued_at === issuedAt)
+            .map((row) => (row.action === "task_start" ? issuedAt + limits.RUN_LEASE_MAX_MS : null));
+          const known = ends.every((end) => end !== null && Number.isSafeInteger(end));
+          lease = { issuedAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
+        }
+      }
+      return { runId, lease, lastStopAt: latest(["task_cancel", "session_stop"]), lastFinalizeAt: latest(["result_finalize"]) };
+    });
   }
 
   // 계약의 VerifyContext.runGeneration에 넘긴다. 읽기가 실패하면 undefined(장부 밖)가 아니라 던진다.

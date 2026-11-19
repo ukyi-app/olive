@@ -87,6 +87,22 @@
 - **인계 참조:** `handoffRef`는 저장소가 낸 불투명 ID 꼴(`<저장소 이름>/<UUID>`)만 받고 `handoffDigest`와 함께 있거나 함께 없다. 인계 저장소의 실제 ID 꼴이 설계에 없어 장부가 받을 수 있는 가장 좁은 꼴로 정했다.
 - **못 씀:** 쓰기나 읽기가 한 번 실패하면 다시 열 때까지 "쓸 수 없음"이다. 새 업무와 규칙 확인·풀기는 `ledger_unwritable`. 정지·종료·영수증·nonce의 기록은 계속 시도한다. 읽기 실패는 `{ known: false }`이고 `runGeneration`과 nonce 소비는 던진다(장부 밖이나 재사용으로 바꾸지 않는다). "모름"은 그 읽기가 실패했을 때다. 실패한 뒤에도 성공한 읽기는 값을 준다(새 업무는 위 1로 닫혀 있다).
 
+## 스케줄러가 쓰는 읽기
+
+스케줄러의 판단(`src/supervisor/scheduler/`의 `planNext`·`nextIntent`)은 상태를 갖지 않고 장부에서 읽은 것을 인자로 받는다. 그 입력은 공개 읽기 `queueView`·`listRuns`·`slotHolds`와 아래 둘로 조립한다. 둘 다 장부를 바꾸지 않고, 원문·원문 참조·자격 값을 싣지 않는다.
+
+| 공개 함수 | 돌려주는 것 | 쓰는 곳 |
+|---|---|---|
+| `listInputs()` | `Read<InputEntry[]>`. 접수한 입력 전부를 순번대로: `requestId`, `seq`, `source`(접수 때 받은 출처 이름 그대로), `receivedAt`, `expiresAt`(원문 만료), `cancelled`. 처리 위치(`processedSeq`)를 지난 입력도 낸다 | `planNext`의 입력(`origin`·`receivedAt`·`expiresAt`·`cancelled`), 시작한 실행의 `cancelRequested` |
+| `instructionTimes(runId)` | `Read<InstructionTimes \| null>`. 없는 실행이면 `null`. `lease`(임대를 준 지시의 `issuedAt`과 임대 끝 `expiresAt`), `lastStopAt`(`task_cancel`·`session_stop`의 기록된 발행 시각 최댓값), `lastFinalizeAt`(`result_finalize`의 기록된 발행 시각 최댓값) | `nextIntent`의 `lease`·`lastInstructionAt` |
+
+- **출처 이름은 분류하지 않는다.** `source`를 관리자 요청과 자동 경보로 나누는 규칙은 접수 정책의 몫이다. 장부는 `enqueueInput`이 받은 이름을 그대로 낸다.
+- **모름과 미발행:** 읽기가 실패하면 `{ known: false }`다. 읽기가 성공했을 때 `lease`·`lastStopAt`·`lastFinalizeAt`의 `null`은 그런 지시를 낸 적이 없음을 장부에서 확인한 값이다. `lease.expiresAt`의 `"unknown"`은 지시는 있는데 그 임대의 끝을 장부가 갖지 않는다는 뜻이다. 0이나 짐작한 값으로 채우지 않는다.
+- **임대의 끝:** 시작 지시(`task_start`)의 임대 끝은 계약이 정한 값(발행 시각 + `RUN_LEASE_MAX_MS`, 실행기가 머리의 `issued_at`에서 같은 식으로 정한다)이라 장부의 `issued_at`에서 계산한다. 지시의 머리에 장부의 `issued_at`보다 이른 시각을 실으면 이 값이 실제보다 늦어진다. **갱신 지시(`run_renew`)와 세션 시작 지시의 임대 끝은 장부에 없어 언제나 `"unknown"`이다.** 갱신 지시가 하나라도 있으면 `lease`는 기록된 갱신 발행 시각의 최댓값과 `"unknown"`이다. 갱신의 발행 시각은 부르는 쪽이 넘긴 값이라 시작보다 이르게 기록될 수 있어도 시작 임대로 돌아가지 않는다. 그래서 갱신을 한 번 낸 실행은 그 뒤로 `nextIntent`가 갱신 대신 같은 ID 조회를 낸다. 갱신이 없을 때만 시작 지시의 임대이고, 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝이다.
+- **종료·확정은 발행 시각의 최댓값:** `lastStopAt`·`lastFinalizeAt`은 마지막으로 기록한 행이 아니라 기록된 발행 시각의 최댓값이다. 더 이른 시각으로 나중에 기록한 지시는 앞 지시의 시각에 가려진다.
+- **지금 상태로 좁히지 않는다:** 장부는 실행이 지금 상태에 들어온 시각을 따로 적지 않는다. `lastStopAt`·`lastFinalizeAt`은 상태와 무관한 그 실행의 마지막 지시다. 예를 들어 `cleanup_pending`의 `lastFinalizeAt`은 그 앞 상태에서 낸 확정 지시일 수 있고, 그러면 확정 재시도가 그 시각부터 답을 기다린 뒤에 나온다.
+- **아직 없는 것:** 갱신 지시의 임대 끝을 적는 칸. 칸은 다음 번호의 판(`instructions`에 NULL 허용 칸 하나, 기존 줄은 NULL=모름)으로 더한다. 판을 더하면 판의 수를 하나로 고정한 기존 시험(`test/ledger/crash.test.ts`의 `migrated: { from: 0, to: 1 }`, `test/ledger/regress5.test.ts`의 `[...loadMigrations(), { version: 2, … }]`)을 판의 수에 맞게 함께 고쳐야 한다.
+
 ## 세션 증거
 
 v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느 대기 실행의 시작 근거인지 장부가 정할 수 없다. 그래서 이 PR은 증거를 받아 적고 읽는 데서 멈춘다.
