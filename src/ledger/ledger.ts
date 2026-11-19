@@ -418,8 +418,9 @@ export interface InputEntry {
 // 읽지 못한 것은 이 값이 아니라 Read의 known: false다.
 export interface InstructionTimes {
   runId: string;
-  // 임대를 준 지시의 발행 시각과 그 임대의 끝. 갱신 지시(run_renew)가 하나라도 있으면 기록된 갱신 발행 시각의 최댓값과
-  // "unknown"이다(갱신의 임대 끝은 장부가 적지 않는다. 발행 시각이 시작보다 이르게 기록됐어도 시작 임대로 돌아가지 않는다).
+  // 임대를 준 지시의 발행 시각과 그 임대의 끝(leaseOf). 갱신 지시(run_renew)가 있으면 마지막 갱신, 곧 발행 시각이 가장 큰 갱신의
+  // 시각과 장부가 적은 끝이다. 갱신마다 끝이 있고, 시각이 시작 뒤로 엄격히 늘고, 각 갱신이 앞 임대가 끝나기 전에 났을 때만 끝을 낸다.
+  // 아니면(이 판 전의 줄, 순서가 어긋나 끝을 적지 않은 갱신, 끝난 임대 뒤의 갱신) 그 시각과 "unknown"이다.
   // 갱신이 없을 때만 시작 지시의 임대다: 시작 지시는 계약이 정한 끝(발행 시각 + RUN_LEASE_MAX_MS), 세션 시작 지시는 "unknown".
   // 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝을 낸다(살아 있지 않은 임대를 살아 있다고 내지 않는 쪽).
   lease: { issuedAt: number; expiresAt: number | "unknown" } | null;
@@ -428,6 +429,47 @@ export interface InstructionTimes {
   // 좁히지 않는다(장부가 상태에 들어온 시각을 따로 적지 않는다).
   lastStopAt: number | null;
   lastFinalizeAt: number | null;
+}
+
+interface InstructionTime {
+  action: InstructionAction;
+  issuedAt: number;
+  leaseUntil: number | null;
+}
+
+// 실행 하나의 지시들에서 지금 임대를 고른다. 모르는 끝을 0이나 짐작한 값으로 채우지 않고 "unknown"으로 낸다.
+// 갱신은 발행 시각 순서로 이어 본다: recordRenewInstruction이 앞 임대 지시보다 늦은 갱신에만 끝을 적으므로, 갱신마다 끝이 있으면
+// 발행 시각 순서가 기록 순서이고 발행 시각이 가장 큰 갱신이 실제로 마지막에 낸 갱신이다. 그 끝을 내되, 이어 보는 중에 하나라도
+// 맞지 않으면 모름이다: 끝이 없는 갱신, 시작 지시보다 늦지 않은 갱신(시작 뒤에만 적히므로 시각이 기록 순서와 어긋났다),
+// 앞 임대가 끝난 시각 이후의 갱신(실행기는 이미 닫았고 지난 임대를 되살리지 않는다), 계약의 상한 밖의 끝.
+function leaseOf(rows: readonly InstructionTime[]): InstructionTimes["lease"] {
+  const starts = rows.filter((row) => row.action === "task_start" || row.action === "session_start");
+  const startAt = starts.length === 0 ? null : Math.max(...starts.map((row) => row.issuedAt));
+  let lease: InstructionTimes["lease"] = null;
+  if (startAt !== null) {
+    const ends = starts.filter((row) => row.issuedAt === startAt).map((row) => (row.action === "task_start" ? startAt + limits.RUN_LEASE_MAX_MS : null));
+    const known = ends.every((end) => end !== null && Number.isSafeInteger(end));
+    lease = { issuedAt: startAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
+  }
+  const renews = rows.filter((row) => row.action === "run_renew").sort((a, b) => a.issuedAt - b.issuedAt);
+  if (renews.length === 0) return lease;
+  const lastAt = renews[renews.length - 1].issuedAt;
+  let issuedAt = startAt;
+  let end = lease?.expiresAt ?? "unknown";
+  for (const renew of renews) {
+    const fits =
+      issuedAt !== null &&
+      end !== "unknown" &&
+      renew.leaseUntil !== null &&
+      issuedAt < renew.issuedAt &&
+      renew.issuedAt < end &&
+      renew.issuedAt < renew.leaseUntil &&
+      renew.leaseUntil <= renew.issuedAt + limits.RUN_LEASE_MAX_MS;
+    if (!fits) return { issuedAt: lastAt, expiresAt: "unknown" };
+    issuedAt = renew.issuedAt;
+    end = renew.leaseUntil as number;
+  }
+  return { issuedAt: lastAt, expiresAt: end };
 }
 
 // 세션에 아직 전하지 않은 입력. 처리 위치는 세션들이 적은 위치의 최댓값이고 그 뒤의 입력만 센다.
@@ -1573,20 +1615,34 @@ export class Ledger {
   }
 
   // 실행 갱신(run_renew) 지시. 기존 실행의 임대를 늘리는 것이라 새 일과 같은 전제(접수 열림, 정지 아님, 지금 세대)를 본다.
-  recordRenewInstruction(input: InstructionInput): { ok: true } | Refused {
+  // 돌려주는 leaseUntil(now + RUN_LEASE_MAX_MS)을 이 지시 본문의 lease_until에, now를 머리의 issued_at에 그대로 싣는다. 계약이 허락하는
+  // 가장 긴 갱신이고(parseRunRenew), 실행기는 그 값이 지금 임대 끝보다 늦으면 그대로 임대 끝으로 삼는다(worker.ts의 onRenew).
+  // 장부는 그 끝을 lease_until에 적되, 같은 실행의 앞 임대 지시(시작·갱신) 가운데 발행 시각이 now 이상인 것이 있으면 적지 않는다(NULL).
+  // 장부에는 지시의 기록 순서가 없어 instructionTimes는 발행 시각으로 마지막 갱신을 고른다. 끝을 적은 갱신들의 시각이 기록 순서대로
+  // 엄격히 느는 것을 여기서만 지킬 수 있다.
+  recordRenewInstruction(input: InstructionInput): { ok: true; leaseUntil: number } | Refused {
     const v = exact(input, ["runId", "requestId", "stopGeneration", "now"], "recordRenewInstruction");
     const runId = str(v.runId, UUID, "runId");
     const requestId = str(v.requestId, UUID, "requestId");
     const stopGeneration = count(v.stopGeneration, "stopGeneration");
     const now = time(v.now, "now");
+    const leaseUntil = now + limits.RUN_LEASE_MAX_MS;
+    // 계약의 시각도 안전 정수다. 넘으면 이 지시의 본문을 만들 수 없다.
+    if (!Number.isSafeInteger(leaseUntil)) throw new LedgerInputError("now: 임대 끝이 안전 정수를 넘는다");
     return this.#write("renew_instruction", "start", () => {
       this.#requireStopGeneration(stopGeneration);
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
       if (!["preparing", "running"].includes(row.state)) throw new Refuse("transition_denied");
       if (row.run_generation !== this.#epoch()) throw new Refuse("run_generation_stale");
-      this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'run_renew', ?, ?)").run(requestId, runId, stopGeneration, now);
-      return { ok: true as const };
+      const prior = this.#db
+        .query("SELECT MAX(issued_at) AS at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'session_start', 'run_renew')")
+        .get(runId) as { at: number | null };
+      const inOrder = prior.at === null || safe(prior.at, "instructions.issued_at") < now;
+      this.#db
+        .query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at, lease_until) VALUES (?, ?, 'run_renew', ?, ?, ?)")
+        .run(requestId, runId, stopGeneration, now, inOrder ? leaseUntil : null);
+      return { ok: true as const, leaseUntil };
     });
   }
 
@@ -1685,28 +1741,22 @@ export class Ledger {
   instructionTimes(runId: string): Read<InstructionTimes | null> {
     return this.#read(() => {
       if (this.#runRow(runId) === null) return null;
-      const rows = this.#db.query("SELECT action, issued_at FROM instructions WHERE run_id = ?").all(runId) as { action: InstructionAction; issued_at: number }[];
+      const rows = (
+        this.#db.query("SELECT action, issued_at, lease_until FROM instructions WHERE run_id = ?").all(runId) as {
+          action: InstructionAction;
+          issued_at: number;
+          lease_until: number | null;
+        }[]
+      ).map((row) => ({
+        action: row.action,
+        issuedAt: safe(row.issued_at, "instructions.issued_at"),
+        leaseUntil: row.lease_until === null ? null : safe(row.lease_until, "instructions.lease_until"),
+      }));
       const latest = (actions: readonly InstructionAction[]): number | null => {
-        const times = rows.filter((row) => actions.includes(row.action)).map((row) => safe(row.issued_at, "instructions.issued_at"));
+        const times = rows.filter((row) => actions.includes(row.action)).map((row) => row.issuedAt);
         return times.length === 0 ? null : Math.max(...times);
       };
-      // 갱신은 시작 뒤에만 기록되지만 발행 시각은 부르는 쪽이 넘긴 값이라 시작보다 이를 수 있다. 시각의 최댓값으로 고르면
-      // 그런 갱신이 가려져 시작 임대를 아는 것처럼 내므로, 갱신이 하나라도 있으면 시각과 무관하게 임대 끝을 모름으로 낸다.
-      const renewedAt = latest(["run_renew"]);
-      let lease: InstructionTimes["lease"] = null;
-      if (renewedAt !== null) {
-        lease = { issuedAt: renewedAt, expiresAt: "unknown" };
-      } else {
-        const issuedAt = latest(["task_start", "session_start"]);
-        if (issuedAt !== null) {
-          const ends = rows
-            .filter((row) => ["task_start", "session_start"].includes(row.action) && row.issued_at === issuedAt)
-            .map((row) => (row.action === "task_start" ? issuedAt + limits.RUN_LEASE_MAX_MS : null));
-          const known = ends.every((end) => end !== null && Number.isSafeInteger(end));
-          lease = { issuedAt, expiresAt: known ? Math.min(...(ends as number[])) : "unknown" };
-        }
-      }
-      return { runId, lease, lastStopAt: latest(["task_cancel", "session_stop"]), lastFinalizeAt: latest(["result_finalize"]) };
+      return { runId, lease: leaseOf(rows), lastStopAt: latest(["task_cancel", "session_stop"]), lastFinalizeAt: latest(["result_finalize"]) };
     });
   }
 

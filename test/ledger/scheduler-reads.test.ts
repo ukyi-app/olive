@@ -3,10 +3,10 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { limits } from "../../src/contract/v1/index.ts";
-import { type Ledger, type LedgerRunState, TRANSITIONS } from "../../src/ledger/index.ts";
+import { type Ledger, type LedgerRunState, loadMigrations, type OpenResult, openLedger, TRANSITIONS } from "../../src/ledger/index.ts";
 import { type LifecyclePolicy, type LifecycleView, nextIntent } from "../../src/supervisor/scheduler/lifecycle.ts";
 import { type Origin, planNext, type SchedulerInput, type SchedulerPolicy, type SchedulerRun, type SchedulerView } from "../../src/supervisor/scheduler/queue.ts";
-import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, tempPath, worker } from "./helpers.ts";
+import { clock, digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, tempPath, worker } from "./helpers.ts";
 
 // 숫자는 이 시험이 고른 값이다. 운영값이 아니다.
 const POLICY: SchedulerPolicy = { alertMaxWaitMs: 60_000 };
@@ -143,10 +143,10 @@ test("미발행과 모름이 다른 값", () => {
   expect(ledger.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW, expiresAt: NOW + limits.RUN_LEASE_MAX_MS }, lastStopAt: null } });
   expect(nextIntent(lifecycle(ledger, runId, NOW + 10_000), LIFE).intent).toBe("renew_lease");
 
-  // 갱신 지시의 임대 끝은 장부가 적지 않는다: 발행 시각은 알고 끝은 모른다. 모르는 임대는 갱신하지 않고 같은 ID로 조회한다.
+  // 갱신 지시의 임대 끝도 장부가 적는다: 본문의 lease_until과 같은 발행 시각 + RUN_LEASE_MAX_MS. 그 임대 안이면 다시 갱신한다.
   must(ledger.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 10_000 }));
-  expect(ledger.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW + 10_000, expiresAt: "unknown" } } });
-  expect(nextIntent(lifecycle(ledger, runId, NOW + 20_000), LIFE).intent).toBe("query");
+  expect(ledger.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW + 10_000, expiresAt: NOW + 10_000 + limits.RUN_LEASE_MAX_MS } } });
+  expect(nextIntent(lifecycle(ledger, runId, NOW + 20_000), LIFE).intent).toBe("renew_lease");
 
   // 종료 지시를 냈으면 그 시각이 마지막 종료 지시다. 답을 기다릴 시간이 지나면 같은 ID로 조회한다.
   must(ledger.recordStopInstruction({ runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 20_000 }));
@@ -173,6 +173,188 @@ test("갱신을 시작보다 이른 시각으로 기록해도 재개방 뒤 임�
   const ledger = ready(open(path));
   expect(ledger.instructionTimes(runId)).toMatchObject({ known: true, value: { lease: { issuedAt: NOW - 1, expiresAt: "unknown" } } });
   expect(nextIntent(lifecycle(ledger, runId, NOW + 10_000), LIFE).intent).toBe("query");
+});
+
+// ---- 갱신 지시의 임대 끝(판 0002-renew-lease-end) ----
+
+const LEASE_END_VERSION = loadMigrations().findIndex((m) => m.name === "0002-renew-lease-end.sql") + 1;
+const MAX = limits.RUN_LEASE_MAX_MS;
+
+function opened(result: OpenResult): Ledger {
+  if (!result.ok) throw new Error(`열지 못함: ${result.reason} ${result.detail}`);
+  return result.ledger;
+}
+
+function failAt(point: string) {
+  return {
+    at(reached: string) {
+      if (reached === point) throw new Error(`주입한 실패: ${point}`);
+    },
+  };
+}
+
+function rawRows(path: string, sql: string, ...params: string[]): unknown[] {
+  const raw = new Database(path, { readonly: true });
+  try {
+    return raw.query(sql).all(...params);
+  } finally {
+    raw.close();
+  }
+}
+
+// 갱신 끝의 판을 적용하기 전의 장부: 코드의 앞 판들만 적용하고 실행을 NOW에 시작한 뒤, 그 판들의 코드가 갱신을 적던 문장 그대로
+// 갱신 한 줄을 넣는다(지금 코드는 끝 칸을 함께 적으므로 그 판의 장부에는 쓸 수 없다).
+function ledgerBeforeLeaseEnd(renewAt: number) {
+  expect(LEASE_END_VERSION).toBeGreaterThan(1);
+  const path = tempPath();
+  const first = ready(open(path, { migrations: loadMigrations().slice(0, LEASE_END_VERSION - 1) }));
+  const requestId = enqueue(first, "admin-dm", NOW);
+  const runId = must(first.admitRun(worker({ inputRequestId: requestId }))).run.runId;
+  must(first.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+  first.close();
+  const renewId = id();
+  const raw = new Database(path);
+  raw.run("PRAGMA foreign_keys = ON");
+  expect((raw.query("PRAGMA table_info(instructions)").all() as { name: string }[]).map((c) => c.name)).not.toContain("lease_until");
+  raw.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'run_renew', 0, ?)").run(renewId, runId, renewAt);
+  raw.close();
+  return { path, runId, renewId };
+}
+
+test("갱신한 실행이 다시 갱신된다", () => {
+  const path = tempPath();
+  const first = ready(open(path));
+  const requestId = enqueue(first, "admin-dm", NOW);
+  const runId = must(first.admitRun(worker({ inputRequestId: requestId }))).run.runId;
+  must(first.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+  expect(nextIntent(lifecycle(first, runId, NOW + 10_000), LIFE).intent).toBe("renew_lease");
+  // 돌려준 끝이 갱신 본문의 lease_until이다. 실행기는 이 값이 지금 임대보다 늦으면 그대로 임대 끝으로 삼는다.
+  expect(first.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 10_000 })).toEqual({ ok: true, leaseUntil: NOW + 10_000 + MAX });
+  first.close();
+
+  const second = ready(open(path));
+  expect(second.instructionTimes(runId)).toEqual({
+    known: true,
+    value: { runId, lease: { issuedAt: NOW + 10_000, expiresAt: NOW + 10_000 + MAX }, lastStopAt: null, lastFinalizeAt: null },
+  });
+  expect(nextIntent(lifecycle(second, runId, NOW + 15_000), LIFE).intent).toBe("wait");
+  expect(nextIntent(lifecycle(second, runId, NOW + 20_000), LIFE).intent).toBe("renew_lease");
+  must(second.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 20_000 }));
+  second.close();
+
+  const ledger = ready(open(path));
+  expect(ledger.instructionTimes(runId)).toMatchObject({ known: true, value: { lease: { issuedAt: NOW + 20_000, expiresAt: NOW + 20_000 + MAX } } });
+  // 시작 지시의 임대가 끝난 시각에도 갱신한 임대 안이라 다시 갱신한다.
+  expect(nextIntent(lifecycle(ledger, runId, NOW + MAX), LIFE).intent).toBe("renew_lease");
+  // 갱신한 임대가 끝나면 갱신하지 않고 같은 ID로 조회한다.
+  expect(nextIntent(lifecycle(ledger, runId, NOW + 20_000 + MAX), LIFE).intent).toBe("query");
+});
+
+test("이관 전 장부의 옛 갱신은 모름", () => {
+  const { path, runId, renewId } = ledgerBeforeLeaseEnd(NOW + 10_000);
+  const before = rawRows(path, "SELECT request_id, run_id, action, stop_generation, issued_at FROM instructions ORDER BY request_id");
+
+  const upgraded = openLedger(path, { clock, mode: "reopen" });
+  expect(upgraded).toMatchObject({ ok: true, migrated: { from: LEASE_END_VERSION - 1, to: loadMigrations().length } });
+  const ledger = ready(opened(upgraded));
+  const unknown = { known: true, value: { runId, lease: { issuedAt: NOW + 10_000, expiresAt: "unknown" }, lastStopAt: null, lastFinalizeAt: null } } as const;
+  expect(ledger.instructionTimes(runId)).toEqual(unknown);
+  expect(nextIntent(lifecycle(ledger, runId, NOW + 20_000), LIFE).intent).toBe("query");
+  ledger.close();
+
+  // 기존 줄의 값은 그대로이고 더한 칸만 NULL이다(0이나 계산값으로 채우지 않는다).
+  expect(rawRows(path, "SELECT request_id, run_id, action, stop_generation, issued_at FROM instructions ORDER BY request_id")).toEqual(before);
+  expect(rawRows(path, "SELECT lease_until FROM instructions")).toEqual([{ lease_until: null }, { lease_until: null }]);
+
+  // 다시 열어도 판은 한 번만 적용돼 있고 같은 값이다.
+  const again = openLedger(path, { clock, mode: "reopen" });
+  expect(again).toMatchObject({ ok: true, migrated: { from: loadMigrations().length, to: loadMigrations().length } });
+  const reopened = ready(opened(again));
+  expect(reopened.instructionTimes(runId)).toEqual(unknown);
+  // 옛 갱신 뒤에 새 갱신을 적어도, 앞 임대의 끝을 모르므로 그 사이에 임대가 끝났는지 알 수 없어 모름이다.
+  must(reopened.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 20_000 }));
+  expect(reopened.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW + 20_000, expiresAt: "unknown" } } });
+  reopened.close();
+  expect(rawRows(path, "SELECT lease_until FROM instructions WHERE request_id = ?", renewId)).toEqual([{ lease_until: null }]);
+});
+
+// 실행 하나를 NOW에 시작하고 갱신을 주어진 발행 시각 순서대로 기록한 뒤 다시 연다. 작업자 슬롯이 하나라 사례마다 장부를 따로 둔다.
+function renewedInOrder(renewAts: number[]) {
+  const path = tempPath();
+  const first = ready(open(path));
+  const runId = must(first.admitRun(worker({ inputRequestId: enqueue(first, "admin-dm", NOW) }))).run.runId;
+  must(first.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+  const returned = renewAts.map((now) => must(first.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now })).leaseUntil);
+  first.close();
+  const ledger = ready(open(path));
+  const times = ledger.instructionTimes(runId);
+  if (!times.known || times.value === null) throw new Error("지시를 읽지 못함");
+  return { path, ledger, runId, lease: times.value.lease, returned };
+}
+
+test("어긋난 시각의 갱신이 임대를 늘리지 않는다", () => {
+  // 앞 리뷰의 재현: 시작 NOW 뒤에 갱신을 NOW-1로 기록했다. 실제로 마지막에 낸 임대는 그 갱신의 것(NOW-1+MAX)이다.
+  const skewed = renewedInOrder([NOW - 1]);
+  expect(skewed.returned).toEqual([NOW - 1 + MAX]);
+  expect(skewed.lease).toEqual({ issuedAt: NOW - 1, expiresAt: "unknown" });
+  expect(nextIntent(lifecycle(skewed.ledger, skewed.runId, NOW + 10_001), LIFE).intent).toBe("query");
+
+  // 갱신이 여럿: NOW+20000 갱신 뒤에 더 이른 NOW+15000 갱신을 기록했다. 발행 시각이 가장 큰 갱신(끝 NOW+20000+MAX)은 마지막이 아니다.
+  const reordered = renewedInOrder([NOW + 20_000, NOW + 15_000]);
+  expect(reordered.lease).toEqual({ issuedAt: NOW + 20_000, expiresAt: "unknown" });
+  expect(nextIntent(lifecycle(reordered.ledger, reordered.runId, NOW + 30_000), LIFE).intent).toBe("query");
+
+  // 같은 발행 시각의 갱신 둘: 어느 쪽이 마지막인지 시각으로 가를 수 없다.
+  const tied = renewedInOrder([NOW + 10_000, NOW + 10_000]);
+  expect(tied.lease).toEqual({ issuedAt: NOW + 10_000, expiresAt: "unknown" });
+  expect(nextIntent(lifecycle(tied.ledger, tied.runId, NOW + 20_000), LIFE).intent).toBe("query");
+
+  // 시작 임대가 끝난 시각(NOW+MAX)에 기록한 갱신: 실행기는 이미 닫았고 지난 임대를 되살리지 않는다.
+  const late = renewedInOrder([NOW + MAX]);
+  expect(late.lease).toEqual({ issuedAt: NOW + MAX, expiresAt: "unknown" });
+  expect(nextIntent(lifecycle(late.ledger, late.runId, NOW + MAX + 10_000), LIFE).intent).toBe("query");
+
+  // 시각 순서대로 기록한 갱신 여럿은 마지막 갱신의 임대다(대조군).
+  const ordered = renewedInOrder([NOW + 10_000, NOW + 20_000]);
+  expect(ordered.lease).toEqual({ issuedAt: NOW + 20_000, expiresAt: NOW + 20_000 + MAX });
+
+  // 끝을 적지 않은 것은 순서가 어긋난 갱신뿐이다. 시각 순서대로 적힌 갱신의 끝은 남아 있다.
+  const ends = (c: { path: string; runId: string; ledger: Ledger }) => {
+    c.ledger.close();
+    return rawRows(c.path, "SELECT issued_at, lease_until FROM instructions WHERE run_id = ? AND action = 'run_renew' ORDER BY issued_at DESC, lease_until", c.runId);
+  };
+  expect(ends(skewed)).toEqual([{ issued_at: NOW - 1, lease_until: null }]);
+  expect(ends(reordered)).toEqual([
+    { issued_at: NOW + 20_000, lease_until: NOW + 20_000 + MAX },
+    { issued_at: NOW + 15_000, lease_until: null },
+  ]);
+  expect(ends(tied)).toEqual([
+    { issued_at: NOW + 10_000, lease_until: null },
+    { issued_at: NOW + 10_000, lease_until: NOW + 10_000 + MAX },
+  ]);
+  expect(ends(late)).toEqual([{ issued_at: NOW + MAX, lease_until: NOW + 2 * MAX }]);
+  expect(ends(ordered)).toEqual([
+    { issued_at: NOW + 20_000, lease_until: NOW + 20_000 + MAX },
+    { issued_at: NOW + 10_000, lease_until: NOW + 10_000 + MAX },
+  ]);
+});
+
+test("이관이 끊긴 뒤 다시 열린다", () => {
+  const { path, runId } = ledgerBeforeLeaseEnd(NOW + 10_000);
+  const versions = (n: number) => Array.from({ length: n }, (_, index) => ({ version: index + 1 }));
+
+  // 판 하나는 트랜잭션 하나다. 판을 적용한 뒤 커밋 전에 끊기면 그 판의 칸도 적용 기록도 남지 않는다.
+  expect(openLedger(path, { clock, mode: "reopen", faults: failAt(`migration:${LEASE_END_VERSION}`) })).toMatchObject({ ok: false, reason: "migration_failed" });
+  expect(rawRows(path, "SELECT version FROM ledger_migrations ORDER BY version")).toEqual(versions(LEASE_END_VERSION - 1));
+  expect((rawRows(path, "PRAGMA table_info(instructions)") as { name: string }[]).map((c) => c.name)).not.toContain("lease_until");
+
+  // 다시 열면 끊긴 판부터 한 번 적용하고, 옛 갱신의 끝은 모름이다.
+  const resumed = openLedger(path, { clock, mode: "reopen" });
+  expect(resumed).toMatchObject({ ok: true, migrated: { from: LEASE_END_VERSION - 1, to: loadMigrations().length } });
+  const ledger = ready(opened(resumed));
+  expect(ledger.instructionTimes(runId)).toMatchObject({ known: true, value: { lease: { issuedAt: NOW + 10_000, expiresAt: "unknown" } } });
+  ledger.close();
+  expect(rawRows(path, "SELECT version FROM ledger_migrations ORDER BY version")).toEqual(versions(loadMigrations().length));
 });
 
 test("입력을 읽지 못하면 수명 판단을 조립하지 않는다", () => {

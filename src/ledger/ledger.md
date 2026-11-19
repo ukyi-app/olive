@@ -19,18 +19,27 @@
 
 ## 마이그레이션
 
-`migrations/NNNN-이름.sql`을 번호 순서대로 한 번씩 적용한다. 판 하나는 트랜잭션 하나라 도중에 실패하거나 끊기면 그 판 전체가 되돌려진다. 적용 기록은 `ledger_migrations(version, name, applied_at)`. 번호가 비거나, 이름과 번호가 다르거나, 폴더에 꼴이 다른 파일이 있거나, 장부의 판이 코드보다 높거나, 같은 번호의 이름이 다르면 열지 않는다. 호출자가 `migrations`로 넘긴 목록도 같은 검사를 파일을 열기 전에 자리마다 거친다(배열의 빈 자리 포함). 적용 시각으로 쓸 시계의 값도 파일을 건드리기 전에 확인한다.
+`migrations/NNNN-이름.sql`을 번호 순서대로 한 번씩 적용한다.
+
+| 판 | 내용 |
+|---|---|
+| `0001-core` | 아래 "표"의 표·트리거·인덱스 전부 |
+| `0002-renew-lease-end` | `instructions.lease_until`(INTEGER, NULL 허용) 칸 하나. 갱신 지시(`run_renew`)만 값을 가질 수 있고 그 값은 발행 시각보다 늦고 9007199254740991 이하다(CHECK). 칸만 더하므로 기존 줄은 NULL(끝 모름)이고 다른 칸의 값과 제약은 그대로다 |
+
+판 하나는 트랜잭션 하나라 도중에 실패하거나 끊기면 그 판 전체가 되돌려진다. 적용 기록은 `ledger_migrations(version, name, applied_at)`. 번호가 비거나, 이름과 번호가 다르거나, 폴더에 꼴이 다른 파일이 있거나, 장부의 판이 코드보다 높거나, 같은 번호의 이름이 다르면 열지 않는다. 호출자가 `migrations`로 넘긴 목록도 같은 검사를 파일을 열기 전에 자리마다 거친다(배열의 빈 자리 포함). 적용 시각으로 쓸 시계의 값도 파일을 건드리기 전에 확인한다.
 
 **지원하는 판의 범위: 모든 판은 식별 행이 없는 빈 DB에서 번호 순서대로 재생할 수 있어야 한다. 기존 행에 기대는 판(데이터 이관이 필요한 판)은 이 장부가 아직 지원하지 않는다.** 재개방은 코드의 판을 빈 메모리 DB에 재생한 스키마와 장부를 대조하기 때문이다. 판을 올리는 `reopen`과 `create`는 실제 판을 커밋하기 전에 목록 전체를 재생해 보고, 재생하지 못하면 장부를 바꾸지 않고 `migration_failed`로 거절한다. 판이 하나도 없는 목록의 `create`는 재개방이 대조할 적용 기록이 남지 않으므로 파일을 만들지 않고 `migration_mismatch`로 거절한다. 재생은 되지만 실제 장부의 행에 따라 다른 스키마를 남기는 판(행이 있을 때만 통계 표를 만드는 `PRAGMA optimize` 등)은 미리 가르지 못한다. 판의 결과 스키마는 데이터에 따라 달라지면 안 된다.
 
 이 장부는 아직 어디에도 배포되지 않아 리뷰 반영을 `0001-core.sql`에 직접 고쳤다. **첫 배포 뒤에는 기존 번호를 고치지 않고 다음 번호로 더한다.**
 
-## 표(0001-core)
+## 표
+
+`instructions.lease_until`만 `0002-renew-lease-end`이고 나머지는 모두 `0001-core`다.
 
 | 묶음 | 표 | 요지 |
 |---|---|---|
 | 정지·일시 중지 | `stop_state`, `diagnosis_pause` | 정지 세대(0 포함, 줄이 없으면 아직 적지 않음), 정지 여부, 확인 단계, 진단 일시 중지의 끝 |
-| 실행·슬롯·예산 | `runs`, `run_epoch`, `run_transitions`, `instructions`, `slot_holds` | 실행 ID·세대·역할·revision 둘·snapshot·실행기·자격 네 칸·기한·남은 예산·상태·영수증 id들. 낸 지시(v1 여섯, 적은 뒤 불변). 점유가 맞지 않은 관측: (실행기, 실행, 세대)마다 한 줄이고 관측 번호를 가진다. 줄이 있으면 그 실행 ID를 영영 시작하지 않고, `holds_slot`이면 그 종류의 슬롯도 막는다 |
+| 실행·슬롯·예산 | `runs`, `run_epoch`, `run_transitions`, `instructions`, `slot_holds` | 실행 ID·세대·역할·revision 둘·snapshot·실행기·자격 네 칸·기한·남은 예산·상태·영수증 id들. 낸 지시(v1 여섯, 적은 뒤 불변)와 갱신 지시의 임대 끝("스케줄러가 쓰는 읽기"의 "갱신의 끝"). 점유가 맞지 않은 관측: (실행기, 실행, 세대)마다 한 줄이고 관측 번호를 가진다. 줄이 있으면 그 실행 ID를 영영 시작하지 않고, `holds_slot`이면 그 종류의 슬롯도 막는다 |
 | 입력·대기열 | `inputs` | 요청 ID, 인증된 출처, 원문 참조(`<저장소>/<UUID>`)와 만료, 순번, 취소 |
 | 영수증·보고 | `deliveries`, `receipt_conflicts`, `report_signals` | 받은 id와 본문 digest, 속한 실행(외래 키), 가리킨 지시, 결과 보고의 저장 자리·digest·반영 시각. 같은 id에 다른 digest의 기록(같은 충돌은 한 줄). 훅·세션 깨짐 보고의 구조화 칸(사건 종류, `session_id`, 턴 ID, 오류 종류, 원인, 표식 digest, 관측 시각) |
 | 세션·인계 | `sessions`, `rule_checks`, `session_takeovers`, `start_permit_uses` | 세션 ID, 시작 순번, 세대 표식 digest, 교체 시각, 처리 위치, 인계 참조, 규칙 확인(D-51)과 낸 쪽, 교체 기록(앞 실행·인수 발신자·표식·허가·확정한 규칙 확인·다음 실행, D-50), 시작 허가의 한 번 사용. **지금 쓰는 것은 `rule_checks`와 `session_takeovers`의 받은 칸뿐이다**("세션 증거" 참조) |
@@ -98,10 +107,11 @@
 
 - **출처 이름은 분류하지 않는다.** `source`를 관리자 요청과 자동 경보로 나누는 규칙은 접수 정책의 몫이다. 장부는 `enqueueInput`이 받은 이름을 그대로 낸다.
 - **모름과 미발행:** 읽기가 실패하면 `{ known: false }`다. 읽기가 성공했을 때 `lease`·`lastStopAt`·`lastFinalizeAt`의 `null`은 그런 지시를 낸 적이 없음을 장부에서 확인한 값이다. `lease.expiresAt`의 `"unknown"`은 지시는 있는데 그 임대의 끝을 장부가 갖지 않는다는 뜻이다. 0이나 짐작한 값으로 채우지 않는다.
-- **임대의 끝:** 시작 지시(`task_start`)의 임대 끝은 계약이 정한 값(발행 시각 + `RUN_LEASE_MAX_MS`, 실행기가 머리의 `issued_at`에서 같은 식으로 정한다)이라 장부의 `issued_at`에서 계산한다. 지시의 머리에 장부의 `issued_at`보다 이른 시각을 실으면 이 값이 실제보다 늦어진다. **갱신 지시(`run_renew`)와 세션 시작 지시의 임대 끝은 장부에 없어 언제나 `"unknown"`이다.** 갱신 지시가 하나라도 있으면 `lease`는 기록된 갱신 발행 시각의 최댓값과 `"unknown"`이다. 갱신의 발행 시각은 부르는 쪽이 넘긴 값이라 시작보다 이르게 기록될 수 있어도 시작 임대로 돌아가지 않는다. 그래서 갱신을 한 번 낸 실행은 그 뒤로 `nextIntent`가 갱신 대신 같은 ID 조회를 낸다. 갱신이 없을 때만 시작 지시의 임대이고, 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝이다.
+- **임대의 끝:** 시작 지시(`task_start`)의 임대 끝은 계약이 정한 값(발행 시각 + `RUN_LEASE_MAX_MS`, 실행기가 머리의 `issued_at`에서 같은 식으로 정한다)이라 장부의 `issued_at`에서 계산한다. 지시의 머리에 장부의 `issued_at`보다 이른 시각을 실으면 이 값이 실제보다 늦어진다. **세션 시작 지시의 임대 끝은 장부에 없어 언제나 `"unknown"`이다.** 갱신이 없을 때만 시작 지시의 임대이고, 발행 시각이 같은 시작 지시가 여럿이면 하나라도 모르면 모름, 아니면 이른 끝이다.
+- **갱신의 끝:** `recordRenewInstruction`은 `leaseUntil`(넘긴 `now` + `RUN_LEASE_MAX_MS`)을 돌려준다. 부르는 쪽은 그 값을 갱신 본문의 `lease_until`에, `now`를 머리의 `issued_at`에 그대로 싣는다. 계약이 허락하는 가장 긴 갱신이고(`parseRunRenew`), 실행기는 그 값이 지금 임대 끝보다 늦으면 임대 끝으로 삼는다(`src/executor/worker.ts`의 `onRenew`). 장부는 같은 값을 `instructions.lease_until`에 적는다. **같은 실행의 앞 임대 지시(시작·갱신) 가운데 발행 시각이 `now` 이상인 것이 있으면 끝을 적지 않는다(NULL).** 기록 자체와 거절 조건은 그대로다. 장부에는 지시의 기록 순서가 없어서, 끝을 적은 갱신들의 발행 시각이 기록 순서대로 엄격히 늘게 하는 곳이 이 기록이다. `now` + `RUN_LEASE_MAX_MS`가 안전 정수를 넘는 `now`는 본문을 만들 수 없어 `LedgerInputError`다.
+- **마지막 갱신:** 갱신이 있으면 `lease`는 발행 시각이 가장 큰 갱신의 시각과 그 끝이다. 갱신을 발행 시각 순서로 시작 임대부터 이어 보아, 하나라도 아래에 걸리면 끝은 `"unknown"`이다: 끝이 없는 갱신(이 판 전에 적힌 줄, 순서가 어긋나 적지 않은 줄), 앞 임대 지시보다 늦지 않은 발행 시각(같은 시각 포함), 앞 임대의 끝 이후에 낸 갱신(실행기는 이미 닫았고 지난 임대를 되살리지 않는다), 발행 시각 이하이거나 발행 시각 + `RUN_LEASE_MAX_MS`보다 늦은 끝, 시작 임대의 끝을 모름. 모든 갱신이 끝을 가지면 발행 시각 순서가 기록 순서이므로, 내는 끝은 실제로 마지막에 기록한 갱신의 끝과 같다. 모름이 된 실행은 그 뒤에 갱신을 적어도 모름이고, `nextIntent`는 계속 실행해도 되는 상태면 같은 ID 조회를 낸다.
 - **종료·확정은 발행 시각의 최댓값:** `lastStopAt`·`lastFinalizeAt`은 마지막으로 기록한 행이 아니라 기록된 발행 시각의 최댓값이다. 더 이른 시각으로 나중에 기록한 지시는 앞 지시의 시각에 가려진다.
 - **지금 상태로 좁히지 않는다:** 장부는 실행이 지금 상태에 들어온 시각을 따로 적지 않는다. `lastStopAt`·`lastFinalizeAt`은 상태와 무관한 그 실행의 마지막 지시다. 예를 들어 `cleanup_pending`의 `lastFinalizeAt`은 그 앞 상태에서 낸 확정 지시일 수 있고, 그러면 확정 재시도가 그 시각부터 답을 기다린 뒤에 나온다.
-- **아직 없는 것:** 갱신 지시의 임대 끝을 적는 칸. 칸은 다음 번호의 판(`instructions`에 NULL 허용 칸 하나, 기존 줄은 NULL=모름)으로 더한다. 판을 더하면 판의 수를 하나로 고정한 기존 시험(`test/ledger/crash.test.ts`의 `migrated: { from: 0, to: 1 }`, `test/ledger/regress5.test.ts`의 `[...loadMigrations(), { version: 2, … }]`)을 판의 수에 맞게 함께 고쳐야 한다.
 
 ## 세션 증거
 
@@ -232,7 +242,7 @@ v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느
 4. **세션 계약.** `startSession`을 열고 교체를 확정·소비하는 일은 이 작업의 몫이다. 조건은 "세션 증거" 절에 있다.
 
 - **실제 연결:** 세션 인수 영수증의 낸 쪽은 앞 세션의 지정 실행기이거나 대기 중인 세션 실행의 지정 실행기여야 한다. 규칙 확인은 `applyRuleCheck(input, { sender })`로 낸 쪽을 함께 넘긴다. 훅·세션 깨짐 보고는 `recordReport`의 `signal`에 v1 본문의 구조화 칸을 옮겨 넣는다. `clearSlotHold`는 그 실행기가 그 세대의 그 실행을 더는 쥐지 않는다고 재대조했거나 종료를 증명했을 때, `slotHolds()`나 2단계가 돌려준 세대와 관측 번호를 함께 넘겨 부른다. 슬롯만 돌아오고 그 실행 ID는 다시 시작할 수 없다. 무엇을 증명으로 볼지(`not_known`은 종료의 증거가 아니다)는 그 작업이 정한다. 맞춤 답의 세대는 `Restorer.stopGeneration()`이고 `null`이면 맞춤에 답하지 않는다.
-- **스케줄러:** 새 업무는 `Restorer.intakeOpen()`이 true일 때만 시도하고, 장부의 거절(`snapshot_hold`, `intake_closed`, `stopped`, `slot_busy`, `run_blocked`, `input_cancelled`, `input_expired`, `deadline_passed`, `run_generation_stale`, `not_startable`, `session_start_closed`)을 그대로 따른다. 복원 5단계의 `queued`는 시작 후보이고 시작의 보장이 아니다. `run_blocked`인 일을 다시 하려면 새 실행 ID로 접수한다. 허가가 버려졌으면(`intake_closed`) 새 `Restorer`로 1단계부터 다시 복원한다. 재시작 뒤 결과 검사는 3단계의 `resumeChecks`·`pendingReports`에서 다시 꺼낸다. 새 세션은 5단계의 `inputs.pending`을 순서대로 한 번씩 전한다.
+- **스케줄러:** 새 업무는 `Restorer.intakeOpen()`이 true일 때만 시도하고, 장부의 거절(`snapshot_hold`, `intake_closed`, `stopped`, `slot_busy`, `run_blocked`, `input_cancelled`, `input_expired`, `deadline_passed`, `run_generation_stale`, `not_startable`, `session_start_closed`)을 그대로 따른다. 복원 5단계의 `queued`는 시작 후보이고 시작의 보장이 아니다. `run_blocked`인 일을 다시 하려면 새 실행 ID로 접수한다. 허가가 버려졌으면(`intake_closed`) 새 `Restorer`로 1단계부터 다시 복원한다. 재시작 뒤 결과 검사는 3단계의 `resumeChecks`·`pendingReports`에서 다시 꺼낸다. 새 세션은 5단계의 `inputs.pending`을 순서대로 한 번씩 전한다. 갱신 지시는 `recordRenewInstruction`이 돌려준 `leaseUntil`을 본문 `lease_until`에, 넘긴 `now`를 머리 `issued_at`에 싣는다. 그 `now`는 장부 시계와 같은 시계에서 읽는다: 시작 지시의 발행 시각은 장부 시계이고, 그보다 늦지 않은 갱신은 끝을 적지 않아 그 실행은 다시 갱신되지 않는다.
 - **CLI 풀기(§7.6):** 장부 쪽은 `releaseStop({ generation })` 하나다. 풀면 접수가 닫히고 새 복원 시도가 끝까지 마쳐야 열린다. 새 실행 세대를 적는 연산은 아직 없다. 세대를 올리면 옛 세대의 대기 실행은 시작되지 않고(`run_generation_stale`, 5단계 `staleQueued`) 종료 기록만 된다. 확인 단계(`phase`)는 `applyStop`의 `phase`로 같은 세대에 덧붙인다.
 - **현관:** 권위 정지 기록의 답은 `{ generation, stopped }` 두 칸이어야 하고 다른 꼴은 모름이다. 게시 연결은 같은 작업 ID에 다른 후보를 다시 연결하지 않는다.
 
