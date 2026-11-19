@@ -1,6 +1,7 @@
 // 실행 하나의 다음 의도를 고르는 순수 판단. 상태를 갖지 않고 장부를 열거나 쓰지 않는다.
-// 의도(LifecycleIntent)는 실행 허가가 아니다. 갱신·종료·확정 지시는 장부의 record*Instruction이 정지·세대·상태를
-// 다시 본 커밋 뒤에만 나간다.
+// 의도(LifecycleIntent)는 실행 허가가 아니다. 지시는 장부의 record*Instruction이 커밋한 뒤에만 나가지만, 그 메서드들이
+// 다시 보는 것은 저마다 다르다(갱신은 상태·실행 세대·정지 세대만 보고 임대 끝과 기한은 보지 않는다). 임대가 살아 있는지와
+// 시각은 이 판단과 부르는 쪽이 확인한다.
 //
 // 의도마다 그 의도가 실행을 데려가려는 장부 상태(toward)가 있다. 의도는 장부의 전이 표(TRANSITIONS)가
 // 지금 상태에서 toward로 가는 길을 허락할 때만 낸다. 표를 이 파일에 옮겨 적지 않고 장부의 것을 그대로 읽는다.
@@ -8,14 +9,18 @@ import { type LedgerRunState, type Run, type RunKind, SLOT_FREE, TRANSITIONS } f
 
 export interface LifecycleView {
   run: Pick<Run, "runId" | "kind" | "state" | "deadlineAt">;
-  // 마지막 시작·갱신 지시의 발행 시각과 그 임대의 끝. 모르면 null이다(그러면 갱신하지 않고 조회한다).
+  // 마지막 시작·갱신 지시의 발행 시각과 실제로 발급한 그 임대의 끝. 모르면 null이다.
+  // null이거나 두 시각이 유한한 수가 아니거나 issuedAt <= now < expiresAt가 아니면 갱신하지 않고 같은 ID로 조회한다.
   lease: { issuedAt: number; expiresAt: number } | null;
   // 이 실행을 멈추라는 요청(입력 취소 등)이 있다.
   cancelRequested: boolean;
-  // 지금 상태에서 낸 마지막 종료·확정 지시의 시각. 아직 내지 않았거나 모르면 null.
-  lastInstructionAt: number | null;
+  // 지금 상태에서 낸 마지막 종료·확정 지시의 시각. 아직 내지 않았음을 확인했으면 null, 읽지 못했으면 "unknown"
+  // (그러면 응답 대기 시간을 셀 수 없어 확정 재시도와 stopping의 조회를 내지 않는다).
+  lastInstructionAt: number | null | "unknown";
   // 결과 검사와 결과 본문의 보관이 끝났다(ready_result에서 확정 지시를 내도 된다). 결과 쪽 판단(S6)이 정한다.
   resultSettled: boolean;
+  // 부르는 쪽이 넣는 지금 시각. 앞 호출보다 이르면 안 된다(상태가 없어 후퇴를 알 수 없고, 후퇴하면 지난 임대가 갱신 대상으로 보인다).
+  // 유한한 수가 아니면 wait만 낸다.
   now: number;
 }
 
@@ -45,6 +50,8 @@ export function tableAllows(kind: RunKind, from: LedgerRunState, to: LedgerRunSt
   return from === to || (TRANSITIONS[kind][from]?.includes(to) ?? false);
 }
 
+const isTime = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+
 function checkPolicy(policy: LifecyclePolicy): void {
   for (const key of ["renewEveryMs", "answerTimeoutMs"] as const) {
     if (!Number.isSafeInteger(policy[key]) || policy[key] <= 0) throw new TypeError(`${key}: 양의 정수가 아니다`);
@@ -58,10 +65,15 @@ export function nextIntent(view: LifecycleView, policy: LifecyclePolicy): Lifecy
   // 표가 허락하는 길만 의도로 낸다. 허락하지 않으면 기다림이다.
   const go = (intent: Exclude<IntentName, "wait">, toward: LedgerRunState): LifecycleIntent | null =>
     tableAllows(run.kind, run.state, toward) ? { intent, runId: run.runId, toward } : null;
-  const answerDue = view.lastInstructionAt === null || now - view.lastInstructionAt >= policy.answerTimeoutMs;
+  if (!isTime(now)) return wait;
+  const last = view.lastInstructionAt;
+  const answerDue = last === null || (isTime(last) && now - last >= policy.answerTimeoutMs);
   const stopWanted = view.cancelRequested || now >= run.deadlineAt;
+  const lease = view.lease;
+  const leaseLive = lease !== null && isTime(lease.issuedAt) && isTime(lease.expiresAt) && lease.issuedAt <= now && now < lease.expiresAt;
 
-  // 대기 실행: 시작은 queue.ts가 고른다. 여기서는 멈추라는 요청만 not_started로 닫는다.
+  // 대기 실행: 시작은 queue.ts가 고른다. 여기서는 명시적인 취소 요청만 not_started로 닫는다.
+  // 기한만 지난 대기 실행은 planNext가 deadline_passed로 보류할 뿐 이 판단이 닫지 않는다.
   if (run.state === "queued") return (view.cancelRequested ? go("stop", "not_started") : null) ?? wait;
   // 끝난 실행(finalized·not_started)은 더 할 일이 없다. 같은 상태에 머무는 것을 확정 의도로 내지 않게 먼저 닫는다.
   if (SLOT_FREE.includes(run.state)) return wait;
@@ -74,8 +86,8 @@ export function nextIntent(view: LifecycleView, policy: LifecyclePolicy): Lifecy
       if (stop !== null) return stop;
     }
     if (run.state === "unknown_running") return go("query", "unknown_running") ?? wait;
-    if (view.lease === null || now >= view.lease.expiresAt) return go("query", "unknown_running") ?? wait;
-    if (now - view.lease.issuedAt >= policy.renewEveryMs) return go("renew_lease", "running") ?? wait;
+    if (!leaseLive) return go("query", "unknown_running") ?? wait;
+    if (now - lease.issuedAt >= policy.renewEveryMs) return go("renew_lease", "running") ?? wait;
     return wait;
   }
 

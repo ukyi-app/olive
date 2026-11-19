@@ -5,11 +5,16 @@
 // 같은 트랜잭션에서 다시 본 뒤에만 된다. 부르는 쪽은 후보를 받아도 startRun의 거절을 그대로 따른다.
 //
 // 틀리는 방향은 늘 "시작하지 않음"이다. 종료를 확인하지 못한 실행, 출처를 모르는 입력, 앞 실행보다 많은 예산은 보류다.
+// 값이 빠졌거나 꼴이 틀리면(유한하지 않은 시각, 0 이상의 안전 정수가 아닌 잔액, 등록되지 않은 출처) 모름으로 보고 보류한다.
 import { type LedgerRunState, type Run, type RunKind, SLOT_FREE, type SlotHold, type StartBar } from "../../ledger/index.ts";
 
 // 입력의 인증된 출처 종류. 장부의 inputs.source(인증된 출처 이름)를 관리자 요청과 자동 경보로 나눈 것이다.
 // 나누는 규칙은 이 판단 밖(접수 쪽)의 일이고, 요청 본문으로 정하지 않는다.
 export type Origin = "admin" | "alert";
+const ORIGINS: readonly unknown[] = ["admin", "alert"] satisfies Origin[];
+
+const isTime = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+const isBudget = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
 // 이 판단이 실행 줄에서 읽는 칸. 모두 장부의 Run에 있는 칸이고 상태 이름도 장부 그대로다.
 // startBar는 queueView()가 대기 실행에 붙여 주는 값이다. 끝난 실행처럼 장부가 붙이지 않는 줄은 null을 넣는다.
@@ -19,7 +24,7 @@ export type SchedulerRun = Pick<Run, "runId" | "kind" | "role" | "state" | "queu
 
 // 실행 줄에 연결된 입력. 장부의 inputs 표에 있는 칸만 둔다(원문은 없다. 본문으로 우선순위를 정하지 않기 위해 타입에 없다).
 // origin과 receivedAt은 장부 표에 있지만 지금의 queueView()가 내주지 않는다. 부르는 쪽이 채우지 못하면 이 항목을 넣지 않는다
-// (그러면 그 실행은 input_unknown으로 보류된다).
+// (그러면 그 실행은 input_unknown으로 보류된다). 넣었더라도 칸이 빠졌거나 꼴이 틀리면 같은 보류다.
 export interface SchedulerInput {
   requestId: string;
   origin: Origin;
@@ -34,6 +39,8 @@ export interface SchedulerView {
   inputs: readonly SchedulerInput[];
   // 장부의 slotHolds(): 재시작 복원이 남긴 점유 관측.
   slotHolds: readonly Pick<SlotHold, "kind" | "runId" | "holdsSlot">[];
+  // 부르는 쪽이 넣는 지금 시각. 앞 호출에서 넣은 값보다 이르면 안 된다: 이 판단은 상태가 없어 시각의 후퇴를 알 수 없고,
+  // 시각이 후퇴하면 이미 만료·기한으로 보류한 입력이 다시 후보가 된다. 유한한 수가 아니면 모든 대기 실행을 보류한다.
   now: number;
 }
 
@@ -56,11 +63,15 @@ export type HoldReason =
   | "waiting_turn"
   // 장부가 붙인 이 실행 자체의 시작 불가 사유. 지금 시각으로 다시 본 입력 만료·취소·기한도 같은 이름을 쓴다.
   | StartBar
-  // 실행 줄에 연결된 입력이 없거나, 입력의 출처·접수 시각을 받지 못했다.
+  // 지금 시각이 유한한 수가 아니다. 만료·기한을 판단할 수 없어 모든 대기 실행을 보류한다.
+  | "now_unknown"
+  // 실행 줄에 연결된 입력이 없거나, 입력의 출처·접수 시각·만료 시각·취소 여부가 빠졌거나 꼴이 틀리다.
   | "input_unknown"
-  // 남은 예산이 없다(이 실행 또는 같은 논리 요청의 앞 실행).
+  // 이 실행 또는 같은 입력의 다른 실행의 남은 예산이 0 이상의 안전 정수가 아니다(읽지 못함).
+  | "budget_unknown"
+  // 남은 예산이 없다(이 실행, 또는 같은 입력에 묶인 다른 실행 중 하나. 대기 순번과 무관하다).
   | "budget_exhausted"
-  // 같은 논리 요청의 앞 실행보다 남은 예산이 많다. 재시도·새 세션이 예산을 보충한 줄이다.
+  // 같은 입력의 앞 순번 실행이나 이미 시작한 실행보다 남은 예산이 많다. 재시도·새 세션이 예산을 보충한 줄이다.
   | "budget_replenished";
 
 export interface Held {
@@ -102,28 +113,40 @@ function slotBlock(view: SchedulerView, kind: RunKind): HoldReason | null {
   return null;
 }
 
-// 같은 입력에 묶인 앞 실행들. 같은 중복 키는 장부가 같은 실행을 돌려주므로, 재시도·새 세션의 새 실행 줄은 입력으로 잇는다.
-function earlierRuns(view: SchedulerView, run: SchedulerRun): SchedulerRun[] {
+// 같은 입력에 묶인 다른 실행들. 같은 중복 키는 장부가 같은 실행을 돌려주므로, 재시도·새 세션의 새 실행 줄은 입력으로 잇는다.
+// 입력 ID가 다른 줄(세션 교체 뒤 새로 접수한 같은 논리 요청 등)은 여기서 이을 수 없다.
+function sameInputRuns(view: SchedulerView, run: SchedulerRun): SchedulerRun[] {
   if (run.inputRequestId === null) return [];
-  return view.runs.filter((other) => other.runId !== run.runId && other.inputRequestId === run.inputRequestId && other.queueSeq < run.queueSeq);
+  return view.runs.filter((other) => other.runId !== run.runId && other.inputRequestId === run.inputRequestId);
 }
 
-// 슬롯과 무관하게 이 대기 실행을 시작해 볼 수 없는 이유.
+function budgetBar(view: SchedulerView, run: SchedulerRun): HoldReason | null {
+  if (!isBudget(run.budgetLeft)) return "budget_unknown";
+  if (run.budgetLeft === 0) return "budget_exhausted";
+  const others = sameInputRuns(view, run);
+  // 소진을 확인한 실행이 하나라도 있으면 순번과 무관하게 막는다. 읽지 못한 잔액이 이 0을 가리지 않게 모름보다 먼저 본다.
+  if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
+  if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
+  // 상한: 앞 순번 실행과 이미 시작한 실행(실제로 쓰고 남긴 잔액). 아직 시작하지 않은 뒤 순번 줄의 최초 배정액은 상한이 아니다.
+  const bounds = others.filter((other) => other.queueSeq < run.queueSeq || other.state !== "queued");
+  if (bounds.some((other) => run.budgetLeft > other.budgetLeft)) return "budget_replenished";
+  return null;
+}
+
+// 입력 행의 칸을 모두 읽었는가. 하나라도 빠졌거나 꼴이 틀리면 출처의 차례·만료·취소를 판단할 수 없다.
+function inputKnown(input: SchedulerInput): boolean {
+  return ORIGINS.includes(input.origin) && isTime(input.receivedAt) && isTime(input.expiresAt) && typeof input.cancelled === "boolean";
+}
+
+// 슬롯과 무관하게 이 대기 실행을 시작해 볼 수 없는 이유. view.now가 유한한 수임을 부르는 쪽(planNext)이 확인했다.
 function ownBar(view: SchedulerView, run: SchedulerRun): HoldReason | { input: SchedulerInput } {
   if (run.startBar !== null) return run.startBar;
   if (view.now >= run.deadlineAt) return "deadline_passed";
   const input = run.inputRequestId === null ? undefined : view.inputs.find((item) => item.requestId === run.inputRequestId);
-  if (input === undefined) return "input_unknown";
+  if (input === undefined || !inputKnown(input)) return "input_unknown";
   if (input.cancelled) return "input_cancelled";
   if (view.now >= input.expiresAt) return "input_expired";
-  if (run.budgetLeft <= 0) return "budget_exhausted";
-  const earlier = earlierRuns(view, run);
-  if (earlier.length > 0) {
-    const least = Math.min(...earlier.map((other) => other.budgetLeft));
-    if (least <= 0) return "budget_exhausted";
-    if (run.budgetLeft > least) return "budget_replenished";
-  }
-  return { input };
+  return budgetBar(view, run) ?? { input };
 }
 
 function checkPolicy(policy: SchedulerPolicy): void {
@@ -144,6 +167,10 @@ export function planNext(view: SchedulerView, policy: SchedulerPolicy): QueueDec
   const decision: QueueDecision = { candidates: [], held: [] };
   for (const kind of KINDS) {
     const queued = view.runs.filter((run) => run.kind === kind && run.state === "queued");
+    if (!isTime(view.now)) {
+      for (const run of queued) decision.held.push({ runId: run.runId, kind, reason: "now_unknown" });
+      continue;
+    }
     const ready: { run: SchedulerRun; input: SchedulerInput }[] = [];
     for (const run of queued) {
       const bar = ownBar(view, run);

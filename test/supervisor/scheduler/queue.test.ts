@@ -126,6 +126,136 @@ describe("다음 시작 후보", () => {
   });
 });
 
+// 장부 밖에서 조립한 값이 빠지거나 꼴이 틀린 경우. 모르면 시작 후보도 갱신도 내지 않는다.
+// 시험이 일부러 틀린 꼴을 넣으므로 타입을 우회한다.
+const broken = <T>(value: unknown) => value as T;
+
+describe("모르거나 꼴이 틀린 입력", () => {
+  test("F1: 같은 입력에서 소진된 실행이 있으면 대기 순번과 무관하게 후보 0", () => {
+    const first = run({ inputRequestId: "same", budgetLeft: 10 });
+    const later = run({ inputRequestId: "same", state: "finalized", budgetLeft: 0 });
+    const inputs = [inputFor(first, "admin")];
+    expect(planNext(view([first, later], inputs), POLICY)).toEqual({ candidates: [], held: [{ runId: first.runId, kind: "worker", reason: "budget_exhausted" }] });
+
+    // 시작한 실행이 실제로 쓰고 남긴 잔액은 순번이 뒤여도 상한이다.
+    const used = { ...later, budgetLeft: 3 };
+    expect(planNext(view([first, used], inputs), POLICY).held).toEqual([{ runId: first.runId, kind: "worker", reason: "budget_replenished" }]);
+
+    // 아직 시작하지 않은 뒤 순번 줄의 최초 배정액은 앞 줄의 상한이 아니다.
+    const smaller = run({ inputRequestId: "same", budgetLeft: 5 });
+    expect(planNext(view([first, smaller], inputs), POLICY).candidates.map((c) => c.runId)).toEqual([first.runId]);
+  });
+
+  test("F4: 읽지 못한 잔액은 모름이고, 다른 실행의 잔액 0을 가리지 않는다", () => {
+    for (const unread of [undefined, Number.NaN]) {
+      const a = run({ inputRequestId: "f4", state: "finalized", budgetLeft: broken<number>(unread) });
+      const b = run({ inputRequestId: "f4", state: "finalized", budgetLeft: 0 });
+      const c = run({ inputRequestId: "f4", budgetLeft: 10 });
+      const decision = planNext(view([a, b, c], [inputFor(c, "admin")]), POLICY);
+      expect(decision).toEqual({ candidates: [], held: [{ runId: c.runId, kind: "worker", reason: "budget_exhausted" }] });
+    }
+    // 앞 실행의 잔액만 모르면 상한을 정할 수 없어 보류다.
+    const prior = run({ inputRequestId: "f4b", state: "finalized", budgetLeft: broken<number>(undefined) });
+    const retry = run({ inputRequestId: "f4b", budgetLeft: 10 });
+    expect(planNext(view([prior, retry], [inputFor(retry, "admin")]), POLICY).held).toEqual([{ runId: retry.runId, kind: "worker", reason: "budget_unknown" }]);
+    // 자기 잔액이 0 이상의 안전 정수가 아니면 보류다.
+    for (const left of [undefined, Number.NaN, -1, 1.5, "10", Number.MAX_SAFE_INTEGER + 1]) {
+      const solo = run({ budgetLeft: broken<number>(left) });
+      expect(planNext(view([solo], [inputFor(solo, "admin")]), POLICY)).toEqual({ candidates: [], held: [{ runId: solo.runId, kind: "worker", reason: "budget_unknown" }] });
+    }
+  });
+
+  test("F2: 지금 시각이 유한한 수가 아니면 후보와 갱신 0, 만료 시각과 같은 순간은 만료", () => {
+    const a = run({ deadlineAt: 999 });
+    const s = run({ kind: "session", role: null, deadlineAt: 999 });
+    const inputs = [inputFor(a, "admin", { expiresAt: 999 }), inputFor(s, "admin", { expiresAt: 999 })];
+    for (const now of [Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      const decision = planNext(view([a, s], inputs, { now: broken<number>(now) }), POLICY);
+      expect(decision).toEqual({
+        candidates: [],
+        held: [
+          { runId: a.runId, kind: "worker", reason: "now_unknown" },
+          { runId: s.runId, kind: "session", reason: "now_unknown" },
+        ],
+      });
+      const life: LifecycleView = {
+        run: { runId: "r", kind: "worker", state: "running", deadlineAt: NOW + 600_000 },
+        lease: { issuedAt: NOW - 20_000, expiresAt: NOW + 10_000 },
+        cancelRequested: false,
+        lastInstructionAt: null,
+        resultSettled: false,
+        now: broken<number>(now),
+      };
+      expect(nextIntent(life, LIFE).intent).toBe("wait");
+    }
+    // 경계: 만료·기한 시각과 같은 순간은 지난 것이다. 1 앞이면 아직 아니다.
+    const edge = run();
+    const exp = NOW + 100;
+    expect(planNext(view([edge], [inputFor(edge, "admin", { expiresAt: exp })], { now: exp }), POLICY).held[0]?.reason).toBe("input_expired");
+    expect(planNext(view([edge], [inputFor(edge, "admin", { expiresAt: exp })], { now: exp - 1 }), POLICY).candidates.map((c) => c.runId)).toEqual([edge.runId]);
+    expect(planNext(view([edge], [inputFor(edge, "admin")], { now: edge.deadlineAt - 1 }), POLICY).candidates.map((c) => c.runId)).toEqual([edge.runId]);
+  });
+
+  test("F3: 출처가 없거나 등록되지 않은 입력, 접수·만료·취소 칸이 빠진 입력은 후보 0", () => {
+    const alert = run();
+    const odd = run();
+    const alertInput = inputFor(alert, "alert");
+    const bads: Partial<SchedulerInput>[] = [
+      { origin: broken<Origin>(undefined) },
+      { origin: broken<Origin>("root") },
+      { receivedAt: broken<number>(undefined) },
+      { receivedAt: Number.NaN },
+      { expiresAt: broken<number>(undefined) },
+      { expiresAt: Number.NaN },
+      { cancelled: broken<boolean>(undefined) },
+      { cancelled: broken<boolean>("false") },
+    ];
+    for (const bad of bads) {
+      const decision = planNext(view([alert, odd], [alertInput, inputFor(odd, "admin", bad)]), POLICY);
+      expect(decision.candidates.map((c) => c.runId)).toEqual([alert.runId]);
+      expect(decision.held).toEqual([{ runId: odd.runId, kind: "worker", reason: "input_unknown" }]);
+    }
+  });
+
+  test("F5: 임대의 발행·만료를 읽었고 지금이 만료 앞일 때만 갱신, 아니면 같은 ID 조회", () => {
+    const base = { cancelRequested: false, lastInstructionAt: null, resultSettled: false, now: NOW };
+    const running = { runId: "r", kind: "worker" as const, state: "running" as const, deadlineAt: NOW + 600_000 };
+    const leases = [
+      { issuedAt: NOW - 20_000, expiresAt: Number.NaN },
+      { issuedAt: NOW - 20_000, expiresAt: broken<number>(undefined) },
+      { issuedAt: Number.NaN, expiresAt: NOW + 10_000 },
+      { issuedAt: broken<number>(undefined), expiresAt: NOW + 10_000 },
+      { issuedAt: NOW + 1, expiresAt: NOW + 30_000 },
+      { issuedAt: NOW - 20_000, expiresAt: NOW },
+    ];
+    for (const lease of leases) {
+      expect(nextIntent({ ...base, run: running, lease }, LIFE)).toEqual({ intent: "query", runId: "r", toward: "unknown_running" });
+    }
+    expect(nextIntent({ ...base, run: running, lease: { issuedAt: NOW - 20_000, expiresAt: NOW + 1 } }, LIFE).intent).toBe("renew_lease");
+  });
+
+  test("F8: 마지막 지시 시각을 읽지 못하면 확정 재시도와 stopping 조회를 내지 않는다", () => {
+    const base = { lease: null, cancelRequested: false, resultSettled: false, now: NOW };
+    const cleanup = { runId: "c", kind: "worker" as const, state: "cleanup_pending" as const, deadlineAt: NOW + 600_000 };
+    const stopping = { ...cleanup, state: "stopping" as const };
+    for (const lastInstructionAt of ["unknown" as const, Number.NaN]) {
+      expect(nextIntent({ ...base, lastInstructionAt, run: cleanup }, LIFE).intent).toBe("wait");
+      expect(nextIntent({ ...base, lastInstructionAt, run: stopping }, LIFE).intent).toBe("wait");
+    }
+    // 아직 내지 않았음을 확인했으면(null) 첫 지시, 응답 대기 시간이 지났으면 다시 낸다.
+    expect(nextIntent({ ...base, lastInstructionAt: null, run: cleanup }, LIFE).intent).toBe("finalize");
+    expect(nextIntent({ ...base, lastInstructionAt: NOW - LIFE.answerTimeoutMs, run: stopping }, LIFE).intent).toBe("query");
+    expect(nextIntent({ ...base, lastInstructionAt: NOW - LIFE.answerTimeoutMs + 1, run: stopping }, LIFE).intent).toBe("wait");
+  });
+
+  test("F6: 기한만 지난 대기 실행은 이 판단이 닫지 않고, 취소 요청이면 not_started로 닫는다", () => {
+    const base = { lease: null, lastInstructionAt: null, resultSettled: false, now: NOW };
+    const queued = { runId: "q", kind: "worker" as const, state: "queued" as const, deadlineAt: NOW };
+    expect(nextIntent({ ...base, cancelRequested: false, run: queued }, LIFE)).toEqual({ intent: "wait", runId: "q", toward: "queued" });
+    expect(nextIntent({ ...base, cancelRequested: true, run: queued }, LIFE)).toEqual({ intent: "stop", runId: "q", toward: "not_started" });
+  });
+});
+
 describe("장부에서 읽은 상태를 입력으로", () => {
   test("queueView·listRuns·slotHolds의 반환이 입력 타입에 맞고, 출처를 받기 전에는 시작 후보가 없다", () => {
     const ledger = ready(open(tempPath()));
@@ -167,6 +297,58 @@ describe("장부에서 읽은 상태를 입력으로", () => {
     const next = planNext({ runs: after.runs, inputs: withOrigin(after.pending), slotHolds: after.slotHolds, now: NOW + 2 }, POLICY);
     expect(next).toEqual({ candidates: [], held: [{ runId: alertRun.runId, kind: "worker", reason: "slot_occupied" }] });
   });
+
+  // 배정기처럼 후보마다 startRun을 부른다. 판단이 후보를 내지 않으면 부를 것이 없어 대기 실행이 그대로 남는다.
+  const startEach = (ledger: ReturnType<typeof open>, candidates: { runId: string }[]) => {
+    for (const c of candidates) ledger.startRun({ runId: c.runId, requestId: id(), stopGeneration: 0, now: NOW });
+  };
+  const stateOf = (ledger: ReturnType<typeof open>, runId: string) => {
+    const got = ledger.getRun(runId);
+    if (!got.known || got.value === null) throw new Error("실행을 읽지 못함");
+    return got.value.state;
+  };
+
+  // 같은 입력에 실행 둘을 잔액 10으로 등록한다. spend면 뒤 순번 실행에 잔액 0과 대기 종료를 장부 API로 적는다.
+  const twoRuns = (spend: boolean) => {
+    const ledger = ready(open(tempPath()));
+    const requestId = id();
+    must(ledger.enqueueInput({ requestId, source: "admin-dm", sourceRef: { ref: `inbox/${id()}`, expiresAt: NOW + 3_600_000 }, receivedAt: NOW }));
+    const first = must(ledger.admitRun(worker({ inputRequestId: requestId, budgetLeft: 10 }))).run;
+    const later = must(ledger.admitRun(worker({ inputRequestId: requestId, budgetLeft: 10 }))).run;
+    if (spend) {
+      must(ledger.recordBudget({ runId: later.runId, budgetLeft: 0, now: NOW }));
+      must(ledger.recordStopInstruction({ runId: later.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW }));
+    }
+    const queue = ledger.queueView();
+    const all = ledger.listRuns();
+    const holds = ledger.slotHolds();
+    if (!queue.known || !all.known || !holds.known) throw new Error("장부를 읽지 못함");
+    const bars = new Map(queue.value.runs.map((r) => [r.runId, r.startBar]));
+    const runs: SchedulerRun[] = all.value.map((r) => ({ ...r, startBar: bars.get(r.runId) ?? null }));
+    const inputs: SchedulerInput[] = queue.value.inputs.pending.map((p) => ({ requestId: p.requestId, origin: "admin", receivedAt: NOW, expiresAt: p.sourceRef.expiresAt, cancelled: false }));
+    return { ledger, first, later, runs, inputs, slotHolds: holds.value };
+  };
+
+  test("F1: 뒤 순번 실행이 소진된 장부에서는 startRun까지 가지 않는다", () => {
+    const { ledger, first, later, runs, inputs, slotHolds } = twoRuns(true);
+    expect(runs.map((r) => [r.runId, r.state, r.budgetLeft])).toEqual([
+      [first.runId, "queued", 10],
+      [later.runId, "not_started", 0],
+    ]);
+    const decision = planNext({ runs, inputs, slotHolds, now: NOW + 1 }, POLICY);
+    startEach(ledger, decision.candidates);
+    expect(stateOf(ledger, first.runId)).toBe("queued");
+    expect(decision.candidates).toEqual([]);
+  });
+
+  test("F2: 지금 시각이 NaN이면 startRun까지 가지 않는다", () => {
+    const { ledger, first, later, runs, inputs, slotHolds } = twoRuns(false);
+    const decision = planNext({ runs, inputs, slotHolds, now: Number.NaN }, POLICY);
+    startEach(ledger, decision.candidates);
+    expect(stateOf(ledger, first.runId)).toBe("queued");
+    expect(stateOf(ledger, later.runId)).toBe("queued");
+    expect(decision.candidates).toEqual([]);
+  });
 });
 
 describe("수명 전이의 의도", () => {
@@ -174,7 +356,7 @@ describe("수명 전이의 의도", () => {
   const allowed = (kind: RunKind, from: LedgerRunState, to: LedgerRunState) => from === to || (TRANSITIONS[kind][from]?.includes(to) ?? false);
 
   const leases = [null, { issuedAt: NOW - 1_000, expiresAt: NOW + 29_000 }, { issuedAt: NOW - 20_000, expiresAt: NOW + 10_000 }, { issuedAt: NOW - 40_000, expiresAt: NOW - 10_000 }];
-  const lasts = [null, NOW - 1_000, NOW - 60_000];
+  const lasts = [null, "unknown" as const, NOW - 1_000, NOW - 60_000];
 
   test("모든 상태와 입력 조합에서 표가 허락하지 않는 의도를 내지 않는다", () => {
     const seen = new Set<string>();
