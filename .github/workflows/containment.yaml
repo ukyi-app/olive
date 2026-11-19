@@ -77,7 +77,9 @@ jobs:
           fi
           deb=${debs[0]}
           apt-cache policy apparmor-profiles
-          echo "apparmor-profiles $(dpkg-deb -f "$deb" Version), sha256 $(sha256sum "$deb" | cut -d' ' -f1)"
+          version=$(dpkg-deb -f "$deb" Version)
+          sha=$(sha256sum "$deb" | cut -d' ' -f1)
+          echo "apparmor-profiles $version, sha256 $sha"
           dpkg-query -W apparmor
           dpkg-deb -x "$deb" "$dir/root"
           profile="$dir/root/usr/share/apparmor/extra-profiles/bwrap-userns-restrict"
