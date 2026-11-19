@@ -25,6 +25,7 @@
 |---|---|
 | `0001-core` | 아래 "표"의 표·트리거·인덱스 전부 |
 | `0002-renew-lease-end` | `instructions.lease_until`(INTEGER, NULL 허용) 칸 하나. 갱신 지시(`run_renew`)만 값을 가질 수 있고 그 값은 발행 시각보다 늦고 9007199254740991 이하다(CHECK). 칸만 더하므로 기존 줄은 NULL(끝 모름)이고 다른 칸의 값과 제약은 그대로다 |
+| `0003-tool-requests` | 표 `tool_requests`와 트리거 셋(`tool_requests_born_waiting`, `tool_requests_permanent`, `tool_requests_fixed`). 아래 "작업 부탁(배정 전 대기)". 새 표만 더하므로 기존 표·줄은 그대로다 |
 
 판 하나는 트랜잭션 하나라 도중에 실패하거나 끊기면 그 판 전체가 되돌려진다. 적용 기록은 `ledger_migrations(version, name, applied_at)`. 번호가 비거나, 이름과 번호가 다르거나, 폴더에 꼴이 다른 파일이 있거나, 장부의 판이 코드보다 높거나, 같은 번호의 이름이 다르면 열지 않는다. 호출자가 `migrations`로 넘긴 목록도 같은 검사를 파일을 열기 전에 자리마다 거친다(배열의 빈 자리 포함). 적용 시각으로 쓸 시계의 값도 파일을 건드리기 전에 확인한다.
 
@@ -34,13 +35,14 @@
 
 ## 표
 
-`instructions.lease_until`만 `0002-renew-lease-end`이고 나머지는 모두 `0001-core`다.
+`instructions.lease_until`은 `0002-renew-lease-end`, `tool_requests`는 `0003-tool-requests`이고 나머지는 모두 `0001-core`다.
 
 | 묶음 | 표 | 요지 |
 |---|---|---|
 | 정지·일시 중지 | `stop_state`, `diagnosis_pause` | 정지 세대(0 포함, 줄이 없으면 아직 적지 않음), 정지 여부, 확인 단계, 진단 일시 중지의 끝 |
 | 실행·슬롯·예산 | `runs`, `run_epoch`, `run_transitions`, `instructions`, `slot_holds` | 실행 ID·세대·역할·revision 둘·snapshot·실행기·자격 네 칸·기한·남은 예산·상태·영수증 id들. 낸 지시(v1 여섯, 적은 뒤 불변)와 갱신 지시가 발급한 임대 끝("스케줄러가 쓰는 읽기"의 "발급한 갱신의 끝"). 점유가 맞지 않은 관측: (실행기, 실행, 세대)마다 한 줄이고 관측 번호를 가진다. 줄이 있으면 그 실행 ID를 영영 시작하지 않고, `holds_slot`이면 그 종류의 슬롯도 막는다 |
 | 입력·대기열 | `inputs` | 요청 ID, 인증된 출처, 원문 참조(`<저장소>/<UUID>`)와 만료, 순번, 취소 |
+| 작업 부탁 | `tool_requests` | 오케스트레이터의 `start_worker` 부탁: 참조(UUID), 소유자(논리 요청, `inputs`의 외래 키), 재시도 키(`dedupe_key`), 역할·목적 분류·원본 참조·입력 digest, 기록한 세션·호출 ID, 단계(`waiting_assignment`·`not_started`), 이을 실행(`run_id`, 비어 있음), 기록·취소 시각과 취소한 세션·호출 ID. (소유자, 재시도 키)마다 한 줄 |
 | 영수증·보고 | `deliveries`, `receipt_conflicts`, `report_signals` | 받은 id와 본문 digest, 속한 실행(외래 키), 가리킨 지시, 결과 보고의 저장 자리·digest·반영 시각. 같은 id에 다른 digest의 기록(같은 충돌은 한 줄). 훅·세션 깨짐 보고의 구조화 칸(사건 종류, `session_id`, 턴 ID, 오류 종류, 원인, 표식 digest, 관측 시각) |
 | 세션·인계 | `sessions`, `rule_checks`, `session_takeovers`, `start_permit_uses` | 세션 ID, 시작 순번, 세대 표식 digest, 교체 시각, 처리 위치, 인계 참조, 규칙 확인(D-51)과 낸 쪽, 교체 기록(앞 실행·인수 발신자·표식·허가·확정한 규칙 확인·다음 실행, D-50), 시작 허가의 한 번 사용. **지금 쓰는 것은 `rule_checks`와 `session_takeovers`의 받은 칸뿐이다**("세션 증거" 참조) |
 | 게시 연결 | `publications` | 현관 작업 ID, 후보 digest, 대기·확정·모름(확정이면 posted·not_posted) |
@@ -55,7 +57,7 @@
 
 ## 새 업무를 열어도 되는 조건
 
-새 접수·실행 줄·시작·자격·게시·갱신(`enqueueInput`, `admitRun`, `startRun`, `startSession`, `recordPublication`, `recordRenewInstruction`)은 모두 한 자리(`Ledger`의 쓰기 모드 `start`)의 전제를 거친다.
+새 접수·작업 부탁·실행 줄·시작·자격·게시·갱신(`enqueueInput`, `recordToolRequest`, `admitRun`, `startRun`, `startSession`, `recordPublication`, `recordRenewInstruction`)은 모두 한 자리(`Ledger`의 쓰기 모드 `start`)의 전제를 거친다.
 
 1. 장부가 건강하다(한 번이라도 쓰기·읽기가 실패했으면 다시 열 때까지 `ledger_unwritable`).
 2. 사본에서 떠 대조가 끝나지 않은 장부가 아니다(`snapshot_hold`, "사본에서 뜬 장부의 보류").
@@ -114,6 +116,36 @@
 - **종료·확정은 발행 시각의 최댓값:** `lastStopAt`·`lastFinalizeAt`은 마지막으로 기록한 행이 아니라 기록된 발행 시각의 최댓값이다. 더 이른 시각으로 나중에 기록한 지시는 앞 지시의 시각에 가려진다.
 - **지금 상태로 좁히지 않는다:** 장부는 실행이 지금 상태에 들어온 시각을 따로 적지 않는다. `lastStopAt`·`lastFinalizeAt`은 상태와 무관한 그 실행의 마지막 지시다. 예를 들어 `cleanup_pending`의 `lastFinalizeAt`은 그 앞 상태에서 낸 확정 지시일 수 있고, 그러면 확정 재시도가 그 시각부터 답을 기다린 뒤에 나온다.
 
+## 작업 부탁(배정 전 대기)
+
+오케스트레이터 세션이 `start_worker`로 낸 부탁을 실행 줄과 따로 적는다. 부탁을 받은 순간에는 맞는 실행기나 계정이 없을 수 있다. 그때 실행 줄(`admitRun`: 실행기·자격·기한·예산을 가진다)을 만들거나 가짜 실행기 ID를 채우지 않고, 부탁만 적고 참조를 돌려준다. 감독의 도구 처리기(`src/supervisor/scheduler/tools.ts`)의 장부 포트 넷을 아래 함수 넷이 채운다.
+
+| 공개 함수 | 동작 | 처리기 포트 |
+|---|---|---|
+| `findToolRequest({ owner, dedupeKey })` | `Read<ToolRequest \| null>`. 그 소유자의 그 재시도 키의 줄 | `findByRetryKey` |
+| `readToolRequest({ owner, ref })` | `Read<ToolRequest \| null>`. 그 소유자의 그 참조의 줄 | `readOwnedWork` |
+| `recordToolRequest(input)` | 쓰기 모드 `start`. `{ ok: true, outcome, request }`(`outcome`은 `created`·`existing`·`conflict`) 또는 거절 | `recordStart` |
+| `cancelToolRequest({ owner, ref, sessionId, callId, now })` | 쓰기 모드 `continue`. 대기 부탁을 `not_started`로 적고 `{ ok: true, phase }` 또는 거절 | `requestCancel` |
+
+`ToolRequest`는 `ref`, `owner`, `dedupeKey`, `role`, `purpose`, `sourceRef`, `inputDigest`, `phase`다. 포트의 `WorkRecord`와는 이름만 다르다(`retryKey` ↔ `dedupeKey`, `content`의 네 칸 ↔ 펼친 네 칸). 장부의 입력 칸 이름은 `test/ledger/static.test.ts`가 막는 조각(`key`로 끝나는 이름은 `dedupe_key`뿐, `content`)을 쓰지 않는다. 그래서 포트를 채우는 어댑터는 이름을 옮기고, 새 참조의 후보를 넘기고, 거절을 포트의 꼴로 옮긴다: `stopped` → `stopped`, `intake_closed`·`snapshot_hold` → `intake_closed`, `transition_denied` → `already_ended`, 그 밖은 모름(`known: false`). 그 어댑터는 `test/ledger/tool-requests.test.ts`에 있다.
+
+- **소유:** 소유자(`owner`)는 부탁을 낸 논리 요청이고 접수한 입력이어야 한다(`inputs`의 외래 키, 아니면 `invariant_violation`이고 줄이 생기지 않는다). 두 조회와 취소는 소유자가 같은 줄만 본다. 다른 소유자의 같은 키·같은 참조는 없는 줄과 같은 답이다: 조회는 `{ known: true, value: null }`, 취소는 `unknown_run`. 읽기 실패의 꼴(`known: false`)도 소유와 무관하다.
+- **유일성:** (소유자, 재시도 키)마다 한 줄이다. 유일 인덱스가 지키고, 같은 참조나 같은 (소유자, 키)의 INSERT는 트리거가 막는다(`INSERT OR REPLACE`가 옛 줄을 지우고 새 참조를 들이는 길이 없다). 기록은 같은 트랜잭션에서 그 소유자의 같은 키를 먼저 찾는다. 있으면 새 줄 없이 그 줄을 돌려준다: 내용(역할·목적 분류·원본 참조·입력 digest)이 같으면 `existing`, 다르면 `conflict`. 처리기가 조회한 뒤 기록하기 전에 같은 키가 생겨도 같다. 다른 소유자가 같은 키를 쓰면 각자 자기 줄을 만들고 서로의 줄에 닿지 않는다. 처리기는 돌려받은 줄의 소유자와 내용을 다시 대조한다.
+- **참조:** 불투명 UUID이고 배정 뒤에도 같다. 장부는 난수를 부르지 않으므로 부르는 쪽이 후보(`ref`)를 넘기고, 장부는 새 줄을 만들 때만 그 후보를 쓴다. 후보가 다른 줄의 참조와 같으면 `invariant_violation`이고 줄이 생기지 않는다.
+- **정지:** 기록은 새 업무다. 처리기가 들어올 때 본 정지와 별개로 "새 업무를 열어도 되는 조건"을 기록 트랜잭션 안에서 다시 본다. 정지(`stopped`), 정지 기록 없음(`stop_unknown`), 접수 허가 없음(`intake_closed`), 사본 보류(`snapshot_hold`), 쓸 수 없음(`ledger_unwritable`)이면 거절이고 줄이 생기지 않는다. 같은 키의 기존 줄을 돌려주는 것도 이 전제를 지난 뒤다. 취소 접수는 닫는 기록이라 정지 중에도, 접수가 닫혀도 적는다(처리기는 정지 중 호출을 문맥에서 먼저 거절한다).
+- **단계:** 부탁이 갖는 단계는 배정 전의 둘이고, 처리기의 단계 이름(`PHASES`) 안에 있다. `waiting_assignment`는 대기, `not_started`는 배정 전에 취소돼 시작하지 않은 부탁이다. 취소는 대기에서 한 번만 된다(다시 취소하면 `transition_denied`). 재시도 키는 논리 요청과 목적 분류로만 만들어지므로, 취소한 뒤 같은 부탁을 다시 내면 새 줄이 아니라 그 줄이 `not_started`로 나온다.
+- **배정 전 대기는 실행 줄이 아니다:** 기록과 취소는 `runs`·`slot_holds`·`instructions`에 아무것도 적지 않는다. 부탁은 슬롯을 쥐지 않고 실행기·자격·기한·예산을 갖지 않는다. 닫았다 다시 연 뒤에도 같은 참조와 단계로 읽힌다.
+- **배정과의 경계:** `tool_requests.run_id`가 부탁을 실행 줄에 잇는 자리다(실행 하나에 부탁 하나, 대기 부탁만, 한 번만 채운다: CHECK와 트리거). 잇는 연산은 없다. 배정한 뒤의 단계는 이은 실행 줄의 상태에서 읽는다. 이 읽기도 배정기가 만든다. 이 판의 코드는 이어진 줄을 만나면 단계를 지어내거나 대기로 답하지 않고, 그 줄의 읽기·기록·취소를 `corrupt`로 닫는다(장부가 실패 상태가 된다).
+
+**넣지 않는 것:** 목적의 자유 글(`brief`), 원문, 실행기 ID, 계정·자격, 모델 이름, 경로. 세션 ID와 호출 ID는 부탁을 기록·취소한 호출의 기록이고 판단(소유·중복·충돌)에 쓰지 않는다. 입력이 그 소유자의 고정된 입력인지(`inputPinned`), 지금 호출권을 가진 세션인지(`liveSession`), 결과(`readResult`)는 이 표가 답하지 않는다.
+
+**배정기가 지킬 것:**
+
+1. 실행 줄을 적는 것과 `run_id`를 채우는 것을 한 트랜잭션에서 한다. 실행 줄만 남고 끊기면 같은 부탁이 다음 배정에서 실행을 하나 더 얻는다.
+2. 같은 트랜잭션에서 부탁이 아직 `waiting_assignment`이고 이어지지 않았는지 다시 본다. 취소된 부탁은 CHECK가 잇지 못하게 막는다.
+3. 부탁의 재시도 키를 실행 줄의 `dedupe_key`로 그대로 쓰지 않는다. `runs.dedupe_key`는 소유자와 무관하게 전역 유일이라, 그 키로 찾으면 다른 소유자의 실행이 돌아올 수 있다. 실행 쪽 중복은 `run_id`의 유일성으로 막는다.
+4. 이은 부탁의 단계를 실행 줄에서 읽도록 두 조회를 바꾸고, 그때 위 `corrupt` 닫기를 없앤다. 이은 부탁의 취소는 실행의 취소 지시(`task_cancel`)이고 `cancelToolRequest`가 아니다.
+
 ## 세션 증거
 
 v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느 대기 실행의 시작 근거인지 장부가 정할 수 없다. 그래서 이 PR은 증거를 받아 적고 읽는 데서 멈춘다.
@@ -162,8 +194,8 @@ v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느
 
 | 쪽 | 쓰기 | 보류 중 |
 |---|---|---|
-| 여는 쪽(쓰기 모드 `start`) | `enqueueInput`, `admitRun`, `startRun`, `startSession`, `recordPublication`, `recordRenewInstruction` | `snapshot_hold`로 거절 |
-| 닫는 쪽(`continue`) | `applyStop`, `mergeStop`, `setPause`, `cancelInput`, `recordStopInstruction`, `recordFinalizeInstruction`, `markResult`, `markCleanupPending`, `recordBudget`, `markLost`, `holdSlots`, `clearSlotHold`, `applyReceipt`, `recordReport`, `settleReport`, `setProcessedSeq`, `planRotation`, `settlePublication`, nonce 소비 | 막지 않는다 |
+| 여는 쪽(쓰기 모드 `start`) | `enqueueInput`, `recordToolRequest`, `admitRun`, `startRun`, `startSession`, `recordPublication`, `recordRenewInstruction` | `snapshot_hold`로 거절 |
+| 닫는 쪽(`continue`) | `applyStop`, `mergeStop`, `setPause`, `cancelInput`, `cancelToolRequest`, `recordStopInstruction`, `recordFinalizeInstruction`, `markResult`, `markCleanupPending`, `recordBudget`, `markLost`, `holdSlots`, `clearSlotHold`, `applyReceipt`, `recordReport`, `settleReport`, `setProcessedSeq`, `planRotation`, `settlePublication`, nonce 소비 | 막지 않는다 |
 | 근거·풀기(`new`) | `applyRuleCheck`, `releaseStop`, `confirmSnapshotReconciled` | 막지 않는다. `releaseStop`은 보류를 풀지 않는다 |
 
 - **읽기:** `snapshotOrigin()`은 원본이면 `null`, 사본에서 떴으면 `snapshotId`, `ledgerId`, `takenAt`, `reconciledAt`, `held`, `mayBeStale`(`account_locks`, `receipts`)을 낸다. 복원 5단계도 같은 값을 `snapshotOrigin`으로 내고, 보류면 `intakeMayOpen: false`, `closedBecause`에 `snapshot_hold`다.
