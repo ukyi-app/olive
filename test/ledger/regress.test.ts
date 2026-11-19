@@ -16,7 +16,8 @@ const PEERS = ["front-door"];
 function ports(overrides: Partial<{ [K in keyof RestorePorts]: Partial<RestorePorts[K]> }> = {}): RestorePorts {
   return {
     stopAuthority: { latestStop: async () => null, ...overrides.stopAuthority },
-    peers: { contracts: async () => PEERS.map((peer) => ({ peer, contract: "olive-control/v1" })), ...overrides.peers },
+    // PEERS는 현관 하나다. 현관은 v2와 맞은 정책으로 답해야 맞은 응답이다.
+    peers: { contracts: async () => PEERS.map((peer) => ({ peer, contract: "olive-control/v2", policy: "match" as const })), ...overrides.peers },
     occupancy: { occupancy: async () => [], ...overrides.occupancy },
     publications: { lookup: async () => ({ kind: "pending" as const }), ...overrides.publications },
   };
@@ -174,7 +175,8 @@ test("R03 맞춤: 더 새로운 정지를 저장하지 못한 장부는 옛 세�
 
 test("R04 점유: 필수 실행기의 응답 행이 없거나 부분 조회뿐이면 접수를 열지 않고, 명시적 빈 응답만 빈 점유다", async () => {
   const required = ["front-door", WORKER];
-  const contracts = async () => required.map((peer) => ({ peer, contract: "olive-control/v1" }));
+  // 판과 정책은 모두 맞게 답한다(현관 v2와 맞은 정책, 실행기 v1). 닫는 사유는 점유뿐이어야 한다.
+  const contracts = async () => required.map((peer) => (peer === "front-door" ? { peer, contract: "olive-control/v2", policy: "match" as const } : { peer, contract: "olive-control/v1" }));
   const closed: OccupancyAnswer[][] = [
     [],
     [{ executorId: WORKER, coverage: "partial", runs: [] }],

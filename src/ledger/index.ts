@@ -53,6 +53,8 @@ export {
   type OccupancyAnswer,
   type OccupancyMismatch,
   type OccupancyPort,
+  type PeerContractAnswer,
+  type PeerPolicy,
   type PeersPort,
   type PublicationPort,
   type RestoreOptions,
