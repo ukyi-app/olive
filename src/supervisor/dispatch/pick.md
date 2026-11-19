@@ -35,20 +35,20 @@ Pick =
 AssignmentInput = Omit<AssignToolRequestInput, "runId">
 ```
 
-`refused`는 부탁 자체가 배정될 수 없다는 뜻이고 다음 박자에도 같다. `held`는 지금 고를 수 없다는 뜻이고 입력이 바뀌면 달라질 수 있다. `input_rejected`는 부르는 쪽이나 주입 자료의 결함이다. `assign` 밖의 답은 모두 배정 입력을 만들지 않는다.
+`refused`는 지금 받은 근거로는 배정할 수 없다는 뜻이다. 입력 취소·만료와 고정된 부탁 내용에서 나온 거절은 다음 박자에도 같지만, `prior_run_end_unconfirmed`는 장부의 최신 실행·종료 근거로 다시 판정하며 종료가 확인되면 풀린다. `held`는 지금 고를 수 없다는 뜻이고 입력이 바뀌면 달라질 수 있다. `input_rejected`는 부르는 쪽이나 주입 자료의 결함이다. `assign` 밖의 답은 모두 배정 입력을 만들지 않는다.
 
 ## 판단 순서
 
 먼저 걸린 답 하나만 낸다.
 
 1. 접수가 열리지 않았으면(`intakeOpen`이 `true`가 아니면) `intake_closed`. 다른 입력은 보지 않는다.
-2. 시각·부탁의 꼴(`ref` UUID, 역할, `inputDigest` sha256, 취소 boolean, 만료 유한 수).
+2. 시각·부탁의 꼴(`ref` UUID, 역할, `inputDigest` sha256, 취소 boolean). `now`와 만료는 장부의 시각 꼴인 양의 안전 정수(ms)여야 한다. 소수·0·음수·안전 범위 밖이면 각각 `malformed_now`, `malformed_request`다.
 3. 입력 취소 → `input_cancelled`, 만료(`expiresAt <= now`, 장부 `queueView`와 같은 경계) → `input_expired`.
 4. 배정 전 거절의 사실: 하나라도 `true`면 그 이름으로 `refused`, 아니면 `false`가 아닌 것을 모아 `evidence_missing`.
 5. 연결마다 `judgeAssignment`. 입력 거절이 하나라도 나오면 그대로 `assignment_input`. 통과한 후보가 없으면 연결마다의 보류 이유를 연결 번호 순으로 `no_executor`.
 6. `selectAccount(부탁의 역할, accounts)`. `none`이면 그 이유로 `no_account`.
 7. 자격 참조: 없으면 `credential_unknown`, 꼴이 틀리면 `malformed_credential`, 고른 계정·방식과 다르면 `credential_mismatch`.
-8. 그 역할의 정책: 없으면 `plan_missing`, 같은 역할이 둘이면 `duplicate_plan`, 꼴이 틀리면(예산 1 미만 포함) `malformed_plan`.
+8. 그 역할의 정책: 행이 없거나 행에 `budgetLeft`·`runDurationMs` 칸이 없으면 `plan_missing`, 같은 역할이 둘이면 `duplicate_plan`, 값이 있는데 꼴이 틀리면(예산 1 미만 포함) `malformed_plan`.
 
 ## 고르는 순서
 
@@ -71,11 +71,11 @@ AssignmentInput = Omit<AssignToolRequestInput, "runId">
 | 스스로 고치는 작성인데 근거 문이 닫힘(D-34) | 사실 `self_fix_basis_closed`. 없으면 보류 | 없음 |
 | 앞 실행의 종료 미확인 | 사실 `prior_run_end_unconfirmed`. 없으면 보류 | 없음(실행 목록을 받지 않음) |
 
-이 사실을 채우는 쪽은 아직 없다. 그래서 지금은 어떤 부탁도 `assign`에 이르지 않는다. 틀리는 방향은 늘 "배정하지 않음"이다.
+이 사실을 채우는 어댑터는 아직 없고, 지금의 운영 경로에서 이 함수를 부르는 곳도 없다. 함수 자체는 여섯 사실이 모두 `false`로 확인되어 들어오면 고른다. 틀리는 방향은 늘 "배정하지 않음"이다.
 
 ## 기한과 예산
 
-예산(`budgetLeft`)과 snapshot digest는 그 역할의 `RunPlan`에서 그대로 옮긴다. 기한은 `min(now + runDurationMs, request.input.expiresAt)`이다: 입력이 만료된 실행은 장부가 시작하지 않으므로 그보다 늦은 기한은 쓸 수 없다. 숫자는 코드에 기본값이 없고, 값이 없으면 `plan_missing`이다.
+예산(`budgetLeft`)과 snapshot digest는 그 역할의 `RunPlan`에서 그대로 옮긴다. 기한은 `min(now + runDurationMs, request.input.expiresAt)`이다: 입력이 만료된 실행은 장부가 시작하지 않으므로 그보다 늦은 기한은 쓸 수 없다. 합이 안전 범위를 넘어도 안전한 만료로 잘리므로 기한은 늘 양의 안전 정수이고 `now`보다 뒤다. 숫자는 코드에 기본값이 없고, 값이 없으면(행이 없거나 숫자 칸이 빠지면) `plan_missing`이다.
 
 ## 다시 만들지 않는 것
 
@@ -85,5 +85,5 @@ AssignmentInput = Omit<AssignToolRequestInput, "runId">
 
 - 부르는 쪽은 `assign`을 받으면 새 UUID 실행 ID를 붙여 `assignToolRequest`에 그대로 넘기고, 장부의 거절을 따른다. `already_assigned`면 돌려받은 실행의 실행기·실행 ID를 쓴다.
 - `credential`은 `selectAccount`가 고를 그 계정의 것이어야 한다. 다르면 `credential_mismatch`로 보류된다.
-- `facts`를 채우는 어댑터는 장부의 고정 입력에서만 복원하고, 모르면 칸을 비운다(`false`로 채우지 않는다).
-- `now`는 장부 시계와 같은 시계에서 읽고, `intakeOpen`은 같은 박자의 `Restorer.intakeOpen()`이다.
+- `facts`를 채우는 어댑터는 그 부탁과 대조한 근거로 채우고, 모르면 칸을 비운다(`false`로 채우지 않는다). 앞 실행의 종료는 고정된 부탁 내용이 아니라 장부의 최신 실행·종료 근거라 박자마다 새로 읽는다.
+- `now`는 장부 시계와 같은 시계에서 읽은 양의 안전 정수(ms)이고, `intakeOpen`은 같은 박자의 `Restorer.intakeOpen()`이다.

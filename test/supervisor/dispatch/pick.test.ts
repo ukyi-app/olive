@@ -3,6 +3,7 @@ import type { AssignToolRequestInput } from "../../../src/ledger/index.ts";
 import { type AssignmentInput, type PickInput, pickAssignment, PRE_ASSIGN_FACTS, type PreAssignFacts } from "../../../src/supervisor/dispatch/pick.ts";
 import type { AssignmentContext, HoldReason, Registration } from "../../../src/supervisor/roles/assign.ts";
 import type { Candidate } from "../../../src/supervisor/transport/connections.ts";
+import { id, NOW as LEDGER_NOW, must, open, ready, tempPath } from "../../ledger/helpers.ts";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 
@@ -82,6 +83,59 @@ describe("pickAssignment: 고른 결과", () => {
     const picked = pickAssignment(base({ request: { ...base().request, input: { cancelled: false, expiresAt: NOW + 10 } } }));
     expect(picked.kind === "assign" && picked.input.deadlineAt).toBe(NOW + 10);
   });
+
+  test("장부가 받지 않는 시각이면 배정 입력을 만들지 않는다", () => {
+    const at = (now: number, expiresAt: number, runDurationMs = 5) =>
+      pickAssignment(
+        base({
+          now,
+          request: { ...base().request, input: { cancelled: false, expiresAt } },
+          plans: [{ role: "isolated_reader", snapshotDigest: SNAPSHOT, budgetLeft: 7, runDurationMs }],
+        }),
+      );
+    const malformedNow = { kind: "input_rejected", reason: "malformed_now" } as const;
+    const malformedRequest = { kind: "input_rejected", reason: "malformed_request" } as const;
+    // 소수 시각은 유한하지만 장부의 시각(양의 안전 정수)이 아니다.
+    expect(at(1000.25, 1010)).toEqual(malformedNow);
+    expect(at(0, 1010)).toEqual(malformedNow);
+    expect(at(-1, 1010)).toEqual(malformedNow);
+    expect(at(2 ** 53, 2 ** 53 + 2, 1)).toEqual(malformedNow);
+    expect(at(1000, 1000.5)).toEqual(malformedRequest);
+    expect(at(1000, 2 ** 53 + 2)).toEqual(malformedRequest);
+    // 합이 안전 범위를 넘어도 안전한 만료로 잘리면 고른다. 기한은 지금보다 뒤다.
+    const max = Number.MAX_SAFE_INTEGER;
+    const clipped = at(max - 10, max, max);
+    expect(clipped.kind === "assign" && clipped.input.deadlineAt).toBe(max);
+  });
+
+  test("고른 입력은 실제 장부의 배정 검사를 지나 실행 줄이 된다", () => {
+    const ledger = ready(open(tempPath()));
+    const owner = id();
+    const source = `inbox/${id()}`;
+    const expiresAt = LEDGER_NOW + 10;
+    must(ledger.enqueueInput({ requestId: owner, source: "admin-dm", sourceRef: { ref: source, expiresAt }, receivedAt: LEDGER_NOW }));
+    const waiting = must(
+      ledger.recordToolRequest({
+        ref: id(),
+        owner,
+        dedupeKey: `start_worker:${owner}:read`,
+        role: "isolated_reader",
+        purpose: "read",
+        sourceRef: source,
+        inputDigest: DIGEST,
+        sessionId: "session-1",
+        callId: id(),
+        now: LEDGER_NOW,
+      }),
+    ).request;
+    // 기한은 정책 길이보다 짧은 입력 만료로 잘린 계산 값이다.
+    const picked = pickAssignment(base({ now: LEDGER_NOW, request: { ref: waiting.ref, role: waiting.role, inputDigest: waiting.inputDigest, input: { cancelled: false, expiresAt } } }));
+    if (picked.kind !== "assign") throw new Error(`배정 입력이 아님: ${JSON.stringify(picked)}`);
+    expect(picked.input.deadlineAt).toBe(expiresAt);
+    const assigned = must(ledger.assignToolRequest({ ...picked.input, runId: id() }));
+    expect(assigned.outcome).toBe("assigned");
+    expect(assigned.run).toEqual(expect.objectContaining({ executorId: picked.input.executorId, deadlineAt: expiresAt, budgetLeft: picked.input.budgetLeft }));
+  });
 });
 
 describe("보장 1: 맞는 실행기가 없으면 부르지 않는다", () => {
@@ -116,6 +170,11 @@ describe("보장 1: 맞는 실행기가 없으면 부르지 않는다", () => {
   test("그 역할의 정책 값이 없으면 숫자를 지어내지 않고 보류한다", () => {
     expect(pickAssignment(base({ plans: [] }))).toEqual({ kind: "held", reason: "plan_missing" });
     expect(pickAssignment(base({ plans: [{ role: "code_author", snapshotDigest: SNAPSHOT, budgetLeft: 1, runDurationMs: 1 }] }))).toEqual({ kind: "held", reason: "plan_missing" });
+    // 행은 있어도 숫자 칸이 빠지면 행이 없을 때와 같은 보류다. 값이 있는데 틀리면 꼴 오류다.
+    const { budgetLeft: _b, ...noBudget } = base().plans[0]!;
+    const { runDurationMs: _d, ...noDuration } = base().plans[0]!;
+    expect(pickAssignment(base({ plans: [noBudget as never] }))).toEqual({ kind: "held", reason: "plan_missing" });
+    expect(pickAssignment(base({ plans: [noDuration as never] }))).toEqual({ kind: "held", reason: "plan_missing" });
     expect(pickAssignment(base({ plans: [{ role: "isolated_reader", snapshotDigest: SNAPSHOT, budgetLeft: 0, runDurationMs: 1 }] }))).toEqual({ kind: "input_rejected", reason: "malformed_plan" });
     const plan = base().plans[0];
     expect(pickAssignment(base({ plans: [plan!, plan!] }))).toEqual({ kind: "input_rejected", reason: "duplicate_plan" });
@@ -199,6 +258,11 @@ describe("보장 4: 취소·만료된 입력과 설계의 배정 전 거절", ()
     for (const fact of PRE_ASSIGN_FACTS) {
       expect(pickAssignment(base({ facts: { ...CLEAR, [fact]: true } }))).toEqual({ kind: "refused", reason: fact });
     }
+  });
+
+  test("앞 실행의 종료 미확인 거절은 종료가 확인되면 풀린다", () => {
+    expect(pickAssignment(base({ facts: { ...CLEAR, prior_run_end_unconfirmed: true } }))).toEqual({ kind: "refused", reason: "prior_run_end_unconfirmed" });
+    expect(pickAssignment(base({ facts: { ...CLEAR, prior_run_end_unconfirmed: false } })).kind).toBe("assign");
   });
 
   test("사실이 없으면 보류(입력 없음)이고 빠진 것을 순서대로 적는다", () => {

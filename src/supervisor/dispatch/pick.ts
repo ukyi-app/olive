@@ -29,7 +29,8 @@ export interface WaitingRequest {
 
 // 설계(supervisor.md §4 start_worker 행)가 배정 전에 거절하라고 한 조건 가운데 이 판단의 다른 입력으로 판정할 수 없는 것.
 // 값은 "그 조건에 해당한다"다: true면 거절, false면 통과, 칸이 없거나 boolean이 아니면 모름(보류).
-// 이 사실을 채우는 쪽(장부의 고정 입력에서 복원하는 어댑터)은 아직 없다. 그동안은 어떤 부탁도 배정되지 않는다.
+// 이 사실을 채우는 어댑터는 아직 없고 운영 경로에서 이 함수를 부르는 곳도 아직 없다. 함수 자체는 여섯 칸이 모두 false로
+// 확인되면 고른다. 앞 실행의 종료는 고정된 부탁 내용이 아니라 장부의 최신 실행·종료 근거라 박자마다 새로 읽어야 한다.
 export const PRE_ASSIGN_FACTS = [
   // 허용되지 않은 역할·목적 조합
   "role_purpose_not_allowed",
@@ -83,7 +84,8 @@ export type PickRejectReason = (typeof PICK_REJECT_REASONS)[number];
 export type Pick =
   | { readonly kind: "assign"; readonly input: AssignmentInput; readonly connection: number; readonly candidate: AssignmentCandidate }
   | { readonly kind: "intake_closed" }
-  // 부탁 자체가 배정될 수 없다. 다음 박자에도 같은 답이다.
+  // 지금 받은 근거로는 배정할 수 없다. 취소·만료와 고정된 부탁 내용의 거절은 다음 박자에도 같지만,
+  // prior_run_end_unconfirmed는 앞 실행의 종료가 확인되면 풀린다.
   | { readonly kind: "refused"; readonly reason: "input_cancelled" | "input_expired" | PreAssignFact }
   // 보류(입력 없음): 판정할 사실이 없다. missing은 PRE_ASSIGN_FACTS 순서다.
   | { readonly kind: "held"; readonly reason: "evidence_missing"; readonly missing: readonly PreAssignFact[] }
@@ -96,7 +98,9 @@ export type Pick =
   | { readonly kind: "input_rejected"; readonly reason: "assignment_input"; readonly assign: InputRejectReason };
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
-const isTime = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
+// 장부의 시각 꼴(양의 안전 정수 ms)과 같다. 장부의 검사 함수는 공개 면에 없어 여기서 같은 조건을 두고,
+// 고른 입력이 실제 장부를 지나는지는 시험이 장부 파일에 배정해 본다. 유한하기만 하면 소수·0·음수 시각이 장부에서 예외가 된다.
+const isTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const isRole = (value: unknown): value is Role => (ROLES as readonly unknown[]).includes(value);
 const matches = (value: unknown, pattern: RegExp): value is string => typeof value === "string" && pattern.test(value);
 
@@ -184,7 +188,8 @@ export function pickAssignment(input: PickInput): Pick {
   const plans = input.plans.filter((plan) => isObject(plan) && plan.role === request.role);
   if (plans.length > 1) return { kind: "input_rejected", reason: "duplicate_plan" };
   const plan = plans[0];
-  if (plan === undefined) return { kind: "held", reason: "plan_missing" };
+  // 행이 없는 것과 행에 숫자 칸이 빠진 것은 같은 "정책 값 없음"이다. 있는데 틀린 값만 꼴 오류다.
+  if (plan === undefined || plan.budgetLeft === undefined || plan.runDurationMs === undefined) return { kind: "held", reason: "plan_missing" };
   if (!validPlan(plan)) return { kind: "input_rejected", reason: "malformed_plan" };
 
   // 기한은 입력의 만료보다 늦지 않게 자른다. 입력이 만료된 실행은 장부가 시작하지 않으므로, 더 긴 기한은 쓸 수 없는 약속이다.
