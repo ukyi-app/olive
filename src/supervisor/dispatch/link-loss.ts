@@ -314,6 +314,7 @@ function judge(
 
 // 답의 옮긴 실행 목록을 칸마다 한 번 읽어 옮겨 적는다. 하나라도 꼴이 틀리거나 markLostFor가 할 수 없는 전이(진행 중 상태에서
 // unknown_running이 아님)면 null: 장부가 실제로 옮긴 것인지 모르므로 옮김으로 세지 않는다.
+// 실행 세대는 장부 스키마대로 1부터다. 세대 0은 장부에 있을 수 없는 실행이므로 꼴이 틀린 답이다(정지 세대는 0부터라 헷갈리기 쉽다).
 function lostRuns(value: unknown): LostRun[] | null {
   if (!Array.isArray(value)) return null;
   const runs: LostRun[] = [];
@@ -321,7 +322,7 @@ function lostRuns(value: unknown): LostRun[] | null {
     if (!isObject(item)) return null;
     const { runId, runGeneration, before, after } = item;
     if (typeof runId !== "string" || !UUID.test(runId)) return null;
-    if (!Number.isSafeInteger(runGeneration) || (runGeneration as number) < 0) return null;
+    if (!Number.isSafeInteger(runGeneration) || (runGeneration as number) < 1) return null;
     if (!isState(before) || !IN_FLIGHT.includes(before) || after !== LOST) return null;
     runs.push({ runId, runGeneration: runGeneration as number, before, after: LOST });
   }

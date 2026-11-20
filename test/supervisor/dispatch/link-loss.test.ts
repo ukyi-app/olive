@@ -462,7 +462,7 @@ describe("보장 3: 자리를 풀지 않고, 옮긴 실행을 돌려준다", () 
     w.setClock(NOW + JUDGE + 1);
     const watch = [{ executorId: WORKER_EXECUTOR, absentSince: NOW }];
     const answerWith = (before: string, after: string): unknown => {
-      w.wrap({ listRuns: () => ledger.listRuns(), markLostFor: () => ({ ok: true, runs: [{ runId: s.runId, runGeneration: 0, before, after }] }) as never });
+      w.wrap({ listRuns: () => ledger.listRuns(), markLostFor: () => ({ ok: true, runs: [{ runId: s.runId, runGeneration: 1, before, after }] }) as never });
       return ran(tick(w, watch)).executors;
     };
     const failed = [{ executorId: WORKER_EXECUTOR, outcome: "ledger_failed", absentSince: NOW, reason: "malformed_answer" }];
@@ -470,10 +470,29 @@ describe("보장 3: 자리를 풀지 않고, 옮긴 실행을 돌려준다", () 
     for (const before of LEDGER_RUN_STATES) {
       const moved = before === "preparing" || before === "running" || before === "stopping";
       expect(answerWith(before, "unknown_running")).toEqual(
-        moved ? [{ executorId: WORKER_EXECUTOR, outcome: "moved", absentSince: NOW, at: NOW + JUDGE + 1, runs: [{ runId: s.runId, runGeneration: 0, before, after: "unknown_running" }] }] : failed,
+        moved ? [{ executorId: WORKER_EXECUTOR, outcome: "moved", absentSince: NOW, at: NOW + JUDGE + 1, runs: [{ runId: s.runId, runGeneration: 1, before, after: "unknown_running" }] }] : failed,
       );
       if (before !== "unknown_running") expect(answerWith("running", before)).toEqual(failed);
     }
+    expect(state(ledger, s.runId)).toBe("running");
+  });
+
+  test("장부의 답에 실행 세대가 양의 안전 정수가 아닌 실행이 있으면 옮김으로 세지 않는다", () => {
+    const w = world();
+    const s = running(w);
+    const ledger = w.ledger;
+    w.setClock(NOW + JUDGE + 1);
+    const watch = [{ executorId: WORKER_EXECUTOR, absentSince: NOW }];
+    const answerWith = (runGeneration: unknown): unknown => {
+      w.wrap({ listRuns: () => ledger.listRuns(), markLostFor: () => ({ ok: true, runs: [{ runId: s.runId, runGeneration, before: "running", after: "unknown_running" }] }) as never });
+      return ran(tick(w, watch)).executors;
+    };
+    const failed = [{ executorId: WORKER_EXECUTOR, outcome: "ledger_failed", absentSince: NOW, reason: "malformed_answer" }];
+    // 장부의 실행 세대는 1부터다. 0만 다른 답이 거절되는지 보려고 나머지 칸은 성공하는 답과 같게 둔다.
+    expect(answerWith(1)).toEqual([
+      { executorId: WORKER_EXECUTOR, outcome: "moved", absentSince: NOW, at: NOW + JUDGE + 1, runs: [{ runId: s.runId, runGeneration: 1, before: "running", after: "unknown_running" }] },
+    ]);
+    expect(answerWith(0)).toEqual(failed);
     expect(state(ledger, s.runId)).toBe("running");
   });
 });
