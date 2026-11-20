@@ -14,8 +14,8 @@ import { type AssignmentCandidate, type AssignmentContext, type HoldReason, type
 import { PATTERNS } from "../scheduler/tools.ts";
 import type { Candidate } from "../transport/connections.ts";
 
-// 대기 부탁 하나. 장부의 대기 부탁 목록 읽기는 아직 없어 그 읽기가 낼 꼴을 여기서 선언한다.
-// 소유자 입력의 취소·만료는 부탁 줄이 아니라 입력 줄의 값이다. 장부의 배정 연산은 이 둘을 보지 않으므로 여기서 거른다.
+// 대기 부탁 하나. 장부 listWaitingToolRequests()의 항목(WaitingToolRequest)에서 owner를 뺀 꼴이다.
+// 소유자 입력의 취소·만료는 부탁 줄이 아니라 입력 줄의 값이다. 고를 때 여기서 먼저 거르고, 이을 때 장부의 배정 연산이 같은 조건을 다시 본다.
 export interface WaitingRequest {
   readonly ref: string;
   readonly role: Role;
