@@ -5,7 +5,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, type KeyObject } from "node:crypto";
 import type * as tls from "node:tls";
 import { type Envelope, limits, type NonceStore, rawPublicKey, type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
-import type { ReplyTools } from "../../../src/supervisor/transport/connections.ts";
+import { Connections, type Event, type ReplyTools } from "../../../src/supervisor/transport/connections.ts";
 import { type RegistrySettings, RegistryState } from "../../../src/supervisor/transport/registry.ts";
 import { type ConnectionServer, type ConnectionServerOptions, type Delivered, type ServerNote, startConnectionServer } from "../../../src/supervisor/transport/server.ts";
 import { createFrameDecoder, encodeFrame } from "../../../src/transport/framing.ts";
@@ -118,8 +118,16 @@ interface Harness {
   readonly delivered: Delivered[];
   readonly notes: ServerNote[];
   readonly nonces: ReturnType<typeof heldNonces>;
+  readonly restorer: { stopGeneration(): number };
   // 서명하는 동안 시간이 흐르게 하는 자리.
   onSeal: () => void;
+  // 서명한 답을 바꿔 끼우는 자리(틀로 만드는 사이 시간이 흐르게 할 때).
+  wrapSealed: (envelope: Envelope) => Envelope;
+  // 서버가 시계·복원기를 읽을 때, 전달할 때, 기록할 때 먼저 부른다. 던지면 그 읽기·전달이 던진다.
+  onClock: () => void;
+  onRestorer: () => void;
+  onDeliver: (output: Delivered) => void;
+  onNote: (note: ServerNote) => void;
   closedNotes(id: number): ServerNote[];
 }
 
@@ -129,11 +137,23 @@ async function start(over: Partial<ConnectionServerOptions> = {}): Promise<Harne
   const notes: ServerNote[] = [];
   const nonces = heldNonces();
   const restorer = { stopGeneration: () => GENERATION };
-  const harness = { clock, delivered, notes, nonces, onSeal: () => {} } as Harness;
+  const harness = {
+    clock,
+    delivered,
+    notes,
+    nonces,
+    restorer,
+    onSeal: () => {},
+    wrapSealed: (envelope: Envelope) => envelope,
+    onClock: () => {},
+    onRestorer: () => {},
+    onDeliver: () => {},
+    onNote: () => {},
+  } as unknown as Harness;
   const reply: ReplyTools = {
     seal: (input) => {
       harness.onSeal();
-      return sealEnvelope(input, SUP.privateKey);
+      return harness.wrapSealed(sealEnvelope(input, SUP.privateKey));
     },
     requestId: uuid,
     nonce: hex32,
@@ -142,14 +162,26 @@ async function start(over: Partial<ConnectionServerOptions> = {}): Promise<Harne
     host: HOST,
     port: 0,
     material: material(pki.supervisor()),
-    clock: () => clock.t,
+    clock: () => {
+      harness.onClock();
+      return clock.t;
+    },
     registry: firstRegistry(),
-    restorer: () => restorer,
+    restorer: () => {
+      harness.onRestorer();
+      return restorer;
+    },
     runGeneration: () => undefined,
     nonces: nonces.store,
     reply,
-    deliver: (output) => delivered.push(output),
-    observe: (note) => notes.push(note),
+    deliver: (output) => {
+      harness.onDeliver(output);
+      delivered.push(output);
+    },
+    observe: (note) => {
+      notes.push(note);
+      harness.onNote(note);
+    },
     ...over,
   });
   if (!result.ok) throw new Error(`서버가 시작하지 않았다: ${result.failure.kind}`);
@@ -203,6 +235,29 @@ async function connect(h: Harness): Promise<Peer> {
 }
 
 const phaseOf = (h: Harness, peer: Peer) => h.server.table().get(peer.id)?.phase;
+
+// 서버 쪽 소켓. 쓰기를 묶거나 하위 쓰기를 바꿔 로컬 쓰기의 완료를 시험이 정한다(서버의 내부 표를 읽는다).
+type ServerSocket = tls.TLSSocket & {
+  _write(chunk: unknown, encoding: string, done: (error?: Error | null) => void): void;
+  _writableState: { highWaterMark: number };
+};
+const serverLinks = (h: Harness) => (h.server as unknown as { links: Map<number, { socket: ServerSocket }> }).links;
+const serverSocket = (h: Harness, peer: Peer) => serverLinks(h).get(peer.id)!.socket;
+
+// 판단에 넣은 사건을 그대로 적는다.
+function spySteps(): Event[] {
+  const events: Event[] = [];
+  const original = Connections.prototype.step;
+  Connections.prototype.step = function (event, ctx, tools) {
+    events.push(event);
+    return original.call(this, event, ctx, tools);
+  };
+  cleanup.push(() => {
+    Connections.prototype.step = original;
+  });
+  return events;
+}
+const repliesSent = (events: Event[], id: number) => events.filter((e) => e.kind === "reply_sent" && e.connection === id).length;
 
 // 맞춤과 인사를 마친 연결.
 async function greet(h: Harness, keys: Keys, sender: string): Promise<Peer> {
@@ -354,6 +409,137 @@ describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => 
     expect(h.server.table().get(b.id)!.sync!.answeredAt).toBe(T1 + ANSWER - 1);
     expect(phaseOf(h, b)).toBe("answered");
   });
+
+  test("답을 틀로 만드는 사이 기한 정각이 되면 소켓에 쓰지 않는다(기한은 쓰기 바로 앞에서 판정한다)", async () => {
+    const h = await start();
+    const steps = spySteps();
+    const a = await connect(h);
+    const T0 = h.clock.t;
+    const gate = h.nonces.hold();
+    a.send(syncRequest(K1, R1, T0));
+    await until(() => gate.entered);
+    h.onSeal = () => (h.clock.t = T0 + ANSWER - 1);
+    // 서명 뒤 4,999ms, 답을 JSON으로 바꾸는 사이 1ms가 흐른다. 실행기가 받는 바이트는 서명한 답 그대로다.
+    h.wrapSealed = (envelope) =>
+      ({
+        toJSON: () => {
+          h.clock.t = T0 + ANSWER;
+          return envelope;
+        },
+      }) as unknown as Envelope;
+    gate.release();
+    await until(() => a.closed());
+    expect(a.frames).toEqual([]);
+    expect(repliesSent(steps, a.id)).toBe(0);
+    expect(h.notes).toContainEqual({ kind: "reply_not_sent", connection: a.id, deadline: T0 + ANSWER, at: T0 + ANSWER });
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
+  });
+
+  test("로컬 쓰기의 완료를 모르는 동안 reply_sent를 넣지 않는다. 그 사이 tick·applyRegistry·다른 연결은 멈추지 않고, 서버는 기다리는 연결을 닫는다", async () => {
+    const h = await start();
+    const steps = spySteps();
+    const b = await greet(h, K2, R2);
+    const a = await connect(h);
+    const sa = serverSocket(h, a);
+    // 쓰기를 소켓 안에 묶는다: write는 받지만 내보내지 않아 완료 콜백이 오지 않는다.
+    sa.cork();
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => sa.writableLength > 0);
+    expect(phaseOf(h, a)).toBe("requested");
+    expect(repliesSent(steps, a.id)).toBe(0);
+
+    h.server.tick();
+    expect(h.server.applyRegistry({ kind: "content", content: doc(2, [row(K1, "r1", "s1"), row(K2, "r2", "s2")]) }).kind).toBe("applied");
+    b.send(statusReport(K2, R2, h.clock.t));
+    await until(() => h.delivered.some((o) => o.kind === "forward" && o.connection === b.id));
+    expect(phaseOf(h, a)).toBe("requested");
+
+    // 쓰기 완료를 모르는 동안 받은 hello는 판단에 넘기지 않고 기다린다(nonce에도 닿지 않는다).
+    const early = hello(K1, R1, h.clock.t);
+    const link = serverLinks(h).get(a.id) as unknown as { received: number };
+    a.send(early);
+    await until(() => link.received === 2);
+    expect(h.nonces.calls).not.toContain(early.header.nonce);
+    expect(phaseOf(h, a)).toBe("requested");
+
+    // 내보내기 전에 소켓이 닫힌다.
+    sa.destroy();
+    await until(() => a.closed() && h.closedNotes(a.id).length > 0);
+    expect(a.frames).toEqual([]);
+    expect(repliesSent(steps, a.id)).toBe(0);
+    expect(h.server.table().get(a.id)).toBeUndefined();
+    expect(h.delivered.filter((o) => o.connection === a.id)).toEqual([]);
+    expect(phaseOf(h, b)).toBe("greeted");
+
+    // 쓰기를 기다리는 연결도 서버를 닫으면 닫힌다.
+    const c = await connect(h);
+    const sc = serverSocket(h, c);
+    sc.cork();
+    c.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => sc.writableLength > 0);
+    await h.server.close();
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "shutdown" }]);
+    expect(repliesSent(steps, c.id)).toBe(0);
+    expect(h.server.table().get(c.id)).toBeUndefined();
+  });
+
+  test("로컬 쓰기의 완료가 오류면 reply_sent를 넣지 않고, 밀렸다가 끝나면 한 번 넣고, 끝난 때가 기한 정각 이후면 닫는다", async () => {
+    const h = await start();
+    const steps = spySteps();
+
+    // 하위 쓰기의 완료가 오류로 돌아온다.
+    const a = await connect(h);
+    const sa = serverSocket(h, a);
+    let fail = () => {};
+    let entered = false;
+    sa._write = (_chunk, _encoding, done) => {
+      entered = true;
+      fail = () => done(new Error("시험: 로컬 쓰기 실패"));
+    };
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => entered);
+    expect(phaseOf(h, a)).toBe("requested");
+    fail();
+    await until(() => a.closed() && h.closedNotes(a.id).length > 0);
+    expect(a.frames).toEqual([]);
+    expect(repliesSent(steps, a.id)).toBe(0);
+    expect(h.server.table().get(a.id)).toBeUndefined();
+
+    // 쓰기 버퍼 임계값을 낮춰 write가 false를 돌려준다. 내보내기는 정상으로 끝난다.
+    const b = await connect(h);
+    const sb = serverSocket(h, b);
+    sb._writableState.highWaterMark = 1;
+    const returned: boolean[] = [];
+    const write = sb.write;
+    sb.write = function (this: ServerSocket, ...args: unknown[]) {
+      const value = (write as (...a: unknown[]) => boolean).apply(this, args);
+      returned.push(value);
+      return value;
+    } as typeof sb.write;
+    b.socket.pause();
+    b.send(syncRequest(K2, R2, h.clock.t));
+    await until(() => phaseOf(h, b) === "answered");
+    expect(returned).toEqual([false]);
+    b.socket.resume();
+    await until(() => b.frames.length === 1);
+    b.send(hello(K2, R2, h.clock.t));
+    await until(() => phaseOf(h, b) === "greeted");
+    expect(repliesSent(steps, b.id)).toBe(1);
+
+    // 쓰기를 묶어 둔 사이 기한 정각이 된다. 완료를 안 때로 재면 늦었다.
+    const c = await connect(h);
+    const sc = serverSocket(h, c);
+    sc.cork();
+    const T = h.clock.t;
+    c.send(syncRequest(K1, R1, T));
+    await until(() => sc.writableLength > 0);
+    h.clock.t = T + ANSWER;
+    sc.uncork();
+    await until(() => h.closedNotes(c.id).length > 0);
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "write_late" }]);
+    expect(repliesSent(steps, c.id)).toBe(0);
+    expect(h.server.table().get(c.id)).toBeUndefined();
+  });
 });
 
 describe("(3) 닫힘과 교체", () => {
@@ -416,6 +602,57 @@ describe("(3) 닫힘과 교체", () => {
     expect(phaseOf(h, b)).toBe("greeted");
     expect(b.closed()).toBe(false);
   });
+
+  test("닫히는 순간 시계가 한 번 던져도 끊긴 실행기는 판단에서 빠진다(닫힘은 시계·복원기를 읽지 않는다)", async () => {
+    const h = await start();
+    const steps = spySteps();
+    const a = await greet(h, K1, R1);
+    const b = await greet(h, K2, R2);
+    let armed = false;
+    let reads = 0;
+    const fault = () => {
+      if (!armed) return;
+      reads++;
+      armed = false;
+      throw new Error("시험: 한 번 실패");
+    };
+    h.onClock = fault;
+    h.onRestorer = fault;
+    // 닫힘을 기록하는 순간(판단에 closed를 넣기 바로 앞)부터 다음 읽기 하나가 던진다.
+    h.onNote = (note) => {
+      if (note.kind === "closed" && note.connection === a.id) armed = true;
+    };
+    a.socket.destroy();
+    await until(() => h.closedNotes(a.id).length > 0);
+    await Bun.sleep(30);
+    armed = false;
+    h.server.tick();
+    expect(reads).toBe(0);
+    expect(serverLinks(h).has(a.id)).toBe(false);
+    expect(h.server.table().get(a.id)).toBeUndefined();
+    expect(steps.filter((e) => e.kind === "closed" && e.connection === a.id)).toHaveLength(1);
+    expect(h.delivered.filter((o) => o.kind === "withdrawn" && o.connection === a.id)).toHaveLength(1);
+    expect(h.server.table().candidates(h.restorer).map((c) => c.connection)).toEqual([b.id]);
+    expect(h.server.table().occupancy(h.restorer).map((o) => o.executorId)).toEqual([R2]);
+    expect(phaseOf(h, b)).toBe("greeted");
+  });
+
+  test("전달이 던져 닫은 연결의 남은 후보는 내지 않는다. 철회와 다른 연결의 출력은 낸다", async () => {
+    const h = await start();
+    const b = await greet(h, K2, R2);
+    const a = await connect(h);
+    h.onDeliver = (output) => {
+      if (output.kind === "occupancy" && output.connection === a.id) throw new Error("시험: 전달 실패");
+    };
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => a.frames.length === 1);
+    a.send(hello(K1, R1, h.clock.t));
+    await until(() => a.closed() && h.closedNotes(a.id).length > 0);
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "deliver_failed" }]);
+    expect(h.delivered.filter((o) => o.connection === a.id).map((o) => o.kind)).toEqual(["withdrawn"]);
+    expect(h.delivered.filter((o) => o.kind === "candidate").map((o) => o.connection)).toEqual([b.id]);
+    expect(phaseOf(h, b)).toBe("greeted");
+  });
 });
 
 describe("(4) 등록표가 바뀌면 판단에 알리고 더는 믿지 않는 연결을 끊는다", () => {
@@ -449,6 +686,19 @@ describe("(4) 등록표가 바뀌면 판단에 알리고 더는 믿지 않는 �
     b.send(syncRequest(K1B, R1, h.clock.t));
     await until(() => b.frames.length === 1);
     expect(phaseOf(h, b)).toBe("answered");
+  });
+
+  test("등록표의 바이트를 얻지 못하면(소유권이 넘어간 배열) 던지지 않고 읽을 수 없는 판으로 적용한다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const content = doc(2, [row(K1, "r1", "s1"), row(K2, "r2", "s2")]);
+    structuredClone(content.buffer, { transfer: [content.buffer] });
+    expect(content.byteLength).toBe(0);
+    const outcome = h.server.applyRegistry({ kind: "content", content });
+    expect(outcome.kind === "rejected" ? outcome.reason : outcome.kind).toBe("unreadable");
+    expect(h.server.registry()).toBe(outcome.state);
+    await until(() => a.closed());
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
   });
 });
 

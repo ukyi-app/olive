@@ -6,8 +6,9 @@
 // - 연결 하나의 봉투는 받은 순서대로, 받은 시각(주입받은 시계를 바이트가 온 순간에 읽은 값)과 함께 넘긴다. 앞 봉투의 check가 끝나고
 //   step이 돈 뒤에 다음 봉투의 check를 시작한다. 틀이 거절한 바이트는 판단에 닿지 않고 그 연결을 닫는다.
 // - step은 await 뒤의 지금 연결 표에 건다. check를 시작한 때의 표에 걸면 그 사이 다른 연결이 바꾼 상태가 되돌아간다.
-// - 답은 기한 정각 전에만 소켓에 싣고, 실은 같은 동기 구간에서 reply_sent를 넣는다. 싣지 못했거나 실었는지 모르면 넣지 않는다.
-// - 닫힘은 연결마다 한 번 closed로 알린다. 닫힌 연결의 늦게 끝난 check 결과는 판단에 넘기지 않는다.
+// - 답은 틀을 다 만든 뒤 쓰기 바로 앞에서 읽은 시각이 기한 정각 전일 때만 소켓에 쓴다. reply_sent는 로컬 쓰기가 오류 없이 끝난 것을
+//   안 뒤에, 그때도 기한 정각 전이고 연결이 살아 있으면 쓰기 앞의 시각으로 한 번 넣는다. 그동안 그 연결의 다음 판단은 기다린다.
+// - 닫힘은 연결마다 한 번 closed로 알린다. closed를 넣는 길은 시계·복원기를 읽지 않는다. 닫힌 연결의 늦게 끝난 check 결과는 판단에 넘기지 않는다.
 // - 등록표를 적용할 때마다 registry 사건을 넣고, 봉투마다 지금의 등록표를 check에 넘긴다(연결을 맺을 때의 키를 쥐지 않는다).
 //
 // 타이머를 두지 않는다. 시간이 흘러 생기는 판단(답·hello의 기한, 복원기가 바뀜)은 부르는 쪽이 tick()을 불러야 일어난다.
@@ -22,6 +23,7 @@ import {
   type Event,
   type Output,
   type ReplyTools,
+  type StepContext,
   type StopGenerationSource,
 } from "./connections.ts";
 import type { ApplyOutcome, RegistryInput, RegistryState } from "./registry.ts";
@@ -32,7 +34,7 @@ export interface ConnectionServerOptions {
   readonly host: string;
   readonly port: number;
   readonly material: RawTlsMaterial;
-  // 받은 시각, 답을 실은 시각, 판단하는 시각, TLS 상대 인증서의 기간 판정에 모두 이 시계를 쓴다.
+  // 받은 시각, 답을 쓰는 시각과 쓰기를 마친 시각, 판단하는 시각, TLS 상대 인증서의 기간 판정에 모두 이 시계를 쓴다.
   readonly clock: () => number;
   // 시작할 때 믿는 등록표. 적용 전이면 RegistryState.start(설정)이다(아무도 믿지 않는다).
   readonly registry: RegistryState;
@@ -56,7 +58,7 @@ export type Delivered = Extract<Output, { readonly kind: "occupancy" | "candidat
 
 // 판단 밖에서 이 서버가 연결을 닫은 까닭.
 export const LINK_CLOSE_CAUSES = [
-  // 판단이 close를 냈다(사유는 note의 reason).
+  // 판단이 close를 냈다.
   "judgment",
   // 상대가 끊었거나 소켓 오류로 닫혔다.
   "peer",
@@ -68,13 +70,15 @@ export const LINK_CLOSE_CAUSES = [
   "check_failed",
   // step이 던졌다(복원기 읽기 오류 등). 판단 결과를 모른다.
   "judgment_failed",
-  // 답을 바이트로 만들지 못했거나 소켓에 싣지 못했다.
+  // 답을 바이트로 만들지 못했거나, 소켓에 넘기지 못했거나, 로컬 쓰기가 오류로 끝났거나, 끝났을 때 소켓이 이미 닫혔다.
   "write_failed",
+  // 로컬 쓰기는 끝났으나 끝난 것을 안 때가 기한 정각 이후다. 상대가 받았을 수 있어도 기한 안에 답한 것으로 치지 않는다.
+  "write_late",
   // 기한이 지나 답을 싣지 않았는데 판단이 그 연결을 닫지 않았다(판단이 정한 대로 tick을 넣은 뒤에도).
   "reply_late",
   // 부르는 쪽의 deliver가 던졌다. 그 출력이 처리됐는지 모른다.
   "deliver_failed",
-  // 주입한 시계가 던졌다. 받은 시각이나 실을 시각을 모른다.
+  // 주입한 시계가 던졌다. 받은 시각, 쓸 시각, 쓰기를 마친 시각 가운데 하나를 모른다.
   "clock_failed",
   // 서버를 닫는다.
   "shutdown",
@@ -153,10 +157,18 @@ interface Link {
   readonly decoder: FrameDecoder;
   readonly queue: Frame[];
   received: number;
-  // 답을 실은 때까지 받은 봉투의 수. 차례가 이보다 작은 봉투는 답을 싣기 전에 받은 것이다. 싣기 전이면 null.
+  // 답을 소켓에 쓴 때까지 받은 봉투의 수. 차례가 이보다 작은 봉투는 답을 쓰기 전에 받은 것이다. 쓰기 전이면 null.
   replyMark: number | null;
+  // 완료를 기다리는 답 쓰기. null이 아니면 이 연결의 다음 봉투를 판단에 넘기지 않는다.
+  writing: Writing | null;
   busy: boolean;
   dead: boolean;
+}
+
+interface Writing {
+  // 쓰기 호출 바로 앞에서 읽은 시각. reply_sent의 at이다.
+  readonly at: number;
+  readonly deadline: number;
 }
 
 class Server implements ConnectionServer {
@@ -208,7 +220,17 @@ class Server implements ConnectionServer {
     }
     const opened = this.current.open(connection.executor, at);
     this.current = opened.table;
-    const link: Link = { id: opened.id, socket, decoder: createFrameDecoder(), queue: [], received: 0, replyMark: null, busy: false, dead: false };
+    const link: Link = {
+      id: opened.id,
+      socket,
+      decoder: createFrameDecoder(),
+      queue: [],
+      received: 0,
+      replyMark: null,
+      writing: null,
+      busy: false,
+      dead: false,
+    };
     this.links.set(link.id, link);
     this.note({ kind: "opened", connection: link.id });
     // 판단에 알리지 않은 닫힘이 없게 한다. 오류는 tls-server.ts가 destroy로 바꾸고, destroy는 close 사건으로 온다.
@@ -232,12 +254,13 @@ class Server implements ConnectionServer {
     void this.pump(link);
   }
 
-  // 연결 하나의 봉투를 차례대로 하나씩 판단에 넘긴다. 한 연결에 하나만 돈다.
+  // 연결 하나의 봉투를 차례대로 하나씩 판단에 넘긴다. 한 연결에 하나만 돈다. 답 쓰기의 완료를 기다리는 동안은 멈추고,
+  // 완료를 처리한 뒤 다시 부른다.
   private async pump(link: Link): Promise<void> {
     if (link.busy) return;
     link.busy = true;
     try {
-      while (!link.dead && link.queue.length > 0) {
+      while (!link.dead && link.writing === null && link.queue.length > 0) {
         const frame = link.queue.shift()!;
         if (link.replyMark !== null && frame.index < link.replyMark) return this.closeLink(link, "before_reply");
         let checked: Checked;
@@ -286,8 +309,7 @@ class Server implements ConnectionServer {
   private step(event: Event, link?: Link): void {
     let result: ReturnType<Connections["step"]>;
     try {
-      const ctx = { now: this.options.clock(), registry: this.trusted, stop: this.restorer() };
-      result = this.current.step(event, ctx, this.options.reply);
+      result = this.current.step(event, event.kind === "closed" ? this.closedContext() : this.context(), this.options.reply);
     } catch {
       if (link) return this.closeLink(link, "judgment_failed");
       for (const each of [...this.links.values()]) this.closeLink(each, "judgment_failed");
@@ -295,6 +317,16 @@ class Server implements ConnectionServer {
     }
     this.current = result.table;
     this.run(result.outputs);
+  }
+
+  private context(): StepContext {
+    return { now: this.options.clock(), registry: this.trusted, stop: this.restorer() };
+  }
+
+  // 판단의 닫힘 처리는 연결 번호만 쓴다. 여기서 시계·복원기를 읽으면 그 읽기가 던질 때 closed가 판단에 들어가지 않아
+  // 끊긴 실행기가 후보와 점유에 남는다. 판단이 이 칸을 읽게 되더라도 NaN 시각과 세대를 모르는 복원기는 닫는 쪽으로 판정된다.
+  private closedContext(): StepContext {
+    return { now: Number.NaN, registry: this.trusted, stop: UNKNOWN_GENERATION };
   }
 
   private run(outputs: readonly Output[]): void {
@@ -308,8 +340,13 @@ class Server implements ConnectionServer {
           if (link) this.closeLink(link, "judgment");
           break;
         }
-        default:
+        case "withdrawn":
+          // 닫힌 연결의 정리이므로 그 연결이 이미 닫혔어도 넘긴다.
           this.hand(output);
+          break;
+        default:
+          // 같은 출력 묶음의 앞 전달이 던져 이 연결을 닫았으면 남은 후보·점유·전달은 넘기지 않는다.
+          if (this.links.has(output.connection)) this.hand(output);
       }
     }
   }
@@ -326,29 +363,44 @@ class Server implements ConnectionServer {
   private sendReply(output: Extract<Output, { kind: "send_reply" }>): void {
     const link = this.links.get(output.connection);
     if (!link || link.dead) return;
+    const frame = frameOf(output.envelope);
+    if (frame === null) return this.closeLink(link, "write_failed");
+    // 기한은 틀을 다 만든 뒤 쓰기 바로 앞에서 읽은 시각으로 판정한다. 이 읽기와 write 사이에 시간이 드는 일을 두지 않는다.
     const at = this.now();
     if (at === null) return this.closeLink(link, "clock_failed");
-    // 기한 정각부터는 싣지 않는다. 판단에는 시간이 흘렀다는 사건(tick)만 넣는다. 판단이 그 연결을 answer_late로 닫는다.
+    // 기한 정각부터는 쓰지 않는다. 판단에는 시간이 흘렀다는 사건(tick)만 넣는다. 판단이 그 연결을 answer_late로 닫는다.
     if (!(at < output.deadline)) {
       this.note({ kind: "reply_not_sent", connection: link.id, deadline: output.deadline, at });
       this.step({ kind: "tick" });
       if (!link.dead && this.current.get(link.id)?.phase === "requested") this.closeLink(link, "reply_late");
       return;
     }
-    const frame = frameOf(output.envelope);
-    if (frame === null) return this.closeLink(link, "write_failed");
-    let written = false;
-    try {
-      if (!link.socket.destroyed && link.socket.writable) {
-        link.socket.write(frame);
-        written = true;
-      }
-    } catch {
-      written = false;
-    }
-    if (!written) return this.closeLink(link, "write_failed");
+    if (link.socket.destroyed || !link.socket.writable) return this.closeLink(link, "write_failed");
+    // write의 반환값(false)은 버퍼가 찼다는 뜻일 뿐 실패가 아니고, true도 내보냈다는 뜻이 아니다. 완료 콜백으로만 가른다.
+    const writing: Writing = { at, deadline: output.deadline };
+    link.writing = writing;
     link.replyMark = link.received;
-    this.step({ kind: "reply_sent", connection: link.id, at }, link);
+    try {
+      link.socket.write(frame, (error) => this.written(link, writing, error));
+    } catch {
+      this.closeLink(link, "write_failed");
+    }
+  }
+
+  // 답의 로컬 쓰기가 끝났다. 오류 없이 끝났고, 그때도 기한 정각 전이고, 연결이 살아 있을 때만 reply_sent를 한 번 넣는다.
+  // 넣는 시각은 쓰기 앞의 시각이다: 그보다 먼저 받은 봉투는 답을 보고 쓴 것이 아니다. 완료 쪽 시각을 쓰면 완료 콜백보다
+  // 먼저 도착한 정상 hello가 답보다 앞선 것으로 판정된다.
+  private written(link: Link, writing: Writing, error: Error | null | undefined): void {
+    if (link.dead || link.writing !== writing) return;
+    link.writing = null;
+    if (error) return this.closeLink(link, "write_failed");
+    if (link.socket.destroyed) return this.closeLink(link, "write_failed");
+    const done = this.now();
+    if (done === null) return this.closeLink(link, "clock_failed");
+    if (!(done < writing.deadline)) return this.closeLink(link, "write_late");
+    this.step({ kind: "reply_sent", connection: link.id, at: writing.at }, link);
+    // 기다리는 동안 받은 봉투를 이어서 넘긴다. pump가 이미 돌고 있으면(완료가 write 안에서 불렸으면) 그쪽이 잇는다.
+    void this.pump(link);
   }
 
   // 소켓을 닫고 판단에 closed를 한 번 알린다. 대기열을 비우고, 진행 중인 check의 결과는 pump가 버린다.
@@ -383,9 +435,15 @@ class Server implements ConnectionServer {
 const UNKNOWN_GENERATION: StopGenerationSource = Object.freeze({ stopGeneration: () => null });
 
 // 부르는 쪽이 넘긴 바이트 배열을 적용 뒤에 다시 쓰거나 바꿔도 이 서버가 적용한 판과 섞이지 않게 복사한다.
+// 복사가 던지면(소유권이 넘어가 분리된 배열 등) 바이트를 얻지 못한 것이므로 읽을 수 없는 판으로 적용한다.
 function copyInput(input: RegistryInput): RegistryInput {
   if (input === null || typeof input !== "object" || input.kind !== "content") return input;
-  return typeof input.content === "string" ? input : { kind: "content", content: new Uint8Array(input.content) };
+  if (typeof input.content === "string") return input;
+  try {
+    return { kind: "content", content: new Uint8Array(input.content) };
+  } catch {
+    return { kind: "unreadable" };
+  }
 }
 
 function frameOf(envelope: unknown): Uint8Array | null {
