@@ -20,6 +20,8 @@ function run(over: Partial<SchedulerRun> = {}): SchedulerRun {
     inputRequestId: `req-${seq}`,
     deadlineAt: NOW + 600_000,
     budgetLeft: 50_000,
+    // 장부의 listRuns는 not_started 줄에만 싣는다. 가짜는 모든 줄에 "관리자가 닫지 않음"을 둔다(다른 상태에서는 읽지 않는다).
+    closedByOperator: false,
     startBar: null,
     ...over,
   };
@@ -162,11 +164,16 @@ describe("모르거나 꼴이 틀린 입력", () => {
   });
 
   test("시작 전에 닫힌 줄(not_started)의 배정액은 상한이 아니고, 소진과 시작한 줄의 잔액은 그대로 상한이다", () => {
-    // not_started로 들어오는 길이 queued에서, 또는 닫기 근거가 있을 때(D-90, 시작 지시의 예산에서 감액이 없을 때만)뿐이고,
-    // 닫기 두 줄을 빼면 시작한 줄이 여러 걸음으로도 not_started에 닿지 않는 동안만 성립한다. 표가 바뀌면 이 단언이 먼저 실패한다.
+    // not_started로 들어오는 길이 queued에서, 또는 닫기 근거가 있을 때(D-90: 시작 지시의 예산에서 감액이 없을 때만, 관리자 닫기 D-91)뿐이고,
+    // 닫기 줄을 빼면 시작한 줄이 여러 걸음으로도 not_started에 닿지 않는 동안만 성립한다. 표가 바뀌면 이 단언이 먼저 실패한다.
+    // D-90 닫기 줄로 닫힌 not_started는 상한에서 빼고, 관리자 닫기 줄로 닫힌 not_started는 상한으로 센다(closedByOperator, 아래 시험).
     for (const kind of ["worker", "session"] as const) {
-      // 예외는 작업자의 D-90 닫기 두 줄뿐이다: 장부 트리거가 실행기가 받은 적 없는(쓴 예산이 없는) 실행의 근거 줄이 있을 때만 허락한다.
-      const closure: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
+      // 예외는 작업자의 닫기 줄뿐이다. 장부 트리거가 근거 줄이 있을 때만 허락한다: D-90(preparing·unknown_running, 실행기가 받은 적
+      // 없는 실행, 쓴 예산 없음)과 관리자 닫기(unknown_running·stopping, 이미 돌았을 수 있음).
+      const unreceived: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
+      const operator: readonly LedgerRunState[] = kind === "worker" ? ["unknown_running", "stopping"] : [];
+      const closure = LEDGER_RUN_STATES.filter((state) => unreceived.includes(state) || operator.includes(state));
+      expect(closure, kind).toEqual(kind === "worker" ? ["preparing", "stopping", "unknown_running"] : []);
       expect(Object.entries(TRANSITIONS[kind]).filter(([, to]) => to?.includes("not_started")).map(([from]) => from), kind).toEqual(["queued", ...closure]);
       const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
       expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
@@ -187,6 +194,20 @@ describe("모르거나 꼴이 틀린 입력", () => {
     // 시작한 적 있는 줄(시작 뒤에 끝난 상태)의 잔액은 순번과 무관하게 상한이다.
     for (const state of ["finalized", "failed_stopped", "cleanup_pending"] as const) {
       expect(planNext(view([current, { ...closedLater, state }], inputs), POLICY).held, state).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
+    }
+  });
+
+  test("관리자가 닫은 not_started 줄과 관리자가 닫았는지 모르는 not_started 줄의 잔액은 순번과 무관하게 상한이다", () => {
+    const current = run({ inputRequestId: "op", budgetLeft: 10 });
+    const inputs = [inputFor(current, "admin")];
+    for (const closedByOperator of [true, undefined, broken<boolean>("false")]) {
+      const closed = run({ inputRequestId: "op", state: "not_started", budgetLeft: 3, closedByOperator });
+      const label = String(closedByOperator);
+      expect(planNext(view([current, closed], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
+      expect(planNext(view([{ ...closed, queueSeq: 0 }, current], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
+      // 잔액이 같거나 크면 상한에 걸리지 않는다. 잔액 0은 소진이다.
+      expect(planNext(view([current, { ...closed, budgetLeft: 10 }], inputs), POLICY).candidates.map((c) => c.runId), label).toEqual([current.runId]);
+      expect(planNext(view([current, { ...closed, budgetLeft: 0 }], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_exhausted" }]);
     }
   });
 

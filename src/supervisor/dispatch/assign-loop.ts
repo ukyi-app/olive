@@ -321,6 +321,8 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
       inputRequestId: run.inputRequestId,
       deadlineAt: run.deadlineAt,
       budgetLeft: run.budgetLeft,
+      // 장부가 싣은 값 그대로 넘긴다. false가 아니면 budgetBar가 그 not_started 줄을 상한으로 센다(막는 쪽).
+      closedByOperator: run.closedByOperator,
       startBar: isStartBar(bar) ? bar : null,
     };
     view.push(entry);
