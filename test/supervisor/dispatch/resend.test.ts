@@ -1,11 +1,12 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
 import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
-import type { Ledger, UnansweredInstructions } from "../../../src/ledger/index.ts";
+import type { Ledger, StartDispatchInput, UnansweredInstructions } from "../../../src/ledger/index.ts";
 import { type Drafted, type DraftAction, finalizeDraft, sealDraft, startDraft, stopDraft } from "../../../src/supervisor/dispatch/envelopes.ts";
 import type { Random, SendOutcome, Signer } from "../../../src/supervisor/dispatch/ports.ts";
 import { type ResendOutcome, type ResendPorts, type ResendTickResult, resendTick, START_LAST_SEAL_MS, type Withheld } from "../../../src/supervisor/dispatch/resend.ts";
-import { digest, from, id, must, NOW, open, ready, tempPath, worker } from "../../ledger/helpers.ts";
+import { digest, from, id, must, NOW, open, ready, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 // 간격·키·digest는 이 시험이 지어 넣는 자료다. 운영값이 아니다.
 const EVERY = 5_000;
@@ -24,12 +25,20 @@ interface World {
   setSend(next: (envelope: Envelope) => Promise<SendOutcome>): void;
   setSigner(next: (() => void) | null): void;
   wrapRead(next: ((real: () => unknown) => unknown) | null): void;
+  // 송신 표식 포트를 감싼다(real은 실제 장부의 markStartDispatch). 기본은 그대로 부른다.
+  wrapMark(next: ((input: StartDispatchInput, real: () => unknown) => unknown) | null): void;
+  // 장부 파일. 송신 표식(start_dispatches)을 원 SQL로 읽는다.
+  path: string;
+  // 장부의 끊김 지점(Faults.at)에 거는 고리.
+  setLedgerFault(next: ((point: string) => void) | null): void;
 }
 
 function world(): World {
   let clockAt = NOW;
+  let ledgerFault: ((point: string) => void) | null = null;
+  const path = tempPath();
   // 장부 시계는 시작 지시의 발행 시각을 정한다. 시험의 박자 시계와 같은 값을 쓴다.
-  const ledger = ready(open(tempPath(), { clock: () => clockAt }));
+  const ledger = ready(open(path, { clock: () => clockAt, faults: { at: (point) => ledgerFault?.(point) } }));
   const log: string[] = [];
   const sent: Envelope[] = [];
   let intake = true;
@@ -37,6 +46,7 @@ function world(): World {
   let send: (envelope: Envelope) => Promise<SendOutcome> = async () => "sent";
   let signerHook: (() => void) | null = null;
   let readHook: ((real: () => unknown) => unknown) | null = null;
+  let markHook: ((input: StartDispatchInput, real: () => unknown) => unknown) | null = null;
   const random: Random = { bytes: (length) => getRandomValues(new Uint8Array(length)) };
   const signer: Signer = {
     seal(input) {
@@ -50,6 +60,10 @@ function world(): World {
       unansweredInstructions: (() => {
         const real = () => ledger.unansweredInstructions();
         return readHook === null ? real() : readHook(real);
+      }) as never,
+      markStartDispatch: ((input: StartDispatchInput) => {
+        const real = () => ledger.markStartDispatch(input);
+        return markHook === null ? real() : markHook(input, real);
       }) as never,
     },
     intake: { intakeOpen: () => intake },
@@ -88,6 +102,13 @@ function world(): World {
     },
     wrapRead: (next) => {
       readHook = next;
+    },
+    wrapMark: (next) => {
+      markHook = next;
+    },
+    path,
+    setLedgerFault: (next) => {
+      ledgerFault = next;
     },
   };
 }
@@ -631,7 +652,7 @@ describe("보장 4: 실패는 결과를 지우지 않는다", () => {
     const w = world();
     const s = started(w);
     w.setClock(NOW + 6_000);
-    const ledger = Object.assign(() => undefined, { unansweredInstructions: w.ports.ledger.unansweredInstructions });
+    const ledger = Object.assign(() => undefined, { unansweredInstructions: w.ports.ledger.unansweredInstructions, markStartDispatch: w.ports.ledger.markStartDispatch });
     expect(outcomes(await resendTick({ ...w.ports, ledger }, { resendEveryMs: EVERY }, { lastResends: [] }))).toEqual([
       { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 6_000, at: NOW + 6_000 },
     ]);
@@ -690,4 +711,137 @@ test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고
   for (const write of [/\brecord[A-Z]\w*Instruction\b/, /\bstartRun\b/, /\bassignToolRequest\b/, /\bcancelToolRequest\b/, /\bapplyReceipt\b/, /\bmarkLost\w*\b/, /\bmarkResult\b/]) {
     expect(source).not.toMatch(write);
   }
+});
+
+// 장부 파일의 송신 표식. 공개 읽기가 없어 원 SQL로 읽는다. 열린 장부 객체가 파일을 잠그므로 먼저 닫는다(그 뒤로 그 객체는 쓰지 않는다).
+function marks(w: { ledger: Ledger; path: string }): { run_id: string; request_id: string; marked_at: number }[] {
+  w.ledger.close();
+  const raw = new Database(w.path, { readonly: true });
+  try {
+    return raw.query("SELECT run_id, request_id, marked_at FROM start_dispatches ORDER BY marked_at").all() as { run_id: string; request_id: string; marked_at: number }[];
+  } finally {
+    raw.close();
+  }
+}
+
+// 표식 포트를 부를 때 기록에 남긴다.
+function logMarks(w: World, during: (() => void) | null = null): void {
+  w.wrapMark((_input, real) => {
+    w.log.push("mark");
+    const answer = real();
+    during?.();
+    return answer;
+  });
+}
+
+describe("송신 표식: 재전송의 시작도 표식이 ok인 뒤에만 내보내기 포트에 닿는다", () => {
+  test("다시 낸 시작은 그 실행·그 요청 ID의 표식을 봉한 뒤, 송신 직전에 커밋한다", async () => {
+    const w = world();
+    const s = started(w);
+    logMarks(w);
+    w.setClock(NOW + 6_000);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 6_000, at: NOW + 6_000 }]);
+    expect(w.log).toEqual(["seal", "mark", "send"]);
+    expect(marks(w)).toEqual([{ run_id: s.runId, request_id: s.requestId, marked_at: NOW + 6_000 }]);
+  });
+
+  test("표식을 적지 못하는 장부(못 씀)에서는 송신이 0이고 구별된 이유를 낸다", async () => {
+    const w = world();
+    const s = started(w);
+    logMarks(w);
+    w.setLedgerFault((point) => {
+      if (point === "start_dispatch:before_commit") throw new Error("디스크 실패");
+    });
+    w.setClock(NOW + 6_000);
+    expect(outcomes(await tick(w))).toEqual([
+      { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId: s.run.executorId, sealedAt: NOW + 6_000, markReason: "ledger_unwritable" },
+    ]);
+    expect(w.log).toEqual(["seal", "mark"]);
+    expect(w.sent).toEqual([]);
+    expect(marks(w)).toEqual([]);
+    // 표식 포트가 던지거나 꼴이 틀린 답을 내도 싣지 않는다.
+    for (const [markReason, answer] of [
+      ["threw", () => { throw new Error("표식 포트 실패"); }],
+      ["malformed_answer", () => ({ ok: true })],
+    ] as const) {
+      const v = world();
+      const t = started(v);
+      v.wrapMark(answer);
+      v.setClock(NOW + 6_000);
+      expect([markReason, outcomes(await tick(v))]).toEqual([markReason, [expect.objectContaining({ requestId: t.requestId, outcome: "not_sent", reason: "start_unmarked", markReason })]]);
+      expect(v.sent).toEqual([]);
+    }
+  });
+
+  test("표식의 커밋은 마지막 시계 읽기보다 앞이다: 커밋 중에 한도가 지나면 싣지 않는다(표식은 남는다)", async () => {
+    const w = world();
+    const s = started(w);
+    const last = NOW + START_LAST_SEAL_MS;
+    // 정각에 판단·봉하고, 표식을 커밋하는 동안 1ms가 지난다.
+    logMarks(w, () => w.setClock(last + 1));
+    w.setClock(last);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "start_expired", issuedAt: NOW, expiresAt: NOW + 30_000 }]);
+    expect(w.log).toEqual(["seal", "mark"]);
+    expect(w.sent).toEqual([]);
+    // 표식만 남고 실리지 않은 것은 자동 닫기를 덜 하는 쪽이다(다른 열기에서는 sent_by_other_open).
+    expect(marks(w)).toEqual([{ run_id: s.runId, request_id: s.requestId, marked_at: last }]);
+  });
+
+  test("취소·확정의 재전송은 표식을 부르지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    acceptStart(w, s);
+    const c = cancel(w, s, NOW + 3_000);
+    logMarks(w);
+    w.setClock(NOW + 60_000);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 }]);
+    must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "completed", bodyDigest: digest(`stopped:${s.runId}`), now: NOW }, s.from));
+    must(w.ledger.markResult({ runId: s.runId, resultDigest: RESULT, now: NOW + 61_000 }));
+    must(w.ledger.recordFinalizeInstruction({ runId: s.runId, requestId: id(), stopGeneration: 0, now: NOW + 61_000, outcome: "succeeded", resultDigest: RESULT, storedAt: NOW + 60_900 }));
+    w.setClock(NOW + 120_000);
+    expect(outcomes(await tick(w))).toEqual([expect.objectContaining({ action: "result_finalize", outcome: "resent" })]);
+    expect(w.log).toEqual(["seal", "send", "seal", "send"]);
+    expect(marks(w)).toEqual([]);
+  });
+
+  test("감독이 다시 뜬 뒤의 재전송은 새 열기의 표식을 남기고, 그 뒤 다시 연 장부의 자동 닫기는 그 실행을 닫지 않는다", async () => {
+    const portsFor = (ledger: Ledger, at: number, sent: Envelope[]): ResendPorts => ({
+      ledger,
+      intake: { intakeOpen: () => true },
+      links: { mayIssue: () => ({ ok: true }) },
+      clock: { now: () => at },
+      random: { bytes: (n) => getRandomValues(new Uint8Array(n)) },
+      signer: { seal: (input) => sealEnvelope(input, keys.privateKey) },
+      sink: {
+        send: async (envelope) => {
+          sent.push(envelope);
+          return "sent";
+        },
+      },
+    });
+    // 실행기가 시작 발행 + 30000ms 뒤에 낸 전체 답에 그 실행이 없다(D-90의 닫는 입력).
+    const unreceived = (runId: string) => ({ runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_005, now: NOW + 30_010 });
+    // 대조군(재전송 없음)은 같은 입력으로 닫힌다: 표식이 없으면 장부는 실린 적 없는 실행으로 읽는다.
+    for (const resend of [true, false]) {
+      const path = tempPath();
+      // 첫 열기: 시작을 적었지만 싣지 못했다(표식 없음. 예: 배정·시작 박자의 표식이 실패했다).
+      const first = ready(open(path));
+      const live = startedWorker(first);
+      first.close();
+      // 감독이 다시 떴다: 새 열기에서 재전송 박자가 그 시작을 싣는다.
+      const second = ready(open(path));
+      const sent: Envelope[] = [];
+      if (resend) {
+        expect(outcomes(await resendTick(portsFor(second, NOW + 6_000, sent), { resendEveryMs: EVERY }, { lastResends: [] }))).toEqual([
+          expect.objectContaining({ requestId: live.requestId, runId: live.runId, outcome: "resent" }),
+        ]);
+      }
+      expect([resend, sent.length, marks({ ledger: second, path })]).toEqual(resend ? [true, 1, [{ run_id: live.runId, request_id: live.requestId, marked_at: NOW + 6_000 }]] : [false, 0, []]);
+      // 다시 연 장부: 다른 열기의 표식이 있는 실행은 자동으로 닫지 않는다.
+      const third = ready(open(path));
+      const closed = third.closeUnreceivedRun(unreceived(live.runId), { sender: WORKER_EXECUTOR });
+      expect([resend, closed]).toEqual(resend ? [true, { ok: false, reason: "sent_by_other_open" }] : [false, expect.objectContaining({ ok: true })]);
+      third.close();
+    }
+  });
 });
