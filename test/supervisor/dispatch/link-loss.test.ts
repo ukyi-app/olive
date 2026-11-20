@@ -1,9 +1,10 @@
 // 연결 상실 반영의 한 박자. 장부는 실제 장부 파일이고, 연결 표는 occupancy(복원기)의 행만 내는 가짜다(맞춤·인사를 거친 실제 연결의
-// 인정은 test/supervisor/transport/connections.test.ts가 본다). 가짜도 실제 표처럼 복원기의 객체 동일성과 세대를 본다.
+// 인정은 test/supervisor/transport/connections.test.ts가 본다). 가짜도 실제 표처럼 조회 때마다 복원기의 객체 동일성과 세대를 본다.
+// 벽시계와 단조 시계는 따로 움직일 수 있다. setClock은 둘을 같은 값으로 둔다(보정이 없는 경우).
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { limits } from "../../../src/contract/v1/index.ts";
-import type { Ledger } from "../../../src/ledger/index.ts";
+import { LEDGER_RUN_STATES, type Ledger } from "../../../src/ledger/index.ts";
 import { type LinkLossLedger, type LinkLossPorts, type LinkLossTickResult, linkLossTick, type WatchEntry } from "../../../src/supervisor/dispatch/link-loss.ts";
 import { type LifecyclePolicy, type LifecycleView, nextIntent, RENEW_MARGIN_MS } from "../../../src/supervisor/scheduler/lifecycle.ts";
 import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
@@ -23,20 +24,25 @@ interface World {
   // markLostFor에 넘긴 실행기 이름의 차례.
   calls: string[];
   setClock(at: number | (() => number)): void;
+  setWall(at: number | (() => number)): void;
+  setMono(at: number | (() => number)): void;
   setLinked(names: string[]): void;
-  setGeneration(value: number | null): void;
+  setGeneration(value: number | null | (() => number | null)): void;
   wrap(over: Partial<LinkLossLedger>): void;
 }
 
+const reader = (at: number | (() => number)) => (typeof at === "number" ? () => at : at);
+
 function world(): World {
-  let clock: () => number = () => NOW;
+  let wall: () => number = () => NOW;
+  let mono: () => number = () => NOW;
   const path = tempPath();
   const ledger = ready(open(path, { clock: () => NOW }));
   let linked: string[] = [];
-  let generation: number | null = 0;
+  let generation: () => number | null = () => 0;
   const calls: string[] = [];
   let over: Partial<LinkLossLedger> = {};
-  const restorer = { stopGeneration: () => generation };
+  const restorer = { stopGeneration: () => generation() };
   const ports: LinkLossPorts = {
     ledger: {
       listRuns: () => (over.listRuns ?? ledger.listRuns.bind(ledger))(),
@@ -46,10 +52,11 @@ function world(): World {
       },
     },
     connections: {
-      occupancy: (source) => (source === restorer && generation !== null ? linked.map((executorId) => ({ executorId, coverage: "full" as const, runs: [] })) : []),
+      occupancy: (source) => (source === restorer && source.stopGeneration() !== null ? linked.map((executorId) => ({ executorId, coverage: "full" as const, runs: [] })) : []),
     },
     restorer,
-    clock: { now: () => clock() },
+    clock: { now: () => wall() },
+    monotonic: { now: () => mono() },
   };
   return {
     ledger,
@@ -57,13 +64,20 @@ function world(): World {
     ports,
     calls,
     setClock: (at) => {
-      clock = typeof at === "number" ? () => at : at;
+      wall = reader(at);
+      mono = reader(at);
+    },
+    setWall: (at) => {
+      wall = reader(at);
+    },
+    setMono: (at) => {
+      mono = reader(at);
     },
     setLinked: (names) => {
       linked = names;
     },
     setGeneration: (value) => {
-      generation = value;
+      generation = typeof value === "function" ? value : () => value;
     },
     wrap: (next) => {
       over = next;
@@ -187,7 +201,7 @@ describe("보장 1: 판정은 시간으로 한다", () => {
     for (const policy of [{ judgeMs: limits.RUN_LEASE_MAX_MS - 1 }, { judgeMs: JUDGE + 0.5 }, {}, null]) {
       expect(tick(w, past, policy)).toEqual({ kind: "not_run", reason: "policy_rejected" });
     }
-    for (const watch of [[{ executorId: WORKER_EXECUTOR, absentSince: 0 }], [{ executorId: "", absentSince: null }], [{ executorId: WORKER_EXECUTOR }]]) {
+    for (const watch of [[{ executorId: WORKER_EXECUTOR, absentSince: -1 }], [{ executorId: "", absentSince: null }], [{ executorId: WORKER_EXECUTOR }]]) {
       expect(tick(w, watch as never)).toEqual({ kind: "not_run", reason: "input_malformed" });
     }
     expect(linkLossTick(w.ports, POLICY, {} as never)).toEqual({ kind: "not_run", reason: "input_malformed" });
@@ -214,6 +228,120 @@ describe("보장 1: 판정은 시간으로 한다", () => {
     expect(w.calls).toEqual([]);
     expect(state(w.ledger, s.runId)).toBe("running");
   });
+
+  test("끊긴 시간은 단조 시계로만 잰다: 벽시계만 앞으로 보정돼도 단조 경과가 판정 시간을 넘기 전에는 옮기지 않는다", () => {
+    // 단조 시각의 기점은 벽시계와 다르다(프로세스가 뜬 뒤의 밀리초).
+    const MONO = 10_002;
+    for (const jump of [40_000, 500]) {
+      const w = world();
+      const s = running(w);
+      w.setLinked([WORKER_EXECUTOR]);
+      w.setWall(NOW);
+      w.setMono(MONO);
+      const seen = ran(tick(w, []));
+      w.setLinked([]);
+      w.setWall(NOW + 1);
+      w.setMono(MONO + 1);
+      const gone = ran(tick(w, [...seen.watch]));
+      expect(gone.watch).toEqual([{ executorId: WORKER_EXECUTOR, absentSince: MONO + 1 }]);
+
+      // 벽시계로 센 경과는 판정 시간을 넘지만 단조 경과는 아직 안이다.
+      const early = Math.max(1, JUDGE - jump + 1);
+      w.setWall(NOW + 1 + early + jump);
+      w.setMono(MONO + 1 + early);
+      expect(ran(tick(w, [...gone.watch])).executors).toEqual([{ executorId: WORKER_EXECUTOR, outcome: "within_judge", absentSince: MONO + 1 }]);
+      w.setWall(NOW + 1 + JUDGE + jump);
+      w.setMono(MONO + 1 + JUDGE);
+      expect(ran(tick(w, [...gone.watch])).executors).toEqual([{ executorId: WORKER_EXECUTOR, outcome: "within_judge", absentSince: MONO + 1 }]);
+      expect(w.calls).toEqual([]);
+      expect(state(w.ledger, s.runId)).toBe("running");
+
+      // 단조 경과가 1ms 넘으면 그 실행기를 한 번 옮긴다. 장부에 넘기는 시각은 벽시계다.
+      w.setWall(NOW + 1 + JUDGE + 1 + jump);
+      w.setMono(MONO + 1 + JUDGE + 1);
+      expect(ran(tick(w, [...gone.watch])).executors).toEqual([
+        {
+          executorId: WORKER_EXECUTOR,
+          outcome: "moved",
+          absentSince: MONO + 1,
+          at: NOW + 1 + JUDGE + 1 + jump,
+          runs: [{ runId: s.runId, runGeneration: w.ledger.runGeneration(s.runId) as number, before: "running", after: "unknown_running" }],
+        },
+      ]);
+      expect(w.calls).toEqual([WORKER_EXECUTOR]);
+      expect(state(w.ledger, s.runId)).toBe("unknown_running");
+    }
+  });
+
+  test("단조 시계를 읽지 못하면 돌지 않고, 없음 시각보다 뒤로 가면 그 실행기만 모름이다(0도 단조 시각이다)", () => {
+    const w = world();
+    const s = running(w);
+    w.setWall(NOW + JUDGE + 1);
+    for (const mono of [() => -1, () => 1.5, () => Number.NaN, () => { throw new Error("단조 시계 실패"); }]) {
+      w.setMono(mono);
+      expect(tick(w, [{ executorId: WORKER_EXECUTOR, absentSince: 0 }])).toEqual({ kind: "not_run", reason: "clock_unavailable" });
+    }
+    // 프로세스가 막 떴으면 단조 시각이 0일 수 있다.
+    w.setMono(0);
+    w.setLinked([WORKER_EXECUTOR]);
+    const seen = ran(tick(w, []));
+    w.setLinked([]);
+    const gone = ran(tick(w, [...seen.watch]));
+    expect(gone.executors).toEqual([{ executorId: WORKER_EXECUTOR, outcome: "within_judge", absentSince: 0 }]);
+    expect(gone.watch).toEqual([{ executorId: WORKER_EXECUTOR, absentSince: 0 }]);
+    // 벽시계가 훨씬 앞서 있어도 단조 시계가 없음 시각보다 이르면 경과를 모른다.
+    w.setWall(NOW + 10 * JUDGE);
+    w.setMono(5);
+    const back = ran(tick(w, [{ executorId: WORKER_EXECUTOR, absentSince: 6 }]));
+    expect(back.executors).toEqual([{ executorId: WORKER_EXECUTOR, outcome: "unknown", reason: "clock_regressed" }]);
+    expect(back.watch).toEqual([{ executorId: WORKER_EXECUTOR, absentSince: 6 }]);
+    expect(w.calls).toEqual([]);
+    expect(state(w.ledger, s.runId)).toBe("running");
+    w.setMono(JUDGE + 1);
+    expect(ran(tick(w, [...gone.watch])).executors).toMatchObject([{ executorId: WORKER_EXECUTOR, outcome: "moved", absentSince: 0, at: NOW + 10 * JUDGE }]);
+    expect(w.calls).toEqual([WORKER_EXECUTOR]);
+  });
+
+  test("연결 표를 읽는 사이 정지 세대를 잃거나 바뀌면 links_unknown이고 쓰지 않는다", () => {
+    const w = world();
+    const s = running(w);
+    w.setLinked([WORKER_EXECUTOR]);
+    w.setClock(NOW + JUDGE + 1);
+    const past = [{ executorId: WORKER_EXECUTOR, absentSince: NOW }];
+    // 실제 복원기는 장부가 한 번 실패하면 다시 열어 복원할 때까지 null이다. 둘째 읽기(연결 표 안)부터 모름이 된 경우다.
+    let reads = 0;
+    w.setGeneration(() => (++reads === 1 ? 0 : null));
+    expect(tick(w, past)).toEqual({ kind: "not_run", reason: "links_unknown" });
+    // 세대가 바뀌면 그 표가 처음 읽은 세대의 표인지 모른다.
+    reads = 0;
+    w.setGeneration(() => ++reads);
+    expect(tick(w, past)).toEqual({ kind: "not_run", reason: "links_unknown" });
+    expect(w.calls).toEqual([]);
+    expect(state(w.ledger, s.runId)).toBe("running");
+  });
+
+  test("작업자 실행기 주체로 읽히지 않는 연결 행은 표 전체를 모름으로 두고, 기억의 이름도 같은 꼴이어야 한다", () => {
+    const w = world();
+    const s = running(w);
+    w.setLinked([WORKER_EXECUTOR]);
+    const seen = ran(tick(w, []));
+    expect(seen.watch).toEqual([{ executorId: WORKER_EXECUTOR, absentSince: null }]);
+    // 실제로는 인정된 채인데 포트의 답만 주체가 아닌 이름 한 행이다. 그것을 A가 없다는 증거로 쓰지 않는다.
+    const original = w.ports.connections;
+    for (const executorId of [" ", SESSION_EXECUTOR, "executor/diagnosis/0", "supervisor"]) {
+      (w.ports as { connections: unknown }).connections = { occupancy: () => [{ executorId, coverage: "full", runs: [] }] };
+      w.setClock(NOW + 1);
+      expect(tick(w, [...seen.watch])).toEqual({ kind: "not_run", reason: "links_unknown" });
+      w.setClock(NOW + 1 + JUDGE + 1);
+      expect(tick(w, [...seen.watch])).toEqual({ kind: "not_run", reason: "links_unknown" });
+    }
+    (w.ports as { connections: unknown }).connections = original;
+    for (const executorId of [" ", SESSION_EXECUTOR, "executor/diagnosis/0", "front-door"]) {
+      expect(tick(w, [{ executorId, absentSince: null }])).toEqual({ kind: "not_run", reason: "input_malformed" });
+    }
+    expect(w.calls).toEqual([]);
+    expect(state(w.ledger, s.runId)).toBe("running");
+  });
 });
 
 describe("보장 2: 그 실행기의 실행만, 정확한 이름으로", () => {
@@ -230,7 +358,8 @@ describe("보장 2: 그 실행기의 실행만, 정확한 이름으로", () => {
     w.wrap({ listRuns: () => ledger.listRuns(), markLostFor: (input) => ledger.markLostFor(input) });
     w.setLinked([NEAR_EXECUTOR]);
     w.setClock(NOW + JUDGE + 1);
-    const result = ran(tick(w, [{ executorId: WORKER_EXECUTOR, absentSince: NOW }, { executorId: SESSION_EXECUTOR, absentSince: NOW }]));
+    // 기억에는 작업자 실행기만 담긴다. 세션 실행기는 기억과 무관하게 not_worker다.
+    const result = ran(tick(w, [{ executorId: WORKER_EXECUTOR, absentSince: NOW }]));
     expect(result.executors.map((e) => [e.executorId, e.outcome])).toEqual([
       [WORKER_EXECUTOR, "moved"],
       [SESSION_EXECUTOR, "not_worker"],
@@ -325,6 +454,28 @@ describe("보장 3: 자리를 풀지 않고, 옮긴 실행을 돌려준다", () 
     expect(ran(tick(w, watch)).executors).toEqual([{ executorId: WORKER_EXECUTOR, outcome: "moved", absentSince: NOW, at: NOW + JUDGE + 1, runs: [] }]);
     expect(state(ledger, s.runId)).toBe("unknown_running");
   });
+
+  test("장부의 답이 진행 중 상태에서 unknown_running으로 옮긴 꼴이 아니면 옮김으로 세지 않는다", () => {
+    const w = world();
+    const s = running(w);
+    const ledger = w.ledger;
+    w.setClock(NOW + JUDGE + 1);
+    const watch = [{ executorId: WORKER_EXECUTOR, absentSince: NOW }];
+    const answerWith = (before: string, after: string): unknown => {
+      w.wrap({ listRuns: () => ledger.listRuns(), markLostFor: () => ({ ok: true, runs: [{ runId: s.runId, runGeneration: 0, before, after }] }) as never });
+      return ran(tick(w, watch)).executors;
+    };
+    const failed = [{ executorId: WORKER_EXECUTOR, outcome: "ledger_failed", absentSince: NOW, reason: "malformed_answer" }];
+    expect(answerWith("queued", "finalized")).toEqual(failed);
+    for (const before of LEDGER_RUN_STATES) {
+      const moved = before === "preparing" || before === "running" || before === "stopping";
+      expect(answerWith(before, "unknown_running")).toEqual(
+        moved ? [{ executorId: WORKER_EXECUTOR, outcome: "moved", absentSince: NOW, at: NOW + JUDGE + 1, runs: [{ runId: s.runId, runGeneration: 0, before, after: "unknown_running" }] }] : failed,
+      );
+      if (before !== "unknown_running") expect(answerWith("running", before)).toEqual(failed);
+    }
+    expect(state(ledger, s.runId)).toBe("running");
+  });
 });
 
 describe("보장 4: 모르면 옮기지 않고, 실패는 결과를 지우지 않는다", () => {
@@ -339,7 +490,7 @@ describe("보장 4: 모르면 옮기지 않고, 실패는 결과를 지우지 �
       markLostFor: () => ({ ok: true, runs: [] }),
     });
     w.setClock(NOW + JUDGE + 1);
-    const watch = [WORKER_EXECUTOR, OTHER_EXECUTOR, NEAR_EXECUTOR, SESSION_EXECUTOR].map((executorId) => ({ executorId, absentSince: NOW }));
+    const watch = [WORKER_EXECUTOR, OTHER_EXECUTOR, NEAR_EXECUTOR].map((executorId) => ({ executorId, absentSince: NOW }));
     expect(ran(tick(w, watch)).executors).toEqual([
       { executorId: WORKER_EXECUTOR, outcome: "unknown", reason: "read_unknown" },
       { executorId: NEAR_EXECUTOR, outcome: "unknown", reason: "read_unknown" },
@@ -397,6 +548,22 @@ describe("보장 4: 모르면 옮기지 않고, 실패는 결과를 지우지 �
       haltedAt: WORKER_EXECUTOR,
     });
     expect(w.calls).toEqual([WORKER_EXECUTOR]);
+  });
+
+  test("실행 목록의 원소를 꺼내다 던지면 예외로 끝나지 않고 read_unknown이다", () => {
+    const w = world();
+    const s = running(w);
+    const rows = [row(WORKER_EXECUTOR)];
+    Object.defineProperty(rows, 0, {
+      get() {
+        throw new Error("줄 읽기 실패");
+      },
+    });
+    w.wrap({ listRuns: () => ({ known: true, value: rows }) as never });
+    w.setClock(NOW + JUDGE + 1);
+    expect(tick(w, [{ executorId: WORKER_EXECUTOR, absentSince: NOW }])).toEqual({ kind: "not_run", reason: "read_unknown" });
+    expect(w.calls).toEqual([]);
+    expect(state(w.ledger, s.runId)).toBe("running");
   });
 
   test("포트 안에서 다시 부른 박자는 읽기·쓰기 없이 돌아온다", () => {
