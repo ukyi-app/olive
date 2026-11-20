@@ -7,9 +7,13 @@
 // 1. 같은 요청으로만 다시 낸다. 요청 ID·본문·정지 세대·실행 세대·받는 쪽은 장부 항목의 값이고, 시작은 발행 시각도 항목의 값이다.
 //    새 요청 ID를 만들지 않는다. 본문을 다시 만들 수 없는 항목(rebuild: null)은 내보내지 않고 구별된 결과를 낸다.
 // 2. 보낼 수 없는 것은 보내지 않는다. 시작은 발행 + START_LAST_SEAL_MS 뒤에 봉하지 않는다(시한이 지난 시작, 새 시각으로 되살리지 않음).
+//    시작은 연결 확인 뒤와 내보내기 직전에 시계를 다시 읽어 한도를 다시 본다. 지키는 것은 "마지막으로 읽은 시각에 봉할 수 있었다"까지이고,
+//    실제로 싣는 순간의 한도는 내보내기 포트가 지킨다.
 //    항목의 정지 세대가 장부의 지금 세대와 다르거나, 연결이 지시를 낼 수 없거나, 읽기가 모름이면 봉하지 않는다.
 // 3. 두드리지 않는다. 같은 요청 ID는 max(항목의 발행 시각, 부르는 쪽이 넘긴 마지막 송신 시각)부터 정책의 간격이 지나야 다시 낸다.
-// 4. 한 항목의 실패는 그 항목의 결과이고 다음 항목을 본다. 그래도 항목 처리 밖으로 예외가 나오면 그때까지의 결과와 함께 halted다.
+//    마지막 송신 시각은 결과의 at(내보내기 포트가 돌아온 뒤 읽은 시각)이다.
+// 4. 한 항목의 실패는 그 항목의 결과이고 다음 항목을 본다. 그래도 항목 처리 밖으로 예외가 나오면(포트 묶음의 속성 접근이 던지는 등)
+//    그때까지의 결과와 함께 halted다.
 import { ACTION_SPECS, type Envelope, limits } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger, type Restorer, type UnansweredInstruction } from "../../ledger/index.ts";
 import { type Drafted, type DraftAction, finalizeDraft, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, stopDraft } from "./envelopes.ts";
@@ -35,7 +39,8 @@ export interface ResendPorts {
   readonly ledger: ResendLedger;
   readonly intake: ResendIntake;
   readonly links: ResendLinkGate;
-  // 장부에 주입한 시계와 같은 시계. 박자 처음과 항목마다 한 번 읽는다(후퇴하면 그 항목은 clock_unavailable).
+  // 장부에 주입한 시계와 같은 시계. 박자 처음, 항목마다, 시작의 봉하기·내보내기 직전, 내보내기 포트가 돌아온 뒤에 읽는다
+  // (앞서 읽은 시각보다 이르면 읽지 못한 것으로 본다).
   readonly clock: Clock;
   // nonce만 여기서 온다. 요청 ID는 만들지 않는다.
   readonly random: Random;
@@ -50,7 +55,7 @@ export interface ResendPolicy {
 }
 
 export interface ResendTickInput {
-  // 앞 박자들이 다시 낸 시각(결과의 resent와 delivery가 unknown인 not_sent의 sealedAt). 부르는 쪽이 메모리에 쥐고 넘긴다.
+  // 앞 박자들이 다시 낸 시각(결과의 resent와 delivery가 unknown인 not_sent의 at. sealedAt이 아니다). 부르는 쪽이 메모리에 쥐고 넘긴다.
   // 감독이 다시 뜨면 비어 있고, 그때는 항목의 발행 시각만으로 간격을 잰다.
   readonly lastResends: readonly { readonly requestId: string; readonly at: number }[];
 }
@@ -60,17 +65,17 @@ export interface ResendTickInput {
 const START_LIFETIME_MS = ACTION_SPECS.task_start.lifetimeMs ?? limits.MESSAGE_TTL_MS;
 export const START_LAST_SEAL_MS = START_LIFETIME_MS - limits.DELIVERY_MAX_MS - limits.CLOCK_SKEW_MS;
 
-type Delivery = "not_sent" | "unknown";
 type Head = { readonly requestId: string; readonly runId: string; readonly action: UnansweredInstruction["action"] };
 
 // 다시 내지 않은 이유 가운데 봉하기 전의 것.
 // session_run: 세션 실행의 지시. stop_recorded: 같은 실행에 종료가 적힌 시작(열자마자 닫힐 실행을 열지 않는다).
-// read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸이 처음 읽은 것과 다르다.
+// read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸(머리 칸과 본문을 다시 만들 칸)이 처음 읽은 것과 다르다.
 export type Withheld = "session_run" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown";
 
 export type ResendOutcome =
   // 같은 요청을 새 봉투에 담아 실었다(sent는 받았다는 뜻이 아니다). sealedAt은 봉할 때 읽은 시각이다.
-  | (Head & { readonly outcome: "resent"; readonly executorId: string; readonly sealedAt: number })
+  // at은 다음 박자의 lastResends에 넘길 시각이다: 내보내기 포트가 돌아온 뒤 읽은 시각, 읽지 못하면 그 봉투의 시한(실은 시각의 상한).
+  | (Head & { readonly outcome: "resent"; readonly executorId: string; readonly sealedAt: number; readonly at: number })
   // 마지막 송신(또는 발행)부터 간격이 지나지 않았다.
   | (Head & { readonly outcome: "held"; readonly lastAt: number })
   // 싣기 직전에 다시 읽으니 더는 답을 기다리는 지시가 아니다(그 사이 영수증이 왔거나 실행이 끝났다).
@@ -84,13 +89,16 @@ export type ResendOutcome =
   | (Head & { readonly outcome: "withheld"; readonly reason: Withheld })
   // 봉투를 만들지 못했다. 실리지 않았다.
   | (Head & { readonly outcome: "not_sealed"; readonly reason: DraftRefusalReason | "draft_threw" | "seal_threw"; readonly field?: string; readonly sealReason?: string })
-  // 봉했지만 실은 것을 확인하지 못했다. delivery가 unknown이면 실렸을 수 있다(부르는 쪽은 sealedAt을 lastResends에 넣는다).
+  // 봉했지만 실은 것을 확인하지 못했다. 포트가 확실히 싣지 않았다고 답했으면 delivery가 not_sent다.
+  | (Head & { readonly outcome: "not_sent"; readonly reason: "no_connection" | "too_late_to_send"; readonly delivery: "not_sent"; readonly executorId: string; readonly sealedAt: number })
+  // 실렸을 수 있다. at은 resent의 at과 같은 규칙의 시각이고 부르는 쪽은 이 값을 lastResends에 넣는다.
   | (Head & {
       readonly outcome: "not_sent";
-      readonly reason: "no_connection" | "too_late_to_send" | "send_threw" | "send_answer_malformed";
-      readonly delivery: Delivery;
+      readonly reason: "send_threw" | "send_answer_malformed";
+      readonly delivery: "unknown";
       readonly executorId: string;
       readonly sealedAt: number;
+      readonly at: number;
     })
   // 항목의 칸을 읽을 수 없다. requestId를 읽지 못했으면 null이다.
   | { readonly requestId: string | null; readonly outcome: "malformed"; readonly field: string };
@@ -280,9 +288,30 @@ function validMemory(input: unknown): Map<string, number> | null {
   }
 }
 
+// 본문을 다시 만들 칸이 같은가. 둘 다 copyRebuild가 만든 사본이라 칸은 원시 값과 그런 값만 담은 객체 하나(자격 참조)뿐이다.
+function sameValues(a: object, b: object): boolean {
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => {
+    if (!Object.hasOwn(right, key)) return false;
+    const x = left[key];
+    const y = right[key];
+    return isObject(x) && isObject(y) ? sameValues(x, y) : Object.is(x, y);
+  });
+}
+
 // 같은 요청 ID의 항목이 처음 읽은 것과 같은 지시인가. 지시 줄은 적은 뒤 바뀌지 않으므로 다르면 틀린 읽기다.
+// 본문 칸도 본다: 다르면 같은 요청 ID에 다른 본문 digest를 봉하게 된다.
 const sameInstruction = (a: Item, b: Item): boolean =>
-  a.action === b.action && a.runId === b.runId && a.runGeneration === b.runGeneration && a.executorId === b.executorId && a.stopGeneration === b.stopGeneration && a.issuedAt === b.issuedAt;
+  a.action === b.action &&
+  a.runId === b.runId &&
+  a.runGeneration === b.runGeneration &&
+  a.executorId === b.executorId &&
+  a.stopGeneration === b.stopGeneration &&
+  a.issuedAt === b.issuedAt &&
+  (a.rebuild === null || b.rebuild === null ? a.rebuild === b.rebuild : sameValues(a.rebuild, b.rebuild));
 
 // 항목의 값만으로 만든 초안. 실행 줄을 따로 읽지 않는다. 정지 세대는 항목의 값(처음 지시의 세대)이다.
 function redraft(item: Item, rebuild: Rebuild): Drafted<DraftAction> {
@@ -315,24 +344,32 @@ interface Trace {
 }
 
 export async function resendTick(ports: ResendPorts, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult> {
-  const key = ports.ledger;
+  // 포트 묶음의 속성 접근(getter)도 던질 수 있다. 박자 처음에 장부 포트를 얻지 못하면 장부를 읽지 못한 것과 같다.
+  // 진행 표시와 첫 읽기는 여기서 한 번 얻은 객체로 한다.
+  let key: unknown;
+  try {
+    key = ports.ledger;
+  } catch {
+    return { kind: "not_run", reason: "read_unknown" };
+  }
+  if (!isObject(key)) return { kind: "not_run", reason: "read_unknown" };
   if (IN_FLIGHT.has(key)) return { kind: "not_run", reason: "tick_in_progress" };
   IN_FLIGHT.add(key);
   try {
-    return await tickOnce(ports, policy, input);
+    return await tickOnce(ports, key as ResendLedger, policy, input);
   } finally {
     IN_FLIGHT.delete(key);
   }
 }
 
-async function tickOnce(ports: ResendPorts, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult> {
+async function tickOnce(ports: ResendPorts, ledger: ResendLedger, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult> {
   const now = readClock(ports, 1);
   if (now === null) return { kind: "not_run", reason: "clock_unavailable" };
   const every = validEvery(policy);
   if (every === null) return { kind: "not_run", reason: "policy_rejected" };
   const lastResends = validMemory(input);
   if (lastResends === null) return { kind: "not_run", reason: "input_malformed" };
-  const read = readUnanswered(ports.ledger);
+  const read = readUnanswered(ledger);
   if (read === null) return { kind: "not_run", reason: "read_unknown" };
   // 정지 기록이 없으면 지시도 적힐 수 없다. 항목과 대조할 세대를 모르므로 아무것도 내지 않는다.
   if (read.stopGeneration === null) return { kind: "not_run", reason: "stop_generation_unknown" };
@@ -348,6 +385,7 @@ async function tickOnce(ports: ResendPorts, policy: ResendPolicy, input: ResendT
     try {
       outcomes.push(await resendOne(ctx, entry.item, trace));
     } catch {
+      // 항목 안에서 포트 묶음의 속성(ledger·intake·links)을 읽다 던지면 여기로 온다.
       // 장부에 쓰지 않으므로 멈춰도 잃는 기록은 없다. 실렸을 수 있는 항목만 그 사실로 남긴다.
       if (trace.fallback !== null) outcomes.push(trace.fallback());
       return { kind: "ran", instructions: outcomes, halted: "threw", haltedAt: entry.item.requestId };
@@ -400,14 +438,29 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   const link = linkVerdict(ctx.ports.links, item.executorId, action);
   if (link !== null) return withheld(link);
 
-  // 여기부터 내보내기까지 await가 없다. 봉하는 시각은 위에서 읽은 at이다.
+  // 시작은 판단한 뒤에도 연결·서명 포트 안에서 시각이 흐른다. 봉하기 직전과 내보내기 직전에 다시 읽어 한도를 다시 본다.
+  // 함정: 마지막으로 읽은 뒤에도 시각은 흐르므로 실제로 싣는 순간의 한도는 내보내기 포트가 지킨다(InstructionSink의 조건).
+  const startStillSealable = (): ResendOutcome | number => {
+    const checked = readClock(ctx.ports, ctx.floor);
+    if (checked === null) return withheld("clock_unavailable");
+    ctx.floor = checked;
+    return checked > item.issuedAt + START_LAST_SEAL_MS ? expired() : checked;
+  };
+  let sealAt = at;
+  if (action === "task_start") {
+    const checked = startStillSealable();
+    if (typeof checked !== "number") return checked;
+    sealAt = checked;
+  }
+
+  // 여기부터 내보내기까지 await가 없다. 취소·확정은 위에서 읽은 at으로, 시작은 연결 확인 뒤에 다시 읽은 시각으로 봉한다.
   let envelope: Envelope;
   try {
     const drafted = redraft(item, rebuild);
     if (!drafted.ok) return { ...head, outcome: "not_sealed", reason: drafted.reason, ...(drafted.field === undefined ? {} : { field: drafted.field }) };
     let sealed: ReturnType<typeof sealDraft>;
     try {
-      sealed = sealDraft(drafted.draft, at, { random: ctx.ports.random, signer: ctx.ports.signer });
+      sealed = sealDraft(drafted.draft, sealAt, { random: ctx.ports.random, signer: ctx.ports.signer });
     } catch {
       return { ...head, outcome: "not_sealed", reason: "seal_threw" };
     }
@@ -425,24 +478,39 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   } catch {
     return { ...head, outcome: "not_sealed", reason: "draft_threw" };
   }
-  // 받는 쪽은 내보내기 전에 확보한 항목의 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과는 바뀌지 않는다.
+  if (action === "task_start") {
+    const checked = startStillSealable();
+    if (typeof checked !== "number") return checked;
+  }
+  // 받는 쪽과 봉투 시한은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과는 바뀌지 않는다.
   const executorId = item.executorId;
-  const notSent = (reason: "no_connection" | "too_late_to_send" | "send_threw" | "send_answer_malformed", delivery: Delivery): ResendOutcome => ({
+  const expiresAt = envelope.header.expires_at;
+  const mayBeLoaded = (reason: "send_threw" | "send_answer_malformed", loadedBy: number): ResendOutcome => ({
     ...head,
     outcome: "not_sent",
     reason,
-    delivery,
+    delivery: "unknown",
     executorId,
-    sealedAt: at,
+    sealedAt: sealAt,
+    at: loadedBy,
   });
-  trace.fallback = () => notSent("send_threw", "unknown");
+  trace.fallback = () => mayBeLoaded("send_threw", expiresAt);
   let sent: unknown;
+  let threw = false;
   try {
     sent = await ctx.ports.sink.send(envelope);
   } catch {
-    return notSent("send_threw", "unknown");
+    threw = true;
   }
-  if (sent === "sent") return { ...head, outcome: "resent", executorId, sealedAt: at };
-  if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent, "not_sent");
-  return notSent("send_answer_malformed", "unknown");
+  if (!threw && (sent === "no_connection" || sent === "too_late_to_send")) {
+    return { ...head, outcome: "not_sent", reason: sent, delivery: "not_sent", executorId, sealedAt: sealAt };
+  }
+  // 간격은 실제로 실은 시각부터 센다. 포트가 돌아온 뒤에 읽은 시각은 실은 시각보다 이르지 않다. 그 시계를 읽지 못하면
+  // 봉투 시한을 쓴다: 포트는 시한 뒤에 싣지 않으므로 실은 시각의 확실한 상한이다(봉한 시각으로 되돌리면 간격이 짧아진다).
+  const after = readClock(ctx.ports, ctx.floor);
+  if (after !== null) ctx.floor = after;
+  const loadedBy = after ?? expiresAt;
+  if (threw) return mayBeLoaded("send_threw", loadedBy);
+  if (sent === "sent") return { ...head, outcome: "resent", executorId, sealedAt: sealAt, at: loadedBy };
+  return mayBeLoaded("send_answer_malformed", loadedBy);
 }

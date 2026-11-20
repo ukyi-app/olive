@@ -170,7 +170,7 @@ describe("보장 1: 같은 요청으로만 다시 낸다", () => {
     const s = started(w);
     const before = snapshot(w);
     w.setClock(NOW + 6_000);
-    expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 6_000 }]);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 6_000, at: NOW + 6_000 }]);
     expect(w.sent).toHaveLength(1);
     const again = w.sent[0] as Envelope;
     expectSameRequest(s.first, again);
@@ -185,7 +185,7 @@ describe("보장 1: 같은 요청으로만 다시 낸다", () => {
     acceptStart(w, s);
     const c = cancel(w, s, NOW + 3_000);
     w.setClock(NOW + 60_000);
-    expect(outcomes(await tick(w))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000 }]);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 }]);
     const resentCancel = w.sent[0] as Envelope;
     expectSameRequest(c.first as Envelope, resentCancel);
     expect(resentCancel.header.issued_at).toBe(NOW + 60_000);
@@ -198,7 +198,7 @@ describe("보장 1: 같은 요청으로만 다시 낸다", () => {
     const firstFinalize = seal(finalizeDraft({ run: s.run, requestId: finalize, stopGeneration: 0, ...body }), NOW + 61_000);
     const before = snapshot(w);
     w.setClock(NOW + 120_000);
-    expect(outcomes(await tick(w))).toEqual([{ requestId: finalize, runId: s.runId, action: "result_finalize", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 120_000 }]);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: finalize, runId: s.runId, action: "result_finalize", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 120_000, at: NOW + 120_000 }]);
     expectSameRequest(firstFinalize, w.sent[1] as Envelope);
     expect((w.sent[1] as Envelope).header.issued_at).toBe(NOW + 120_000);
     expect(snapshot(w)).toEqual(before);
@@ -211,6 +211,28 @@ describe("보장 1: 같은 요청으로만 다시 낸다", () => {
     const c = cancel(w, s, NOW + 1_000, null);
     w.setClock(NOW + 60_000);
     expect(outcomes(await tick(w))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "not_rebuildable" }]);
+    expect(w.log).toEqual([]);
+  });
+
+  test("싣기 직전에 다시 읽은 항목의 본문 칸이 처음과 다르면 내보내지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    w.setClock(NOW + 6_000);
+    type StartRebuild = { budgetLeft: number; credential: Record<string, string> };
+    const changes: ((rebuild: StartRebuild) => StartRebuild)[] = [
+      (rebuild) => ({ ...rebuild, budgetLeft: rebuild.budgetLeft - 1 }),
+      (rebuild) => ({ ...rebuild, credential: { ...rebuild.credential, revision: `${rebuild.credential.revision}-other` } }),
+    ];
+    for (const change of changes) {
+      let calls = 0;
+      w.wrapRead((real) => {
+        const answer = real() as { known: true; value: UnansweredInstructions };
+        if (++calls === 1) return answer;
+        const instructions = answer.value.instructions.map((item) => ({ ...item, rebuild: change(item.rebuild as unknown as StartRebuild) }));
+        return { known: true, value: { ...answer.value, instructions } };
+      });
+      expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "read_unknown" }]);
+    }
     expect(w.log).toEqual([]);
   });
 });
@@ -227,6 +249,56 @@ describe("보장 2: 보낼 수 없는 것은 보내지 않는다", () => {
     w.setClock(NOW + START_LAST_SEAL_MS + 1);
     expect(outcomes(await tick(w, [], 1))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "start_expired", issuedAt: NOW, expiresAt: NOW + 30_000 }]);
     expect(w.log).toEqual([]);
+  });
+
+  test("시작은 연결 확인 중이나 서명 중에 한도가 지나면 내보내기 포트에 닿지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    const expired: ResendOutcome[] = [{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "start_expired", issuedAt: NOW, expiresAt: NOW + 30_000 }];
+    const last = NOW + START_LAST_SEAL_MS;
+    // 정각에 판단하고 연결 포트 안에서 1ms가 지난다.
+    w.setClock(last);
+    w.setLink(() => {
+      w.setClock(last + 1);
+      return { ok: true };
+    });
+    expect(outcomes(await tick(w))).toEqual(expired);
+    expect(w.log).toEqual([]);
+    // 정각에 판단하고 서명 포트 안에서 1ms가 지난다.
+    w.setLink(() => ({ ok: true }));
+    w.setClock(last);
+    w.setSigner(() => w.setClock(last + 1));
+    expect(outcomes(await tick(w))).toEqual(expired);
+    expect(w.log).toEqual(["seal"]);
+    // 다시 읽은 시각이 정각이면 나가고, 그 시각으로 봉한다.
+    w.setSigner(null);
+    w.log.length = 0;
+    w.setClock(last - 1);
+    w.setLink(() => {
+      w.setClock(last);
+      return { ok: true };
+    });
+    expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "resent", executorId: s.run.executorId, sealedAt: last, at: last }]);
+    expect(w.log).toEqual(["seal", "send"]);
+    expect((w.sent[0] as Envelope).header.issued_at).toBe(NOW);
+  });
+
+  test("시작의 다시 읽은 시계를 읽지 못하면 내보내지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    const lost: ResendOutcome[] = [{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "clock_unavailable" }];
+    w.setClock(NOW + 6_000);
+    w.setLink(() => {
+      w.setClock(NOW + 5_999);
+      return { ok: true };
+    });
+    expect(outcomes(await tick(w))).toEqual(lost);
+    expect(w.log).toEqual([]);
+    w.setLink(() => ({ ok: true }));
+    w.setClock(NOW + 6_000);
+    w.setSigner(() => w.setClock(NOW + 5_999));
+    expect(outcomes(await tick(w))).toEqual(lost);
+    expect(w.log).toEqual(["seal"]);
   });
 
   test("항목의 정지 세대가 장부의 지금 세대와 다르면 봉하지 않는다", async () => {
@@ -307,7 +379,7 @@ describe("보장 2: 보낼 수 없는 것은 보내지 않는다", () => {
     w.setClock(NOW + 7_000);
     expect(outcomes(await tick(w))).toEqual([
       { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "stop_recorded" },
-      { requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 7_000 },
+      { requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 7_000, at: NOW + 7_000 },
     ]);
     expect(w.sent.map((e) => e.header.action)).toEqual(["task_cancel"]);
   });
@@ -322,7 +394,7 @@ describe("보장 2: 보낼 수 없는 것은 보내지 않는다", () => {
     acceptStart(w, s);
     const c = cancel(w, s, NOW + 6_000);
     w.setClock(NOW + 12_000);
-    expect(outcomes(await tick(w))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 12_000 }]);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 12_000, at: NOW + 12_000 }]);
   });
 });
 
@@ -343,6 +415,43 @@ describe("보장 3: 두드리지 않는다", () => {
     w.setClock(NOW + 8_000 + EVERY);
     expect(outcomes(await tick(w, memory))[0]).toMatchObject({ outcome: "resent", sealedAt: NOW + 13_000 });
     expect(w.sent).toHaveLength(2);
+  });
+
+  test("다음 박자에 넘길 시각은 내보내기 포트가 돌아온 뒤에 읽은 시각이다", async () => {
+    const w = world();
+    const s = started(w);
+    acceptStart(w, s);
+    const c = cancel(w, s, NOW + 3_000);
+    const head = { requestId: c.requestId, runId: s.runId, action: "task_cancel" as const, executorId: s.run.executorId };
+    const remember = (result: ResendTickResult) => outcomes(result).flatMap((o) => ("at" in o ? [{ requestId: o.requestId as string, at: o.at }] : []));
+    // 포트 안에서 5000ms가 지나 실린다. 결과의 at을 넘겨 곧바로 다음 박자를 부르면 다시 내지 않는다.
+    w.setClock(NOW + 10_000);
+    w.setSend(async () => {
+      w.setClock(NOW + 15_000);
+      return "sent";
+    });
+    const first = await tick(w);
+    expect(outcomes(first)).toEqual([{ ...head, outcome: "resent", sealedAt: NOW + 10_000, at: NOW + 15_000 }]);
+    w.setSend(async () => "sent");
+    expect(outcomes(await tick(w, remember(first)))).toEqual([{ requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "held", lastAt: NOW + 15_000 }]);
+    expect(w.sent).toHaveLength(1);
+    // 실렸는지 모르는 결과도 같은 규칙이다.
+    w.setClock(NOW + 20_000);
+    w.setSend(async () => {
+      w.setClock(NOW + 25_000);
+      throw new Error("내보내기 실패");
+    });
+    const unknown = await tick(w, remember(first));
+    expect(outcomes(unknown)).toEqual([{ ...head, outcome: "not_sent", reason: "send_threw", delivery: "unknown", sealedAt: NOW + 20_000, at: NOW + 25_000 }]);
+    // 돌아온 뒤 시계를 읽지 못하면(뒤로 감) 그 봉투의 시한이 상한이다.
+    w.setClock(NOW + 30_000);
+    w.setSend(async () => {
+      w.setClock(NOW + 29_000);
+      return "sent";
+    });
+    const regressed = outcomes(await tick(w, remember(unknown)));
+    expect(regressed).toEqual([{ ...head, outcome: "resent", sealedAt: NOW + 30_000, at: (w.sent[1] as Envelope).header.expires_at }]);
+    expect((w.sent[1] as Envelope).header.expires_at).toBe(NOW + 60_000);
   });
 
   test("실행기가 답하면 읽기에서 사라져 더 내지 않는다", async () => {
@@ -368,7 +477,7 @@ describe("보장 3: 두드리지 않는다", () => {
     });
     w.setClock(NOW + 60_000);
     expect(outcomes(await tick(w))).toEqual([
-      { requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000 },
+      { requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 },
       { requestId: b.requestId, runId: s.runId, action: "task_cancel", outcome: "answered" },
     ]);
     expect(w.sent).toHaveLength(1);
@@ -418,8 +527,8 @@ describe("보장 4: 실패는 결과를 지우지 않는다", () => {
     w.setSend(() => (answers.shift() as () => Promise<SendOutcome>)());
     const result = ran(await tick(w));
     expect(result.instructions).toEqual([
-      { requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "not_sent", reason: "send_threw", delivery: "unknown", executorId: s.run.executorId, sealedAt: NOW + 60_000 },
-      { requestId: b.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000 },
+      { requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "not_sent", reason: "send_threw", delivery: "unknown", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 },
+      { requestId: b.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 },
     ]);
     expect(result.halted).toBeNull();
 
@@ -441,8 +550,45 @@ describe("보장 4: 실패는 결과를 지우지 않는다", () => {
     });
     expect(outcomes(await tick(w))).toEqual([
       { requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "not_sealed", reason: "seal_threw" },
-      { requestId: b.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000 },
+      { requestId: b.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 },
     ]);
+  });
+
+  test("항목 안에서 포트 묶음의 속성을 읽다 던지면 그때까지의 결과와 함께 멈춘다", async () => {
+    const w = world();
+    const { s, a, b } = twoCancels(w);
+    w.setClock(NOW + 60_000);
+    let linkReads = 0;
+    const ports = {
+      ...w.ports,
+      get links() {
+        if (++linkReads === 2) throw new Error("포트 묶음 실패");
+        return w.ports.links;
+      },
+    } as ResendPorts;
+    expect(await resendTick(ports, { resendEveryMs: EVERY }, { lastResends: [] })).toEqual({
+      kind: "ran",
+      instructions: [{ requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 }],
+      halted: "threw",
+      haltedAt: b.requestId,
+    });
+    expect(w.sent.map((e) => e.header.request_id)).toEqual([a.requestId]);
+  });
+
+  test("박자 처음에 장부 포트를 얻지 못하면 예외 대신 읽지 못한 것이다", async () => {
+    const w = world();
+    started(w);
+    w.setClock(NOW + 6_000);
+    const throwing = {
+      ...w.ports,
+      get ledger(): never {
+        throw new Error("포트 묶음 실패");
+      },
+    } as ResendPorts;
+    const policy = { resendEveryMs: EVERY };
+    expect(await resendTick(throwing, policy, { lastResends: [] })).toEqual({ kind: "not_run", reason: "read_unknown" });
+    expect(await resendTick({ ...w.ports, ledger: undefined } as never, policy, { lastResends: [] })).toEqual({ kind: "not_run", reason: "read_unknown" });
+    expect(w.log).toEqual([]);
   });
 
   test("꼴이 틀린 항목은 그 항목의 결과이고 다음 항목을 본다", async () => {
