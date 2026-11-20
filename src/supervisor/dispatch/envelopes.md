@@ -37,11 +37,11 @@
 
 - **입력이 모자람:** `issued_at_unknown`(시작·갱신의 발행 시각 모름), `lease_unknown`(갱신의 임대 끝 모름), `missing_field`(`field`에 칸 이름), `random_unavailable`(난수 포트가 길이가 다른 값을 줌).
 - **꼴·관계:** `input_malformed`(입력·`run`·초안이 객체가 아니거나 모르는 동작 이름, `field`에 칸 이름), `stop_generation_invalid`(0 이상의 안전 정수가 아님), `run_generation_invalid`(실행에 묶인 지시는 1 이상, 조회·ack는 0이 아님), `not_worker_run`, `recipient_invalid`(동작의 받는 쪽 종류가 아님), `role_mismatch`, `budget_exhausted`, `lease_out_of_range`(발급 시각 이하이거나 발급 + `RUN_LEASE_MAX_MS` 초과), `deadline_not_after_issue`, `run_ids_invalid`(1~8개, 중복 없음), `ids_invalid`(1~32개, 중복 없음).
-- **봉하는 때:** `bad_time`, `issued_in_future`(장부의 발행 시각이 `now`보다 늦음), `deadline_passed`(작업 기한이 `now` 이하), `deadline_too_close`(작업 기한까지 `DELIVERY_MAX_MS + CLOCK_SKEW_MS`보다 적게 남음), `too_late_to_send`(남은 시한이 `DELIVERY_MAX_MS + CLOCK_SKEW_MS`보다 짧음), `seal_refused`(계약의 `SealError`, `sealReason`에 계약 사유), `signer_mismatch`(서명 포트가 돌려준 봉투가 넘긴 값과 다름).
+- **봉하는 때:** `bad_time`, `issued_in_future`(장부의 발행 시각이 `now`보다 늦음), `deadline_passed`(작업 기한이 `now` 이하), `deadline_too_close`(작업 기한까지 `DELIVERY_MAX_MS + CLOCK_SKEW_MS`보다 적게 남음), `too_late_to_send`(남은 시한이 `DELIVERY_MAX_MS + CLOCK_SKEW_MS`보다 짧음), `seal_refused`(계약의 `SealError`, `sealReason`에 계약 사유), `signer_mismatch`(서명 포트가 돌려준 봉투가 넘긴 값과 다르거나 서명이 v1이 읽을 수 없는 꼴).
 
 초안의 세대·발행 시각 검사는 초안을 만들 때와 봉할 때 같은 함수로 한 번씩 한다. 그래서 공개 `Draft`를 직접 고쳐 봉해도 같은 거절이 나온다.
 
-**서명 포트 대조:** 서명 포트에 넘기기 전에 본문의 정규 바이트와 digest, 기대하는 머리(계약 판부터 nonce까지 11칸)를 따로 만들고, 포트에는 그 바이트에서 다시 만든 본문 사본을 넘긴다. 돌려받은 봉투는 칸이 `header`·`signature`·`body` 셋뿐이고, 서명이 문자열이며, 머리 전체와 본문이 그 기준과 같은 정규 바이트일 때만 내보낸다. 내보내는 봉투는 포트가 돌려준 객체가 아니라 기준 머리, 보관한 정규 바이트에서 새로 만든 본문, 서명 문자열로 새로 만든 것이다. 그래서 포트가 받은 본문을 고쳐도 기준과 초안은 바뀌지 않고, 포트가 입력이나 자기 반환값을 `sealDraft`가 돌아온 뒤에 고쳐도 내보낸 봉투는 바뀌지 않는다. 한계: 서명 바이트는 공개 키가 없어 대조하지 않는다. 감독의 키로 머리에 맞게 서명했는지는 받는 쪽 `verifyEnvelope`만 안다.
+**서명 포트 대조:** 서명 포트에 넘기기 전에 본문의 정규 바이트와 digest, 기대하는 머리(계약 판부터 nonce까지 11칸)를 따로 만들고, 포트에는 그 바이트에서 다시 만든 본문 사본을 넘긴다. 돌려받은 봉투는 칸이 `header`·`signature`·`body` 셋뿐이고, 서명이 v1의 받는 쪽이 읽을 수 있는 꼴(86자, base64url 정규 표기, 디코딩하면 64바이트)이며, 머리 전체와 본문이 그 기준과 같은 정규 바이트일 때만 내보낸다. 서명 칸은 한 번만 읽어, 검사한 그 문자열을 내보낸다. 내보내는 봉투는 포트가 돌려준 객체가 아니라 기준 머리, 보관한 정규 바이트에서 새로 만든 본문, 서명 문자열로 새로 만든 것이다. 그래서 포트가 받은 본문을 고쳐도 기준과 초안은 바뀌지 않고, 포트가 입력이나 자기 반환값을 `sealDraft`가 돌아온 뒤에 고쳐도 내보낸 봉투는 바뀌지 않는다. 한계: 꼴은 보고, 서명의 진위는 보지 않는다. 공개 키가 없어, 감독의 키로 머리에 맞게 서명했는지는 받는 쪽 `verifyEnvelope`만 안다.
 
 ## 포트 (`ports.ts`)
 
@@ -49,7 +49,7 @@
 |---|---|---|
 | `Clock` | `now(): number` | 장부 시계와 같은 시계, 후퇴하지 않음, 안전 정수 밀리초 |
 | `Random` | `bytes(length): Uint8Array` | 암호학적 난수(CSPRNG). 요청 ID·nonce·실행 ID가 모두 여기서 온다 |
-| `Signer` | `seal(input: SealInput): Envelope` | 감독의 개인 키로 계약의 `sealEnvelope`를 그대로 부른다. 키는 이 구현만 쥔다. 서명 바이트는 모듈이 대조하지 못한다 |
+| `Signer` | `seal(input: SealInput): Envelope` | 감독의 개인 키로 계약의 `sealEnvelope`를 그대로 부른다. 키는 이 구현만 쥔다. 모듈은 서명의 꼴은 보고, 서명의 진위는 보지 않는다 |
 | `InstructionSink` | `send(envelope): Promise<"sent" \| "no_connection" \| "too_late_to_send">` | 실제로 싣는 시각에 연결, 봉투 시한과 (시작이면) 작업 기한의 여유를 다시 본다. `sent`는 받았다는 뜻이 아니다 |
 | `CredentialPort` | `reference({ account, method })` | 자격의 revision·digest를 붙인다. 아직 쓰는 곳이 없다 |
 

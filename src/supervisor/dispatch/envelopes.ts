@@ -381,21 +381,31 @@ export function sealDraft(draft: Draft, now: number, ports: SealPorts): Sealed {
     if (error instanceof SealError) return refuse("seal_refused", { sealReason: error.reason });
     throw error;
   }
-  if (!sameAsSent(envelope, expected, bodyJson)) return refuse("signer_mismatch");
+  const signature = signatureIfSameAsSent(envelope, expected, bodyJson);
+  if (signature === null) return refuse("signer_mismatch");
   // 대조한 객체를 그대로 내주지 않는다. 포트가 넘겨받은 입력이나 자기 반환값의 참조를 쥐고 있다가 나중에 고치면 전송할 봉투도 바뀐다.
-  // 이 모듈만 쥔 기준 머리, 보관한 정규 바이트에서 새로 만든 본문, 서명 문자열(값)로 새 봉투를 만든다.
-  return { ok: true, envelope: { header: expected, signature: envelope.signature, body: JSON.parse(bodyJson) } };
+  // 이 모듈만 쥔 기준 머리, 보관한 정규 바이트에서 새로 만든 본문, 꼴을 검사한 서명 문자열(값)로 새 봉투를 만든다.
+  return { ok: true, envelope: { header: expected, signature, body: JSON.parse(bodyJson) } };
 }
 
-// 서명 포트가 돌려준 봉투가 넘긴 값 그대로인가. 봉투의 칸은 셋뿐이고, 서명은 문자열이며, 머리는 칸 전부(계약 판, 여분 칸 포함)가
-// 기대한 머리와 같은 정규 바이트이고, 본문은 넘기기 전에 만든 정규 바이트와 같다(머리의 body_digest도 그 바이트의 digest다).
-// 한계: 서명 바이트는 공개 키가 없어 대조하지 않는다. 서명이 감독의 키로 머리에 맞는지는 받는 쪽 verifyEnvelope만 안다.
-function sameAsSent(envelope: unknown, expected: Header, bodyJson: string): envelope is Envelope {
-  if (!isRecord(envelope) || Object.keys(envelope).sort().join() !== "body,header,signature") return false;
-  if (typeof envelope.signature !== "string") return false;
+// 서명 포트가 돌려준 봉투가 넘긴 값 그대로이면 그 서명 문자열, 아니면 null. 봉투의 칸은 셋뿐이고, 서명은 v1이 읽을 수 있는 꼴이며,
+// 머리는 칸 전부(계약 판, 여분 칸 포함)가 기대한 머리와 같은 정규 바이트이고, 본문은 넘기기 전에 만든 정규 바이트와 같다
+// (머리의 body_digest도 그 바이트의 digest다). 서명 칸은 한 번만 읽는다: 접근자라면 검사한 값과 내보낼 값이 달라질 수 있다.
+// 한계: 꼴은 보고, 서명의 진위는 보지 않는다. 공개 키가 없어, 감독의 키로 머리에 맞게 서명했는지는 받는 쪽 verifyEnvelope만 안다.
+function signatureIfSameAsSent(envelope: unknown, expected: Header, bodyJson: string): string | null {
+  if (!isRecord(envelope) || Object.keys(envelope).sort().join() !== "body,header,signature") return null;
+  const signature = envelope.signature;
+  if (!readableSignature(signature)) return null;
   try {
-    return canonicalJson(envelope.header) === canonicalJson(expected) && canonicalJson(envelope.body) === bodyJson;
+    return canonicalJson(envelope.header) === canonicalJson(expected) && canonicalJson(envelope.body) === bodyJson ? signature : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// 계약 v1 verifyEnvelope의 서명 꼴 규칙과 같다(src/contract/v1/envelope.ts의 SIGNATURE 정규식과 디코딩 64바이트·같은 표기 재인코딩).
+function readableSignature(signature: unknown): signature is string {
+  if (typeof signature !== "string" || !/^[A-Za-z0-9_-]{86}$/.test(signature)) return false;
+  const bytes = Buffer.from(signature, "base64url");
+  return bytes.length === 64 && bytes.toString("base64url") === signature;
 }

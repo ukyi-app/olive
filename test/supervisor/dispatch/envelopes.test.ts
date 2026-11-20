@@ -437,6 +437,31 @@ describe("보낼 수 있다고 낸 봉투는 전달 상한 안에서 받는 쪽�
     for (const s of cases) expect(sealDraft(draft, NOW, ports(1, s))).toEqual({ ok: false, reason: "signer_mismatch" });
   });
 
+  test("서명 포트가 v1이 읽을 수 없는 꼴의 서명 문자열을 돌려주면 내보내지 않고, 정상 서명은 받는 쪽을 통과한다", async () => {
+    const draft = drafts().task_cancel.draft;
+    const resigned = (change: (signature: string) => string): Signer => ({
+      seal: (input) => {
+        const e = sealEnvelope(input, keys.privateKey);
+        return { ...e, signature: change(e.signature) };
+      },
+    });
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    // 86자의 마지막 글자는 아래 4비트를 버린다. 그 비트만 바꾸면 같은 64바이트로 풀리지만 정규 표기가 아니다.
+    const offCanonical = (s: string) => s.slice(0, 85) + alphabet[alphabet.indexOf(s.slice(85)) ^ 1];
+    const cases = [
+      () => "",
+      (s: string) => s.slice(0, 85),
+      (s: string) => `${s}A`,
+      offCanonical,
+      (s: string) => `+${s.slice(1)}`,
+      (s: string) => `${s.slice(0, 84)}==`,
+    ];
+    for (const change of cases) expect(sealDraft(draft, NOW, ports(1, resigned(change)))).toEqual({ ok: false, reason: "signer_mismatch" });
+    const envelope = sealed(draft, NOW, ports(1, resigned((s) => s)));
+    expect(envelope.signature).toHaveLength(86);
+    expect(await verifyEnvelope(envelope, ctx(WORKER, NOW, true))).toMatchObject({ ok: true, action: "task_cancel" });
+  });
+
   test("서명 포트가 쥔 입력과 반환값을 봉한 뒤에 고쳐도 돌려준 봉투는 그대로이고 받는 쪽을 통과한다", async () => {
     // 포트가 입력과 자기 반환값의 참조를 보관했다가 sealDraft가 돌아온 뒤 임대 끝 T+30000을 T+20000으로 고치는 입력이다.
     const leaseUntil = NOW + limits.RUN_LEASE_MAX_MS;
