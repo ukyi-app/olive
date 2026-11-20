@@ -941,4 +941,60 @@ describe("맡기지 않을 실행기", () => {
     expect(ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests).toEqual([{ ref, outcome: "withheld", reason: "listed", executorId: EXECUTOR }]);
     expect([reads > 1, w.log, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([true, [], 0, 0, [ref]]);
   });
+
+  test("빈 집합이면 후보 목록의 길이를 거르기 때문에 더 읽지 않는다. 길이를 몇 번만 읽을 수 있는 목록도 기존 no_executor다", async () => {
+    let lengthReads = 0;
+    // 길이를 세 번까지만 0으로 주고 그 뒤에는 던지는 빈 목록.
+    const brittle = new Proxy([] as Candidate[], {
+      get(target, key, receiver) {
+        if (key === "length" && ++lengthReads > 3) throw new Error("길이 읽기 초과");
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const w = world();
+    withConnections(w, brittle);
+    w.setWithheld(listed());
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({
+      kind: "ran",
+      starts: [],
+      requests: [{ ref, outcome: "skipped", pick: { kind: "held", reason: "no_executor", holds: [] } }],
+      halted: null,
+      haltedAt: null,
+    });
+    expect([w.log, w.sent.length, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([[], 0, 0, 0, [ref]]);
+  });
+
+  test("후보의 답이 거를 때 배열이 아니면 거르지 않고 넘겨, 집합이 비었을 때처럼 부탁마다 고르기가 거절한다", async () => {
+    for (const set of [[], [EXECUTOR2]]) {
+      const w = world();
+      // 한 답의 value가 두 번째 읽기까지는 배열이고 그 뒤(읽기 포트가 넘기는 값)에는 배열이 아니다.
+      w.ports = {
+        ...w.ports,
+        connections: {
+          candidates: () => {
+            let reads = 0;
+            return {
+              known: true,
+              get value() {
+                reads += 1;
+                return reads <= 2 ? [CONNECTION] : {};
+              },
+            } as never;
+          },
+        },
+      };
+      w.setWithheld(listed(...set));
+      const first = w.enqueueRequest().ref;
+      const second = w.enqueueRequest().ref;
+      const uuids = w.uuids;
+      const rejected = { outcome: "skipped", pick: { kind: "input_rejected", reason: "malformed_connections" } } as const;
+      expect([set, await assignAndStartTick(w.ports, POLICY, NOW)]).toEqual([
+        set,
+        { kind: "ran", starts: [], requests: [{ ref: first, ...rejected }, { ref: second, ...rejected }], halted: null, haltedAt: null },
+      ]);
+      expect([w.log, w.sent.length, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger).length]).toEqual([[], 0, 0, 0, 2]);
+    }
+  });
 });

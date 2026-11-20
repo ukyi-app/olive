@@ -227,10 +227,11 @@ function candidateName(candidate: Candidate): string | null {
   }
 }
 
-// 후보 연결에서 맡기지 않을 실행기를 뺀다. 집합이 비었거나 목록에 빈 자리가 있으면 받은 목록을 그대로 낸다:
-// filter는 빈 자리를 건너뛰므로 고르기가 malformed_connections로 거절할 목록을 정상 목록으로 바꾼다.
+// 후보 연결에서 맡기지 않을 실행기를 뺀다. 집합이 비었거나, 목록이 배열이 아니거나, 빈 자리가 있으면 받은 값을 그대로 낸다:
+// filter는 빈 자리를 건너뛰므로 고르기가 malformed_connections로 거절할 목록을 정상 목록으로 바꾸고, 배열이 아니면 던진다.
+// 읽기 포트가 검사한 값과 넘긴 값이 다를 수 있으므로(접근자) 받은 값을 여기서 다시 본다.
 function withoutWithheld(connections: readonly Candidate[], withheld: ReadonlySet<string>): readonly Candidate[] {
-  if (withheld.size === 0) return connections;
+  if (withheld.size === 0 || !Array.isArray(connections)) return connections;
   for (let i = 0; i < connections.length; i += 1) {
     if (!(i in connections)) return connections;
   }
@@ -429,7 +430,8 @@ async function assignOne(
   if (withheld === null) return { ref, outcome: "withheld", reason: "withheld_unknown", executorId: null };
   const kept = withoutWithheld(connections, withheld);
   let picked = pickAssignment({ ...given, connections: kept });
-  if (picked.kind === "held" && picked.reason === "no_executor" && kept.length < connections.length) {
+  // 거르지 않았으면(같은 참조) 길이를 다시 읽지 않는다: 읽기마다 답이 다른 목록이면 그 읽기가 박자를 멈춘다.
+  if (picked.kind === "held" && picked.reason === "no_executor" && kept !== connections && kept.length < connections.length) {
     // 뺀 실행기가 맞았는지만 가린다(이 답으로는 잇지 않는다). 맞았다면 no_executor와 구별해 내고,
     // 아니면 빼지 않은 고르기의 답(맞는 실행기 없음, 자격 모름 등)을 그대로 싣는다.
     const unfiltered = pickAssignment({ ...given, connections });
