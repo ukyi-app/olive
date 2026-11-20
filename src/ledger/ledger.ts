@@ -243,20 +243,43 @@ export interface LostRun {
   after: LedgerRunState;
 }
 
-// 실행기의 답 하나(applyExecutorAnswer). runs는 계약 v1의 실행 상태 항목 그대로다. answeredAt은 검증된 답 봉투의 issued_at(실행기 시계),
-// now는 장부에 적는 시각(장부 시계)이다. full은 hello의 전체 목록, partial은 조회의 답이다. 지금은 둘을 같은 규칙으로 처리하고 관측에 적기만 한다.
+// 실행기의 답 하나(applyExecutorAnswer). runs는 계약 v1의 실행 상태 항목 그대로다. answeredAt은 검증된 답 봉투의 issued_at(실행기 시계)이고,
+// 그 값을 모르면 null이다(이른 not_known과 가를 수 없어 not_known으로는 임대를 거두지 않는다). now는 장부에 적는 시각(장부 시계)이다.
+// full은 hello의 전체 목록, partial은 조회의 답이다. 지금은 둘을 같은 규칙으로 처리하고 관측에 적기만 한다.
 export interface ExecutorAnswerInput {
   coverage: "full" | "partial";
   runs: readonly RunStatus[];
-  answeredAt: number;
+  answeredAt: number | null;
   now: number;
 }
 
-// moved: 믿던 임대를 거두고 unknown_running으로 옮긴 실행(접수 순번 순서). outsideLedger: 장부 밖 실행, 닫는 지시에만 쓰는 세대와 함께.
+// not_known이 왔지만 임대를 거두지 않은 실행. 부르는 쪽은 같은 ID를 다시 조회한다.
+// start_may_arrive: 답이 그 실행의 시작 봉투가 아직 실행기에 닿을 수 있는 동안(시작 발행 + RUN_LEASE_MAX_MS 전, 실행기 시계) 만들어졌다.
+// answer_time_unknown: 답의 시각(answeredAt)을 모른다.
+export interface DeferredLoss {
+  runId: string;
+  runGeneration: number;
+  state: LedgerRunState;
+  why: "start_may_arrive" | "answer_time_unknown";
+}
+
+// moved: 믿던 임대를 거두고 unknown_running으로 옮긴 실행(접수 순번 순서). deferred: not_known을 받고도 옮기지 않은 실행(접수 순번 순서).
+// outsideLedger: 장부 밖 실행, 닫는 지시에만 쓰는 세대와 함께.
 export interface ExecutorAnswerResult {
   ok: true;
   moved: LostRun[];
+  deferred: DeferredLoss[];
   outsideLedger: { runId: string; runGeneration: number }[];
+}
+
+// applyExecutorAnswer가 아무것도 적지 못했다(상태 이동도 양성 관측도 없다). unsavedSightings는 이 답의 not_known 밖 항목 전부다
+// (장부와 대조하기 전이라 지정 실행기·세대가 다른 항목도 들어 있다). 비어 있지 않으면 부르는 쪽은 그 실행기의 더 새 답을 넘기기 전에
+// 이 답을 같은 값(coverage·runs·answeredAt)으로 다시 넘긴다: 새 답이 그 실행을 빼먹으면 "안다고 한 적이 있다"가 영영 사라진다.
+// 프로세스가 다시 떠 이 답을 잃으면 장부에는 흔적이 없다(run_sightings 0행이 "본 적 없음"이 아니게 된다. hasRunSighting).
+export interface ExecutorAnswerUnsaved {
+  ok: false;
+  reason: Refusal;
+  unsavedSightings: { runId: string; runGeneration: number }[];
 }
 
 // 재시작 복원 2단계가 적는 양성 관측 하나. 지정 실행기·같은 세대·not_known 밖의 답만 넘긴다(트리거가 다시 본다).
@@ -2361,19 +2384,22 @@ export class Ledger {
   // - 장부가 preparing·running인데 답이 갱신을 받는 상태(preparing·running)가 아니면 믿던 임대를 거둔다: markLostFor와 같은
   //   #moveLost로 unknown_running에 둔다. 자리는 그대로 쥔다. 끝난 상태(checking·failed_stopped 등)로는 옮기지 않는다:
   //   그 상태는 종료 확인 영수증이 있어야 하고(CHECK), 실행기는 ack를 받을 때까지 그 영수증을 다시 보낸다.
+  // - 다만 not_known은 시작 봉투가 아직 닿을 수 있는 동안 만들어졌으면 거두지 않는다(#notKnownTooEarly). 그 답은 "아직 시작을
+  //   받지 못했다"일 뿐이라, 거두면 곧 시작을 받아 정상으로 도는 작업이 갱신을 잃고 실패한다.
   // - "돈다"는 답은 상태도 임대도 바꾸지 않는다. 답에는 실행기의 임대 끝이 없어 갱신의 근거가 아니다.
   // - 장부 밖 실행은 실행 줄로 올리지 않고 닫을 대상으로만 돌려준다(계약의 runsOutsideLedger).
   // 쓰기 모드는 markLostFor와 같은 continue다: 임대를 거두는 것도 관측을 남기는 것도 자리를 더 오래 쥐는 쪽의 기록이다.
-  applyExecutorAnswer(input: ExecutorAnswerInput, from: { sender: string }): ExecutorAnswerResult | Refused {
+  applyExecutorAnswer(input: ExecutorAnswerInput, from: { sender: string }): ExecutorAnswerResult | ExecutorAnswerUnsaved {
     const v = exact(input, ["coverage", "runs", "answeredAt", "now"], "applyExecutorAnswer");
     const coverage = oneOf(v.coverage, COVERAGES, "coverage");
     const runs = answerRuns(v.runs, coverage);
-    const answeredAt = time(v.answeredAt, "answeredAt");
+    const answeredAt = v.answeredAt === null ? null : time(v.answeredAt, "answeredAt");
     const now = time(v.now, "now");
     const sender = runExecutor(exact(from, ["sender"], "from").sender, "from.sender");
-    return this.#write("executor_answer", "continue", () => {
+    const written = this.#write("executor_answer", "continue", () => {
       const outsideLedger = runsOutsideLedger(runs, (runId) => this.#runRow(runId)?.run_generation).map((run) => ({ runId: run.run_id, runGeneration: run.run_generation }));
       const moved: { row: RunRow; next: LedgerRunState }[] = [];
+      const deferred: { row: RunRow; why: DeferredLoss["why"] }[] = [];
       for (const status of runs) {
         const row = this.#runRow(status.run_id);
         if (row === null || row.executor_id !== sender) continue;
@@ -2381,16 +2407,34 @@ export class Ledger {
           if (status.run_generation !== row.run_generation) continue;
           this.#sight(sender, status, coverage, answeredAt, now);
         }
-        if (LEASE_TRUSTED.includes(row.state) && !RENEWABLE_REPORTED.includes(status.state)) moved.push(...this.#moveLost(now, sender, row.run_id));
+        if (!LEASE_TRUSTED.includes(row.state) || RENEWABLE_REPORTED.includes(status.state)) continue;
+        const early = status.state === "not_known" ? this.#notKnownTooEarly(row.run_id, answeredAt) : null;
+        if (early !== null) deferred.push({ row, why: early });
+        else moved.push(...this.#moveLost(now, sender, row.run_id));
       }
+      const byQueue = (a: { row: RunRow }, b: { row: RunRow }) => a.row.queue_seq - b.row.queue_seq;
       return {
         ok: true as const,
-        moved: moved
-          .sort((a, b) => a.row.queue_seq - b.row.queue_seq)
-          .map(({ row, next }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), before: row.state, after: next })),
+        moved: moved.sort(byQueue).map(({ row, next }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), before: row.state, after: next })),
+        deferred: deferred.sort(byQueue).map(({ row, why }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), state: row.state, why })),
         outsideLedger,
       };
     });
+    if (written.ok) return written;
+    const unsavedSightings = runs.filter((run) => run.state !== "not_known").map((run) => ({ runId: run.run_id, runGeneration: run.run_generation as number }));
+    return { ok: false, reason: written.reason, unsavedSightings };
+  }
+
+  // not_known이 그 실행의 시작을 받기 전에 만들어졌을 수 있는가. 시작 지시는 실행마다 하나이고 다시 봉해도 장부의 발행 시각을 싣는다.
+  // 실행기는 발행 + MESSAGE_TTL_MAX_MS(봉투 시한) 뒤로는 그 봉투를 받지 않고, 받아도 발행 + RUN_LEASE_MAX_MS에 임대가 끝난다. 둘은 v1에서
+  // 같은 30000ms다. 그래서 실행기 시계로 발행 + RUN_LEASE_MAX_MS 이후(정각 포함)에 만든 not_known만 "그 시작을 받을 수 없다"이다.
+  // 발행 시각은 지시 줄의 값이다: 갱신 뒤의 instructionTimes.lease.issuedAt은 갱신의 시각이라 시작이 닿을 수 있는 동안을 말하지 않는다.
+  // 답의 시각이나 시작 지시를 모르면 보류한다: 살아 있을 수 있는 작업을 죽이지 않는 쪽이고, 그 임대는 실행기 쪽에서 스스로 끝난다.
+  #notKnownTooEarly(runId: string, answeredAt: number | null): DeferredLoss["why"] | null {
+    if (answeredAt === null) return "answer_time_unknown";
+    const start = this.#db.query("SELECT MAX(issued_at) AS at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'session_start')").get(runId) as { at: number | null };
+    if (start.at === null || answeredAt < safe(start.at, "issued_at") + limits.RUN_LEASE_MAX_MS) return "start_may_arrive";
+    return null;
   }
 
   // 재시작 복원 2단계가 받은 실행기의 답 가운데 지정 실행기·같은 세대·not_known 밖의 것을 같은 표에 적는다. 복원의 판정은 바꾸지 않는다.
@@ -2415,6 +2459,9 @@ export class Ledger {
   }
 
   // 그 실행의 지정 실행기가 그 실행을 안다고 답한 적이 있는가(양성 관측이 하나라도 있는가). 없는 실행이면 null이다. 장부를 바꾸지 않는다.
+  // 함정: false(0행)는 저장에 실패한 양성 관측이 없었을 때만 "본 적 없음"이다. 저장에 실패한 답은 같은 프로세스 안에서만 다시 넘길 수 있고
+  // (applyExecutorAnswer의 unsavedSightings, 복원기가 붙든 항목), 프로세스가 다시 뜨거나 장부를 다시 열면 그 답은 어디에도 없다.
+  // 자리를 푸는 쪽은 이 값만으로 판정하지 않고, 저장 공백을 걸친 실행을 자동 해제에서 빼는 조건을 스스로 갖춰야 한다.
   // D-90의 조건 1을 보는 쪽은 이 값과 unansweredInstructions()의 "영수증·보고 없음"을 함께 본다. 닫는 판단은 같은 트랜잭션에서 다시 본다.
   hasRunSighting(runId: string): Read<boolean | null> {
     return this.#read(() => {

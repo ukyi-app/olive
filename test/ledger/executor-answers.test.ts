@@ -103,7 +103,7 @@ test("보장 1: 다른 실행기·다른 세대의 답은 상태도 임대도 �
     [WORKER_EXECUTOR, status(live.runId, "running", 2)],
   ];
   for (const [sender, run] of ignored) {
-    expect(answer(ledger, [run], sender), `${sender} ${run.state} ${run.run_generation}`).toEqual({ ok: true, moved: [], outsideLedger: [] });
+    expect(answer(ledger, [run], sender), `${sender} ${run.state} ${run.run_generation}`).toEqual({ ok: true, moved: [], deferred: [], outsideLedger: [] });
     expect(state(ledger, live.runId)).toBe("running");
     expect(sighted(ledger, live.runId)).toBe(false);
   }
@@ -111,7 +111,7 @@ test("보장 1: 다른 실행기·다른 세대의 답은 상태도 임대도 �
   // 믿던 임대가 그대로라 판단은 여전히 갱신이다.
   expect(nextIntent(lifecycle(ledger, live.runId, CHECK_AT), LIFE).intent).toBe("renew_lease");
   // 대조군: 지정 실행기가 같은 세대로 답하면 관측이 남는다.
-  expect(answer(ledger, [status(live.runId, "running")])).toEqual({ ok: true, moved: [], outsideLedger: [] });
+  expect(answer(ledger, [status(live.runId, "running")])).toEqual({ ok: true, moved: [], deferred: [], outsideLedger: [] });
   expect(sighted(ledger, live.runId)).toBe(true);
 });
 
@@ -171,7 +171,7 @@ test("보장 1: 실행을 맡을 수 없는 낸 쪽과 계약 밖의 답은 장�
   expect(state(ledger, live.runId)).toBe("running");
   expect(sighted(ledger, live.runId)).toBe(false);
   // 전체 목록의 빈 답은 "쥔 것 없음"이라 받는다. 지금은 목록에 없는 실행을 닫지 않는다(뒤 조각의 몫).
-  expect(answer(ledger, [], WORKER_EXECUTOR, { coverage: "full" })).toEqual({ ok: true, moved: [], outsideLedger: [] });
+  expect(answer(ledger, [], WORKER_EXECUTOR, { coverage: "full" })).toEqual({ ok: true, moved: [], deferred: [], outsideLedger: [] });
   expect(state(ledger, live.runId)).toBe("running");
 });
 
@@ -348,9 +348,16 @@ test("보장 3: 장부가 preparing·running이면 갱신을 받는 답만 그�
       expect(state(ledger, live.runId), label).toBe(ledgerState);
       expect(nextIntent(lifecycle(ledger, live.runId, at), LIFE).intent, label).toBe("renew_lease");
       const timesBefore = times(ledger, live.runId);
-      const moves = !RENEWABLE.includes(reported);
+      // ANSWERED_AT은 시작 발행 + MAX 전이라 not_known은 보류된다. 늦은 not_known의 이동은 "F1" 시험들이 본다.
+      const defers = reported === "not_known";
+      const moves = !RENEWABLE.includes(reported) && !defers;
       const result = must(ledger.applyExecutorAnswer({ coverage: "partial", runs: [status(live.runId, reported, 1, reported === "not_known" ? null : id())], answeredAt: ANSWERED_AT, now: at }, { sender: WORKER_EXECUTOR }));
-      expect(result, label).toEqual({ ok: true, moved: moves ? [{ runId: live.runId, runGeneration: 1, before: ledgerState, after: "unknown_running" }] : [], outsideLedger: [] });
+      expect(result, label).toEqual({
+        ok: true,
+        moved: moves ? [{ runId: live.runId, runGeneration: 1, before: ledgerState, after: "unknown_running" }] : [],
+        deferred: defers ? [{ runId: live.runId, runGeneration: 1, state: ledgerState, why: "start_may_arrive" }] : [],
+        outsideLedger: [],
+      });
       expect(state(ledger, live.runId), label).toBe(moves ? "unknown_running" : ledgerState);
       // 답은 지시를 만들지 않는다: 임대·발급 기록이 그대로다(돈다는 답도 임대를 늘리지 않는다).
       expect(times(ledger, live.runId), label).toEqual(timesBefore);
@@ -375,7 +382,7 @@ test("보장 3: 장부가 stopping·unknown_running·대기·끝난 쪽이면 �
   const answers = (runId: string) => RUN_STATES.map((reported) => status(runId, reported, 1, reported === "not_known" ? null : id()));
   const unchanged = (runId: string, expected: LedgerRunState) => {
     for (const run of answers(runId)) {
-      expect(answer(ledger, [run]), `${expected} × ${run.state}`).toEqual({ ok: true, moved: [], outsideLedger: [] });
+      expect(answer(ledger, [run]), `${expected} × ${run.state}`).toEqual({ ok: true, moved: [], deferred: [], outsideLedger: [] });
       expect(state(ledger, runId), `${expected} × ${run.state}`).toBe(expected);
     }
   };
@@ -424,10 +431,150 @@ test("보장 3: 한 답에 여러 실행이 있으면 지정 실행기·같은 �
   const waiting = must(ledger.admitRun(worker())).run.runId;
   // 다른 실행기(세션)에 지정된 대기 실행. 작업자 실행기의 답은 이 실행을 보지 않는다.
   const sessionRun = must(ledger.admitRun({ ...worker(), kind: "session", role: null, snapshotDigest: null, executorId: SESSION_EXECUTOR })).run.runId;
-  const result = must(answer(ledger, [status(waiting, "finalized", 1, id()), status(sessionRun, "running"), status(live.runId, "not_known")]));
-  expect(result).toEqual({ ok: true, moved: [{ runId: live.runId, runGeneration: 1, before: "running", after: "unknown_running" }], outsideLedger: [] });
+  // live의 not_known은 시작 봉투의 시한(실행기 시계) 뒤에 만든 답이다.
+  const result = must(answer(ledger, [status(waiting, "finalized", 1, id()), status(sessionRun, "running"), status(live.runId, "not_known")], WORKER_EXECUTOR, { answeredAt: NOW + MAX, now: NOW + MAX }));
+  expect(result).toEqual({ ok: true, moved: [{ runId: live.runId, runGeneration: 1, before: "running", after: "unknown_running" }], deferred: [], outsideLedger: [] });
   expect([state(ledger, waiting), state(ledger, sessionRun)]).toEqual(["queued", "queued"]);
   expect([sighted(ledger, waiting), sighted(ledger, sessionRun), sighted(ledger, live.runId)]).toEqual([true, false, false]);
+});
+
+// ---- F1: 시작 봉투가 아직 닿을 수 있는 동안 만든 not_known은 임대를 거두지 않는다 ----
+
+test("F1: preparing에 온 not_known은 실행기 시계로 시작 발행 + MAX 전이면 보류하고 정각부터 옮긴다(답의 시각을 모르면 보류)", () => {
+  const cases: { answeredAt: number | null; why: "start_may_arrive" | "answer_time_unknown" | null }[] = [
+    { answeredAt: NOW - 1, why: "start_may_arrive" },
+    { answeredAt: NOW + 1, why: "start_may_arrive" },
+    { answeredAt: NOW + MAX - 1, why: "start_may_arrive" },
+    { answeredAt: null, why: "answer_time_unknown" },
+    { answeredAt: NOW + MAX, why: null },
+  ];
+  const at = NOW + LIFE.renewEveryMs;
+  for (const { answeredAt, why } of cases) {
+    const label = `answeredAt ${answeredAt === null ? "null" : `발행 ${answeredAt - NOW}`}`;
+    const ledger = ready(open(tempPath()));
+    const live = startedWorker(ledger);
+    const timesBefore = times(ledger, live.runId);
+    // 장부 시계(now)는 모두 같다: 판정은 실행기 시계의 답 시각으로 한다.
+    const result = must(answer(ledger, [status(live.runId, "not_known")], WORKER_EXECUTOR, { answeredAt, now: NOW + 1 }));
+    if (why !== null) {
+      expect(result, label).toEqual({ ok: true, moved: [], deferred: [{ runId: live.runId, runGeneration: 1, state: "preparing", why }], outsideLedger: [] });
+      expect(state(ledger, live.runId), label).toBe("preparing");
+      expect(nextIntent(lifecycle(ledger, live.runId, at), LIFE).intent, label).toBe("renew_lease");
+    } else {
+      expect(result, label).toEqual({ ok: true, moved: [{ runId: live.runId, runGeneration: 1, before: "preparing", after: "unknown_running" }], deferred: [], outsideLedger: [] });
+      expect(nextIntent(lifecycle(ledger, live.runId, at), LIFE), label).toEqual({ intent: "query", runId: live.runId, toward: "unknown_running" });
+      expect(ledger.recordRenewInstruction({ runId: live.runId, requestId: id(), stopGeneration: 0, now: at }), label).toEqual({ ok: false, reason: "transition_denied" });
+    }
+    expect(times(ledger, live.runId), label).toEqual(timesBefore);
+    expect(ledger.slotFree("worker"), label).toEqual({ known: true, value: false });
+    expect(sighted(ledger, live.runId), label).toBe(false);
+    ledger.close();
+  }
+  // 끝났다는 답은 답의 시각을 몰라도 지금처럼 옮긴다(보류는 not_known에만).
+  const ledger = ready(open(tempPath()));
+  const live = startedWorker(ledger);
+  expect(must(answer(ledger, [status(live.runId, "failed_stopped", 1, id())], WORKER_EXECUTOR, { answeredAt: null, now: NOW + 1 }))).toEqual({
+    ok: true,
+    moved: [{ runId: live.runId, runGeneration: 1, before: "preparing", after: "unknown_running" }],
+    deferred: [],
+    outsideLedger: [],
+  });
+});
+
+test("F1: 보류한 뒤 도착한 시작 영수증으로 실행은 정상으로 이어지고 실제 수명 판단이 갱신을 낸다(늦은 답이 없는 대조군과 같다)", () => {
+  const run = (earlyAnswer: boolean) => {
+    const ledger = ready(open(tempPath()));
+    const live = startedWorker(ledger);
+    if (earlyAnswer) {
+      // 시작을 받기 전에 조회를 먼저 받은 실행기의 답: 박자 시각(발행 − 1)에 서명됐다.
+      const held = must(answer(ledger, [status(live.runId, "not_known")], WORKER_EXECUTOR, { answeredAt: NOW - 1, now: NOW + 1 }));
+      expect(held.deferred).toEqual([{ runId: live.runId, runGeneration: 1, state: "preparing", why: "start_may_arrive" }]);
+    }
+    must(ledger.applyReceipt({ action: "receipt_started", receiptId: id(), runId: live.runId, instructionRequestId: live.requestId, bodyDigest: digest("started"), now: NOW + 2 }, live.from));
+    const at = NOW + LIFE.renewEveryMs;
+    const intent = nextIntent(lifecycle(ledger, live.runId, at), LIFE).intent;
+    const renewed = ledger.recordRenewInstruction({ runId: live.runId, requestId: id(), stopGeneration: 0, now: at });
+    const out = { state: state(ledger, live.runId), intent, renewed: renewed.ok, lease: times(ledger, live.runId).lease };
+    ledger.close();
+    return out;
+  };
+  const expected = { state: "running", intent: "renew_lease", renewed: true, lease: { issuedAt: NOW + LIFE.renewEveryMs, expiresAt: NOW + LIFE.renewEveryMs + MAX } } as const;
+  expect(run(false)).toEqual(expected);
+  expect(run(true)).toEqual(expected);
+});
+
+test("F1: 갱신이 적힌 실행도 시작 지시 줄의 발행 시각으로 잰다(갱신의 시각으로 재지 않는다)", () => {
+  // trustedRunning: 시작 NOW, 갱신 RENEWED_AT. instructionTimes의 lease.issuedAt은 RENEWED_AT이다.
+  for (const [answeredAt, moves] of [
+    [NOW + MAX - 1, false],
+    [NOW + MAX, true],
+  ] as const) {
+    const label = `발행 + ${answeredAt - NOW}`;
+    const ledger = ready(open(tempPath()));
+    const live = trustedRunning(ledger);
+    expect(answeredAt < RENEWED_AT + MAX, label).toBe(true);
+    const result = must(answer(ledger, [status(live.runId, "not_known")], WORKER_EXECUTOR, { answeredAt, now: answeredAt }));
+    expect(result, label).toEqual({
+      ok: true,
+      moved: moves ? [{ runId: live.runId, runGeneration: 1, before: "running", after: "unknown_running" }] : [],
+      deferred: moves ? [] : [{ runId: live.runId, runGeneration: 1, state: "running", why: "start_may_arrive" }],
+      outsideLedger: [],
+    });
+    expect(state(ledger, live.runId), label).toBe(moves ? "unknown_running" : "running");
+    ledger.close();
+  }
+});
+
+// ---- F2: 저장에 실패한 "안다"는 관측을 같은 프로세스 안에서 잊지 않는다 ----
+
+test("F2: 복원 2단계는 적지 못한 양성 관측을 붙들고, 다시 물은 답이 그 실행을 빼먹어도 앞의 관측을 적어야 통과한다", async () => {
+  let fail = false;
+  const path = tempPath();
+  const ledger = open(path, {
+    faults: {
+      at(point) {
+        if (fail && point === "run_sighting:before_commit") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
+      },
+    },
+  });
+  const live = startedWorker(ledger);
+  let reported: RunStatus[] = [status(live.runId, "preparing")];
+  const restorer = new Restorer(ledger, ports(async () => [{ executorId: WORKER_EXECUTOR, coverage: "full", runs: reported }]), clock, { requiredPeers: ["front-door"] });
+  await restorer.step1();
+  fail = true;
+  await expect(restorer.step2()).rejects.toThrow("양성 관측을 적지 못함");
+  // 다시 물은 답은 빈 전체 목록이다. 앞의 관측을 적지 못하는 동안 단계는 통과하지 않는다.
+  reported = [];
+  await expect(restorer.step2()).rejects.toThrow("양성 관측을 적지 못함");
+  expect(sighted(ledger, live.runId)).toBe(false);
+  fail = false;
+  await restorer.step2();
+  expect(sighted(ledger, live.runId)).toBe(true);
+  ledger.close();
+  expect(rawRows(path, `SELECT ${SIGHTING_COLUMNS} FROM run_sightings`)).toEqual([
+    { run_id: live.runId, executor_id: WORKER_EXECUTOR, run_generation: 1, reported_state: "preparing", last_receipt_id: null, answered_at: null, received_at: NOW, coverage: "full" },
+  ]);
+});
+
+test("F2: 운영 중 관측을 적지 못한 답은 양성 항목을 실은 실패로 구별되고, 같은 답으로 다시 넘기면 남는다", () => {
+  let failCommit = false;
+  const ledger = open(tempPath(), {
+    faults: {
+      at(point) {
+        if (failCommit && point === "executor_answer:before_commit") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
+      },
+    },
+  });
+  const live = startedWorker(ledger);
+  const first: RunStatus[] = [status(live.runId, "preparing"), status(id(), "not_known")];
+  failCommit = true;
+  expect(answer(ledger, first)).toEqual({ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId: live.runId, runGeneration: 1 }] });
+  // 양성 항목이 없는 답의 실패는 붙들 것이 없다.
+  expect(answer(ledger, [status(live.runId, "not_known")], WORKER_EXECUTOR, { answeredAt: NOW + MAX })).toEqual({ ok: false, reason: "ledger_unwritable", unsavedSightings: [] });
+  failCommit = false;
+  expect([state(ledger, live.runId), sighted(ledger, live.runId)]).toEqual(["preparing", false]);
+  expect(answer(ledger, first)).toEqual({ ok: true, moved: [], deferred: [], outsideLedger: [] });
+  expect(sighted(ledger, live.runId)).toBe(true);
 });
 
 test("보장 3: 쓰기 모드는 markLostFor와 같다(못 씀이 된 뒤에도 시도하고, 커밋 전에 끊기면 아무것도 남지 않고, 닫힌 장부는 거절)", () => {
@@ -443,7 +590,7 @@ test("보장 3: 쓰기 모드는 markLostFor와 같다(못 씀이 된 뒤에도 
   });
   const live = trustedRunning(ledger);
   failCommit = true;
-  expect(answer(ledger, [status(live.runId, "finalized", 1, id())])).toEqual({ ok: false, reason: "ledger_unwritable" });
+  expect(answer(ledger, [status(live.runId, "finalized", 1, id())])).toEqual({ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId: live.runId, runGeneration: 1 }] });
   failCommit = false;
   expect(state(ledger, live.runId)).toBe("running");
   expect(sighted(ledger, live.runId)).toBe(false);
@@ -455,7 +602,7 @@ test("보장 3: 쓰기 모드는 markLostFor와 같다(못 씀이 된 뒤에도 
   expect(must(answer(ledger, [status(live.runId, "finalized", 1, id())])).moved).toEqual([{ runId: live.runId, runGeneration: 1, before: "running", after: "unknown_running" }]);
   expect(sighted(ledger, live.runId)).toBe(true);
   ledger.close();
-  expect(answer(ledger, [status(live.runId, "finalized", 1, id())])).toEqual({ ok: false, reason: "ledger_unwritable" });
+  expect(answer(ledger, [status(live.runId, "finalized", 1, id())])).toEqual({ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId: live.runId, runGeneration: 1 }] });
 });
 
 // ---- 보장 4: 기존 장부는 그대로 열리고 기존 동작은 그대로다 ----
@@ -470,7 +617,7 @@ test("이관: 판 1~4의 장부가 판 5로 올라가고 기존 줄은 그대로
     const live = startedWorker(before);
     must(before.applyReceipt({ action: "receipt_started", receiptId: id(), runId: live.runId, instructionRequestId: live.requestId, bodyDigest: digest("started"), now: NOW }, live.from));
     // 판 5 전의 장부에서는 이 쓰기가 틀린 값을 내지 않고 닫힌다(표가 없다). 상태는 그대로다.
-    expect(answer(before, [status(live.runId, "finalized", 1, id())]), `판 ${version}`).toEqual({ ok: false, reason: "ledger_unwritable" });
+    expect(answer(before, [status(live.runId, "finalized", 1, id())]), `판 ${version}`).toEqual({ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId: live.runId, runGeneration: 1 }] });
     expect(state(before, live.runId)).toBe("running");
     before.close();
     // 그 판에 있던 칸만 비교한다(판 2·4가 더하는 칸은 그 이관의 시험이 본다).

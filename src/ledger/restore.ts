@@ -194,6 +194,9 @@ export class Restorer {
   #attempt: RestoreAttempt | null = null;
   // 5단계가 쓰는 2단계의 판정. 돌려준 값과 따로 둔다.
   #step2: Step2 | null = null;
+  // 2단계가 모았지만 아직 적지 못한 양성 관측. 다음 2단계 시도가 새 답의 것보다 먼저 적는다: 다시 물은 답이 그 실행을 빼먹어도
+  // "안다고 한 적이 있다"를 잃지 않게 한다. 메모리에만 있어 이 복원기를 버리거나 프로세스가 다시 뜨면 사라진다(ledger.md "실행기의 답").
+  #unsavedSightings: RunSightingObservation[] = [];
   readonly #requiredPeers: readonly string[];
   readonly #requiredExecutors: readonly string[];
 
@@ -384,16 +387,28 @@ export class Restorer {
             }
           }
         }
+        // 앞 시도에서 적지 못한 것을 먼저 둔다. 같은 (실행, 실행기, 세대)면 앞의 것이 첫 관측이다(#sight는 있는 줄을 덮지 않는다).
+        // 점유 차단보다 먼저 붙들어, 차단 쓰기가 실패해도 이번에 받은 관측을 잃지 않는다.
+        // 실패가 거듭돼도 목록이 자라지 않게 같은 열쇠는 하나만 둔다.
+        const keys = new Set<string>();
+        const pending = [...this.#unsavedSightings, ...sightings].filter((seen) => {
+          const key = JSON.stringify([seen.status.run_id, seen.executorId, seen.status.run_generation]);
+          if (keys.has(key)) return false;
+          keys.add(key);
+          return true;
+        });
+        this.#unsavedSightings = pending;
         if (observations.length > 0) {
           const written = this.ledger.holdSlots(RESTORE_KEY, observations, this.clock());
           if (!written.ok) throw new RestoreStepError(2, `점유 차단을 적지 못함(${written.reason})`);
           out.holds = written.holds;
         }
         // 관측을 잃으면 뒤의 자동 해제(D-90)가 실행기가 안다고 했던 실행의 자리를 풀 수 있어, 적지 못하면 이 단계를 실패로 끝낸다.
-        if (sightings.length > 0) {
-          const sighted = this.ledger.recordRunSightings(RESTORE_KEY, sightings, this.clock());
+        if (pending.length > 0) {
+          const sighted = this.ledger.recordRunSightings(RESTORE_KEY, pending, this.clock());
           if (!sighted.ok) throw new RestoreStepError(2, `양성 관측을 적지 못함(${sighted.reason})`);
         }
+        this.#unsavedSightings = [];
         return out;
       },
       (result) => {

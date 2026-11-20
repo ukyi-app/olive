@@ -5,10 +5,12 @@ export { type CredentialRef, LedgerInputError, type SourceRef } from "./input.ts
 export {
   type AdmitRunInput,
   type AssignToolRequestInput,
+  type DeferredLoss,
   type Delivery,
   type EnvelopeFrom,
   type ExecutorAnswerInput,
   type ExecutorAnswerResult,
+  type ExecutorAnswerUnsaved,
   FINALIZE_OUTCOMES,
   type FinalizeInstructionInput,
   type FinalizeOutcome,
