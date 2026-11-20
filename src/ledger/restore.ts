@@ -7,7 +7,7 @@
 // 반환값은 그 순간의 판정이다. 그 뒤의 판단(stopGeneration, intakeOpen)은 단계 결과가 아니라 지금의 장부에서 읽는다.
 import { CONTRACT as CONTRACT_V1, parsePrincipal, queriesAfterReconnect, type RunStatus } from "../contract/v1/index.ts";
 import { CONTRACT as CONTRACT_V2 } from "../contract/v2/index.ts";
-import { type Ledger, type PendingInputs, type PendingReport, RESTORE_KEY, type RestoreAttempt, type Run, type SlotHold, type SlotHoldObservation, type SnapshotOrigin } from "./ledger.ts";
+import { type Ledger, type PendingInputs, type PendingReport, RESTORE_KEY, type RestoreAttempt, type Run, type RunSightingObservation, type SlotHold, type SlotHoldObservation, type SnapshotOrigin } from "./ledger.ts";
 import { SLOT_FREE, TERMINAL } from "./states.ts";
 
 // ---- 포트(뒤 작업이 채운다) ----
@@ -323,7 +323,8 @@ export class Restorer {
         for (const executor of this.#requiredExecutors) if (fullAnswers.get(executor) !== 1) out.occupancyUnconfirmed.push(executor);
 
         const observations: SlotHoldObservation[] = [];
-        for (const { executorId, runs: reported } of occupancy) {
+        const sightings: RunSightingObservation[] = [];
+        for (const { executorId, coverage, runs: reported } of occupancy) {
           const kind = slotKind(executorId);
           for (const status of reported) {
             if (status.state === "not_known") continue;
@@ -359,6 +360,8 @@ export class Restorer {
               if (active || queued) observe("generation");
               continue;
             }
+            // 지정 실행기가 같은 세대로 이 실행을 안다고 답했다: 운영 중의 답과 같은 표에 첫 관측으로 남긴다(아래 판정과 무관하다).
+            sightings.push({ executorId, coverage, status });
             if (queued) {
               out.occupancyMismatches.push({ executorId, runId: known.runId, why: "state" });
               observe("state");
@@ -385,6 +388,11 @@ export class Restorer {
           const written = this.ledger.holdSlots(RESTORE_KEY, observations, this.clock());
           if (!written.ok) throw new RestoreStepError(2, `점유 차단을 적지 못함(${written.reason})`);
           out.holds = written.holds;
+        }
+        // 관측을 잃으면 뒤의 자동 해제(D-90)가 실행기가 안다고 했던 실행의 자리를 풀 수 있어, 적지 못하면 이 단계를 실패로 끝낸다.
+        if (sightings.length > 0) {
+          const sighted = this.ledger.recordRunSightings(RESTORE_KEY, sightings, this.clock());
+          if (!sighted.ok) throw new RestoreStepError(2, `양성 관측을 적지 못함(${sighted.reason})`);
         }
         return out;
       },
