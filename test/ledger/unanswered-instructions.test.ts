@@ -446,7 +446,7 @@ test("이관: 판 1~3에 적힌 확정 줄도 판 4의 제약을 지나 올라�
   }
 });
 
-test("이관: 본문 칸의 CHECK는 다시 만들 수 있는 완전한 꼴이거나 전부 빈 줄만 받는다", () => {
+test("이관: 본문 칸의 CHECK는 칸의 조합이 다시 만들 수 있는 완전한 꼴이거나 전부 빈 줄만 받는다", () => {
   const path = tempPath();
   const ledger = openAt(path);
   const start = startWorker(ledger);
@@ -455,6 +455,7 @@ test("이관: 본문 칸의 CHECK는 다시 만들 수 있는 완전한 꼴이�
   const before = count();
 
   // 공개 쓰기(finalizeFields·oneOf)가 먼저 막는 조합이다. SQL로 직접 넣어도 줄이 생기지 않는지 본다.
+  // CHECK는 칸의 조합만 본다. 값의 형식(결과 digest의 소문자 16진수 64자리 등)은 공개 쓰기가 검사하므로 여기서 다루지 않는다.
   const rejected = [
     // 결과 digest만 있는 확정: outcome이 NULL이면 `=` 비교는 NULL이고 CHECK는 NULL을 통과로 보므로 이관이 IS로 막는 조합이다.
     { action: "result_finalize", result_digest: RESULT },
