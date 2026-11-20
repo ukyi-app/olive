@@ -323,6 +323,51 @@ test("새 연결: 앞 처리가 멈춘 채 감독이 닫아도 그 끝을 알아
   expect(s.opened).toHaveLength(2);
 });
 
+// 저장소가 고장 나면 nonce의 한 번 사용을 보장할 수 없어 어느 연결이든 닫는다(store.ts의 전역 장애 통지 → worker → link).
+// 그래서 늦게 풀린 앞 처리가 저장 오류로 끝나면 그때의 연결, 곧 새 연결이 닫힌다. 이 동작을 그대로 고정한다.
+test("새 연결: 늦게 풀린 앞 처리가 저장소의 오류로 끝나면 전역 장애 통지가 새 연결을 닫고 다음 간격으로 다시 붙기를 건다. 옛 조회의 답은 싣지 않는다", async () => {
+  const disk = scriptedIo();
+  const s = await setup({ io: disk.io });
+  s.socket.start();
+  const a = await syncPeer(s, 0);
+  const consuming = barrier();
+  disk.markers.gate = consuming;
+  a.socket.write(frame(query(s, randomUUID())));
+  await consuming.entered;
+  // 감독이 조회 하나를 더 보내고 닫는다.
+  a.socket.end(frame(query(s, randomUUID())));
+  await until(() => a.closed && s.timer.waits.length === 1);
+  expect(closedReasons(s)).toEqual(["peer_ended"]);
+  expect(s.opened[0]!.inFlight).toBe(1);
+  s.timer.waits[0]!.fire();
+  await until(() => (s.peers[1]?.got.length ?? 0) >= 1);
+  const b = s.peers[1]!;
+  const connectionB = s.opened[1]!.connection;
+  expect(actionsOf(b)).toEqual(["stop_sync_request"]);
+  expect(connectionB.state).toBe("syncing");
+  expect(connectionB.pending()).not.toBeNull();
+
+  // 앞 연결의 nonce 쓰기만 저장 오류로 끝낸다. B는 아직 아무것도 검증하지 않았다.
+  disk.markers.gate = undefined;
+  disk.markers.failing = true;
+  consuming.open();
+  await until(() => s.opened[0]!.inFlight === 0);
+  disk.markers.failing = false;
+  await until(() => b.closed && s.timer.waits.length === 2);
+  expect(closedReasons(s)).toEqual(["peer_ended", "link_closed"]);
+  expect(connectionB.state).toBe("closed");
+  expect(connectionB.pending()).toBeNull();
+  expect(s.r.store.healthy()).toBe(false);
+  expect(s.socket.phase()).toBe("waiting");
+  // 맞추지 못한 연결 뒤이므로 기준값은 는다.
+  expect(s.timer.waits.map((w) => w.ms)).toEqual([100, 200]);
+  expect(kinds(s).filter((k) => k === "synced")).toHaveLength(1);
+  // 옛 조회의 답은 어느 연결에도 실리지 않는다. 둘째 조회는 판단에 닿지 않았다.
+  expect(actionsOf(b)).toEqual(["stop_sync_request"]);
+  expect(actionsOf(a)).toEqual(["stop_sync_request", "hello"]);
+  expect(s.opened[0]!.seen).toHaveLength(2);
+});
+
 test("받기: 처리를 기다리는 받은 틀이 상한을 넘으면 그 연결만 닫고 넘친 틀은 판단에 닿지 않는다", async () => {
   const s = await setup();
   s.socket.start();
@@ -503,6 +548,46 @@ test("멈춤: 멈춘 뒤 늦게 돌아온 검증된 소켓도 link에 열지 않
   expect(s.opened).toHaveLength(0);
   expect(s.timer.waits).toHaveLength(0);
   expect(kinds(s)).toEqual(["connecting", "stopped"]);
+});
+
+test("멈춤: 검증은 끝났고 반환만 늦은 소켓을 감독이 끝내는 중에 넘겨받아도 stop()은 그 소켓의 실제 close 뒤에 돌아온다", async () => {
+  const verifiedReady = gate();
+  const closing = gate();
+  let closeHeard = false;
+  let atHandOver: { closed: boolean; closeHeard: boolean } | undefined;
+  const s = await setup({
+    wrap: (client) => ({
+      connect: async () => {
+        const verified = await client.connect();
+        const raw = verified.socket;
+        raw.once("close", () => (closeHeard = true));
+        // 감독의 끝을 받은 소켓이 스스로 destroy를 부른 차례에 결과를 넘긴다. 그때 closed는 이미 참이지만
+        // close 사건은 아직 오지 않았다.
+        const destroy = raw.destroy.bind(raw);
+        raw.destroy = (error?: Error) => {
+          destroy(error);
+          atHandOver ??= { closed: raw.closed, closeHeard };
+          closing.open();
+          return raw;
+        };
+        verifiedReady.open();
+        await closing.wait;
+        return verified;
+      },
+    }),
+  });
+  s.socket.start();
+  await verifiedReady.wait;
+  await until(() => s.peers.length === 1);
+  const stopping = s.socket.stop();
+  s.peers[0]!.socket.end();
+  await stopping;
+  // 겨냥한 차례가 실제로 만들어졌다.
+  expect(atHandOver).toEqual({ closed: true, closeHeard: false });
+  expect(closeHeard).toBe(true);
+  expect(s.client.openConnections()).toBe(0);
+  expect(s.opened).toHaveLength(0);
+  expect(s.timer.waits).toHaveLength(0);
 });
 
 // bun test는 처리되지 않은 거절을 그때 돌던 시험의 실패로 센다(unhandledRejection을 들어도 같다). 그래서 이 시험은

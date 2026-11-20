@@ -30,7 +30,8 @@ const FRAME_MAX_BYTES = FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES;
 
 // 받았지만 아직 판단에 넘기지 않은 틀의 양. 숫자는 실측 전이라 부르는 쪽이 넘긴다(기본값 없음).
 export interface ReceivePolicy {
-  // 줄에 쌓아 둘 틀 바이트(접두 포함)의 상한. FRAME_MAX_BYTES(65,540) 이상의 정수. 넘으면 그 연결을 닫는다(receive_backlog).
+  // 줄에서 처리를 기다리는 완성된 틀의 전송 길이(접두 포함) 합의 상한. FRAME_MAX_BYTES(65,540) 이상의 JavaScript 안전 정수.
+  // 넘으면 그 연결을 닫는다(receive_backlog). 처리 중인 틀 하나와 디코더의 덜 온 조각은 세지 않는다.
   readonly maxQueuedBytes: number;
 }
 
@@ -187,12 +188,11 @@ class Socket implements ExecutorSocket {
     await Promise.all(this.unclosed);
   }
 
-  // 받은 소켓의 close를 stop이 기다리도록 unclosed에 넣는다.
-  track(socket: RawSocket): void {
-    const gone = new Promise<void>((resolve) => {
-      if (socket.closed) resolve();
-      else socket.once("close", () => resolve());
-    });
+  // 받은 소켓의 close를 stop이 기다리도록 unclosed에 넣는다. tls-client가 검증 직후 건 close 사건의 약속을 쓴다:
+  // 소켓의 closed·destroyed는 close 사건보다 먼저 참이 될 수 있어, 그 속성으로 "이미 닫혔다"를 판정하면
+  // 닫히는 중에 늦게 받은 소켓을 기다리지 않고 돌아온다.
+  private track(verified: VerifiedSupervisorConnection): void {
+    const gone = verified.closed;
     this.unclosed.add(gone);
     void gone.then(() => this.unclosed.delete(gone));
   }
@@ -230,16 +230,16 @@ class Socket implements ExecutorSocket {
   }
 
   private connected(attempt: number, verified: VerifiedSupervisorConnection): void {
-    // 멈춘 뒤나 다른 붙기로 넘어간 뒤에 끝난 붙기의 소켓은 쓰지 않고 닫는다. stop이 그 close까지 기다린다.
+    // 받은 소켓은 어느 길로 가든 stop이 그 close까지 기다린다.
+    this.track(verified);
+    // 멈춘 뒤나 다른 붙기로 넘어간 뒤에 끝난 붙기의 소켓은 쓰지 않고 닫는다.
     if (this.state === "stopped" || this.pending?.attempt !== attempt) {
-      this.track(verified.socket);
       verified.socket.destroy();
       return;
     }
     this.pending = null;
-    // 돌려받기 전에 이미 끊긴 소켓이면 close 사건을 놓쳤을 수 있다. link에 열지 않고 실패로 센다.
+    // 돌려받기 전에 이미 끊긴 소켓이면 Wire가 close 사건을 놓쳤을 수 있다. link에 열지 않고 실패로 센다.
     if (verified.socket.destroyed) {
-      this.track(verified.socket);
       verified.socket.destroy();
       this.emit({ kind: "connect_failed", attempt, reason: "tls_error" });
       this.schedule();
@@ -351,7 +351,6 @@ class Wire implements Transport {
     private readonly socket: RawSocket,
     private readonly maxQueuedBytes: number,
   ) {
-    owner.track(socket);
     // tls-client가 핸드셰이크까지 건 error 처리는 한 번뿐이다. 붙은 뒤의 error가 처리 없이 던져지지 않게 바로 건다.
     socket.on("error", () => this.owner.shut(this, "socket_error"));
     socket.on("close", () => this.owner.shut(this, "socket_closed"));
