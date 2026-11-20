@@ -2261,6 +2261,9 @@ export class Ledger {
   markLostFor(input: { executorId: string; now: number }): { ok: true; runs: LostRun[] } | Refused {
     const v = exact(input, ["executorId", "now"], "markLostFor");
     const executorId = str(v.executorId, REF, "executorId");
+    // admitRun과 같은 판정: 실행을 맡을 수 없는 이름은 잘못 넘긴 값이라, 실행이 없는 유효한 이름의 빈 목록과 가른다.
+    const executorKind = parsePrincipal(executorId)?.kind;
+    if (executorKind !== "worker_executor" && executorKind !== "session_executor") throw new LedgerInputError("executorId: 실행을 맡을 수 있는 실행기 주체가 아니다");
     const when = time(v.now, "now");
     return this.#write("lost", "continue", () => ({
       ok: true as const,

@@ -147,6 +147,21 @@ test("보장 1: 없는 실행기, 진행 중 실행이 없는 실행기는 아�
   expect(runs(idle)).toEqual(idleBefore);
 });
 
+test("보장 1: 같은 종류의 다른 실행기(대기만 있는 작업자 B)의 끊김은 진행 중인 작업자 A의 실행·임대를 건드리지 않는다", () => {
+  // 공개 연산만으로 만든다: A는 시작 영수증과 갱신까지 받은 running, B는 접수만 된 queued.
+  const ledger = ready(open(tempPath()));
+  const a = trustedRunning(ledger);
+  const b = must(ledger.admitRun(worker({ executorId: OTHER_WORKER_EXECUTOR }))).run.runId;
+  const before = runs(ledger);
+  const aTimes = times(ledger, a.runId);
+  expect(ledger.markLostFor({ executorId: OTHER_WORKER_EXECUTOR, now: CHECK_AT })).toEqual({ ok: true, runs: [] });
+  expect(runs(ledger)).toEqual(before);
+  expect([a.runId, b].map((runId) => state(ledger, runId))).toEqual(["running", "queued"]);
+  expect(times(ledger, a.runId)).toEqual(aTimes);
+  expect(times(ledger, a.runId).lease).toEqual({ issuedAt: RENEWED_AT, expiresAt: RENEWED_AT + MAX });
+  expect(ledger.slotFree("worker")).toEqual({ known: true, value: false });
+});
+
 test("보장 1: 실행 세대로 좁히지 않는다(실행 세대가 오른 뒤의 옛 세대 진행 중 실행도 옮긴다)", () => {
   const path = tempPath();
   const first = open(path);
@@ -190,6 +205,8 @@ test("보장 3: 옮긴 실행은 자리를 쥐고, 믿은 임대가 남아 있�
   expect(times(ledger, live.runId).lease).toEqual({ issuedAt: RENEWED_AT, expiresAt: RENEWED_AT + MAX });
   expect(times(ledger, live.runId).renewIssued).toEqual(issuedBefore);
   expect(nextIntent(lifecycle(ledger, live.runId, CHECK_AT), LIFE)).toEqual({ intent: "query", runId: live.runId, toward: "unknown_running" });
+  // 취소가 걸려 있으면 같은 시각에도 조회보다 종료가 먼저다.
+  expect(nextIntent({ ...lifecycle(ledger, live.runId, CHECK_AT), cancelRequested: true }, LIFE)).toEqual({ intent: "stop", runId: live.runId, toward: "stopping" });
   // 갱신 기록: 지금 규칙 그대로 preparing·running 밖이라 transition_denied.
   expect(ledger.recordRenewInstruction({ runId: live.runId, requestId: id(), stopGeneration: 0, now: CHECK_AT })).toEqual({ ok: false, reason: "transition_denied" });
 });
@@ -256,6 +273,15 @@ test("입력: 정해진 두 칸만 받고 꼴이 틀리면 장부를 바꾸지 �
     { executorId: WORKER_EXECUTOR, now: 1.5 },
   ];
   for (const input of bad) expect(() => ledger.markLostFor(input as { executorId: string; now: number }), JSON.stringify(input)).toThrow(LedgerInputError);
+  expect(state(ledger, live.runId)).toBe("preparing");
+  // 꼴은 참조 문자열이지만 실행을 맡을 수 없는 이름: admitRun이 지정 실행기로 받지 않는 값과 같다.
+  for (const executorId of ["supervisor", "executor", "executor/wrong/0/store-a", WORKER_EXECUTOR.toUpperCase()]) {
+    expect(() => ledger.admitRun(worker({ executorId })), executorId).toThrow(LedgerInputError);
+    expect(() => ledger.markLostFor({ executorId, now: NOW }), executorId).toThrow(LedgerInputError);
+  }
+  expect(state(ledger, live.runId)).toBe("preparing");
+  // 문법상 유효하지만 실행이 없는 이름은 거부가 아니라 빈 목록이다.
+  expect(ledger.markLostFor({ executorId: OTHER_WORKER_EXECUTOR, now: NOW })).toEqual({ ok: true, runs: [] });
   expect(state(ledger, live.runId)).toBe("preparing");
   // from 도우미가 쓰는 낸 쪽 이름이 지정 실행기와 같은지(위 시험들이 같은 이름으로 부른다).
   expect(live.from).toEqual(from({ executorId: WORKER_EXECUTOR, runGeneration: 1 }));
