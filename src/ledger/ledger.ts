@@ -232,6 +232,14 @@ export interface SlotHold extends SlotHoldObservation {
   observation: number;
 }
 
+// markLostFor가 옮긴 실행 하나. 부르는 쪽은 runId로 같은 ID의 상태 조회를 낸다. after는 지금 규칙에서 늘 unknown_running이다.
+export interface LostRun {
+  runId: string;
+  runGeneration: number;
+  before: LedgerRunState;
+  after: LedgerRunState;
+}
+
 // 이 대기 실행 자체를 시작하면 안 되는 이유. 5단계의 후보 목록과 시작 트랜잭션이 같은 판정을 읽는다(접수·슬롯·예산은 시작 트랜잭션만 본다).
 export type StartBar = "run_generation_stale" | "run_blocked" | "input_cancelled" | "input_expired" | "deadline_passed";
 
@@ -2244,18 +2252,42 @@ export class Ledger {
   // 실행기 쪽 상태의 함수라, 장부에서는 stop_receipt_id가 없는 줄에만 그대로 쓴다.
   markLost(now: number): { ok: true; runIds: string[] } | Refused {
     const when = time(now, "now");
-    return this.#write("lost", "continue", () => {
-      const rows = this.#db.query(`SELECT * FROM runs WHERE stop_receipt_id IS NULL AND state IN (${IN_FLIGHT.map(() => "?").join(", ")})`).all(...IN_FLIGHT) as RunRow[];
-      const changed: string[] = [];
-      for (const row of rows) {
-        const next = stateAfterLoss(row.state as RunState) as LedgerRunState;
-        if (next !== row.state) {
-          this.#setState(row, next, when);
-          changed.push(row.run_id);
-        }
+    return this.#write("lost", "continue", () => ({ ok: true as const, runIds: this.#moveLost(when, null).map((moved) => moved.row.run_id) }));
+  }
+
+  // 운영 중 실행기 하나의 연결이 끊겼다: 지정 실행기가 그 실행기인 실행만 markLost와 같은 규칙으로 옮긴다.
+  // 실행 세대로 더 좁히지 않는다. 세대는 시작·영수증의 대조 값이고 연결과 무관해서, 끊긴 연결 위의 옛 세대 실행도 똑같이 살아 있음을 모른다.
+  // 옮긴 실행은 자리를 쥔 채이고(unknown_running), 이미 옮긴 실행은 집합 밖이라 다시 부르면 빈 목록이다.
+  markLostFor(input: { executorId: string; now: number }): { ok: true; runs: LostRun[] } | Refused {
+    const v = exact(input, ["executorId", "now"], "markLostFor");
+    const executorId = str(v.executorId, REF, "executorId");
+    // admitRun과 같은 판정: 실행을 맡을 수 없는 이름은 잘못 넘긴 값이라, 실행이 없는 유효한 이름의 빈 목록과 가른다.
+    const executorKind = parsePrincipal(executorId)?.kind;
+    if (executorKind !== "worker_executor" && executorKind !== "session_executor") throw new LedgerInputError("executorId: 실행을 맡을 수 있는 실행기 주체가 아니다");
+    const when = time(v.now, "now");
+    return this.#write("lost", "continue", () => ({
+      ok: true as const,
+      runs: this.#moveLost(when, executorId)
+        .sort((a, b) => a.row.queue_seq - b.row.queue_seq)
+        .map(({ row, next }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), before: row.state, after: next })),
+    }));
+  }
+
+  // 연결 상실 뒤의 상태로 옮기는 한 자리(markLost·markLostFor). 옮기는 집합과 뒤 상태의 규칙이 두 연산에서 갈리지 않게 여기에만 둔다.
+  // executorId가 null이면 실행기를 가리지 않는다.
+  #moveLost(when: number, executorId: string | null): { row: RunRow; next: LedgerRunState }[] {
+    const scope = executorId === null ? "" : " AND executor_id = ?";
+    const params: string[] = executorId === null ? [...IN_FLIGHT] : [...IN_FLIGHT, executorId];
+    const rows = this.#db.query(`SELECT * FROM runs WHERE stop_receipt_id IS NULL AND state IN (${IN_FLIGHT.map(() => "?").join(", ")})${scope}`).all(...params) as RunRow[];
+    const moved: { row: RunRow; next: LedgerRunState }[] = [];
+    for (const row of rows) {
+      const next = stateAfterLoss(row.state as RunState) as LedgerRunState;
+      if (next !== row.state) {
+        this.#setState(row, next, when);
+        moved.push({ row, next });
       }
-      return { ok: true as const, runIds: changed };
-    });
+    }
+    return moved;
   }
 
   getRun(runId: string): Read<Run | null> {
