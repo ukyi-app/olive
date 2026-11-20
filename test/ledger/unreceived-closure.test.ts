@@ -69,6 +69,23 @@ function resultReport(runId: string) {
   return { reportId: id(), action: "report_result" as const, runId, bodyDigest: digest("result"), storedRef: `results/${id()}`, resultDigest: digest("r"), now: SHUT + 20 };
 }
 
+// 경계 트리거를 같은 정의로 지웠다 다시 만들며 그 사이에 그 사본 기록의 경계 줄(지금의 순번 최댓값)을 넣는다. 스키마는 그대로라
+// 장부가 다시 열린다. 경계 트리거가 뚫린 장부에서도 코드와 근거 트리거가 따로 막는지 본다.
+function bypassBound(path: string, snapshotId: string): void {
+  const raw = new Database(path);
+  try {
+    raw.run("PRAGMA foreign_keys = ON");
+    const sealed = (raw.query("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'snapshot_run_bounds_sealed'").get() as { sql: string }).sql;
+    raw.transaction(() => {
+      raw.run("DROP TRIGGER snapshot_run_bounds_sealed");
+      raw.query("INSERT INTO snapshot_run_bounds (snapshot_id, queue_seq_bound) VALUES (?, (SELECT COALESCE(MAX(queue_seq), 0) FROM runs))").run(snapshotId);
+      raw.run(sealed);
+    })();
+  } finally {
+    raw.close();
+  }
+}
+
 // 코드를 거치지 않고 넣는 닫기 근거 줄(답의 시각, 열기 'o'). 트리거만으로 막히는지 본다.
 const RAW_CLOSURE = "INSERT INTO unreceived_closures (run_id, from_state, answer_executor_id, answer_issued_at, answer_received_at, open_id, closed_at) VALUES (?, 'preparing', ?, ?, 1, 'o', 1)";
 
@@ -318,11 +335,51 @@ test("사본의 경계: 적고 보내기 전에 죽은 실행은 사본이 없�
   ready(restored);
   const fresh = startedAt(restored, NOW + 1);
   restored.close();
+  // 판 6에서 봉한 사본은 경계가 함께 적히고, 판 6 전의 사본 기록은 없다.
+  expect(rows(copyPath, "SELECT snapshot_id, queue_seq_bound FROM snapshot_run_bounds")).toEqual([{ snapshot_id: snapshot.snapshotId, queue_seq_bound: 1 }]);
+  expect(rows(copyPath, "SELECT count(*) AS n FROM snapshots_before_closure")).toEqual([{ n: 0 }]);
   const again = ready(open(copyPath, later));
   expect(close(again, fresh.runId, { answeredAt: SHUT + 1 })).toMatchObject({ ok: true, run: { state: "not_started" } });
   // 사본에 대기로 들어 있던 실행은 되살린 장부에서 시작해도 경계 안이라 닫지 않는다.
   must(again.startRun({ runId: inCopy, requestId: id(), stopGeneration: 0, now: NOW + 1 }));
   expect(close(again, inCopy, { answeredAt: SHUT + 1 })).toEqual({ ok: false, reason: "created_before_snapshot" });
+});
+
+test("사본 시각의 같은 밀리초: 시계가 뒤로 가지 않아도 사본과 같은 밀리초에 만들거나 발행한 새 실행은 경계 밖이어도 닫지 않고, 기다려도 그대로다(코드와 트리거)", () => {
+  // 대기 실행 하나(순번 1)가 든 사본을 NOW에 만들고, 되살린 장부를 대조까지 마쳐 연다. 되살린 장부의 새 실행은 순번 2라 경계 밖이다.
+  function restored(clock: () => number) {
+    const dir = tempDir();
+    const copyPath = join(dir, "copy.db");
+    const original = ready(open(join(dir, "ledger.db")));
+    must(original.admitRun(worker()));
+    const snapshot = original.createSnapshot({ path: copyPath, maxBytes: 10_000_000 });
+    if (!snapshot.ok) throw new Error(`사본: ${snapshot.reason}`);
+    expect(snapshot.takenAt).toBe(NOW);
+    original.close();
+    const copy = open(copyPath, { clock });
+    must(copy.confirmSnapshotReconciled({ snapshotId: snapshot.snapshotId, now: NOW }));
+    return { copy: ready(copy), copyPath };
+  }
+
+  // 생성(접수 때 넘긴 시각)과 발행(장부 시계)이 모두 사본 시각과 같다.
+  const same = restored(clock);
+  const tied = startedAt(same.copy, NOW);
+  expect(run(same.copy, tied.runId).queueSeq).toBe(2);
+  expect(close(same.copy, tied.runId)).toEqual({ ok: false, reason: "created_before_snapshot" });
+  expect(close(same.copy, tied.runId, { answeredAt: SHUT + 3_600_000, receivedAt: SHUT + 3_600_000, now: SHUT + 3_600_000 })).toEqual({ ok: false, reason: "created_before_snapshot" });
+  expect(run(same.copy, tied.runId).state).toBe("preparing");
+  expect(slotFree(same.copy)).toBe(false);
+  same.copy.close();
+  expect(() => rawWrite(same.copyPath, RAW_CLOSURE, tied.runId, WORKER_EXECUTOR, SHUT)).toThrow("unreceived_closure_unproven");
+
+  // 생성만 사본 시각과 같고 발행은 2ms 뒤다.
+  const later = restored(() => NOW + 2);
+  const createdTied = must(later.copy.admitRun(worker({ now: NOW }))).run.runId;
+  must(later.copy.startRun({ runId: createdTied, requestId: id(), stopGeneration: 0, now: NOW + 2 }));
+  expect(close(later.copy, createdTied, { answeredAt: SHUT + 2 })).toEqual({ ok: false, reason: "created_before_snapshot" });
+  expect(run(later.copy, createdTied).state).toBe("preparing");
+  later.copy.close();
+  expect(() => rawWrite(later.copyPath, RAW_CLOSURE, createdTied, WORKER_EXECUTOR, SHUT + 2)).toThrow("unreceived_closure_unproven");
 });
 
 test("사본의 경계: 경계가 없는 사본 기록(판 6 전에 만든 사본)이 있는 장부에서는 사본 뒤에 만든 실행도 닫지 않는다(코드와 트리거)", () => {
@@ -344,6 +401,41 @@ test("사본의 경계: 경계가 없는 사본 기록(판 6 전에 만든 사�
   expect(() => rawWrite(copyPath, RAW_CLOSURE, fresh.runId, WORKER_EXECUTOR, SHUT + 1)).toThrow("unreceived_closure_unproven");
   // 대조가 끝난 옛 사본 기록에 경계를 뒤에 붙여 "모름"을 값으로 바꾸지 못한다.
   expect(() => rawWrite(copyPath, "INSERT INTO snapshot_run_bounds (snapshot_id, queue_seq_bound) VALUES (?, 1)", snapshot.snapshotId)).toThrow("snapshot_bound_fixed");
+});
+
+test("사본의 경계: 판 6 전의 사본 기록은 대조 전에도 경계를 받지 않고, 그 기록이 있는 장부는 경계가 붙어도 자동으로 닫지 않는다(코드와 트리거)", () => {
+  const dir = tempDir();
+  const copyPath = join(dir, "copy.db");
+  const before = ready(open(join(dir, "ledger.db"), { migrations: loadMigrations().slice(0, VERSION - 1) }));
+  const snapshot = before.createSnapshot({ path: copyPath, maxBytes: 10_000_000 });
+  if (!snapshot.ok) throw new Error(`사본: ${snapshot.reason}`);
+  before.close();
+  // 판 6으로 올리기만 하고 대조 전에 닫는다. 그 사본 기록은 가장 최근의 대조 안 된 기록이라 새 사본을 봉하는 순간과 행이 같다.
+  open(copyPath).close();
+  expect(rows(copyPath, "SELECT reconciled_at FROM ledger_snapshots")).toEqual([{ reconciled_at: null }]);
+  expect(rows(copyPath, "SELECT snapshot_id FROM snapshots_before_closure")).toEqual([{ snapshot_id: snapshot.snapshotId }]);
+  expect(() => rawWrite(copyPath, "INSERT INTO snapshot_run_bounds (snapshot_id, queue_seq_bound) VALUES (?, (SELECT COALESCE(MAX(queue_seq), 0) FROM runs))", snapshot.snapshotId)).toThrow(
+    "snapshot_bound_fixed",
+  );
+  expect(rows(copyPath, "SELECT count(*) AS n FROM snapshot_run_bounds")).toEqual([{ n: 0 }]);
+  // 그 집합은 판의 트랜잭션 뒤로는 늘거나 바뀌거나 줄지 않는다.
+  expect(() => rawWrite(copyPath, "INSERT INTO snapshots_before_closure (snapshot_id) VALUES (?)", snapshot.snapshotId)).toThrow("snapshots_before_closure_fixed");
+  expect(() => rawWrite(copyPath, "UPDATE snapshots_before_closure SET snapshot_id = snapshot_id")).toThrow("snapshots_before_closure_fixed");
+  expect(() => rawWrite(copyPath, "DELETE FROM snapshots_before_closure")).toThrow("snapshots_before_closure_fixed");
+
+  // 경계 트리거가 뚫려 그 기록에 경계가 붙어도, 집합에 줄이 있으면 코드와 근거 트리거가 따로 막는다.
+  bypassBound(copyPath, snapshot.snapshotId);
+  expect(rows(copyPath, "SELECT queue_seq_bound FROM snapshot_run_bounds")).toEqual([{ queue_seq_bound: 0 }]);
+  const copy = open(copyPath, { clock: () => NOW + 1 });
+  must(copy.confirmSnapshotReconciled({ snapshotId: snapshot.snapshotId, now: NOW + 1 }));
+  ready(copy);
+  const fresh = startedAt(copy, NOW + 1);
+  expect(close(copy, fresh.runId, { answeredAt: SHUT + 1 })).toEqual({ ok: false, reason: "snapshot_bound_unknown" });
+  expect(run(copy, fresh.runId).state).toBe("preparing");
+  expect(slotFree(copy)).toBe(false);
+  copy.close();
+  expect(() => rawWrite(copyPath, RAW_CLOSURE, fresh.runId, WORKER_EXECUTOR, SHUT + 1)).toThrow("unreceived_closure_unproven");
+  expect(rows(copyPath, "SELECT count(*) AS n FROM unreceived_closures")).toEqual([{ n: 0 }]);
 });
 
 test("판 이전의 시작: 판 5에서 낸 시작은 판 6의 적용과 같은 밀리초여도 닫지 않는다(코드와 트리거)", () => {
@@ -375,6 +467,8 @@ test("판 이전의 시작: 판 6을 적용한 뒤 새로 낸 시작은 적용�
   must(after.startRun({ runId: waiting, requestId, stopGeneration: 0, now: NOW }));
   expect(close(after, waiting)).toMatchObject({ ok: true, run: { state: "not_started" } });
   after.close();
+  // 적용 시각 쪽은 같은 밀리초를 받는다: 발행 = 적용 = NOW.
+  expect(rows(path, "SELECT issued_at FROM instructions WHERE request_id = ?", requestId)).toEqual([{ issued_at: NOW }]);
   expect(rows(path, "SELECT applied_at FROM ledger_migrations WHERE version = ?", VERSION)).toEqual([{ applied_at: NOW }]);
   expect(rows(path, "SELECT count(*) AS n FROM starts_before_closure")).toEqual([{ n: 0 }]);
   const fresh = tempPath();

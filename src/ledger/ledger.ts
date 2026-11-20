@@ -2561,10 +2561,11 @@ export class Ledger {
   // unknown_running이고 종료 확인 없음(transition_denied) → 시작 지시가 하나(unknown_instruction) → 답을 낸 쪽이 지정 실행기(sender_mismatch) →
   // 답의 시각을 앎(answer_time_unknown) → 답의 시각 >= 시작 발행 + 시한(answer_too_early) → 그 답에 이 실행이 없음(run_in_answer) →
   // 영수증·보고 0(receipt_seen) → 양성 관측 0(run_sighted) → 점유 관측 0(run_blocked) → 이 판을 적용한 뒤에 낸 시작(started_before_migration) →
-  // 시작 뒤 적힌 예산 감액 없음(budget_reduced) → 사본 기록마다 경계가 있음(snapshot_bound_unknown) → 사본에 없던 실행(created_before_snapshot) →
-  // 송신 표식이 없거나 모두 이 열기의 것(sent_by_other_open).
-  // 판 이전의 시작과 사본 안의 실행은 시계와 무관한 값(starts_before_closure, 사본 경계의 queue_seq)으로 가른다. 함께 보는 시각의 비교
-  // (적용 시각, 사본 시각)는 시계가 뒤로 간 장부에서 더 막기만 한다: 빼면 그런 장부에서 닫히는 경우가 늘어난다.
+  // 시작 뒤 적힌 예산 감액 없음(budget_reduced) → 판 6 전의 사본 기록이 없고 사본 기록마다 경계가 있음(snapshot_bound_unknown) →
+  // 사본에 없던 실행(created_before_snapshot) → 송신 표식이 없거나 모두 이 열기의 것(sent_by_other_open).
+  // 판 이전의 시작과 사본 안의 실행은 시계와 무관한 값(starts_before_closure, snapshots_before_closure, 사본 경계의 queue_seq)으로 가른다.
+  // 함께 보는 시각의 비교(적용 시각, 사본 시각)는 더 막기만 하는 보조다: 빼면 닫히는 경우가 늘어난다. 사본 시각은 같은 밀리초도 막아,
+  // 시계가 뒤로 가지 않아도 사본과 같은 밀리초에 만들거나 발행한 실행은 닫지 않는다(적용 시각은 같은 밀리초를 받는다).
   // 닫으면 근거 줄과 not_started가 한 커밋이다. 근거 줄의 INSERT 트리거가 행으로 볼 수 있는 조건을 다시 본다(이관 0006의 주석).
   closeUnreceivedRun(input: UnreceivedClosureInput, from: { sender: string }): { ok: true; run: Run } | Refused {
     const v = exact(input, ["runId", "runs", "answeredAt", "receivedAt", "now"], "closeUnreceivedRun");
@@ -2602,7 +2603,8 @@ export class Ledger {
       const fixed = this.#db.query("SELECT budget_left FROM instructions WHERE request_id = ?").get(start.request_id) as { budget_left: number | null };
       if (fixed.budget_left === null || safe(fixed.budget_left, "instructions.budget_left") !== row.budget_left) throw new Refuse("budget_reduced");
       if (this.#snapshots) {
-        // 경계가 없는 사본 기록(판 6 전에 만든 사본)이 하나라도 있으면 그 사본에 어느 실행이 들어 있었는지 모른다.
+        // 판 6을 적용할 때 있던 사본 기록이나 경계가 없는 사본 기록이 하나라도 있으면 그 사본에 어느 실행이 들어 있었는지 모른다.
+        if (this.#db.query("SELECT 1 AS x FROM snapshots_before_closure LIMIT 1").get() !== null) throw new Refuse("snapshot_bound_unknown");
         if (this.#db.query("SELECT 1 AS x FROM ledger_snapshots p WHERE NOT EXISTS (SELECT 1 FROM snapshot_run_bounds b WHERE b.snapshot_id = p.snapshot_id) LIMIT 1").get() !== null) {
           throw new Refuse("snapshot_bound_unknown");
         }
