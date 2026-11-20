@@ -8,7 +8,7 @@
 // 2. 처리기에는 장부의 사실만 답한다: 적었으면 { ok: true, phase }, 끝난 부탁이면 already_ended, 그 밖은 모름(known: false).
 // 3. 전달의 실패는 처리기의 답을 바꾸지 않고, 이 어댑터는 다시 보내지 않는다(그 지시는 unansweredInstructions()에 남아 재전송 박자의 몫이다).
 //    전달의 결과는 observe 포트로 따로 낸다. 처리기의 포트는 동기이고 내보내기는 비동기라 답에 실을 자리가 없다.
-// 4. 입력을 바꾸지 않고, 관측에 원문·자격 참조·봉투·서명·nonce를 싣지 않는다.
+// 4. 입력을 바꾸지 않고, 관측에 원문·자격 참조·봉투·서명·nonce와 꼴이 틀린 입력의 값을 싣지 않는다.
 import { type Envelope, TASK_CANCEL_REASONS } from "../../contract/v1/index.ts";
 import { type Ledger, REFUSALS as LEDGER_REFUSALS, type Refusal as LedgerRefusal, type TaskCancelReason } from "../../ledger/index.ts";
 import type { Answer, CancelInput, CancelWrite } from "../scheduler/tools.ts";
@@ -33,8 +33,10 @@ export interface CancelPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
-  // 취소 호출 하나마다 한 번 부른다. 실었는지는 내보내기 포트가 끝난 뒤에야 알므로 sent·delivery_unknown과 내보내기의 거절은
-  // 처리기에 답한 뒤에 오고, 포트의 약속이 끝나지 않으면 오지 않는다. 던져도 처리기의 답과 다른 취소에 영향이 없다.
+  // 취소 호출 하나마다 한 번 부른다. 내보내기 포트가 돌려준 약속의 완료로 정해지는 결과(sent, 그 약속의 거부·no_connection·
+  // too_late_to_send·정의 밖의 답)만 처리기에 답한 뒤에 오고, 그 약속이 끝나지 않으면 오지 않는다. 나머지(내보내기 포트가 동기로 던진
+  // send_threw 포함)는 처리기가 답을 받기 전에 온다. 그래서 받는 쪽은 부르기 전에 등록해 둔다.
+  // 동기로 던지거나 돌려준 약속이 거부돼도 처리기의 답·전달·장부와 다른 취소에 닿지 않는다.
   readonly observe: (event: CancelDelivery) => void;
 }
 
@@ -58,17 +60,17 @@ export type CancelDelivery =
   // 장부를 부르지 않았다.
   | { readonly outcome: "not_recorded"; readonly ref: string | null; readonly reason: "input_malformed" | "random_unavailable" | "clock_unavailable" }
   // 장부가 거절했다. 아무것도 적히지 않았다.
-  | { readonly outcome: "refused"; readonly ref: string; readonly requestId: string; readonly reason: LedgerRefusal }
+  | { readonly outcome: "refused"; readonly ref: string | null; readonly requestId: string; readonly reason: LedgerRefusal }
   // 장부를 불렀지만 무엇이 적혔는지 모른다(쓰기가 던짐, 답이 정의 밖). 지시가 적혔다면 이 요청 ID다.
-  | { readonly outcome: "record_unknown"; readonly ref: string; readonly requestId: string; readonly reason: "threw" | "malformed_answer" }
+  | { readonly outcome: "record_unknown"; readonly ref: string | null; readonly requestId: string; readonly reason: "threw" | "malformed_answer" }
   // 적었고 보낼 지시가 없다(배정 전 대기의 부탁, 시작 전 실행).
-  | { readonly outcome: "nothing_to_send"; readonly ref: string; readonly requestId: string }
+  | { readonly outcome: "nothing_to_send"; readonly ref: string | null; readonly requestId: string }
   // 적었고 연결에 실었다. 실행기가 받았다는 뜻은 아니다(받았는지는 영수증으로만 안다).
-  | { readonly outcome: "sent"; readonly ref: string; readonly requestId: string; readonly runId: string; readonly executorId: string }
+  | { readonly outcome: "sent"; readonly ref: string | null; readonly requestId: string; readonly runId: string; readonly executorId: string }
   // 적었지만 싣지 않았다. executorId는 지시 줄을 대조하기 전이면 null이다.
   | {
       readonly outcome: "recorded_not_sent";
-      readonly ref: string;
+      readonly ref: string | null;
       readonly requestId: string;
       readonly runId: string;
       readonly executorId: string | null;
@@ -79,7 +81,7 @@ export type CancelDelivery =
   // 적었고 내보내기 포트를 불렀지만 실었는지 모른다(포트가 던지거나 거부된 약속, 정의 밖의 답).
   | {
       readonly outcome: "delivery_unknown";
-      readonly ref: string;
+      readonly ref: string | null;
       readonly requestId: string;
       readonly runId: string;
       readonly executorId: string;
@@ -99,11 +101,15 @@ export function cancelAdapter(ports: CancelPorts): (input: CancelInput) => Answe
   return (input) => cancelOnce(ports, input);
 }
 
+const ignore = (): void => {};
+
+// 관측 포트의 실패는 처리기의 답·전달·장부에 닿지 않는다. 반환형이 void여도 async 함수가 대입되므로 돌려준 약속의 거절도 여기서 삼킨다.
+// 삼키지 않으면 처리되지 않은 거절이 되어 런타임이 감독 프로세스를 내린다. 약속을 기다리지 않으므로 답과 내보내기의 순서는 그대로다.
 function emit(ports: CancelPorts, event: CancelDelivery): void {
   try {
-    ports.observe(event);
+    Promise.resolve(ports.observe(event) as unknown).then(undefined, ignore);
   } catch {
-    // 관측 포트의 실패는 처리기의 답과 장부에 닿지 않는다.
+    // 관측 포트가 동기로 던졌다.
   }
 }
 
@@ -118,8 +124,11 @@ function cancelOnce(ports: CancelPorts, input: CancelInput): Answer<CancelWrite>
     emit(ports, { outcome: "not_recorded", ref: null, reason: "input_malformed" });
     return UNKNOWN;
   }
+  // 관측에는 UUID 꼴의 참조만 싣는다. 처리기는 꼴을 걸러 부르지만 이 함수를 직접 부르면 아무 문자열이나 올 수 있고,
+  // 관측은 기록으로 남으므로 꼴이 틀린 원문을 옮기지 않는다. 장부에는 받은 값 그대로 넘긴다(거절은 장부가 한다).
+  const shown = typeof ref === "string" && UUID.test(ref) ? ref : null;
   if (typeof ref !== "string" || typeof owner !== "string" || typeof sessionId !== "string") {
-    emit(ports, { outcome: "not_recorded", ref: typeof ref === "string" ? ref : null, reason: "input_malformed" });
+    emit(ports, { outcome: "not_recorded", ref: shown, reason: "input_malformed" });
     return UNKNOWN;
   }
 
@@ -132,7 +141,7 @@ function cancelOnce(ports: CancelPorts, input: CancelInput): Answer<CancelWrite>
     requestId = null;
   }
   if (requestId === null) {
-    emit(ports, { outcome: "not_recorded", ref, reason: "random_unavailable" });
+    emit(ports, { outcome: "not_recorded", ref: shown, reason: "random_unavailable" });
     return UNKNOWN;
   }
   // 기록 시각은 문맥의 now가 아니라 장부와 같은 시계를 장부를 부르기 직전에 읽은 값이다. 이 시각이 lastStopAt이 되어 수명 판단이
@@ -144,7 +153,7 @@ function cancelOnce(ports: CancelPorts, input: CancelInput): Answer<CancelWrite>
     recordAt = null;
   }
   if (!Number.isSafeInteger(recordAt) || (recordAt as number) < 1) {
-    emit(ports, { outcome: "not_recorded", ref, reason: "clock_unavailable" });
+    emit(ports, { outcome: "not_recorded", ref: shown, reason: "clock_unavailable" });
     return UNKNOWN;
   }
   const now = recordAt as number;
@@ -154,25 +163,25 @@ function cancelOnce(ports: CancelPorts, input: CancelInput): Answer<CancelWrite>
     // 종료 사유는 장부가 이은 부탁의 취소에 늘 requested로 함께 적는다(이 연산은 사유 칸을 받지 않는다). 그래서 다시 만들 수 있는 줄로 남는다.
     answer = ports.ledger.cancelToolRequest({ owner, ref, sessionId, callId: requestId, now });
   } catch {
-    emit(ports, { outcome: "record_unknown", ref, requestId, reason: "threw" });
+    emit(ports, { outcome: "record_unknown", ref: shown, requestId, reason: "threw" });
     return UNKNOWN;
   }
   const read = readAnswer(answer, requestId);
   if (read.kind === "malformed") {
-    emit(ports, { outcome: "record_unknown", ref, requestId, reason: "malformed_answer" });
+    emit(ports, { outcome: "record_unknown", ref: shown, requestId, reason: "malformed_answer" });
     return UNKNOWN;
   }
   if (read.kind === "refused") {
-    emit(ports, { outcome: "refused", ref, requestId, reason: read.reason });
+    emit(ports, { outcome: "refused", ref: shown, requestId, reason: read.reason });
     // 종료가 확인됐거나 끝난 실행, 이미 닫힌 부탁이다(ledger.md "이은 부탁의 취소"). 다른 거절은 처리기의 답 꼴에 갈래가 없다.
     return read.reason === "transition_denied" ? { known: true, value: { ok: false, reason: "already_ended" } } : UNKNOWN;
   }
   if (read.kind === "closed") {
-    emit(ports, { outcome: "nothing_to_send", ref, requestId });
+    emit(ports, { outcome: "nothing_to_send", ref: shown, requestId });
     return { known: true, value: { ok: true, phase: "not_started" } };
   }
   // 여기부터 장부에는 이 요청 ID의 task_cancel이 적혔다. 전달의 결과와 무관하게 답은 이것이다.
-  deliver(ports, ref, requestId, read.runId, read.stopGeneration, now);
+  deliver(ports, shown, requestId, read.runId, read.stopGeneration, now);
   return { known: true, value: { ok: true, phase: "stopping" } };
 }
 
@@ -250,7 +259,7 @@ function locate(ledger: CancelLedger, requestId: string, runId: string, stopGene
 }
 
 // 적은 지시를 그 실행의 지정 실행기에 한 번 싣는다. 어느 실패든 다시 시도하지 않고 결과를 관측으로만 낸다.
-function deliver(ports: CancelPorts, ref: string, requestId: string, runId: string, stopGeneration: number, now: number): void {
+function deliver(ports: CancelPorts, ref: string | null, requestId: string, runId: string, stopGeneration: number, now: number): void {
   const notSent = (reason: CancelNotSentReason, executorId: string | null, extra: { field?: string; sealReason?: string } = {}): void =>
     emit(ports, {
       outcome: "recorded_not_sent",

@@ -177,12 +177,9 @@ function unansweredIds(ledger: Ledger): string[] {
   return read.value.instructions.filter((i) => i.action === "task_cancel").map((i) => i.requestId);
 }
 
-// ---- 보장 1: 장부가 적은 것만, 적은 그대로 ----
-
-test("처리기의 취소는 장부에 적은 지시 줄의 값 그대로 지정 실행기에 한 번 나간다", async () => {
-  const w = world();
-  const { ref, run } = linked(w);
-  const toolPorts: ToolPorts = {
+// 실제 처리기(handleToolCall)의 포트. 취소 포트만 이 어댑터이고 나머지는 cancel_worker가 지나가는 데 필요한 만큼만 채운다.
+function toolPortsFor(w: World): ToolPorts {
+  return {
     config: { purposeBriefMaxChars: 200 },
     policy: { judge: () => "allowed" },
     ledger: {
@@ -201,8 +198,18 @@ test("처리기의 취소는 장부에 적은 지시 줄의 값 그대로 지정
       requestCancel: w.cancel,
     },
   };
+}
+
+const toolContext = (callId: string = id()) => ({ session: SESSION, requestId: OWNER, callId, now: NOW, stop: { known: true as const, stopped: false } });
+
+// ---- 보장 1: 장부가 적은 것만, 적은 그대로 ----
+
+test("처리기의 취소는 장부에 적은 지시 줄의 값 그대로 지정 실행기에 한 번 나간다", async () => {
+  const w = world();
+  const { ref, run } = linked(w);
+  const toolPorts = toolPortsFor(w);
   const callId = id();
-  const ctx = { session: SESSION, requestId: OWNER, callId, now: NOW, stop: { known: true as const, stopped: false } };
+  const ctx = toolContext(callId);
   expect(handleToolCall("cancel_worker", { ref }, ctx, toolPorts)).toEqual({ outcome: "ok", tool: "cancel_worker", ref, cancel: "accepted", phase: "stopping" });
   await flush();
 
@@ -354,7 +361,55 @@ test("적은 뒤의 전달 실패는 처리기의 답을 바꾸지 않고, 다�
   }
 });
 
+// 관측 포트에는 async 함수도 대입된다. 그 약속의 거부를 아무도 받지 않으면 처리되지 않은 거절이 되어 Bun이 프로세스를 내리고,
+// bun test는 그것을 실패로 센다. 그래서 이 시험은 전역 처리기 없이 런타임의 감지에 맡기고, 거부가 일어날 때까지 기다린다.
+test("관측이 비동기로 거부돼도 처리되지 않은 거절이 남지 않고, 본체의 답·지시 줄·발송 수는 그대로다", async () => {
+  const cases: [string, (w: World) => void, CancelDelivery["outcome"], number][] = [
+    ["연결이 끊긴 채", (w) => w.setLink(() => ({ ok: false, reason: "lost" })), "recorded_not_sent", 0],
+    ["전송 성공 뒤", () => {}, "sent", 1],
+  ];
+  for (const [name, arrange, outcome, sends] of cases) {
+    const w = world();
+    const { ref, run } = linked(w);
+    arrange(w);
+    const seen: CancelDelivery["outcome"][] = [];
+    w.setObserve(async (event) => {
+      seen.push(event.outcome);
+      throw new Error("관측 저장 실패");
+    });
+    expect([name, handleToolCall("cancel_worker", { ref }, toolContext(), toolPortsFor(w))]).toEqual([
+      name,
+      { outcome: "ok", tool: "cancel_worker", ref, cancel: "accepted", phase: "stopping" },
+    ]);
+    await flush();
+    await flush();
+    expect([name, seen]).toEqual([name, [outcome]]);
+    expect([name, w.sendCalls()]).toEqual([name, sends]);
+    expect([name, cancelRows(w, run.runId).length]).toEqual([name, 1]);
+  }
+});
+
 // ---- 보장 4: 순수하고 닫힌다 ----
+
+test("직접 호출의 꼴이 틀린 참조·소유자·세션은 관측에 원문으로 실리지 않는다", async () => {
+  const w = world();
+  const odd = "sample-private-text-for-review";
+  const oddOwner = "sample-private-owner-for-review";
+  const oddSession = "sample-private-session-for-review";
+  const valid = id();
+  expect(w.cancel(input(odd))).toEqual({ known: false });
+  expect(w.cancel(input(odd, { owner: 7 as never }))).toEqual({ known: false });
+  expect(w.cancel(input(valid, { owner: oddOwner, sessionId: oddSession }))).toEqual({ known: false });
+  await flush();
+  expect(w.sendCalls()).toBe(0);
+  expect(w.events.map((e) => [e.outcome, e.ref])).toEqual([
+    ["record_unknown", null],
+    ["not_recorded", null],
+    ["record_unknown", valid],
+  ]);
+  const seen = JSON.stringify(w.events);
+  for (const raw of [odd, oddOwner, oddSession]) expect(seen).not.toContain(raw);
+});
 
 test("지금 정지 세대를 모르거나 바뀌었거나 지시 줄이 맞지 않으면 내보내지 않는다(답은 적힌 그대로)", async () => {
   const cases: [string, (value: { stopGeneration: number | null; instructions: Record<string, unknown>[] }) => unknown, string][] = [
