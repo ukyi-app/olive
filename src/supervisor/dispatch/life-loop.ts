@@ -16,7 +16,8 @@
 //    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 쓰기를 부른 뒤 내보내기의 결과가
 //    정해지기 전의 어느 줄에서 던져도 그 항목까지 싣고 halted로 멈춘다.
 //
-// 확정(result_finalize)은 내지 않는다: 결과 보관(S6)이 없어 판단에 넘기는 resultSettled는 늘 false다.
+// 확정(result_finalize)은 내지 않는다. 판단에 넘기는 resultSettled는 늘 false다: 장부에 "그 실행의 결과 보고가 저장 자리와 함께
+// 반영됐다"를 읽는 공개 읽기가 없다(ready_result 상태만으로는 본문이 보관됐는지 모른다: markResult는 보고 없이도 판정한다).
 import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
   type InstructionTimes,

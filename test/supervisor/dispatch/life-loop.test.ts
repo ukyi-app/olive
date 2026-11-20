@@ -289,6 +289,24 @@ describe("보장 1: 의도 하나, 장부에 적은 뒤에만 지시", () => {
     expect(w.log).toEqual([]);
     expect(times(w, s.runId).lastFinalizeAt).toBeNull();
   });
+
+  // 장부에 "그 실행의 결과 보고가 저장 자리와 함께 반영됐다"를 읽는 공개 읽기가 없어 resultSettled는 false로 넘긴다(닫는 쪽).
+  // 결과 보고가 받아들여지고 판정까지 끝나도 확정 의도가 나오지 않고, 자리는 쥔 채다(보고의 수락은 종료 증명·게시 허가가 아니다).
+  test("결과 보고가 저장 자리와 함께 반영된 ready_result도 확정 의도를 내지 않고 자리를 풀지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "completed", bodyDigest: digest("stopped ok"), now: NOW + 1 }, s.from));
+    const reportId = id();
+    const resultDigest = digest("result body");
+    must(w.ledger.recordReport({ reportId, action: "report_result", runId: s.runId, bodyDigest: digest("report"), storedRef: `results/${id()}`, resultDigest, signal: null, now: NOW + 2 }, s.from));
+    must(w.ledger.markResult({ runId: s.runId, resultDigest, reportId, now: NOW + 3 }));
+    expect(state(w, s.runId)).toBe("ready_result");
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "wait" });
+    expect(w.log).toEqual([]);
+    expect(times(w, s.runId).lastFinalizeAt).toBeNull();
+    expect(w.ledger.slotFree("worker")).toEqual({ known: true, value: false });
+  });
 });
 
 describe("보장 2: 갱신은 시작 접수 뒤에만, 여유가 있을 때만", () => {
