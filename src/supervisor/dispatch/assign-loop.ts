@@ -87,14 +87,15 @@ export type LoopRead = (typeof LOOP_READS)[number];
 // pickAssignment가 assign이 아닌 답을 낸 부탁. 그 답을 그대로 싣는다(원문·자격 값이 없는 이름과 목록뿐이다).
 export type NotPicked = Exclude<PickResult, { kind: "assign" }>;
 
-// 맡기지 않을 실행기 때문에 쓰지 않은 이유. listed는 그 실행기가 집합에 있고, executor_unknown은 대기 실행의 지정 실행기를 읽지 못했고
-// (집합이 비어 있지 않을 때만), withheld_unknown은 쓰기 직전에 다시 읽은 집합이 모름이다.
+// 맡기지 않을 실행기 때문에 쓰지 않은 이유. listed는 그 실행기가 집합에 있고, executor_unknown은 대기 실행의 지정 실행기가
+// 작업자 실행기 이름으로 읽히지 않았고(집합이 비어 있어도), withheld_unknown은 쓰기 직전에 다시 읽은 집합이 모름이다.
 export type WithheldReason = "listed" | "executor_unknown" | "withheld_unknown";
 
 export type RequestOutcome =
   | { readonly ref: string; readonly outcome: "skipped"; readonly pick: NotPicked }
   // 맞는 실행기가 맡기지 않을 실행기뿐이다(listed: 그 실행기를 빼지 않았다면 고르기가 고른 실행기), 또는 집합을 다시 읽지 못했다.
-  // 잇지 않았고 부탁은 대기로 남는다. 기존의 no_executor(맞는 실행기가 연결돼 있지 않음)와 다르다.
+  // 이 호출이 그 부탁을 잇지 않았다는 뜻이고 그 부탁의 지금 장부 상태는 보장하지 않는다(겹친 박자의 다른 호출이 이미 이었을 수 있다).
+  // 기존의 no_executor(지금의 연결·정책 조합에 맞는 후보 없음)와 다르다.
   | { readonly ref: string; readonly outcome: "withheld"; readonly reason: Exclude<WithheldReason, "executor_unknown">; readonly executorId: string | null }
   | { readonly ref: string; readonly outcome: "assigned"; readonly runId: string; readonly executorId: string }
   // 이미 이어진 부탁. 넘긴 실행 ID는 쓰이지 않았고 장부가 돌려준 실행이 그 부탁의 실행이다.
@@ -135,7 +136,7 @@ export type StartOutcome =
   | { readonly runId: string; readonly outcome: "start_refused"; readonly reason: LedgerRefusal }
   // 장부를 부르지 않았거나(random_unavailable) 장부가 던졌거나 답이 성공·거절의 꼴이 아니다. 적혔는지 모르므로 지시를 만들지 않는다.
   | { readonly runId: string; readonly outcome: "start_failed"; readonly failure: "random_unavailable" | "threw" | "malformed_answer" }
-  // 맡기지 않을 실행기에 배정된 대기 실행이거나 그것을 가리지 못했다. startRun을 부르지 않았고 그 실행은 queued 그대로다.
+  // 맡기지 않을 실행기에 배정된 대기 실행이거나 그것을 가리지 못했다. 이 호출은 startRun을 부르지 않았다(그 실행을 queued에서 바꾸지 않았다).
   // executorId는 listed일 때의 지정 실행기이고 나머지는 null이다.
   | { readonly runId: string; readonly outcome: "withheld"; readonly reason: WithheldReason; readonly executorId: string | null }
   // 세션 후보. 세션 시작은 장부가 닫아 두었고(session_start_closed) 이 조각이 내지 않는다.
@@ -193,12 +194,14 @@ function readList<T>(read: () => unknown): readonly T[] | null {
 const isWorkerName = (value: unknown): value is string => parsePrincipal(value)?.kind === "worker_executor";
 
 // 맡기지 않을 실행기의 집합. 포트가 없거나 던지거나 꼴이 틀리면(배열이 아님, 작업자 실행기 주체 이름이 아닌 항목) null(모름)이다.
+// value는 한 번만 읽고 그 값에 배열 검사와 원소 검사를 모두 건다: 읽을 때마다 다른 값을 내는 접근자면 검사한 값과 쓰는 값이 갈린다.
 // 빈 원소는 every가 건너뛰므로 길이만큼 직접 본다. 받은 배열은 곧바로 집합으로 옮긴다(부르는 쪽이 뒤에 바꿔도 이 판정은 그대로다).
 function readWithheld(ports: AssignLoopPorts): ReadonlySet<string> | null {
   try {
     const answer: unknown = ports.withheld.executors();
-    if (!isObject(answer) || answer.known !== true || !Array.isArray(answer.value)) return null;
-    const value: readonly unknown[] = answer.value;
+    if (!isObject(answer) || answer.known !== true) return null;
+    const value: unknown = answer.value;
+    if (!Array.isArray(value)) return null;
     const names = new Set<string>();
     for (let i = 0; i < value.length; i += 1) {
       const name = value[i];
@@ -212,7 +215,8 @@ function readWithheld(ports: AssignLoopPorts): ReadonlySet<string> | null {
 }
 
 // 후보 연결의 주체 이름. 고르기가 장부에 적는 이름(executorName(역할, 인스턴스, 저장소), 인스턴스·저장소는 그 주체와 같아야 고른다)과 같은 조립이다.
-// 작업자 실행기 주체가 아니거나 이름을 만들 수 없는 후보는 null이고 빼지 않는다: 고르기가 그 후보를 고르지 않으므로 기존 답을 그대로 둔다.
+// 작업자 실행기 주체가 아니거나 이름을 만들 수 없는 후보는 null이고 빼지 않는다: 정상 후보면 고르기도 그 후보를 고르지 않고,
+// 주체를 읽을 때마다 다른 값을 내는 후보를 고르기가 골랐다면 고른 뒤의 대조(assignOne)가 막는다.
 function candidateName(candidate: Candidate): string | null {
   try {
     const principal: unknown = candidate.principal;
@@ -223,20 +227,32 @@ function candidateName(candidate: Candidate): string | null {
   }
 }
 
+// 후보 연결에서 맡기지 않을 실행기를 뺀다. 집합이 비었거나 목록에 빈 자리가 있으면 받은 목록을 그대로 낸다:
+// filter는 빈 자리를 건너뛰므로 고르기가 malformed_connections로 거절할 목록을 정상 목록으로 바꾼다.
+function withoutWithheld(connections: readonly Candidate[], withheld: ReadonlySet<string>): readonly Candidate[] {
+  if (withheld.size === 0) return connections;
+  for (let i = 0; i < connections.length; i += 1) {
+    if (!(i in connections)) return connections;
+  }
+  return connections.filter((connection) => {
+    const name = candidateName(connection);
+    return name === null || !withheld.has(name);
+  });
+}
+
 // startRun 직전의 판정. 집합은 여기서 다시 읽는다(박자 처음의 읽기로 정하지 않는다). 막지 않으면 null이다.
-// 집합이 비면 지정 실행기를 보지 않는다: 어느 실행기도 막지 않으므로 기존 동작 그대로다.
+// 지정 실행기는 집합이 비어 있어도 본다: 작업자 실행기 이름으로 읽히지 않으면 시작 지시를 받을 쪽을 모르는 것이다.
 function startWithheld(ports: AssignLoopPorts, row: Run | undefined): { reason: WithheldReason; executorId: string | null } | null {
   const withheld = readWithheld(ports);
   if (withheld === null) return { reason: "withheld_unknown", executorId: null };
-  if (withheld.size === 0) return null;
   let executorId: unknown;
   try {
     executorId = row?.executorId;
   } catch {
     executorId = undefined;
   }
-  // 지정 실행기를 읽지 못하면 그 실행기가 집합에 있는지 모른다. 시작하지 않는다.
-  if (typeof executorId !== "string") return { reason: "executor_unknown", executorId: null };
+  // 빠졌거나 빈 문자열이거나 꼴이 틀리면 그 실행기가 집합에 있는지 가릴 수 없다. 시작하지 않는다.
+  if (!isWorkerName(executorId)) return { reason: "executor_unknown", executorId: null };
   return withheld.has(executorId) ? { reason: "listed", executorId } : null;
 }
 
@@ -293,10 +309,9 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
   const view: SchedulerRun[] = [];
   const rows = new Map<string, Run>();
   for (const run of runs) {
-    rows.set(run.runId, run);
     const bar = bars.get(run.runId);
     if (run.state === "queued" && bar !== null && !isStartBar(bar)) return { kind: "not_run", reason: "read_unknown", read: "queue_view" };
-    view.push({
+    const entry: SchedulerRun = {
       runId: run.runId,
       kind: run.kind,
       role: run.role,
@@ -306,7 +321,10 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
       deadlineAt: run.deadlineAt,
       budgetLeft: run.budgetLeft,
       startBar: isStartBar(bar) ? bar : null,
-    });
+    };
+    view.push(entry);
+    // 시작 후보의 실행 ID는 planNext가 view의 값에서 꺼내므로 같은 값을 열쇠로 쓴다. 행의 칸을 다시 읽으면 다른 값이 나와 다른 행의 지정 실행기와 대조될 수 있다.
+    rows.set(entry.runId, run);
   }
   // 출처를 나누지 못한 입력은 넣지 않는다. 그 입력의 실행은 planNext가 input_unknown으로 보류한다.
   const known: SchedulerInput[] = [];
@@ -409,10 +427,7 @@ async function assignOne(
   // 같은 까닭으로 맡기지 않을 실행기도 고르기 직전에 다시 읽는다. 접수가 닫혔으면 이보다 먼저 멈춘다.
   const withheld = readWithheld(ports);
   if (withheld === null) return { ref, outcome: "withheld", reason: "withheld_unknown", executorId: null };
-  const kept = connections.filter((connection) => {
-    const name = candidateName(connection);
-    return name === null || !withheld.has(name);
-  });
+  const kept = withoutWithheld(connections, withheld);
   let picked = pickAssignment({ ...given, connections: kept });
   if (picked.kind === "held" && picked.reason === "no_executor" && kept.length < connections.length) {
     // 뺀 실행기가 맞았는지만 가린다(이 답으로는 잇지 않는다). 맞았다면 no_executor와 구별해 내고,
@@ -423,6 +438,8 @@ async function assignOne(
   }
   if (picked.kind === "intake_closed") return "intake_closed";
   if (picked.kind !== "assign") return { ref, outcome: "skipped", pick: picked };
+  // 고른 실행기를 같은 집합과 한 번 더 대조한다. 후보의 주체를 거를 때 읽지 못해 남긴 후보를 고르기가 고를 수 있다.
+  if (withheld.has(picked.input.executorId)) return { ref, outcome: "withheld", reason: "listed", executorId: picked.input.executorId };
 
   const runId = freshUuid(ports.random);
   if (runId === null) return { ref, outcome: "assign_failed", failure: "random_unavailable" };

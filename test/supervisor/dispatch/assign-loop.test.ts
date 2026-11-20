@@ -798,7 +798,7 @@ describe("맡기지 않을 실행기", () => {
     expect([result.starts.map((s) => s.outcome), result.requests.map((r) => r.outcome)]).toEqual([["sent"], ["assigned"]]);
   });
 
-  test("집합이 비어 있지 않은데 대기 실행의 지정 실행기를 읽지 못하면 시작하지 않는다. 빈 집합이면 지정 실행기를 보지 않는다", async () => {
+  test("대기 실행의 지정 실행기를 읽지 못하면 집합이 비어 있어도 시작하지 않는다. 정상 행으로 돌아오면 시작된다", async () => {
     const withoutExecutor = (w: World) => () => {
       const real = w.ledger.listRuns();
       if (!real.known) throw new Error("읽지 못함");
@@ -813,7 +813,132 @@ describe("맡기지 않을 실행기", () => {
     expect([w.log, w.sent.length, runStates(w.ledger).get(runId)]).toEqual([[], 0, "queued"]);
 
     w.setWithheld(listed());
+    const empty = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(empty.starts).toEqual([{ runId, outcome: "withheld", reason: "executor_unknown", executorId: null }]);
+    expect([w.log, w.sent.length, runStates(w.ledger).get(runId)]).toEqual([[], 0, "queued"]);
+
+    w.wrap({});
     const open = ran(await assignAndStartTick(w.ports, POLICY, NOW));
     expect(open.starts).toEqual([expect.objectContaining({ runId, outcome: "sent", executorId: EXECUTOR })]);
+  });
+
+  test("지정 실행기의 이름이 빈 문자열이거나 작업자 실행기 주체의 꼴이 아니면 집합과 상관없이 시작하지 않는다", async () => {
+    // 실제 장부는 이런 행을 내지 않으므로 listRuns 포트의 답에서 지정 실행기 칸만 바꾼다.
+    const renamed = (w: World, name: unknown) => () => {
+      const real = w.ledger.listRuns();
+      if (!real.known) throw new Error("읽지 못함");
+      return { known: true, value: real.value.map((run) => ({ ...run, executorId: name })) };
+    };
+    const cases: [unknown, string[]][] = [
+      ["", [EXECUTOR]],
+      ["", []],
+      ["executor/session/r1/s1", []],
+      ["executor/isolated_reader/R1/s1", [EXECUTOR2]],
+      [42, []],
+    ];
+    for (const [name, set] of cases) {
+      const w = world();
+      const runId = await queuedOnExecutor(w);
+      const uuids = w.uuids;
+      w.wrap({ listRuns: renamed(w, name) as never });
+      w.setWithheld(listed(...set));
+      const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+      expect([name, set, result.starts]).toEqual([name, set, [{ runId, outcome: "withheld", reason: "executor_unknown", executorId: null }]]);
+      expect([w.log, w.sent.length, w.uuids - uuids, runStates(w.ledger).get(runId)]).toEqual([[], 0, 0, "queued"]);
+    }
+  });
+
+  test("집합의 답은 value를 한 번만 읽고, 검사한 그 값으로 막는다", async () => {
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    // 한 답의 value가 첫 읽기에는 [EXECUTOR], 그 뒤 읽기에는 배열이 아닌 값을 낸다.
+    w.setWithheld(() => {
+      let reads = 0;
+      return {
+        known: true,
+        get value() {
+          reads += 1;
+          return reads === 1 ? [EXECUTOR] : {};
+        },
+      };
+    });
+    expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({
+      kind: "ran",
+      starts: [{ runId, outcome: "withheld", reason: "listed", executorId: EXECUTOR }],
+      requests: [{ ref, outcome: "withheld", reason: "listed", executorId: EXECUTOR }],
+      halted: null,
+      haltedAt: null,
+    });
+    expect([w.log, w.sent.length, w.uuids - uuids, runStates(w.ledger).get(runId), waitingRefs(w.ledger)]).toEqual([[], 0, 0, "queued", [ref]]);
+  });
+
+  test("시작 직전에 대조하는 행은 시작 후보와 같은 실행 ID 값으로 찾는다(행의 실행 ID 칸을 다시 읽지 않는다)", async () => {
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    const uuids = w.uuids;
+    // 실제 행 뒤에 세션 행 하나를 덧붙인다. 그 행의 실행 ID 칸은 첫 읽기에만 대기 실행의 ID를 내고, 지정 실행기는 막지 않은 실행기다.
+    w.wrap({
+      listRuns: (() => {
+        const real = w.ledger.listRuns();
+        if (!real.known) throw new Error("읽지 못함");
+        const queued = real.value.find((run) => run.runId === runId);
+        if (queued === undefined) throw new Error("대기 실행이 없음");
+        let reads = 0;
+        const other = id();
+        const decoy = {
+          ...queued,
+          kind: "session",
+          state: "not_started",
+          inputRequestId: null,
+          executorId: EXECUTOR2,
+          get runId() {
+            reads += 1;
+            return reads === 1 ? runId : other;
+          },
+        };
+        return { known: true, value: [...real.value, decoy] };
+      }) as never,
+    });
+    w.setWithheld(listed(EXECUTOR));
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(result.starts).toEqual([{ runId, outcome: "withheld", reason: "listed", executorId: EXECUTOR }]);
+    expect([w.log, w.sent.length, w.uuids - uuids, runStates(w.ledger).get(runId)]).toEqual([[], 0, 0, "queued"]);
+  });
+
+  test("빈 자리가 섞인 후보 목록은 집합이 비었든 아니든 고르기가 거절한 그대로이고 잇지 않는다", async () => {
+    const holey: Candidate[] = [CONNECTION];
+    holey.length = 2;
+    for (const set of [[], [EXECUTOR2]]) {
+      const w = world();
+      withConnections(w, holey);
+      w.setWithheld(listed(...set));
+      const { ref } = w.enqueueRequest();
+      const uuids = w.uuids;
+      const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+      expect([set, result.requests]).toEqual([set, [{ ref, outcome: "skipped", pick: { kind: "input_rejected", reason: "malformed_connections" } }]]);
+      expect([w.log, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([[], 0, 0, [ref]]);
+    }
+  });
+
+  test("후보의 주체를 거를 때 읽지 못했어도 고르기가 고른 실행기가 집합에 있으면 잇지 않는다", async () => {
+    let reads = 0;
+    // 주체 칸이 첫 읽기(거르기)에서만 던지고 그 뒤 읽기(고르기)에는 정상 주체를 낸다.
+    const flaky: Candidate = {
+      ...CONNECTION,
+      get principal() {
+        reads += 1;
+        if (reads === 1) throw new Error("주체 읽기 실패");
+        return CONNECTION.principal;
+      },
+    };
+    const w = world();
+    withConnections(w, [flaky]);
+    w.setWithheld(listed(EXECUTOR));
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    expect(ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests).toEqual([{ ref, outcome: "withheld", reason: "listed", executorId: EXECUTOR }]);
+    expect([reads > 1, w.log, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([true, [], 0, 0, [ref]]);
   });
 });
