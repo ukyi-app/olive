@@ -6,17 +6,18 @@
 // 지키는 것:
 // 1. 실행마다 의도 하나만 옮긴다. 기다림이면 쓰지 않는다. 갱신·취소는 쓰기 직전에 그 실행의 줄·입력 취소·지시 이력을 다시 읽어 판단을
 //    다시 하고, 여전히 그 의도일 때만 적는다. 장부의 기록이 성공한 뒤에만 그 답의 값으로 초안을 만들어 봉하고 지정 실행기에 내보낸다.
-//    판단에 쓰는 읽기가 모름이거나 칸의 꼴이 틀리거나 같은 실행의 줄이 둘이면 그 실행은 이번 박자에 쓰지 않는다.
+//    판단에 쓰는 읽기가 모름이거나 칸의 꼴이 틀리거나 같은 실행의 줄이 둘이면 그 실행은 이번 박자에 쓰지 않는다. 쓰기 직전에 다시 읽은
+//    줄의 실행 세대가 0이거나, 지정 실행기가 실행의 종류와 다른 종류의 실행기이거나, 처음 읽은 줄과 식별값이 다르면 그 줄도 모름이다.
 // 2. 갱신은 유효한 시작 접수 영수증 ID가 있고, 지정 실행기의 연결이 지시를 낼 수 있고, 기록에 쓸 시각으로 여유와 작업 기한을 다시 잰
 //    뒤에만 적는다. 싣는 순간 min(앞 임대의 끝, 봉투 시한, 작업 기한) - 지금 >= RENEW_MARGIN_MS일 때만 싣는다. 부르는 쪽이 싣지 못했다고
 //    넘긴 갱신의 실행은 장부의 임대 끝을 판단에 넘기지 않는다(조회로 간다).
 // 3. 임대를 모르거나 판단이 조회를 내면 같은 실행 ID로 status_query를 내고, 내보낸 조회를 기다리는 조회로 결과에 싣는다.
 // 4. 취소(requested)와 기한(deadline)은 사유를 장부에 함께 적고 내보낸다(연결이 없어도 적는다). 이미 종료 지시가 적힌 실행에는 새 종료
-//    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 답을 해석하다 던지면 그 항목까지
-//    싣고 halted로 멈춘다.
+//    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 쓰기를 부른 뒤 내보내기의 결과가
+//    정해지기 전의 어느 줄에서 던져도 그 항목까지 싣고 halted로 멈춘다.
 //
 // 확정(result_finalize)은 내지 않는다: 결과 보관(S6)이 없어 판단에 넘기는 resultSettled는 늘 false다.
-import type { Envelope } from "../../contract/v1/index.ts";
+import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
   type InstructionTimes,
   LEDGER_RUN_STATES,
@@ -59,7 +60,8 @@ export interface LifeLoopPorts {
 }
 
 export interface LifeTickInput {
-  // 앞 박자들이 실행마다 낸 상태 조회의 시각(결과의 query_sent와 delivery가 unknown인 query_not_sent의 at. 실은 뒤에 읽은 시각이다).
+  // 앞 박자들이 실행마다 낸 상태 조회의 시각(결과의 query_sent와 delivery가 unknown인 query_not_sent의 at. 실은 뒤에 읽은 시각이거나,
+  // 그 시계를 읽지 못했으면 봉투 시한이다).
   // 장부는 조회를 적지 않으므로 부르는 쪽이 메모리에 쥐고 넘긴다. 같은 실행의 조회는 마지막 조회부터 answerTimeoutMs가 지나야 다시 낸다.
   // 감독이 다시 뜨면 비어 있고, 그 박자는 조회가 필요한 실행을 곧바로 묻는다.
   readonly lastQueries: readonly { readonly runId: string; readonly at: number }[];
@@ -161,7 +163,7 @@ export type RunOutcome =
       readonly sealReason?: string;
     }
   // 같은 실행 ID의 상태 조회. cause가 stop_already_recorded이면 판단은 종료를 냈지만 이미 종료 지시가 적힌 실행이라 묻기만 했다.
-  // at은 내보내기 포트가 돌아온 뒤에 읽은 시각이다(그 뒤에 실렸을 수는 없다).
+  // at은 내보내기 포트가 돌아온 뒤에 읽은 시각이다(그 뒤에 실렸을 수는 없다). 그 시계를 읽지 못했으면 봉투 시한이다(포트는 시한 뒤에 싣지 않는다).
   | { readonly runId: string; readonly outcome: "query_sent"; readonly requestId: string; readonly executorId: string; readonly at: number; readonly cause: QueryCause }
   | { readonly runId: string; readonly outcome: "query_held"; readonly lastQueryAt: number; readonly cause: QueryCause }
   | {
@@ -200,7 +202,8 @@ const isRefusal = (value: unknown): value is LedgerRefusal => (LEDGER_REFUSALS a
 const DONE: readonly string[] = ["finalized", "not_started"];
 
 // 같은 장부 포트로 진행 중인 박자. 박자를 겹쳐 부르지 않는 것이 호출 계약이고(앞 박자가 돌아온 뒤에 다음을 부른다), 이 표시는 그 계약을
-// 어긴 호출을 읽기·쓰기 없이 돌려보낸다. 다른 포트 객체로 같은 장부를 겹쳐 부르면 알아채지 못한다(그때는 쓰기 직전의 다시 읽기가 막는다).
+// 어긴 호출을 읽기·쓰기 없이 돌려보낸다. 다른 포트 객체로 같은 장부를 겹쳐 부르면 알아채지 못한다. 쓰기 직전의 다시 읽기는 앞 항목을
+// 기다리는 동안 끼어든 쓰기만 막고, 다른 포트 객체로 겹친 박자·동기 포트 안의 재진입·마지막 시계 읽기 안의 외부 쓰기는 막지 못한다.
 const IN_FLIGHT = new WeakSet<object>();
 
 function freshUuid(random: Random): string | null {
@@ -212,9 +215,10 @@ function freshUuid(random: Random): string | null {
 }
 
 // 시계를 다시 읽는다. 앞서 읽은 값보다 이르거나 꼴이 틀리면 null이다(nextIntent와 장부는 후퇴하지 않는 시각을 요구한다).
-function readClock(clock: Clock, floor: number): number | null {
+// 포트 묶음에서 시계 객체를 얻는 일도 예외 처리 안에 둔다: 쓰기 뒤에 그 접근자가 던지면 적은 항목이 결과에서 빠진다.
+function readClock(ports: { readonly clock: Clock }, floor: number): number | null {
   try {
-    const at: unknown = clock.now();
+    const at: unknown = ports.clock.now();
     return isTime(at) && at >= floor ? at : null;
   } catch {
     return null;
@@ -244,7 +248,7 @@ function linkVerdict(links: LinkGate, executorId: string): "no_connection" | "li
     const answer: unknown = links.mayIssue(executorId, "run_renew");
     if (!isObject(answer)) return "link_unknown";
     if (answer.ok === true) return null;
-    return answer.ok === false ? "no_connection" : "link_unknown";
+    return answer.ok === false && typeof answer.reason === "string" ? "no_connection" : "link_unknown";
   } catch {
     return "link_unknown";
   }
@@ -325,20 +329,25 @@ function indexRuns(rows: readonly Record<string, unknown>[]): Map<string, RunRow
   return index;
 }
 
-// 입력 요청 ID마다 취소 여부. 같은 ID의 줄이 둘 이상이거나 칸이 불리언이 아니면 null(모름). 요청 ID를 읽지 못한 줄은 어느 실행에도
+// 입력 요청 ID마다 취소 여부. 같은 ID의 줄이 둘 이상이거나 칸이 불리언이 아니거나 읽다 던지면 null(모름). 요청 ID를 읽은 줄은
+// 버리지 않는다: 버리면 같은 ID의 다른 줄(cancelled: false)만 남아 취소가 갱신으로 바뀐다. 요청 ID를 읽지 못한 줄은 어느 실행에도
 // 닿지 않으므로 그 입력에 이어진 실행은 줄이 없는 것으로 모름이 된다.
 function cancelIndex(rows: readonly Record<string, unknown>[]): Map<string, boolean | null> {
   const index = new Map<string, boolean | null>();
   for (const raw of rows) {
     let requestId: unknown;
-    let cancelled: unknown;
     try {
       requestId = raw.requestId;
-      cancelled = raw.cancelled;
     } catch {
       continue;
     }
     if (typeof requestId !== "string") continue;
+    let cancelled: unknown;
+    try {
+      cancelled = raw.cancelled;
+    } catch {
+      cancelled = undefined;
+    }
     index.set(requestId, index.has(requestId) || typeof cancelled !== "boolean" ? null : cancelled);
   }
   return index;
@@ -373,11 +382,20 @@ function factsOf(ledger: LifeLoopLedger, run: RunRow, cancels: Map<string, boole
   return { run, times, cancelRequested: cancelled };
 }
 
+// 지시를 적어도 되는 실행 줄인가. 실행 세대는 1 이상이고(장부는 0을 만들지 않고 받는 쪽은 0인 실행 지시를 받지 않는다), 지정 실행기는
+// 실행의 종류와 같은 종류의 주체이며(계약 v1의 주체 이름), 박자 처음에 읽은 줄과 종류·지정 실행기·실행 세대가 같다. 아니면 잘못 읽은
+// 줄이다: 다른 실행기의 연결로 판정해 그쪽에 보내면 지정 실행기에는 닿지 않고 장부만 연장된다.
+function writable(planned: RunRow, fresh: RunRow): boolean {
+  const party = parsePrincipal(fresh.executorId)?.kind;
+  const fits = party === (fresh.kind === "worker" ? "worker_executor" : "session_executor");
+  return fits && fresh.runGeneration >= 1 && fresh.kind === planned.kind && fresh.executorId === planned.executorId && fresh.runGeneration === planned.runGeneration;
+}
+
 // 쓰기 직전의 다시 읽기. 박자 처음의 읽기 뒤에 다른 박자나 다른 쓰기가 갱신·취소·종료를 적었을 수 있다.
-function reread(ports: LifeLoopPorts, runId: string): Facts | { read: LifeRead } {
+function reread(ports: LifeLoopPorts, planned: RunRow): Facts | { read: LifeRead } {
   const rows = readList(() => ports.ledger.listRuns());
-  const run = rows === null ? undefined : indexRuns(rows)?.get(runId);
-  if (run === undefined || run === null) return { read: "runs" };
+  const run = rows === null ? undefined : indexRuns(rows)?.get(planned.runId);
+  if (run === undefined || run === null || !writable(planned, run)) return { read: "runs" };
   const inputs = readList(() => ports.ledger.listInputs());
   if (inputs === null) return { read: "inputs" };
   return factsOf(ports.ledger, run, cancelIndex(inputs));
@@ -451,7 +469,7 @@ export async function lifeTick(ports: LifeLoopPorts, policy: LifecyclePolicy, in
 }
 
 async function tickOnce(ports: LifeLoopPorts, policy: LifecyclePolicy, input: LifeTickInput): Promise<LifeTickResult> {
-  const now = readClock(ports.clock, 1);
+  const now = readClock(ports, 1);
   if (now === null) return { kind: "not_run", reason: "clock_unavailable" };
   const memory = validMemory(input);
   if (memory === null) return { kind: "not_run", reason: "input_malformed" };
@@ -543,15 +561,16 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
   // 요청 ID를 먼저 만든다. 마지막 시계 읽기부터 장부 호출까지 다른 포트를 부르면 그 사이 흐른 시간만큼 기록 시각이 낡는다.
   const requestId = freshUuid(ctx.ports.random);
   if (requestId === null) return { runId, outcome: "renew_failed", failure: "random_unavailable" };
-  const fresh = reread(ctx.ports, runId);
+  const fresh = reread(ctx.ports, plan.facts.run);
   if ("read" in fresh) return { runId, outcome: "read_unknown", read: fresh.read };
   if (!intakeOpen(ctx.ports.intake)) return withheld("intake_closed");
   // 기록 전에 연결이 지시를 낼 수 있는지 본다(ledger.md "기록 전에 mayIssue"). 끊긴 실행기에 적은 갱신은 장부만 연장한다.
   const link = linkVerdict(ctx.ports.links, fresh.run.executorId);
   if (link !== null) return withheld(link);
-  const recordAt = readClock(ctx.ports.clock, ctx.now);
+  const recordAt = readClock(ctx.ports, ctx.now);
   if (recordAt === null) return withheld("clock_unavailable");
-  // 여기부터 장부 호출까지 포트를 부르지 않고 await도 없다: 다시 읽은 것과 쓰는 것 사이에 다른 박자가 끼지 않는다.
+  // 여기부터 장부 호출까지 포트를 부르지 않고 await도 없다. 다시 읽기부터 여기까지의 동기 포트(접수·연결·시계) 안에서 일어난 쓰기는
+  // 막지 못한다(박자의 직렬화와 다른 쓰기와의 순서는 부르는 쪽의 조건이다).
   const view = viewOf(fresh, recordAt, ctx.unsentRenews);
   if (!startAccepted(fresh.run)) return withheld("start_not_accepted");
   // 실행기는 임대보다 작업 기한을 먼저 보므로, 기한이 기록 시각 + RENEW_MARGIN_MS보다 이르면 갱신이 닿기 전에 기한으로 끝날 수 있다.
@@ -595,9 +614,10 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
     });
   trace.fallback = () => notSentWith(null)("ledger_answer_malformed");
   const answered: unknown = answer.leaseUntil;
-  trace.fallback = null;
   const leaseUntil = isTime(answered) ? answered : null;
   const notSent = notSentWith(leaseUntil);
+  // 내보내기의 결과가 정해질 때까지 이 항목을 붙든다. 싣기를 부르기 전에 던지면 싣지 않았고, 부른 뒤에는 실렸는지 모른다.
+  trace.fallback = () => notSent("draft_threw");
   let envelope: Envelope;
   try {
     const drafted = renewDraft({ run: { runId, runGeneration, executorId }, requestId, stopGeneration, now: recordAt, leaseUntil });
@@ -616,10 +636,11 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
   // 송신 규칙(ledger.md "봉투는 기본 수명 전체로 봉하고, 싣는 순간 남은 시간을 잰다"): 앞 임대의 끝과 봉투 시한 가운데 이른 것까지
   // RENEW_MARGIN_MS가 남아야 싣는다. 작업 기한도 같은 여유가 남아야 한다(기록 뒤 처리가 길면 싣는 때에는 기한이 가깝거나 지났다).
   // 잰 뒤 포트를 부르기까지 await가 없다. 포트 안에서 실제로 싣기까지의 시간은 이 박자가 재지 못한다.
-  const sendAt = readClock(ctx.ports.clock, recordAt);
+  const sendAt = readClock(ctx.ports, recordAt);
   if (sendAt === null) return notSent("clock_unavailable");
   if (Math.min(priorEnd, envelope.header.expires_at) - sendAt < RENEW_MARGIN_MS) return notSent("renew_margin_lost");
   if (deadlineAt - sendAt < RENEW_MARGIN_MS) return notSent("deadline_within_margin");
+  trace.fallback = () => notSent("send_threw", { delivery: "unknown" });
   let sent: unknown;
   try {
     sent = await ctx.ports.sink.send(envelope);
@@ -635,12 +656,12 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   const runId = plan.facts.run.runId;
   const requestId = freshUuid(ctx.ports.random);
   if (requestId === null) return { runId, outcome: "stop_failed", failure: "random_unavailable" };
-  const fresh = reread(ctx.ports, runId);
+  const fresh = reread(ctx.ports, plan.facts.run);
   if ("read" in fresh) return { runId, outcome: "read_unknown", read: fresh.read };
-  const recordAt = readClock(ctx.ports.clock, ctx.now);
+  const recordAt = readClock(ctx.ports, ctx.now);
   if (recordAt === null) return { runId, outcome: "stop_failed", failure: "clock_unavailable" };
   // 여기부터 장부 호출까지 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 종료이고 그 사이 다른 쓰기가 종료를 적지 않았을
-  // 때만 적는다(장부는 새 요청 ID의 종료를 또 받아 준다).
+  // 때만 적는다(장부는 새 요청 ID의 종료를 또 받아 준다). 마지막 시계 읽기 안에서 일어난 외부 쓰기는 보지 못한다.
   if (nextIntent(viewOf(fresh, recordAt, ctx.unsentRenews), ctx.policy).intent !== "stop" || (fresh.times !== null && fresh.times.lastStopAt !== null)) {
     return { runId, outcome: "superseded", planned: "stop" };
   }
@@ -684,7 +705,8 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   const run: unknown = answer.run;
   if (!isObject(run)) return notSent("ledger_answer_malformed");
   const { runId: answeredId, state, runGeneration, executorId: recipient } = run;
-  trace.fallback = null;
+  // 내보내기의 결과가 정해질 때까지 이 항목을 붙든다(갱신과 같다).
+  trace.fallback = () => notSent("draft_threw");
   if (answeredId !== runId) return notSent("ledger_answer_malformed");
   if (state === "not_started") return { runId, outcome: "closed_not_started" };
   if (!Number.isSafeInteger(runGeneration) || typeof recipient !== "string") return notSent("ledger_answer_malformed");
@@ -704,13 +726,15 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   } catch {
     return notSent("draft_threw");
   }
+  trace.fallback = () => notSent("send_threw", { delivery: "unknown" });
   let sent: unknown;
   try {
     sent = await ctx.ports.sink.send(envelope);
   } catch {
     return notSent("send_threw", { delivery: "unknown" });
   }
-  if (sent === "sent") return { runId, outcome: "stop_sent", requestId, cancelReason, issuedAt: recordAt, executorId: envelope.header.recipient };
+  // 받는 쪽은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과를 읽다 던지지 않는다.
+  if (sent === "sent") return { runId, outcome: "stop_sent", requestId, cancelReason, issuedAt: recordAt, executorId: recipient };
   if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
   return notSent("send_answer_malformed", { delivery: "unknown" });
 }
@@ -731,7 +755,7 @@ async function queryOne(ctx: Context, run: RunRow, cause: QueryCause): Promise<R
     ...(extra.field === undefined ? {} : { field: extra.field }),
     ...(extra.sealReason === undefined ? {} : { sealReason: extra.sealReason }),
   });
-  const at = readClock(ctx.ports.clock, ctx.now);
+  const at = readClock(ctx.ports, ctx.now);
   if (at === null) return notSent(null, "clock_unavailable");
   let envelope: Envelope;
   try {
@@ -748,7 +772,9 @@ async function queryOne(ctx: Context, run: RunRow, cause: QueryCause): Promise<R
   } catch {
     return notSent(at, "draft_threw");
   }
+  // 기다리는 조회와 봉투 시한은 내보내기 전에 확보한다(포트가 넘겨받은 봉투를 고쳐도 바뀌지 않는다).
   const pending: PendingQuery = { requestId: envelope.header.request_id, recipient: envelope.header.recipient, runIds: [runId] };
+  const expiresAt = envelope.header.expires_at;
   let sent: unknown;
   let threw = false;
   try {
@@ -756,19 +782,13 @@ async function queryOne(ctx: Context, run: RunRow, cause: QueryCause): Promise<R
   } catch {
     threw = true;
   }
-  // 조회의 간격은 실제로 실은 시각부터 센다. 포트가 돌아온 뒤에 읽은 시각은 실은 시각보다 이르지 않다.
-  // 그 시계를 읽지 못하면 봉한 시각을 쓴다(간격이 그만큼 짧아질 수 있다).
-  const loadedBy = readClock(ctx.ports.clock, at) ?? at;
-  if (threw) {
-    // 실렸을 수 있으므로 답을 대조할 수 있게 기다리는 조회에 넣는다.
-    ctx.pendingQueries.push(pending);
-    return notSent(loadedBy, "send_threw", { delivery: "unknown" });
-  }
-  if (sent === "sent") {
-    ctx.pendingQueries.push(pending);
-    return { runId, outcome: "query_sent", requestId: pending.requestId, executorId: pending.recipient, at: loadedBy, cause };
-  }
-  if (sent === "no_connection" || sent === "too_late_to_send") return notSent(at, sent);
+  if (!threw && (sent === "no_connection" || sent === "too_late_to_send")) return notSent(at, sent);
+  // 실었거나 실렸을 수 있다. 답을 대조할 수 있게 시계를 읽기 전에 기다리는 조회에 넣는다(시계의 고장과 무관하다).
   ctx.pendingQueries.push(pending);
+  // 조회의 간격은 실제로 실은 시각부터 센다. 포트가 돌아온 뒤에 읽은 시각은 실은 시각보다 이르지 않다. 그 시계를 읽지 못하면
+  // 봉투 시한을 쓴다: 포트는 시한 뒤에 싣지 않으므로 실은 시각의 확실한 상한이다(봉한 시각으로 되돌리면 간격이 짧아진다).
+  const loadedBy = readClock(ctx.ports, at) ?? expiresAt;
+  if (threw) return notSent(loadedBy, "send_threw", { delivery: "unknown" });
+  if (sent === "sent") return { runId, outcome: "query_sent", requestId: pending.requestId, executorId: pending.recipient, at: loadedBy, cause };
   return notSent(loadedBy, "send_answer_malformed", { delivery: "unknown" });
 }

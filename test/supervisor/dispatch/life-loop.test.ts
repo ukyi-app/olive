@@ -5,7 +5,7 @@ import type { InstructionTimes, Ledger } from "../../../src/ledger/index.ts";
 import { type LifeLoopLedger, type LifeLoopPorts, type LifeTickResult, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
 import type { Random, SendOutcome, Signer } from "../../../src/supervisor/dispatch/ports.ts";
 import type { LifecyclePolicy } from "../../../src/supervisor/scheduler/lifecycle.ts";
-import { digest, from, id, must, NOW, open, ready, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
+import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 // 정책 숫자와 키는 이 시험이 지어 넣는 자료다. 운영값이 아니다.
 const POLICY: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 20_000 };
@@ -680,7 +680,7 @@ describe("쓰기 직전의 확인: 연결, 최신 읽기, 칸의 꼴, 싣지 못
     expect(w2.sent.map((e) => e.header.action)).toEqual(["task_cancel"]);
   });
 
-  test("다른 포트 묶음으로 같은 장부를 겹쳐 불러도 쓰기 직전의 다시 읽기가 같은 실행의 두 번째 지시를 막는다", async () => {
+  test("다른 포트 묶음의 박자가 앞 항목을 기다리는 동안 끼어들면 쓰기 직전의 다시 읽기가 같은 실행의 두 번째 지시를 막는다", async () => {
     // 대기 실행 Q, 접수된 실행 A 순. 두 박자가 모두 A의 의도를 고른 뒤 Q를 처리하는 사이에 서로 끼어든다.
     for (const cancel of [false, true]) {
       const w = world();
@@ -876,6 +876,242 @@ describe("쓰기 직전의 확인: 연결, 최신 읽기, 칸의 꼴, 싣지 못
     w.setSend(async () => "sent");
     w.setClock(NOW + 30_000);
     expect(only(await tick(w, [{ runId: s.runId, at: outcome.at }]), s.runId)).toMatchObject({ outcome: "query_held", lastQueryAt: NOW + 29_000 });
+  });
+});
+
+// 쓰기가 커밋된 뒤의 접근을 자리 이름으로 적고, trap으로 고른 자리 하나를 처음 한 번 던지게 한다. 커밋 전의 접근은 건드리지 않는다.
+// 자리 이름은 "ports.clock"(포트 묶음의 접근자), "ports.clock.now"(포트의 메서드), "answer.leaseUntil"(쓰기 답의 칸) 꼴이다.
+function afterWrite(w: World, write: (typeof WRITES)[number], trap: string | null) {
+  let committed = false;
+  let fired = false;
+  let requestId: string | undefined;
+  const seen: string[] = [];
+  const watch = <T extends object>(target: T, path: string): T =>
+    new Proxy(target, {
+      get(obj, key, receiver) {
+        const value: unknown = Reflect.get(obj, key, receiver);
+        if (typeof key !== "string" || !committed) return value;
+        const point = `${path}.${key}`;
+        seen.push(point);
+        if (point === trap && !fired) {
+          fired = true;
+          throw new Error(`쓰기 뒤 ${point} 실패`);
+        }
+        return typeof value === "object" && value !== null ? watch(value, point) : value;
+      },
+    });
+  const ledger: LifeLoopLedger = {
+    ...w.ports.ledger,
+    [write]: ((args: { requestId: string }) => {
+      const answer: unknown = (w.ports.ledger[write] as (a: unknown) => unknown)(args);
+      requestId = args.requestId;
+      committed = true;
+      return typeof answer === "object" && answer !== null ? watch(answer, "answer") : answer;
+    }) as never,
+  };
+  return { ports: watch({ ...w.ports, ledger }, "ports"), seen, requestId: () => requestId, fired: () => fired };
+}
+
+// 부르는 쪽이 결과에서 고르는 싣지 못한 갱신(life-loop.md "넣는 것").
+const unsentOf = (result: LifeTickResult) =>
+  ran(result)
+    .runs.filter((r) => r.outcome === "renew_recorded_not_sent" || r.outcome === "renew_record_unknown")
+    .map((r) => r.runId);
+
+describe("쓰기 전의 검증과 쓰기 뒤의 결과 보존", () => {
+  const plain = (ports: LifeLoopPorts) => lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] });
+
+  test("다시 읽은 줄의 지정 실행기가 실행 종류와 맞지 않거나 실행 세대가 0이면 갱신·종료를 적지 않는다", async () => {
+    // 지정 작업자의 연결은 끊겼고 세션 실행기의 연결만 산다. 잘못 읽은 실행기로 판정하면 연결이 살아 있다고 나온다.
+    const changes: [string, (row: Record<string, unknown>, nth: number) => Record<string, unknown>][] = [
+      ["다시 읽은 줄만 세션 실행기", (row, nth) => (nth === 0 ? row : { ...row, executorId: SESSION_EXECUTOR })],
+      ["실행 세대 0", (row) => ({ ...row, runGeneration: 0 })],
+    ];
+    for (const [name, change] of changes) {
+      for (const cancel of [false, true]) {
+        const w = world();
+        const owner = input(w);
+        const s = started(w, { inputRequestId: owner });
+        accept(w, s);
+        if (cancel) must(w.ledger.cancelInput(owner, NOW + 1));
+        w.setClock(NOW + 17_000);
+        w.setLink((executorId) => (executorId === SESSION_EXECUTOR ? { ok: true } : { ok: false, reason: "no_connection" }));
+        let nth = 0;
+        w.wrap({
+          listRuns: (() => {
+            const read = w.ledger.listRuns();
+            if (!read.known) return read;
+            const value = read.value.map((row) => (row.runId === s.runId ? change(row as never, nth) : row));
+            nth += 1;
+            return { known: true, value };
+          }) as never,
+        });
+        expect({ name, cancel, outcome: only(await tick(w), s.runId) }).toEqual({ name, cancel, outcome: { runId: s.runId, outcome: "read_unknown", read: "runs" } });
+        expect(writes(w)).toEqual([]);
+        expect(w.sent).toEqual([]);
+        expect(times(w, s.runId)).toMatchObject({ lease: { issuedAt: NOW, expiresAt: NOW + 30_000 }, renewIssued: null, lastStopAt: null });
+      }
+    }
+  });
+
+  test("갱신을 적은 뒤 송신 시계의 접근자가 던져도 적은 갱신이 결과에 남고, 다음 박자는 새 갱신 대신 조회한다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    w.setClock(NOW + 17_000);
+    const trap = afterWrite(w, "recordRenewInstruction", "ports.clock");
+    const result = await plain(trap.ports);
+    expect(trap.fired()).toBe(true);
+    expect(only(result, s.runId)).toMatchObject({ outcome: "renew_recorded_not_sent", requestId: trap.requestId(), issuedAt: NOW + 17_000, leaseUntil: NOW + 47_000, delivery: "not_sent" });
+    expect(w.sent).toEqual([]);
+    const unsent = unsentOf(result);
+    expect(unsent).toEqual([s.runId]);
+    w.setClock(NOW + 31_000);
+    expect(only(await tick(w, [], unsent), s.runId)).toMatchObject({ outcome: "query_sent" });
+    expect(writes(w)).toEqual(["recordRenewInstruction"]);
+    expect(times(w, s.runId).renewIssued).toEqual({ issuedAt: NOW + 17_000, leaseUntil: NOW + 47_000 });
+  });
+
+  test("종료를 실은 뒤 포트가 봉투의 받는 쪽을 읽지 못하게 해도 내보내기 전에 확보한 받는 쪽으로 결과를 낸다", async () => {
+    const w = world();
+    const owner = input(w);
+    const s = started(w, { inputRequestId: owner });
+    accept(w, s);
+    must(w.ledger.cancelInput(owner, NOW + 1));
+    w.setClock(NOW + 2_000);
+    const sink = {
+      send: async (envelope: Envelope): Promise<SendOutcome> => {
+        Object.defineProperty(envelope.header, "recipient", {
+          get(): never {
+            throw new Error("봉투 읽기 실패");
+          },
+        });
+        return "sent";
+      },
+    };
+    const result = ran(await plain({ ...w.ports, sink }));
+    const stopLine = unanswered(w).find((i) => i.runId === s.runId && i.action === "task_cancel");
+    expect(result.halted).toBeNull();
+    expect(only(result, s.runId)).toEqual({ runId: s.runId, outcome: "stop_sent", requestId: stopLine?.requestId as string, cancelReason: "requested", issuedAt: NOW + 2_000, executorId: WORKER_EXECUTOR });
+  });
+
+  test("쓰기가 성공한 뒤의 어느 포트 접근이 던져도 그 항목이 결과에 남는다(갱신·종료의 접근 자리 훑기)", async () => {
+    for (const write of WRITES) {
+      const make = () => {
+        const w = world();
+        const owner = input(w);
+        const s = started(w, { inputRequestId: owner });
+        accept(w, s);
+        if (write === "recordStopInstruction") must(w.ledger.cancelInput(owner, NOW + 1));
+        w.setClock(NOW + 10_000);
+        return { w, s };
+      };
+      const probe = make();
+      const clean = afterWrite(probe.w, write, null);
+      expect(only(await plain(clean.ports), probe.s.runId).outcome).toBe(write === "recordRenewInstruction" ? "renew_sent" : "stop_sent");
+      const points = [...new Set(clean.seen)];
+      expect(points).toEqual(expect.arrayContaining(["answer.ok", "ports.signer", "ports.random", "ports.sink", "ports.sink.send", ...(write === "recordRenewInstruction" ? ["answer.leaseUntil", "ports.clock", "ports.clock.now"] : ["answer.run", "answer.run.executorId"])]));
+      const kinds = write === "recordRenewInstruction" ? ["renew_recorded_not_sent", "renew_record_unknown"] : ["stop_recorded_not_sent", "stop_record_unknown"];
+      for (const point of points) {
+        const { w, s } = make();
+        const trap = afterWrite(w, write, point);
+        const result = await plain(trap.ports);
+        expect({ point, fired: trap.fired() }).toEqual({ point, fired: true });
+        const item = only(result, s.runId) as { outcome: string; requestId?: string };
+        expect({ point, kind: kinds.includes(item.outcome), requestId: item.requestId }).toEqual({ point, kind: true, requestId: trap.requestId() });
+        if (write === "recordRenewInstruction") expect({ point, unsent: unsentOf(result) }).toEqual({ point, unsent: [s.runId] });
+        expect(writes(w)).toEqual([write]);
+      }
+    }
+  });
+
+  test("같은 소유자 입력의 줄 하나가 취소 칸을 읽다 던지면 두 순서 모두 그 입력은 모름이다", async () => {
+    for (const throwingFirst of [false, true]) {
+      const w = world();
+      const owner = input(w);
+      const s = started(w, { inputRequestId: owner });
+      accept(w, s);
+      // 장부에서는 취소됐다. 버린 줄 대신 남은 cancelled: false를 믿으면 갱신이 나간다.
+      must(w.ledger.cancelInput(owner, NOW + 1));
+      w.setClock(NOW + 10_000);
+      w.wrap({
+        listInputs: (() => {
+          const read = w.ledger.listInputs();
+          if (!read.known) return read;
+          const value = read.value.flatMap((row): unknown[] => {
+            if (row.requestId !== owner) return [row];
+            const kept = { ...row, cancelled: false };
+            const broken = {
+              requestId: row.requestId,
+              get cancelled(): never {
+                throw new Error("칸 읽기 실패");
+              },
+            };
+            return throwingFirst ? [broken, kept] : [kept, broken];
+          });
+          return { known: true, value };
+        }) as never,
+      });
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "inputs" });
+      expect(writes(w)).toEqual([]);
+      expect(w.sent).toEqual([]);
+    }
+  });
+
+  test("조회를 실은 뒤 시계를 읽지 못해도 기다리는 조회에 남기고, 간격은 봉투 시한부터 센다", async () => {
+    for (const broken of ["now", "getter"] as const) {
+      const w = world();
+      const s = started(w);
+      must(w.ledger.markLost(NOW + 1));
+      w.setClock(NOW + 10_000);
+      const clock = w.ports.clock;
+      let loaded = false;
+      const ports: LifeLoopPorts = {
+        ...w.ports,
+        get clock() {
+          if (!loaded) return clock;
+          if (broken === "getter") throw new Error("시계 접근 실패");
+          return {
+            now: () => {
+              throw new Error("시계 실패");
+            },
+          };
+        },
+        // 봉한 10000보다 19000ms 늦게 싣는다.
+        sink: {
+          send: async (envelope) => {
+            w.sent.push(envelope);
+            w.setClock(NOW + 29_000);
+            loaded = true;
+            return "sent";
+          },
+        },
+      };
+      const result = ran(await plain(ports));
+      const outcome = only(result, s.runId) as Extract<RunOutcome, { outcome: "query_sent" }>;
+      const [envelope] = w.sent as [Envelope];
+      expect(envelope.header.expires_at).toBe(NOW + 40_000);
+      expect({ broken, outcome }).toMatchObject({ broken, outcome: { outcome: "query_sent", at: NOW + 40_000 } });
+      expect(result.pendingQueries).toEqual([{ requestId: outcome.requestId, recipient: WORKER_EXECUTOR, runIds: [s.runId] }]);
+      // 실제로 실은 29000부터 answerTimeoutMs가 지나지 않은 30000에는 다시 묻지 않는다. 시한부터 센 60000에는 묻는다.
+      const asked = [{ runId: s.runId, at: outcome.at }];
+      w.setClock(NOW + 30_000);
+      expect(only(await tick(w, asked), s.runId)).toMatchObject({ outcome: "query_held", lastQueryAt: NOW + 40_000 });
+      w.setClock(NOW + 60_000);
+      expect(only(await tick(w, asked), s.runId)).toMatchObject({ outcome: "query_sent", at: NOW + 60_000 });
+    }
+  });
+
+  test("연결 포트의 거절에 문자열 reason이 없으면 연결 끊김이 아니라 모름이다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    w.setClock(NOW + 17_000);
+    for (const answer of [{ ok: false }, { ok: false, reason: 7 }]) {
+      w.setLink(() => answer);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "renew_withheld", reason: "link_unknown" });
+    }
+    expect(w.log).toEqual([]);
   });
 });
 
