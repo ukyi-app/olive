@@ -58,10 +58,11 @@ function bytesOf(text: string): Uint8Array {
 // 결과를 JSON으로 펼쳐 값 전체와 네 글자 조각이 하나도 없는지 본다.
 // 이 단언이 실패해도 출력에 값이 실리지 않게, 포함 여부를 불리언으로 먼저 계산하고 실패 메시지와 차이에는 조각의 시작 위치만 둔다.
 // 결과 객체를 통째로 비교하는 단언보다 먼저 부른다: 그쪽이 먼저 실패하면 값이 든 객체가 차이로 찍힌다.
-function expectNoSecret(answer: unknown): void {
+// sample은 그 시험이 파일이나 포트에 넣은 표본이다. 표본마다 SECRET과 같은 규칙(대문자·숫자, 소스 이름과 겹치지 않음)으로 짓는다.
+function expectNoSecret(answer: unknown, sample: string = SECRET): void {
   const text = JSON.stringify(answer) ?? "";
   const leakedAt: number[] = [];
-  for (let i = 0; i + 4 <= SECRET.length; i += 1) if (text.includes(SECRET.slice(i, i + 4))) leakedAt.push(i);
+  for (let i = 0; i + 4 <= sample.length; i += 1) if (text.includes(sample.slice(i, i + 4))) leakedAt.push(i);
   expect(leakedAt, "값의 네 글자 조각이 결과에 있다(배열은 조각의 시작 위치)").toEqual([]);
 }
 
@@ -113,7 +114,9 @@ describe("지문은 정확한 바이트로", () => {
 describe("고른 계정의 폴더 안의 파일만 읽는다", () => {
   const choice = { account: "claude-sub", method: "subscription" };
   // 다른 계정의 자격. 이것의 지문이 claude-sub의 참조로 나가면 계정이 섞인 것이다.
-  const OTHER = bytesOf("other-account-cred");
+  // SECRET과 네 글자도 겹치지 않는다. 소문자 이름(outside_account 등)과 겹치는 값이면 누출 검사가 정상 거절에서도 실패한다.
+  const OTHER_TEXT = "7HDN-K4QW-2RT-XB";
+  const OTHER = bytesOf(OTHER_TEXT);
 
   test("별칭이 같은 루트의 다른 계정 폴더를 가리키는 링크면 outside_account이고 파일을 열지 않는다", async () => {
     const dir = tempAccounts();
@@ -121,6 +124,7 @@ describe("고른 계정의 폴더 안의 파일만 읽는다", () => {
     writeFileSync(join(dir, "normal", KEY), OTHER);
     symlinkSync("normal", join(dir, "claude-sub"));
     const seen = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir), choice));
+    expectNoSecret(seen.result, OTHER_TEXT);
     expect(seen.result).toEqual({ ok: false, reason: "outside_account" });
     expect([seen.reads, seen.closes]).toEqual([0, 0]);
     expect(await credentialPort(nodeCredentialFiles, policy(dir)).reference(choice)).toEqual({ known: false });
@@ -132,6 +136,7 @@ describe("고른 계정의 폴더 안의 파일만 읽는다", () => {
     writeFileSync(join(outside, KEY), OTHER);
     symlinkSync(outside, join(dir, "claude-sub"));
     const seen = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir), choice));
+    expectNoSecret(seen.result, OTHER_TEXT);
     expect(seen.result).toEqual({ ok: false, reason: "outside_account" });
     expect([seen.reads, seen.closes]).toEqual([0, 0]);
   });
@@ -144,6 +149,7 @@ describe("고른 계정의 폴더 안의 파일만 읽는다", () => {
     mkdirSync(join(dir, "claude-sub"));
     symlinkSync(join("..", "normal", KEY), join(dir, "claude-sub", KEY));
     const viaKey = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir), choice));
+    expectNoSecret(viaKey.result, OTHER_TEXT);
     expect(viaKey.result).toEqual({ ok: false, reason: "outside_account" });
     expect([viaKey.reads, viaKey.closes]).toEqual([0, 0]);
 
@@ -155,6 +161,7 @@ describe("고른 계정의 폴더 안의 파일만 읽는다", () => {
     symlinkSync(outside, join(dir2, "claude-sub", "..data"));
     symlinkSync(join("..data", KEY), join(dir2, "claude-sub", KEY));
     const viaData = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir2), choice));
+    expectNoSecret(viaData.result, OTHER_TEXT);
     expect(viaData.result).toEqual({ ok: false, reason: "outside_account" });
     expect([viaData.reads, viaData.closes]).toEqual([0, 0]);
   });
