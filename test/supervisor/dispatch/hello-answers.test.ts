@@ -364,7 +364,7 @@ describe("보장 3: 장부의 답을 구별해 돌려주고, 실패한 답은 �
       },
     } as unknown as HelloAnswerLedger;
     const thrown = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop });
-    expect(thrown).toMatchObject({ kind: "ledger_failed", failure: "threw", message: "boom", withhold: WORKER_EXECUTOR });
+    expect(thrown).toMatchObject({ kind: "ledger_failed", failure: "threw", message: null, withhold: WORKER_EXECUTOR });
     expect((thrown as { retry: HelloRetry | null }).retry).not.toBeNull();
     for (const answer of [null, { ok: true }, { ok: false, reason: "made_up", unsavedSightings: [] }, { ok: false, reason: "ledger_unwritable" }]) {
       const odd = { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger;
@@ -431,5 +431,72 @@ describe("보장 4: 자리를 풀지 않고, 기존 동작은 그대로다", () 
     expect(ledger.listRuns()).toEqual(runsBefore);
     ledger.close();
     expect(sightings(path)).toEqual([]);
+  });
+});
+
+describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
+  test("시각 0은 두 입구 모두 장부를 부르기 전에 거절하고 맡기지 않을 실행기를 내지 않는다", async () => {
+    const ledger = ready(open(tempPath()));
+    const live = runningWorker(ledger);
+    const w = new World(ledger);
+    const { output } = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED, RECEIVED);
+    const { calls, port } = spy(ledger);
+    const ports = { ledger: port, intake: w.stop };
+    // 계약의 머리 시각과 장부의 시각은 1 이상이다. 0을 넘기면 장부가 입력을 거절해 재시도 없는 실행기 오류처럼 보인다.
+    expect(passHelloAnswer({ output, table: w.table, now: 0 }, ports)).toEqual({ kind: "refused", why: "malformed_now" });
+    expect(passHelloAnswer({ output: { ...(output as object), issuedAt: 0 }, table: w.table, now: LATER }, ports)).toEqual({ kind: "refused", why: "signed_time_missing" });
+    const throwing = {
+      applyExecutorAnswer: () => {
+        throw new Error("boom");
+      },
+    } as unknown as HelloAnswerLedger;
+    const retry = (passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop }) as { retry: HelloRetry }).retry;
+    expect(retryHelloAnswer(retry, 0, { ledger: port })).toEqual({ kind: "refused", why: "malformed_now" });
+    expect(calls).toEqual([]);
+    expect(runState(ledger, live.runId)).toBe("running");
+  });
+
+  test("장부 답을 읽다가 던져도 밖으로 나가지 않고, 약속한 꼴이 아닌 항목은 반영으로 세지 않는다", async () => {
+    const ledger = ready(open(tempPath()));
+    const w = new World(ledger);
+    const { output } = await w.greet(K0, WORKER_EXECUTOR, [], SIGNED, RECEIVED);
+    const runId = id();
+    const answers: unknown[] = [
+      { ok: true, moved: [null], deferred: [{ unexpected: "CANARY" }], outsideLedger: [{ runId: 17, runGeneration: -1 }] },
+      { ok: true, moved: [null], deferred: [], outsideLedger: [] },
+      { ok: true, moved: [], deferred: [{ unexpected: "CANARY" }], outsideLedger: [] },
+      { ok: true, moved: [], deferred: [], outsideLedger: [{ runId: 17, runGeneration: -1 }] },
+      { ok: true, moved: [{ runId, runGeneration: 1, before: "running", after: "nowhere" }], deferred: [], outsideLedger: [] },
+      { ok: true, moved: [], deferred: [{ runId, runGeneration: 1, state: "preparing", why: "because" }], outsideLedger: [] },
+      { ok: true, moved: [], deferred: [], outsideLedger: [{ runId, runGeneration: 0 }] },
+      { ok: false, reason: "ledger_unwritable", unsavedSightings: [false] },
+      {
+        get ok(): never {
+          throw new Error("getter");
+        },
+      },
+    ];
+    for (const answer of answers) {
+      const odd = { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger;
+      const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: odd, intake: w.stop });
+      expect(outcome, String(answers.indexOf(answer))).toMatchObject({ kind: "ledger_failed", failure: "malformed_answer", message: null, withhold: WORKER_EXECUTOR });
+      expect((outcome as { retry: HelloRetry | null }).retry).not.toBeNull();
+    }
+  });
+
+  test("장부 포트가 던진 일반 예외의 원문은 결과에 싣지 않는다", async () => {
+    const ledger = ready(open(tempPath()));
+    const w = new World(ledger);
+    const { output } = await w.greet(K0, WORKER_EXECUTOR, [], SIGNED, RECEIVED);
+    for (const thrown of [new Error("DIAGNOSTIC_CANARY"), "DIAGNOSTIC_CANARY"]) {
+      const throwing = {
+        applyExecutorAnswer: () => {
+          throw thrown;
+        },
+      } as unknown as HelloAnswerLedger;
+      const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop });
+      expect(outcome).toMatchObject({ kind: "ledger_failed", failure: "threw", message: null, withhold: WORKER_EXECUTOR });
+      expect(JSON.stringify(outcome)).not.toContain("DIAGNOSTIC_CANARY");
+    }
   });
 });

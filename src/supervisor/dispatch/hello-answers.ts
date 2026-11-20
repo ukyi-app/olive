@@ -9,7 +9,17 @@
 // 3. 장부의 답을 지우거나 합치지 않고 돌려준다. 반영하지 못했으면 같은 값을 다시 넘길 값과 "새 일을 맡기지 않을 실행기"를 낸다.
 // 4. 자리를 풀거나 실행을 닫는 길이 없다. 장부 연산은 applyExecutorAnswer 하나만 부른다.
 import type { RunStatus } from "../../contract/v1/index.ts";
-import { type DeferredLoss, type Ledger, LedgerInputError, type LostRun, REFUSALS, type Refusal, type Restorer } from "../../ledger/index.ts";
+import {
+  type DeferredLoss,
+  LEDGER_RUN_STATES,
+  type Ledger,
+  LedgerInputError,
+  type LedgerRunState,
+  type LostRun,
+  REFUSALS,
+  type Refusal,
+  type Restorer,
+} from "../../ledger/index.ts";
 import type { Connections } from "../transport/connections.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는다. 자리를 푸는 연산이 이 포트에 없다.
@@ -75,7 +85,8 @@ export type HelloAnswerOutcome =
       readonly retry: HelloRetry;
       readonly withhold: string;
     }
-  // 장부가 던졌거나 답의 꼴이 틀렸다. input_rejected는 장부의 LedgerInputError(같은 값을 다시 넘겨도 같다)라 retry가 null이다.
+  // 장부가 던졌거나 답의 꼴이 틀렸다(항목 하나라도 약속한 꼴이 아니거나 답을 읽다가 던짐). input_rejected는 장부의 LedgerInputError
+  // (같은 값을 다시 넘겨도 같다)라 retry가 null이다. message는 input_rejected의 장부 문구뿐이고 그 밖에는 null이다.
   | {
       readonly kind: "ledger_failed";
       readonly executorId: string;
@@ -108,6 +119,7 @@ export function passHelloAnswer(input: HelloAnswerInput, ports: HelloAnswerPorts
 
 // 반영하지 못한 인사를 같은 값으로 다시 넘긴다. 연결과 접수를 다시 보지 않는다: 처음 넘길 때 지금의 인사였고, 같은 값을 다시 적어야
 // 그 인사의 양성 관측이 남는다(ledger.md "실행기의 답을 넘기는 쪽"). 그 실행기의 더 새 답보다 먼저 부르는 것은 부르는 쪽이 지킨다.
+// 함정: 접수를 보지 않으므로 복원 중(2단계 전)에도 장부에 닿는다. 복원 작업과의 순서는 조립이 정한다(hello-answers.md).
 export function retryHelloAnswer(retry: HelloRetry, now: number, ports: Pick<HelloAnswerPorts, "ledger">): HelloAnswerOutcome {
   if (typeof retry !== "object" || retry === null || !issuedRetries.has(retry)) return { kind: "refused", why: "not_retry" };
   if (!isTime(now)) return { kind: "refused", why: "malformed_now" };
@@ -121,30 +133,74 @@ function apply(ledger: HelloAnswerLedger, answer: HelloRetry, now: number): Hell
   try {
     result = ledger.applyExecutorAnswer({ coverage: "full", runs: answer.runs, answeredAt: answer.answeredAt, now }, { sender: executorId });
   } catch (error) {
-    const message = error instanceof Error ? error.message : null;
-    if (error instanceof LedgerInputError) return { kind: "ledger_failed", executorId, connection, failure: "input_rejected", message, retry: null, withhold: executorId };
-    return { kind: "ledger_failed", executorId, connection, failure: "threw", message, retry, withhold: executorId };
+    // 장부의 입력 거절 문구는 장부가 정한 형식이다. 그 밖의 예외 문구는 포트의 진단(경로·값)을 담을 수 있어 결과에 싣지 않는다.
+    if (error instanceof LedgerInputError) return { kind: "ledger_failed", executorId, connection, failure: "input_rejected", message: error.message, retry: null, withhold: executorId };
+    return { kind: "ledger_failed", executorId, connection, failure: "threw", message: null, retry, withhold: executorId };
   }
   const malformed: HelloAnswerOutcome = { kind: "ledger_failed", executorId, connection, failure: "malformed_answer", message: null, retry, withhold: executorId };
-  if (typeof result !== "object" || result === null) return malformed;
-  const r = result as Record<string, unknown>;
-  if (r.ok === true) {
-    if (!Array.isArray(r.moved) || !Array.isArray(r.deferred) || !Array.isArray(r.outsideLedger)) return malformed;
-    return {
-      kind: "applied",
-      executorId,
-      connection,
-      answeredAt: answer.answeredAt,
-      moved: [...(r.moved as LostRun[])],
-      deferred: [...(r.deferred as DeferredLoss[])],
-      outsideLedger: [...(r.outsideLedger as { runId: string; runGeneration: number }[])],
-    };
+  // 답을 읽는 것도 포트의 값을 건드리는 일이다(접근자가 던질 수 있다). 꼴이 틀린 항목을 반영으로 세면 뒤 조각이 지어낸 실행을 닫는다.
+  try {
+    if (typeof result !== "object" || result === null) return malformed;
+    const r = result as Record<string, unknown>;
+    if (r.ok === true) {
+      const moved = items(r.moved, lostRun);
+      const deferred = items(r.deferred, deferredLoss);
+      const outsideLedger = items(r.outsideLedger, runRef);
+      if (moved === null || deferred === null || outsideLedger === null) return malformed;
+      return { kind: "applied", executorId, connection, answeredAt: answer.answeredAt, moved, deferred, outsideLedger };
+    }
+    if (r.ok === false && (REFUSALS as readonly unknown[]).includes(r.reason)) {
+      const unsavedSightings = items(r.unsavedSightings, runRef);
+      if (unsavedSightings === null) return malformed;
+      return { kind: "ledger_unsaved", executorId, connection, reason: r.reason as Refusal, unsavedSightings, retry, withhold: executorId };
+    }
+    return malformed;
+  } catch {
+    return malformed;
   }
-  if (r.ok === false && (REFUSALS as readonly unknown[]).includes(r.reason) && Array.isArray(r.unsavedSightings)) {
-    const unsavedSightings = [...(r.unsavedSightings as { runId: string; runGeneration: number }[])];
-    return { kind: "ledger_unsaved", executorId, connection, reason: r.reason as Refusal, unsavedSightings, retry, withhold: executorId };
+}
+
+// 장부가 약속한 항목의 꼴(ledger.ts의 LostRun·DeferredLoss·{ runId, runGeneration })만 받는다. 칸 수까지 맞아야 하고 필드별 사본을 낸다.
+function items<T>(value: unknown, read: (item: Record<string, unknown>) => T | null): T[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: T[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) return null;
+    const copy = read(item as Record<string, unknown>);
+    if (copy === null) return null;
+    out.push(copy);
   }
-  return malformed;
+  return out;
+}
+
+function runRef(item: Record<string, unknown>): { runId: string; runGeneration: number } | null {
+  if (Object.keys(item).length !== 2 || !isRunId(item.runId) || !isGeneration(item.runGeneration)) return null;
+  return { runId: item.runId, runGeneration: item.runGeneration };
+}
+
+function lostRun(item: Record<string, unknown>): LostRun | null {
+  if (Object.keys(item).length !== 4 || !isRunId(item.runId) || !isGeneration(item.runGeneration) || !isLedgerState(item.before) || !isLedgerState(item.after)) return null;
+  return { runId: item.runId, runGeneration: item.runGeneration, before: item.before, after: item.after };
+}
+
+const DEFER_WHY: readonly unknown[] = ["start_may_arrive", "answer_time_unknown"] satisfies DeferredLoss["why"][];
+
+function deferredLoss(item: Record<string, unknown>): DeferredLoss | null {
+  if (Object.keys(item).length !== 4 || !isRunId(item.runId) || !isGeneration(item.runGeneration) || !isLedgerState(item.state) || !DEFER_WHY.includes(item.why)) return null;
+  return { runId: item.runId, runGeneration: item.runGeneration, state: item.state, why: item.why as DeferredLoss["why"] };
+}
+
+function isRunId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+// 계약의 실행 세대는 1 이상이다.
+function isGeneration(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1;
+}
+
+function isLedgerState(value: unknown): value is LedgerRunState {
+  return (LEDGER_RUN_STATES as readonly unknown[]).includes(value);
 }
 
 function issue(answer: HelloRetry): HelloRetry {
@@ -225,6 +281,7 @@ function frozenRuns(runs: readonly RunStatus[]): readonly RunStatus[] {
   return Object.freeze(runs.map((run) => Object.freeze({ run_id: run.run_id, state: run.state, run_generation: run.run_generation, last_receipt_id: run.last_receipt_id }) as RunStatus));
 }
 
+// 계약의 머리 시각과 장부의 시각은 1 이상이다. 0을 장부에 넘기면 입력 거절(input_rejected)이 되어 정상 인사가 재시도 없는 실패로 보인다.
 function isTime(value: unknown): value is number {
-  return Number.isSafeInteger(value) && (value as number) >= 0;
+  return Number.isSafeInteger(value) && (value as number) >= 1;
 }
