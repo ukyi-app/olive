@@ -100,7 +100,8 @@ export type NotSentReason =
 
 export type StartOutcome =
   | { readonly runId: string; readonly outcome: "sent"; readonly requestId: string; readonly issuedAt: number; readonly executorId: string }
-  // 장부에는 시작(preparing, task_start 지시)이 적혔고 지시는 나가지 않았다. 다시 보내는 쪽(뒤 조각)이 쓸 식별값을 싣는다.
+  // 장부에는 시작(preparing, task_start 지시)이 적혔고 전송 성공은 확인하지 못했다. 연결에 실렸는지는 delivery로 읽는다.
+  // 다시 보내는 쪽(뒤 조각)이 쓸 식별값을 싣는다.
   // issuedAt·executorId는 장부의 답에서 읽지 못했으면 null이다.
   | {
       readonly runId: string;
@@ -120,7 +121,8 @@ export type StartOutcome =
   // 세션 후보. 세션 시작은 장부가 닫아 두었고(session_start_closed) 이 조각이 내지 않는다.
   | { readonly runId: string; readonly outcome: "not_worker" };
 
-// 박자가 멈춘 자리: 결과를 내지 못한 첫 항목(시작 후보의 실행, 또는 대기 부탁).
+// 박자가 멈춘 자리: 보통 결과를 내지 못한 첫 항목(시작 후보의 실행, 또는 대기 부탁).
+// 멈춘 대기 부탁의 ref를 읽지 못하면(ref getter, 목록의 빈 원소) 앞서 결과를 낸 항목이나 null로 남는다.
 export type HaltedAt = { readonly step: "start"; readonly runId: string } | { readonly step: "assign"; readonly ref: string };
 
 export type TickResult =
@@ -132,7 +134,9 @@ export type TickResult =
       readonly requests: readonly RequestOutcome[];
       // 남은 일을 하지 않고 멈춘 이유. intake_closed는 박자 중에 접수가 닫혀 남은 쓰기를 부르지 않은 것이고,
       // threw는 항목을 처리하다 예상하지 못한 예외가 난 것이다. 목록에는 그 전까지 한 것이 모두 있다.
-      // 멈춘 자리의 항목은 목록에 없다. threw이면 그 항목에 장부 쓰기가 있었는지 이 값으로는 모른다.
+      // 멈춘 자리의 항목은 목록에 없다. threw이면 그 항목에 장부 쓰기가 있었는지 이 값으로는 모르고, haltedAt이 앞 항목을
+      // 가리킬 수 있으므로 부르는 쪽은 결과 목록에 없는 대기 부탁·실행 전체를 장부에서 다시 읽는다.
+      // kind와 빈 두 목록은 정상 유휴 박자와 같으므로 완료 여부는 이 값으로 가른다.
       readonly halted: "intake_closed" | "threw" | null;
       readonly haltedAt: HaltedAt | null;
     };
@@ -210,6 +214,8 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
 
   // 대기 실행의 시작 불가 사유는 queueView만 준다. 대기 실행의 사유는 명시적 null이거나 장부가 정한 이름이어야 한다.
   // 두 읽기가 어긋나 줄이 없거나, 칸이 빠졌거나(undefined) 다른 값이면 null(막지 않음)로 읽지 않고 모름이다.
+  // 검사는 행마다 본 범위다: 같은 실행의 행이 여럿이면 Map에 마지막 행만 남아 앞 행의 틀린 사유가 가려진다(실제 장부는 한 실행에 한 행).
+  // 이 해석은 try 밖이라 행의 칸 getter나 배열의 빈 원소가 던지면 박자가 예외로 끝난다(아직 쓰기 전이다).
   const bars = new Map((queue.runs as Record<string, unknown>[]).map((r) => [r.runId, r.startBar]));
   const view: SchedulerRun[] = [];
   for (const run of runs) {
@@ -256,7 +262,7 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
   const requests: RequestOutcome[] = [];
   let at: HaltedAt | null = null;
   const halt = (halted: "intake_closed" | "threw"): TickResult => ({ kind: "ran", starts, requests, halted, haltedAt: at });
-  // 쓰기가 시작된 뒤에는 예외를 박자 밖으로 내지 않는다. 내면 이미 장부에 적은 시작(recorded_not_sent·sent)과 이은 부탁의 결과를
+  // 시작·잇기에 들어선 뒤에는(따라서 장부에 쓰기가 한 번이라도 성공한 뒤에는) 예외를 박자 밖으로 내지 않는다. 내면 이미 장부에 적은 시작(recorded_not_sent·sent)과 이은 부탁의 결과를
   // 부르는 쪽이 잃고, 그 실행은 아무도 모르는 채 자리를 쥔다. 포트의 예외는 항목 안에서 구별된 결과가 되고, 이 catch는 그 밖의 예외를 받는다.
   try {
     // 시작을 먼저 한다: 판단은 박자 처음의 읽기로 했으므로, 잇기의 비동기 포트를 기다리는 동안 그 판단과 봉투의 시각이 낡지 않게 한다.
@@ -357,7 +363,8 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
   if (!isObject(answer) || (answer.ok !== true && answer.ok !== false)) return { runId, outcome: "start_failed", failure: "malformed_answer" };
   if (answer.ok === false) return isRefusal(answer.reason) ? { runId, outcome: "start_refused", reason: answer.reason } : { runId, outcome: "start_failed", failure: "malformed_answer" };
 
-  // 여기부터 장부에는 시작이 적혔다. 어느 실패든 그 실행을 그대로 두고 식별값을 낸다(새 실행 ID·요청 ID로 다시 만들지 않는다).
+  // 여기부터 장부에는 시작이 적혔다. 실패는 그 실행을 그대로 두고 식별값을 낸다(새 실행 ID·요청 ID로 다시 만들지 않는다).
+  // 다만 아래에서 결과를 만들기 전에 성공 답의 칸을 읽다 던지면 박자의 catch로 가서 halted "threw", haltedAt이 이 실행이다.
   const run = answer.run;
   const issuedAt = isTime(answer.issuedAt) ? answer.issuedAt : null;
   const executorId = isObject(run) && typeof run.executorId === "string" ? run.executorId : null;
