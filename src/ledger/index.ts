@@ -16,6 +16,7 @@ export {
   type InstructionRebuild,
   type InstructionTimes,
   type Ledger,
+  type LostRun,
   openLedger,
   type OpenOptions,
   type OpenResult,
