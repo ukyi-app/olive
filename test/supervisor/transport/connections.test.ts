@@ -454,8 +454,23 @@ describe("hello 누락 때 full 행 0", () => {
   test("hello는 full 행 하나다: 빈 목록은 쥔 것이 없다는 답이다", async () => {
     const w = new World();
     const id = await w.greet(READER, K1, R1, T);
-    expect(w.all.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "full", runs: [] } }]);
+    expect(w.all.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "full", runs: [] }, issuedAt: T + 1 }]);
     expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [] }]);
+  });
+
+  test("full 출력과 인사는 받은 시각이 아니라 실행기가 서명한 issued_at을 싣는다. partial과 occupancy(source)에는 칸이 없다", async () => {
+    const w = new World();
+    const { id } = await w.sync(READER, K1, R1, T);
+    // 실행기 시계가 감독보다 늦어 서명 시각이 받은 시각보다 이르다.
+    const out = await w.receive(id, hello(K1, R1, 0, T - 700, [running]), T + 300);
+    expect(out.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "full", runs: [running] }, issuedAt: T - 700 }]);
+    expect(w.table.get(id)!.greeting).toEqual({ at: T + 300, issued_at: T - 700, profile_revision: "profile-1", policy_revision: "policy-1", runs: [running] });
+    const report = await w.receive(id, statusReport(K1, R1, 0, T + 400, [running]), T + 500);
+    const partial = report.find((o) => o.kind === "occupancy");
+    expect(partial).toEqual({ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "partial", runs: [running] } });
+    expect(Object.hasOwn(partial!, "issuedAt")).toBe(false);
+    expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
+    expect(Object.keys(w.table.occupancy(w.stop)[0]!)).toEqual(["executorId", "coverage", "runs"]);
   });
 
   test("status_report는 partial이고 full 행을 늘리지 않는다", async () => {
