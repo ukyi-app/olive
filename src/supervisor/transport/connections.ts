@@ -23,6 +23,8 @@
 // 실행기 → 감독 봉투가 내는 것(맞춤에 답한 복원기가 지금의 복원기이며 그 세대를 아는 연결에서만. 아니면 닫거나 버린다):
 //   hello          answered → greeted. 맞춤에 답한 단계에서 받는 첫 인사이고, 그 밖의 단계에서 오면 out_of_order로 닫는다.
 //                  occupancy(full) + candidate. full은 이 hello의 runs로만 만든다(occupancy(source)도 같은 값).
+//                  full 출력의 issuedAt은 그 hello 봉투 머리의 issued_at(실행기 시계로 서명한 시각)이다. 받은 시각(Greeting.at)과 다르다.
+//                  occupancy(source)의 행은 복원 포트의 꼴(OccupancyAnswer) 그대로라 서명 시각을 싣지 않는다.
 //   status_report  greeted인 연결에서만. occupancy(partial) + forward(검증된 봉투 그대로). 조회 대조는 forward를 받은
 //                  handleForward가 한다. status_report는 인사의 runs를 바꾸지 않으므로 full 행·candidates·occupancy(source)에 들어가지 않는다.
 //   영수증·보고    greeted인 연결에서만. forward.
@@ -100,7 +102,10 @@ export interface SyncRecord {
 }
 
 export interface Greeting {
+  // 인사를 받은 시각(부르는 쪽이 check에 넘긴 now, 감독 시계).
   readonly at: number;
+  // 인사 봉투 머리의 issued_at. 실행기가 실행 목록과 같은 동기 구간에서 자기 시계로 서명한 시각이라 at과 다르다.
+  readonly issued_at: number;
   readonly profile_revision: string;
   readonly policy_revision: string;
   readonly runs: readonly RunStatus[];
@@ -137,7 +142,8 @@ export type Output =
   // 그 연결을 닫는다. 판단은 이미 그 연결을 closed로 두었다.
   | { readonly kind: "close"; readonly connection: number; readonly reason: CloseReason; readonly reject?: RejectReason }
   // OccupancyPort의 행. full은 이번 복원에서 이 연결이 맞춘 뒤 받은 hello, partial은 status_report다. status_report는 full이 되지 않는다.
-  | { readonly kind: "occupancy"; readonly connection: number; readonly answer: OccupancyAnswer }
+  // issuedAt은 full에만 있다: 그 hello 봉투 머리의 issued_at(실행기 시계)이고 Greeting.issued_at과 같은 값이다. partial에는 칸이 없다.
+  | { readonly kind: "occupancy"; readonly connection: number; readonly answer: OccupancyAnswer; readonly issuedAt?: number }
   // 그 연결이 배정 후보가 됐다(권한 아님).
   | { readonly kind: "candidate"; readonly connection: number; readonly candidate: Candidate }
   // 그 연결이 배정 후보에서 빠졌다. 그 연결의 주체에 대한 사실일 뿐이고 다른 주체·종류의 슬롯이나 실행 상태를 바꾸지 않는다.
@@ -382,7 +388,7 @@ class Draft {
     if (result.action === "hello") {
       // hello는 이 연결에서 답한 세대 그대로여야 한다. 인사한 뒤 새 정지로 오른 세대는 비상 종료로 옮겨 가므로 막지 않는다.
       if (current !== sync.generation) return this.close(conn, "restore_changed");
-      return this.hello(conn, sync, result.body, checked.at, ctx.now);
+      return this.hello(conn, sync, result.body, result.header.issued_at, checked.at, ctx.now);
     }
     if (conn.phase !== "greeted") return this.close(conn, "out_of_order");
     // status_report는 점유 행(partial)과 forward를 함께 낸다. 점유 행에는 in_reply_to가 없어 조회와 대조할 수 없고,
@@ -457,7 +463,7 @@ class Draft {
   }
 
   // 받은 시각과 판단하는 시각이 모두 대기 한도 안이어야 한다(검증이 오래 걸려 한도를 넘긴 것도 늦은 것이다).
-  private hello(conn: ConnectionState, sync: SyncRecord, body: Bodies["hello"], at: number, now: number): void {
+  private hello(conn: ConnectionState, sync: SyncRecord, body: Bodies["hello"], issuedAt: number, at: number, now: number): void {
     if (conn.phase !== "answered") return this.close(conn, "out_of_order");
     // 답을 실은 시각보다 먼저 받은 프레임은 이 연결의 답을 보고 쓴 hello가 아니다. 같은 시각이면 부르는 쪽이 지킨 소켓 사건
     // 순서(reply_sent를 알린 뒤 받은 프레임만 이 단계에서 check에 넘긴다)를 따른다.
@@ -466,12 +472,13 @@ class Draft {
     if (!within(at - sync.receivedAt, limit) || !within(now - sync.receivedAt, limit)) return this.close(conn, "hello_late");
     const greeting: Greeting = Object.freeze({
       at,
+      issued_at: issuedAt,
       profile_revision: body.profile_revision,
       policy_revision: body.policy_revision,
       runs: frozenRuns(body.runs),
     });
     const next = this.put(conn, { phase: "greeted", greeting });
-    this.outputs.push({ kind: "occupancy", connection: conn.id, answer: fullAnswer(next) });
+    this.outputs.push({ kind: "occupancy", connection: conn.id, answer: fullAnswer(next), issuedAt: greeting.issued_at });
     this.outputs.push({ kind: "candidate", connection: conn.id, candidate: candidateOf(next) });
   }
 
