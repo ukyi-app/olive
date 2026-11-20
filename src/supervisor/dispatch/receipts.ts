@@ -4,9 +4,10 @@
 //
 // 지키는 것:
 // 1. 장부에 넘기는 from(낸 쪽, 실행 세대)은 검증된 봉투의 머리에서만 만든다. 본문의 값으로 대신하지 않는다.
-//    지정 실행기·세대의 대조는 장부가 한다(이 모듈은 그 검사를 복사하지 않는다).
+//    낸 쪽·세대의 대조는 장부가 한다(이 모듈은 그 검사를 복사하지 않는다). 일반 영수증·보고는 그 실행의 지정 실행기만,
+//    세션 인수 영수증은 앞 세션 또는 대기 중인 세션 실행의 지정 실행기도 낼 수 있다(인수의 ack는 증거 저장의 확인일 뿐이다).
 // 2. 장부가 ok를 돌려준 것에만, 장부가 돌려준 id로 ack 초안을 만든다. 거절·예외·꼴이 틀린 답이면 ack가 없어 실행기가 다시 보낸다.
-//    장부가 duplicate를 돌려주면(이미 반영함) ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다.
+//    장부가 duplicate를 돌려주면(이미 반영함) 정지 세대를 알고 초안 생성에 성공할 때 ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다.
 // 3. status_report는 감독이 낸 조회의 답이고 그 조회를 받은 실행기가 보냈을 때만 받는다. 운영 중에 그 답을 장부에 적는
 //    공개 연산이 장부에 없어 대조까지만 하고 status_matched(장부 반영 없음)를 낸다.
 // 4. 결과 보고(report_result)는 결과 보관(S6) 전에는 받지 않는다. 장부에 넘기지 않고 ack도 만들지 않는다.
@@ -92,7 +93,7 @@ export const STATUS_UNMATCHED_REASONS = [
 ] as const;
 export type StatusUnmatchedReason = (typeof STATUS_UNMATCHED_REASONS)[number];
 
-// ack 초안을 만들지 못한 이유. 장부는 이미 받았으므로 실행기가 다시 보내면 duplicate로 ack를 다시 만든다.
+// ack 초안을 만들지 못한 이유. 장부는 이미 받았으므로 실행기가 다시 보내면 duplicate가 되고, 그때 정지 세대를 알고 초안 생성에 성공하면 ack한다.
 export type AckUnavailable = DraftRefusalReason | "stop_generation_unknown" | "draft_threw";
 
 export type ReceiptOutcome =
