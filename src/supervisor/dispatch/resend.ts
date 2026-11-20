@@ -11,10 +11,15 @@
 //    작업 기한의 여유는 봉할 때(sealDraft)와 실제로 싣는 순간의 내보내기 포트가 보고, 싣는 순간의 시작 한도도 그 포트가 지킨다.
 //    항목의 정지 세대가 장부의 지금 세대와 다르거나, 연결이 지시를 낼 수 없거나, 읽기가 모름이면 봉하지 않는다.
 // 3. 두드리지 않는다. 같은 요청 ID는 max(항목의 발행 시각, 부르는 쪽이 넘긴 마지막 송신 시각)부터 정책의 간격이 지나야 다시 낸다.
-//    마지막 송신 시각은 결과의 at(내보내기 포트가 돌아온 뒤 읽은 시각)이다. 전달이 모름(포트가 던짐)일 때 이 값이 실은 시각의 상한인 것은
-//    내보내기 포트가 돌아오기 전에 맡은 쓰기를 끝냈거나 거둔 경우뿐이다(InstructionSink를 조립할 때의 조건).
+//    마지막 송신 시각은 결과의 at(내보내기 포트가 돌아온 뒤 읽은 시각)이다. 전달이 모름(포트가 던지거나 정의 밖의 값을 돌려줌)일 때
+//    이 값이 실은 시각의 상한인 것은 내보내기 포트가 전달을 확정할 수 없는 모든 끝(예외, 정의 밖의 반환값)에서 맡은 쓰기를
+//    이미 끝냈거나 거둔 경우뿐이다(InstructionSink를 조립할 때의 조건).
 // 4. 한 항목의 실패는 그 항목의 결과이고 다음 항목을 본다. 항목 안에서 ports.ledger·ports.intake·ports.links의 접근이 던지면
-//    그때까지의 결과와 함께 halted다. 그 밖의 포트(시계·난수·서명·내보내기)를 얻다 던지면 그 항목의 실패 결과다.
+//    그때까지의 결과와 함께 halted다. 그 밖의 포트(시계·난수·서명·내보내기)를 얻다 던지면 halted가 아니고, 결과는 단계에 따라 다르다.
+//    난수·서명은 not_sealed(seal_threw)다. 시계는 내보내기 포트를 부르기 전이면 withheld(clock_unavailable)이고, 포트가 돌아온 뒤면
+//    결과는 포트의 답대로(실었으면 resent)이며 at은 그 봉투의 시한이다(부르는 쪽은 그 at을 기억한다). 내보내기 포트를 얻다 던지면
+//    not_sent(sink_unavailable)이지만, 시작은 그 뒤의 마지막 시계 읽기가 먼저라 한도를 넘었으면 start_expired, 그 시계까지 던지면
+//    withheld(clock_unavailable)다.
 import { ACTION_SPECS, type Envelope, limits } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger, type Restorer, type UnansweredInstruction } from "../../ledger/index.ts";
 import { type Drafted, type DraftAction, finalizeDraft, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, stopDraft } from "./envelopes.ts";
