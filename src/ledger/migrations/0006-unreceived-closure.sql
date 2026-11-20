@@ -15,7 +15,8 @@
 -- 기존 표의 NULL 허용 칸과 비교하는 곳(instructions.budget_left: 판 4 전에 적힌 시작 지시는 NULL)은 IS NOT으로 비교해 NULL을 다름으로 읽는다.
 --
 -- 다음 판이 바꿀 수 있는 것(이 저장소의 Bun 1.4.4가 묶은 SQLite 3.53.4에서 돌려 본 것): 트리거는 DROP·CREATE로 다시 만든다. 칸은
--- ALTER TABLE ADD COLUMN으로 더한다(0002·0004가 그렇게 했다. NOT NULL 칸은 기본값이 있어야 더해지고 기존 줄은 그 기본값이 된다).
+-- ALTER TABLE ADD COLUMN으로 더한다(0002·0004가 그렇게 했다). 기존 줄이 있는 표에 일반 NOT NULL 칸을 더하려면 NULL이 아닌 기본값이
+-- 필요하고 기존 줄은 그 기본값이 된다. 빈 표에는 기본값 없이도 더해지고, 그 뒤 그 칸의 값을 빼고 넣는 INSERT는 거절된다.
 -- 있는 칸의 NOT NULL은 ALTER COLUMN의 SET NOT NULL·DROP NOT NULL로 넣고 뺀다(NULL인 줄이 있으면 SET은 실패한다).
 -- 바꿀 수 없는 것: 칸에 이름 없이 단 CHECK는 빼거나 넓히지 못한다(DROP CONSTRAINT는 이름 붙은 제약만 받고, 더 넓은 CHECK를 더해도
 -- 옛 CHECK가 그대로 막는다). 기본 키를 더하는 ADD PRIMARY KEY는 구문 오류다. 그래서 늘어날 수 있는 집합(닫을 수 있는 앞 상태)은

@@ -40,14 +40,14 @@
 
 ## 표
 
-`instructions.lease_until`은 `0002-renew-lease-end`, `tool_requests`는 `0003-tool-requests`, `run_sightings`는 `0005-run-sightings`, `start_dispatches`·`starts_before_closure`·`snapshot_run_bounds`·`unreceived_closures`는 `0006-unreceived-closure`이고 나머지는 모두 `0001-core`다(`instructions`의 본문 칸 다섯은 `0004`).
+`instructions.lease_until`은 `0002-renew-lease-end`, `tool_requests`는 `0003-tool-requests`, `run_sightings`는 `0005-run-sightings`, `start_dispatches`·`starts_before_closure`·`snapshots_before_closure`·`snapshot_run_bounds`·`unreceived_closures` 다섯은 판 6(`0006-unreceived-closure`)에서 처음 생기고 나머지는 모두 `0001-core`다(`instructions`의 본문 칸 다섯은 `0004`).
 
 | 묶음 | 표 | 요지 |
 |---|---|---|
 | 정지·일시 중지 | `stop_state`, `diagnosis_pause` | 정지 세대(0 포함, 줄이 없으면 아직 적지 않음), 정지 여부, 확인 단계, 진단 일시 중지의 끝 |
 | 실행·슬롯·예산 | `runs`, `run_epoch`, `run_transitions`, `instructions`, `slot_holds` | 실행 ID·세대·역할·revision 둘·snapshot·실행기·자격 네 칸·기한·남은 예산·상태·영수증 id들. 낸 지시(v1 여섯, 적은 뒤 불변)와 갱신 지시가 발급한 임대 끝("스케줄러가 쓰는 읽기"의 "발급한 갱신의 끝"), 지시 본문을 다시 만들 칸("답을 받지 못한 지시"). 점유가 맞지 않은 관측: (실행기, 실행, 세대)마다 한 줄이고 관측 번호를 가진다. 줄이 있으면 그 실행 ID를 영영 시작하지 않고, `holds_slot`이면 그 종류의 슬롯도 막는다 |
 | 양성 관측 | `run_sightings` | 실행기가 그 실행을 안다고(`not_known` 밖으로) 답한 첫 관측. (실행, 실행기, 세대)마다 한 줄이고 그 셋은 실행 줄의 실행·지정 실행기·실행 세대와 같아야 한다. 답한 상태, 답의 시각(실행기 시계, 복원 경로는 없음), 받은 시각, `full`·`partial`. 지우거나 고치거나 덮지 않는다 |
-| 송신 표식·닫기 근거 | `start_dispatches`, `starts_before_closure`, `snapshot_run_bounds`, `unreceived_closures` | 시작 봉투를 실었을 수 있는 장부 열기: (실행, 열기 ID)마다 한 줄, 그 실행의 시작 지시의 요청 ID와 적은 시각. 판 6을 적용할 때 이미 있던 시작 지시: (실행, 요청 ID)마다 한 줄, 판의 트랜잭션에서만 들어간다. 사본의 경계: 사본 기록마다 한 줄, 사본을 봉할 때의 `runs.queue_seq` 최댓값. D-90으로 닫은 실행의 근거: 실행마다 한 줄, 앞 상태, 그 실행을 싣지 않은 전체 답의 낸 쪽·서명 시각(실행기 시계)·받은 시각, 닫은 열기 ID, 닫은 시각. 넷 다 지우거나 고치지 않는다 |
+| 송신 표식·닫기 근거 | `start_dispatches`, `starts_before_closure`, `snapshots_before_closure`, `snapshot_run_bounds`, `unreceived_closures` | 시작 봉투를 실었을 수 있는 장부 열기: (실행, 열기 ID)마다 한 줄, 그 실행의 시작 지시의 요청 ID와 적은 시각. 판 6을 적용할 때 이미 있던 시작 지시: (실행, 요청 ID)마다 한 줄, 판의 트랜잭션에서만 들어간다. 판 6을 적용할 때 이미 있던 사본 기록(경계를 모르는 사본): 사본 기록마다 한 줄, 판의 트랜잭션에서만 들어간다. 사본의 경계: 판 6에서 봉한 사본 기록마다 한 줄, 사본을 봉할 때의 `runs.queue_seq` 최댓값. D-90으로 닫은 실행의 근거: 실행마다 한 줄, 앞 상태, 그 실행을 싣지 않은 전체 답의 낸 쪽·서명 시각(실행기 시계)·받은 시각, 닫은 열기 ID, 닫은 시각. 다섯 다 지우거나 고치지 않는다 |
 | 입력·대기열 | `inputs` | 요청 ID, 인증된 출처, 원문 참조(`<저장소>/<UUID>`)와 만료, 순번, 취소 |
 | 작업 부탁 | `tool_requests` | 오케스트레이터의 `start_worker` 부탁: 참조(UUID), 소유자(논리 요청, `inputs`의 외래 키), 재시도 키(`dedupe_key`), 역할·목적 분류·원본 참조·입력 digest, 기록한 세션·호출 ID, 단계(`waiting_assignment`·`not_started`), 이은 실행(`run_id`, 배정 전에는 비어 있음), 기록·취소 시각과 취소한 세션·호출 ID. (소유자, 재시도 키)마다 한 줄 |
 | 영수증·보고 | `deliveries`, `receipt_conflicts`, `report_signals` | 받은 id와 본문 digest, 속한 실행(외래 키), 가리킨 지시, 결과 보고의 저장 자리·digest·반영 시각. 같은 id에 다른 digest의 기록(같은 충돌은 한 줄). 훅·세션 깨짐 보고의 구조화 칸(사건 종류, `session_id`, 턴 ID, 오류 종류, 원인, 표식 digest, 관측 시각) |

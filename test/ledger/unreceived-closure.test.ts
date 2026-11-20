@@ -380,6 +380,19 @@ test("사본 시각의 같은 밀리초: 시계가 뒤로 가지 않아도 사�
   expect(run(later.copy, createdTied).state).toBe("preparing");
   later.copy.close();
   expect(() => rawWrite(later.copyPath, RAW_CLOSURE, createdTied, WORKER_EXECUTOR, SHUT + 2)).toThrow("unreceived_closure_unproven");
+
+  // 발행만 사본 시각과 같다: 부르는 쪽이 넘긴 생성 시각은 2ms 뒤이고, 장부 시계(NOW)가 적은 발행 시각만 사본 시각과 같다.
+  const issued = restored(clock);
+  const issuedTied = must(issued.copy.admitRun(worker({ now: NOW + 2 }))).run.runId;
+  must(issued.copy.startRun({ runId: issuedTied, requestId: id(), stopGeneration: 0, now: NOW + 2 }));
+  expect(close(issued.copy, issuedTied, { answeredAt: SHUT + 2 })).toEqual({ ok: false, reason: "created_before_snapshot" });
+  expect(run(issued.copy, issuedTied).state).toBe("preparing");
+  expect(slotFree(issued.copy)).toBe(false);
+  issued.copy.close();
+  expect(rows(issued.copyPath, "SELECT r.queue_seq, r.created_at, i.issued_at FROM runs r JOIN instructions i ON i.run_id = r.run_id AND i.action = 'task_start' WHERE r.run_id = ?", issuedTied)).toEqual([
+    { queue_seq: 2, created_at: NOW + 2, issued_at: NOW },
+  ]);
+  expect(() => rawWrite(issued.copyPath, RAW_CLOSURE, issuedTied, WORKER_EXECUTOR, SHUT + 2)).toThrow("unreceived_closure_unproven");
 });
 
 test("사본의 경계: 경계가 없는 사본 기록(판 6 전에 만든 사본)이 있는 장부에서는 사본 뒤에 만든 실행도 닫지 않는다(코드와 트리거)", () => {
