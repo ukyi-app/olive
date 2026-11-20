@@ -12,6 +12,7 @@ import {
   type ReplyTools,
   type StopGenerationSource,
 } from "../../../src/supervisor/transport/connections.ts";
+import { handleForward, type ReceiptPorts } from "../../../src/supervisor/dispatch/receipts.ts";
 import { type AssignmentContext, eligibleConnections } from "../../../src/supervisor/roles/assign.ts";
 import { type ExecutorPeer, type RegistrySettings, RegistryState } from "../../../src/supervisor/transport/registry.ts";
 
@@ -119,9 +120,9 @@ function hello(keys: Keys, sender: string, generation: number, at: number, runs:
     keys.privateKey,
   );
 }
-function statusReport(keys: Keys, sender: string, generation: number, at: number, runs: RunStatus[]): Envelope {
+function statusReport(keys: Keys, sender: string, generation: number, at: number, runs: RunStatus[], inReplyTo = uuid()): Envelope {
   return sealEnvelope(
-    { sender, recipient: "supervisor", action: "status_report", request_id: uuid(), stop_generation: generation, run_generation: 0, issued_at: at, nonce: hex32(), body: { in_reply_to: uuid(), runs } },
+    { sender, recipient: "supervisor", action: "status_report", request_id: uuid(), stop_generation: generation, run_generation: 0, issued_at: at, nonce: hex32(), body: { in_reply_to: inReplyTo, runs } },
     keys.privateKey,
   );
 }
@@ -461,7 +462,8 @@ describe("hello 누락 때 full 행 0", () => {
     const w = new World();
     const id = await w.greet(READER, K1, R1, T, [running]);
     const out = await w.receive(id, statusReport(K1, R1, 0, T + 2, [running]), T + 2);
-    expect(out).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "partial", runs: [running] } }]);
+    expect(out.filter((o) => o.kind !== "forward")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "partial", runs: [running] } }]);
+    expect(kinds(out)).toEqual(["occupancy", "forward"]);
     expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
   });
 
@@ -667,6 +669,112 @@ describe("등록표 교체 뒤의 무효", () => {
     w.registry = applyDoc(w.registry, 2, ROWS);
     expect(w.step({ kind: "registry" }, T + 5)).toEqual([]);
     expect(w.table.candidates(w.stop)).toHaveLength(1);
+  });
+});
+
+describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도 나간다", () => {
+  // 상태 보고는 장부를 부르지 않아야 한다. 불리면 시험이 드러나도록 기록한다.
+  const ledgerCalls: string[] = [];
+  const ports: ReceiptPorts = {
+    ledger: {
+      applyReceipt: () => {
+        ledgerCalls.push("applyReceipt");
+        throw new Error("상태 보고가 장부를 불렀다");
+      },
+      recordReport: () => {
+        ledgerCalls.push("recordReport");
+        throw new Error("상태 보고가 장부를 불렀다");
+      },
+    },
+    random: { bytes: (length) => new Uint8Array(length) },
+  };
+  const forwardOf = (outputs: Output[]) => {
+    const found = outputs.filter((o) => o.kind === "forward");
+    expect(found).toHaveLength(1);
+    const forward = found[0]!;
+    if (forward.kind !== "forward") throw new Error("forward가 아니다");
+    return forward;
+  };
+
+  test("인사한 연결의 status_report는 점유 행 뒤에 forward로도 나가고, 그 꼴로 기다리는 조회와 대조된다", async () => {
+    const w = new World();
+    const id = await w.greet(READER, K1, R1, T, [running]);
+    const query = uuid();
+    const out = await w.receive(id, statusReport(K1, R1, 0, T + 2, [running], query), T + 2);
+    expect(kinds(out)).toEqual(["occupancy", "forward"]);
+    const forward = forwardOf(out);
+    expect(forward.connection).toBe(id);
+    if (!forward.verified.ok || forward.verified.action !== "status_report") throw new Error("검증된 status_report가 아니다");
+    expect([forward.verified.header.sender, forward.verified.header.run_generation, forward.verified.header.stop_generation]).toEqual([R1, 0, 0]);
+    expect(forward.verified.body).toEqual({ in_reply_to: query, runs: [running] });
+
+    const pending = [{ requestId: query, recipient: R1, runIds: [RUN] }];
+    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: pending }, ports)).toEqual({
+      outcome: "status_matched",
+      queryRequestId: query,
+      executor: R1,
+      runs: [running],
+      ledger: "not_reflected",
+    });
+    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: [] }, ports)).toEqual({ outcome: "status_unmatched", reason: "unknown_query" });
+    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: [{ ...pending[0]!, requestId: uuid() }] }, ports)).toEqual({
+      outcome: "status_unmatched",
+      reason: "unknown_query",
+    });
+    expect(ledgerCalls).toEqual([]);
+  });
+
+  test("status_report는 full 행·후보·인사의 실행 목록을 바꾸지 않는다", async () => {
+    const w = new World();
+    const id = await w.greet(READER, K1, R1, T, [running]);
+    const before = { candidates: w.table.candidates(w.stop), occupancy: w.table.occupancy(w.stop), greeting: w.table.get(id)!.greeting };
+    const gone: RunStatus = { run_id: RUN, state: "not_known", run_generation: null, last_receipt_id: null };
+    const out = await w.receive(id, statusReport(K1, R1, 0, T + 2, [gone]), T + 2);
+    expect(out.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "partial", runs: [gone] } }]);
+    expect(w.table.occupancy(w.stop)).toEqual(before.occupancy);
+    expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
+    expect(w.table.candidates(w.stop)).toEqual(before.candidates);
+    expect(w.table.get(id)!.greeting).toBe(before.greeting);
+  });
+
+  test("맞춤·인사 전 연결의 status_report는 검증 없이 닫고 넘기지 않는다", async () => {
+    const w = new World();
+    const fresh = w.open(READER, T);
+    expect(await w.receive(fresh, statusReport(K1, R1, 0, T, [running]), T)).toEqual([{ kind: "close", connection: fresh, reason: "out_of_order" }]);
+    const { id: synced } = await w.sync(READER, K2, R2, T);
+    expect(await w.receive(synced, statusReport(K2, R2, 0, T + 1, [running]), T + 1)).toEqual([{ kind: "close", connection: synced, reason: "out_of_order" }]);
+    expect(w.nonces.size()).toBe(1);
+    expect(w.all.filter((o) => o.kind === "forward" || o.kind === "occupancy")).toEqual([]);
+  });
+
+  test("옛 복원에서 인사한 연결의 status_report는 닫고 넘기지 않는다", async () => {
+    const w = new World();
+    const id = await w.greet(READER, K1, R1, T, [running]);
+    w.stop = restorer(0);
+    expect(await w.receive(id, statusReport(K1, R1, 0, T + 2, [running]), T + 2)).toEqual([
+      { kind: "withdrawn", connection: id, principal: R1 },
+      { kind: "close", connection: id, reason: "restore_changed" },
+    ]);
+  });
+
+  test("닫는 중·닫힌 연결과 밀려난 연결의 status_report는 버린다", async () => {
+    const w = new World();
+    const a = await w.greet(READER, K1, R1, T, [running]);
+    // 검증하는 사이에 그 연결이 닫혔다(세대를 모르게 되어 tick이 닫음). 늦게 끝난 검증 결과는 버린다.
+    const late = await w.check(a, statusReport(K1, R1, 0, T + 2, [running]), T + 2);
+    w.stop.generation = null;
+    expect(kinds(w.step({ kind: "tick" }, T + 2))).toEqual(["withdrawn", "close"]);
+    w.stop.generation = 0;
+    expect(w.step({ kind: "envelope", checked: late }, T + 2)).toEqual([]);
+    expect(await w.receive(a, statusReport(K1, R1, 0, T + 3, [running]), T + 3)).toEqual([]);
+
+    // 같은 주체의 나중 연결이 맞추면 앞 연결은 밀려난다. 앞 연결에서 온 보고는 버린다.
+    const w2 = new World();
+    const old = await w2.greet(READER, K1, R1, T, [running]);
+    const now = await w2.greet(READER, K1, R1, T + 2, [running]);
+    expect(closes(w2.all)).toEqual([[old, "superseded", null]]);
+    expect(await w2.receive(old, statusReport(K1, R1, 0, T + 4, [running]), T + 4)).toEqual([]);
+    expect(kinds(await w2.receive(now, statusReport(K1, R1, 0, T + 5, [running]), T + 5))).toEqual(["occupancy", "forward"]);
   });
 });
 

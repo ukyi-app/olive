@@ -19,6 +19,16 @@
 //
 // 맞춤과 hello는 권한이 아니다. 낼 것(Output)에는 접수 열기·자격·실행 허가·슬롯 해제가 없다. greeted는 배정 후보라는 표시까지이고,
 // 배정은 roles/assign.ts의 판단(두 revision 대조 포함)과 장부의 시작 트랜잭션을 따로 지나야 한다.
+//
+// 실행기 → 감독 봉투가 내는 것(맞춤에 답한 복원기가 지금의 복원기이며 그 세대를 아는 연결에서만. 아니면 닫거나 버린다):
+//   hello          answered → greeted. 맞춤에 답한 단계에서 받는 첫 인사이고, 그 밖의 단계에서 오면 out_of_order로 닫는다.
+//                  occupancy(full) + candidate. full은 이 hello의 runs로만 만든다(occupancy(source)도 같은 값).
+//   status_report  greeted인 연결에서만. occupancy(partial) + forward(검증된 봉투 그대로). 조회 대조는 forward를 받은
+//                  handleForward가 한다. status_report는 인사의 runs를 바꾸지 않으므로 full 행·candidates·occupancy(source)에 들어가지 않는다.
+//   영수증·보고    greeted인 연결에서만. forward.
+// 인정되지 않은 연결의 status_report는 새 출력이 없다: 맞춤·인사 전은 검증 없이 out_of_order로 닫고, 옛 복원기로 맞춘 연결은
+// restore_changed로 닫고, 닫혔거나(닫는 중 포함) 지운 연결·밀려난 연결의 것은 버린다.
+// 맞춤 요청은 작업자 실행기 주체만 받는다(syncRequest). 세션 실행기의 영수증·보고·status_report는 지금 이 판단을 지나 forward로 오지 않는다.
 import { type Bodies, type Envelope, limits, type NonceStore, parsePrincipal, type Principal, RECEIPTS, type RejectReason, REPORTS, type Role, type RunStatus, type SealInput, type Verified, verifyEnvelope } from "../../contract/v1/index.ts";
 import type { OccupancyAnswer, Restorer } from "../../ledger/index.ts";
 import type { ExecutorPeer, RegistryState } from "./registry.ts";
@@ -126,13 +136,14 @@ export type Output =
   | { readonly kind: "send_reply"; readonly connection: number; readonly envelope: Envelope; readonly deadline: number }
   // 그 연결을 닫는다. 판단은 이미 그 연결을 closed로 두었다.
   | { readonly kind: "close"; readonly connection: number; readonly reason: CloseReason; readonly reject?: RejectReason }
-  // OccupancyPort의 행. full은 이번 복원에서 이 연결이 맞춘 뒤 받은 hello, partial은 status_report다.
+  // OccupancyPort의 행. full은 이번 복원에서 이 연결이 맞춘 뒤 받은 hello, partial은 status_report다. status_report는 full이 되지 않는다.
   | { readonly kind: "occupancy"; readonly connection: number; readonly answer: OccupancyAnswer }
   // 그 연결이 배정 후보가 됐다(권한 아님).
   | { readonly kind: "candidate"; readonly connection: number; readonly candidate: Candidate }
   // 그 연결이 배정 후보에서 빠졌다. 그 연결의 주체에 대한 사실일 뿐이고 다른 주체·종류의 슬롯이나 실행 상태를 바꾸지 않는다.
   | { readonly kind: "withdrawn"; readonly connection: number; readonly principal: string }
-  // hello 뒤에 온 검증된 영수증·보고. 내용 처리(장부 반영, ack)는 뒤 조각의 처리기가 한다.
+  // hello 뒤에 온 검증된 영수증·보고·status_report. 내용 처리(장부 반영, ack, 조회 대조)는 dispatch/receipts.ts의 handleForward가 한다.
+  // verified를 그대로 실으므로 머리의 낸 쪽·실행 세대와 본문(status_report의 in_reply_to)이 모두 남는다.
   | { readonly kind: "forward"; readonly connection: number; readonly verified: Verified };
 
 // check의 결과. step에 envelope 사건으로 넘긴다.
@@ -374,9 +385,10 @@ class Draft {
       return this.hello(conn, sync, result.body, checked.at, ctx.now);
     }
     if (conn.phase !== "greeted") return this.close(conn, "out_of_order");
+    // status_report는 점유 행(partial)과 forward를 함께 낸다. 점유 행에는 in_reply_to가 없어 조회와 대조할 수 없고,
+    // forward의 검증된 봉투가 그 대조(receipts.ts의 handleForward)에 닿는 유일한 길이다. 점유 행이 먼저다.
     if (result.action === "status_report") {
       this.outputs.push({ kind: "occupancy", connection: conn.id, answer: { executorId: sync.principal, coverage: "partial", runs: copyRuns(result.body.runs) } });
-      return;
     }
     this.outputs.push({ kind: "forward", connection: conn.id, verified: result });
   }
