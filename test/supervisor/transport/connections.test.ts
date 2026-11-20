@@ -673,17 +673,22 @@ describe("등록표 교체 뒤의 무효", () => {
 });
 
 describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도 나간다", () => {
-  // 상태 보고는 장부를 부르지 않아야 한다. 불리면 시험이 드러나도록 기록한다.
+  // 상태 보고는 영수증·보고 연산을 부르지 않고, 대조된 답만 applyExecutorAnswer에 닿는다. 불린 것을 모두 기록한다.
   const ledgerCalls: string[] = [];
+  const answers: unknown[] = [];
   const ports: ReceiptPorts = {
     ledger: {
       applyReceipt: () => {
         ledgerCalls.push("applyReceipt");
-        throw new Error("상태 보고가 장부를 불렀다");
+        throw new Error("상태 보고가 영수증 연산을 불렀다");
       },
       recordReport: () => {
         ledgerCalls.push("recordReport");
-        throw new Error("상태 보고가 장부를 불렀다");
+        throw new Error("상태 보고가 보고 연산을 불렀다");
+      },
+      applyExecutorAnswer: (input, from) => {
+        answers.push({ input, from });
+        return { ok: true, moved: [], deferred: [], outsideLedger: [] };
       },
     },
     random: { bytes: (length) => new Uint8Array(length) },
@@ -709,18 +714,24 @@ describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도
     expect(forward.verified.body).toEqual({ in_reply_to: query, runs: [running] });
 
     const pending = [{ requestId: query, recipient: R1, runIds: [RUN] }];
-    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: pending }, ports)).toEqual({
+    // 지금 인정된 연결은 이 연결 하나다. now는 봉투의 issued_at(T + 2)과 다르게 둔다(answeredAt이 받은 시각이 아님을 가른다).
+    const links = { current: (connection: number, executor: string) => connection === id && executor === R1 };
+    expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: pending, links, backlog: [] }, ports)).toEqual({
       outcome: "status_matched",
       queryRequestId: query,
       executor: R1,
-      runs: [running],
-      ledger: "not_reflected",
+      connection: id,
+      settled: [{ settled: "applied", answer: { sender: R1, coverage: "partial", runs: [running], answeredAt: T + 2 }, moved: [], deferred: [], outsideLedger: [] }],
+      backlog: [],
     });
-    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: [] }, ports)).toEqual({ outcome: "status_unmatched", reason: "unknown_query" });
-    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: [{ ...pending[0]!, requestId: uuid() }] }, ports)).toEqual({
+    expect(answers).toEqual([{ input: { coverage: "partial", runs: [running], answeredAt: T + 2, now: T + 3 }, from: { sender: R1 } }]);
+    // 맞지 않은 두 답은 장부를 부르지 않는다(applyExecutorAnswer 기록이 늘지 않는다).
+    expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: [], links, backlog: [] }, ports)).toEqual({ outcome: "status_unmatched", reason: "unknown_query" });
+    expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: [{ ...pending[0]!, requestId: uuid() }], links, backlog: [] }, ports)).toEqual({
       outcome: "status_unmatched",
       reason: "unknown_query",
     });
+    expect(answers).toHaveLength(1);
     expect(ledgerCalls).toEqual([]);
   });
 
