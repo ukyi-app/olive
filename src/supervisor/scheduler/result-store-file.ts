@@ -152,6 +152,13 @@ export function createFileResultBackend(options: FileBackendOptions): FileBacken
   if (dirStateOf(files, dir) !== "dir") return { status: "invalid", reason: "not_dir" };
   const at = (name: string) => join(dir, name);
 
+  // 키 연산이 경로를 쓰기 전에 목록과 같은 조건으로 폴더를 본다. 만든 뒤 링크나 파일로 바뀐 자리를 따라가 읽거나 쓰거나 지우지 않는다.
+  // 이미 바뀌어 있는 자리만 거른다. 이 확인과 뒤의 호출 사이의 바꿔치기, 상위 경로의 링크는 막지 못한다(부르는 쪽의 조건).
+  function dirFault(): FileUnknown | null {
+    const state = dirStateOf(files, dir);
+    return state === "dir" ? null : unknown(state);
+  }
+
   // 이름이 없을 때 그것이 "없음"인지 정한다. 폴더가 있고 폴더일 때만 absent다. 볼륨이 빠져 폴더가 사라졌으면 unknown이다.
   function missing(): { readonly status: "absent" } | FileUnknown {
     const state = dirStateOf(files, dir);
@@ -206,6 +213,8 @@ export function createFileResultBackend(options: FileBackendOptions): FileBacken
     if (name === null) return unknown("invalid_key");
     if (!(bytes instanceof Uint8Array)) return unknown("invalid_input");
     if (bytes.length > maxRecordBytes) return unknown("too_large");
+    const fault = dirFault();
+    if (fault !== null) return fault;
     const target = at(name);
     const temp = at(tempNameOf(name));
     let present: FileStat | null;
@@ -285,6 +294,8 @@ export function createFileResultBackend(options: FileBackendOptions): FileBacken
 
   // 키의 파일을 열어 크기를 확인한 뒤 [offset, end)를 읽는다. end는 크기에서 자른다.
   function readSpan(name: string, offset: number, length: number | null): BackendRead | FileUnknown {
+    const fault = dirFault();
+    if (fault !== null) return fault;
     let fd: number;
     try {
       fd = files.open(at(name), READ_FILE);
@@ -335,6 +346,8 @@ export function createFileResultBackend(options: FileBackendOptions): FileBacken
   function has(key: string): ReturnType<FileResultBackend["has"]> {
     const name = nameOf(key);
     if (name === null) return unknown("invalid_key");
+    const fault = dirFault();
+    if (fault !== null) return fault;
     try {
       const found = entry(at(name));
       if (found === null) return missing();
@@ -347,6 +360,8 @@ export function createFileResultBackend(options: FileBackendOptions): FileBacken
   function remove(key: string): ReturnType<FileResultBackend["remove"]> {
     const name = nameOf(key);
     if (name === null) return unknown("invalid_key");
+    const fault = dirFault();
+    if (fault !== null) return fault;
     const path = at(name);
     let removed: boolean;
     try {

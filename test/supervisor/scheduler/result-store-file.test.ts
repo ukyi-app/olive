@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Result, resultDigest } from "../../../src/contract/v1/index.ts";
@@ -497,6 +497,7 @@ describe("보장 2: 없음과 모름을 가른다", () => {
     expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "no_dir" });
     expect(backend.keys("result/")).toEqual({ status: "unknown", reason: "no_dir" });
     expect(backend.putNew(KEY_A, bytesOf("x")).status).toBe("unknown");
+    expect(backend.putNew(KEY_A, bytesOf("x"))).toEqual({ status: "unknown", reason: "no_dir" });
   });
 
   test("만든 뒤 폴더 자리가 파일로 바뀌면 absent가 아니다", () => {
@@ -507,14 +508,54 @@ describe("보장 2: 없음과 모름을 가른다", () => {
     rmSync(notDir, { recursive: true });
     writeFileSync(notDir, "폴더가 아님");
     for (const answer of [backend.read(KEY_A), backend.has(KEY_A), backend.remove(KEY_A), backend.keys("")]) expect(answer.status).toBe("unknown");
+    // 폴더 자리가 폴더가 아니면 모든 연산이 목록과 같은 사유다. 키 연산도 이름을 열기 전에 폴더를 본다.
+    const noDir = { status: "unknown", reason: "no_dir" } as const;
+    expect(backend.read(KEY_A)).toEqual(noDir);
+    expect(backend.readRange(KEY_A, 0, 4)).toEqual(noDir);
+    expect(backend.has(KEY_A)).toEqual(noDir);
+    expect(backend.remove(KEY_A)).toEqual(noDir);
+    expect(backend.keys("")).toEqual(noDir);
+    expect(backend.putNew(KEY_A, bytesOf("x"))).toEqual(noDir);
+    expect(readFileSync(notDir, "utf8")).toBe("폴더가 아님");
   });
+
+  for (const [label, seeded] of [
+    ["기존 키가 있는 폴더", true],
+    ["빈 폴더", false],
+  ] as const) {
+    test(`만든 뒤 폴더 자리가 같은 폴더를 가리키는 링크로 바뀌면 모든 연산이 목록과 같은 unknown(no_dir)이다: ${label}`, () => {
+      const parent = tempDir();
+      const store = join(parent, "store");
+      mkdirSync(store);
+      const backend = fileBackend(store);
+      if (seeded) expect(backend.putNew(KEY_A, bytesOf("원본 바이트"))).toEqual({ status: "stored" });
+      const moved = join(parent, "moved");
+      renameSync(store, moved);
+      symlinkSync(moved, store);
+      const before = listing(moved);
+      const noDir = { status: "unknown", reason: "no_dir" } as const;
+      expect(backend.keys("result/")).toEqual(noDir);
+      expect(backend.read(KEY_A)).toEqual(noDir);
+      expect(backend.readRange(KEY_A, 0, 2)).toEqual(noDir);
+      expect(backend.has(KEY_A)).toEqual(noDir);
+      expect(backend.putNew(KEY_A, bytesOf("원본 바이트"))).toEqual(noDir);
+      expect(backend.putNew(KEY_B, bytesOf("새 바이트"))).toEqual(noDir);
+      expect(backend.remove(KEY_A)).toEqual(noDir);
+      expect(backend.remove(KEY_B)).toEqual(noDir);
+      // 링크 너머의 폴더에는 아무것도 쓰이거나 지워지지 않았다.
+      expect(listing(moved)).toEqual(before);
+      expect(before).toEqual(seeded ? [NAME_A] : []);
+      if (seeded) expect(readFileSync(join(moved, NAME_A), "utf8")).toBe("원본 바이트");
+    });
+  }
 
   test("권한 오류는 unknown이다", () => {
     const { port, backend } = spied();
     backend.putNew(KEY_A, bytesOf("본문"));
     port.failNext("open", "EACCES");
     expect(backend.read(KEY_A)).toEqual({ status: "unknown", reason: "io" });
-    port.failNext("lstat", "EACCES");
+    // 첫 lstat은 보관 폴더의 확인이다. 키 이름의 lstat을 실패시킨다.
+    port.failNext("lstat", "EACCES", 1);
     expect(backend.has(KEY_A)).toEqual({ status: "unknown", reason: "io" });
     port.failNext("unlink", "EACCES");
     expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "io" });
