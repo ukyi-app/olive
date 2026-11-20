@@ -11,6 +11,7 @@ AssignLoopPorts = {
   ledger: Pick<Ledger, "listWaitingToolRequests" | "assignToolRequest" | "queueView" | "listRuns" | "slotHolds" | "listInputs" | "startRun">
   intake: Pick<Restorer, "intakeOpen" | "stopGeneration">
   connections: { candidates(): { known: true, value: Candidate[] } | { known: false } }
+  withheld: { executors(): { known: true, value: string[] } | { known: false } }  // 맡기지 않을 실행기(작업자 실행기 주체 이름)
   facts: { facts(request: WaitingToolRequest): PreAssignFacts | Promise<PreAssignFacts> }
   credentials: CredentialPort   // ports.ts
   random: Random                // 실행 ID, 시작 지시의 요청 ID, nonce
@@ -34,7 +35,7 @@ TickResult =
 HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 ```
 
-`LoopRead`는 `waiting_requests`, `candidates`, `queue_view`, `runs`, `slot_holds`, `inputs`다. `halted`와 `haltedAt`은 아래 "박자가 멈출 때".
+`LoopRead`는 `waiting_requests`, `candidates`, `withheld`, `queue_view`, `runs`, `slot_holds`, `inputs`다. `halted`와 `haltedAt`은 아래 "박자가 멈출 때".
 
 | 부탁마다 (`RequestOutcome`) | 뜻 |
 |---|---|
@@ -43,6 +44,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 | `already_assigned` + `runId`, `executorId` | 이미 이어진 부탁이다. 장부가 돌려준 실행이고 새 실행 줄은 없다 |
 | `assign_refused` + `reason` | 장부가 거절했다(`input_cancelled`·`input_expired` 포함). 이번 호출이 새 실행을 잇지 않았다는 뜻이다. 부탁이 대기로 남는지는 장부가 정한다(그 사이 취소되어 장부가 이미 닫은 부탁이면 `transition_denied`이고 대기 목록에 없다) |
 | `assign_failed` + `failure` | `random_unavailable`(장부를 부르지 않음), `threw`, `malformed_answer` |
+| `withheld` + `reason`, `executorId` | 이 호출이 그 부탁을 잇지 않았다. 그 부탁의 지금 장부 상태는 보장하지 않는다(겹친 박자의 다른 호출이 이미 이었을 수 있다). 재시도나 지표에 지금 단계가 필요하면 장부를 다시 읽는다. `listed`: 빼고 고른 답이 `no_executor`였고 빼지 않았다면 고르기가 고를 실행기가 맡기지 않을 실행기다(`executorId`가 그 실행기), 또는 고르기가 고른 실행기 하나가 고른 뒤의 대조에서 집합에 있었다(`executorId`가 그 실행기). 뒤의 경우는 맞는 후보가 모두 막혔다는 뜻이 아니다: 같은 박자에서 다른 후보를 다시 고르지 않고, 다음 박자가 다시 고른다. `withheld_unknown`: 고르기 직전에 다시 읽은 집합이 모름이다(`executorId: null`). 아래 "맡기지 않을 실행기" |
 
 | 실행마다 (`StartOutcome`) | 뜻 |
 |---|---|
@@ -50,6 +52,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 | `recorded_not_sent` + `requestId`, `stopGeneration`, `issuedAt`, `executorId`, `reason`, `delivery` | 장부에는 시작이 적혔고 전송 성공을 확인하지 못했다. 연결에 실렸는지는 `delivery`로 읽는다(`unknown`이면 실렸을 수 있다). 아래 "내보내지 못했을 때" |
 | `start_refused` + `reason` | 장부가 거절했다. 지시를 만들지 않았다 |
 | `start_failed` + `failure` | `random_unavailable`(장부를 부르지 않음), `threw`, `malformed_answer`. 적혔는지 모르므로 지시를 만들지 않았다 |
+| `withheld` + `reason`, `executorId` | 이 호출은 `startRun`을 부르지 않았다(장부 쓰기·난수·송신 0, 그 실행을 `queued`에서 바꾸지 않았다). `listed`: 지정 실행기가 맡기지 않을 실행기다(`executorId`가 그 이름). `executor_unknown`: 실행 줄의 지정 실행기가 작업자 실행기 주체 이름으로 읽히지 않았다(집합이 비어 있어도). `withheld_unknown`: `startRun` 직전에 다시 읽은 집합이 모름이다. 뒤 둘은 `executorId: null` |
 | `not_worker` | 세션 후보다. 세션 시작은 장부가 닫아 두었고(`session_start_closed`) 이 박자가 내지 않는다 |
 
 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest와 서명이 없음을 본다). 부르는 쪽은 이 목록으로 기록과 지표를 만든다.
@@ -57,10 +60,10 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 ## 한 박자의 순서
 
 1. `now`가 장부의 시각 꼴(양의 안전 정수 ms)이 아니면 `malformed_now`.
-2. **쓰기 전의 읽기.** 접수(`intakeOpen()`이 `true`가 아니면 `intake_closed`), 정지 세대(0 이상의 안전 정수가 아니면 `stop_generation_unknown`), 대기 부탁 목록, 후보 연결, 시작 판단의 읽기 넷(`queueView`, `listRuns`, `slotHolds`, `listInputs`)을 이 차례로 읽는다. 하나라도 `known`이 불리언 `true`가 아니거나 던지거나 꼴이 틀리면(배열이 아님, 객체가 아닌 항목) 그 이름으로 `read_unknown`이다. `listRuns`의 대기 실행에 대한 `queueView`의 시작 불가 사유(`startBar`)는 명시적 `null`이거나 장부가 정한 이름(`StartBar`)이어야 하고, 줄이 없거나(두 읽기가 어긋남) 칸이 빠졌거나 다른 값이면 `queue_view`다. 이 검사는 행마다 본 범위에서다: 같은 실행의 `queueView` 행이 여럿이면 마지막 행만 보므로, 앞 행의 틀린 사유는 뒤의 정상 행에 가려져 시작이 불릴 수 있다(실제 장부는 한 실행에 한 행을 낸다). 읽기의 답은 받았으나 그 행을 해석하다 던지면(행의 칸 getter, 배열의 빈 원소) 구별된 결과 없이 박자가 예외로 끝난다(아래 "박자가 멈출 때").
+2. **쓰기 전의 읽기.** 접수(`intakeOpen()`이 `true`가 아니면 `intake_closed`), 정지 세대(0 이상의 안전 정수가 아니면 `stop_generation_unknown`), 대기 부탁 목록, 후보 연결, 맡기지 않을 실행기(항목이 모두 작업자 실행기 주체 이름이 아니면 `withheld`, 아래 "맡기지 않을 실행기"), 시작 판단의 읽기 넷(`queueView`, `listRuns`, `slotHolds`, `listInputs`)을 이 차례로 읽는다. 하나라도 `known`이 불리언 `true`가 아니거나 던지거나 꼴이 틀리면(배열이 아님, 객체가 아닌 항목) 그 이름으로 `read_unknown`이다. `listRuns`의 대기 실행에 대한 `queueView`의 시작 불가 사유(`startBar`)는 명시적 `null`이거나 장부가 정한 이름(`StartBar`)이어야 하고, 줄이 없거나(두 읽기가 어긋남) 칸이 빠졌거나 다른 값이면 `queue_view`다. 이 검사는 행마다 본 범위에서다: 같은 실행의 `queueView` 행이 여럿이면 마지막 행만 보므로, 앞 행의 틀린 사유는 뒤의 정상 행에 가려져 시작이 불릴 수 있다(실제 장부는 한 실행에 한 행을 낸다). 읽기의 답은 받았으나 그 행을 해석하다 던지면(행의 칸 getter, 배열의 빈 원소) 구별된 결과 없이 박자가 예외로 끝난다(아래 "박자가 멈출 때").
 3. 그 읽기로 `planNext`의 입력을 만들어 부른다. 출처를 나누지 못한 입력(`originOf`가 `undefined`)은 넣지 않아 그 실행이 `input_unknown`으로 보류된다. `planNext`가 정책 검사에서 던지면 `policy_rejected`다.
-4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → `sink.send`. 거절·예외이면 지시를 만들지 않는다. 성공 답은 초안에 필요한 칸(실행 줄과 `issuedAt`)만 검증하고, 이 모듈이 쓰지 않는 칸(성공 답의 별도 `credential` 등)은 보지 않는다.
-5. **잇기.** 대기 부탁마다 목록의 순서로: 사실 포트, 자격 포트, `pickAssignment`. `assign`이면 난수 포트로 실행 ID를 만들어 `assignToolRequest`. 어느 답이든 그 부탁만의 결과이고 다음 부탁을 본다.
+4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 맡기지 않을 실행기를 다시 읽어 그 실행의 지정 실행기와 대조하고(걸리면 `withheld`, 그 실행은 건너뛴다), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → `sink.send`. 거절·예외이면 지시를 만들지 않는다. 성공 답은 초안에 필요한 칸(실행 줄과 `issuedAt`)만 검증하고, 이 모듈이 쓰지 않는 칸(성공 답의 별도 `credential` 등)은 보지 않는다.
+5. **잇기.** 대기 부탁마다 목록의 순서로: 사실 포트, 자격 포트, 접수와 맡기지 않을 실행기의 다시 읽기, 그 실행기를 뺀 후보로 `pickAssignment`. `assign`이면 고른 실행기를 같은 집합과 한 번 더 대조하고, 걸리지 않으면 난수 포트로 실행 ID를 만들어 `assignToolRequest`. 어느 답이든 그 부탁만의 결과이고 다음 부탁을 본다.
 
 2의 읽기에서 1~5의 어느 쓰기도 부르지 않는다. 읽기 하나라도 닫힘·모름·틀림이면 그 박자에는 잇기도 시작도 없다.
 
@@ -84,7 +87,18 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 
 ### 접수를 다시 보는 자리
 
-포트가 비동기라 박자 중에 접수가 닫힐 수 있다. 쓰기 직전마다 접수를 다시 읽는다: `startRun` 직전, 그리고 `pickAssignment`에 넘기는 `intakeOpen`(고르기가 `intake_closed`를 내면 잇지 않는다). 닫혔으면 남은 쓰기를 부르지 않고 `halted: "intake_closed"`로 그 전까지의 목록을 낸다. 장부도 같은 트랜잭션에서 접수 허가를 다시 본다(`intake_closed`).
+포트가 비동기라 박자 중에 접수가 닫힐 수 있다. 쓰기 직전마다 접수를 다시 읽는다: `startRun` 직전, 그리고 `pickAssignment`에 넘기는 `intakeOpen`(고르기가 `intake_closed`를 내면 잇지 않는다). 닫혔으면 남은 쓰기를 부르지 않고 `halted: "intake_closed"`로 그 전까지의 목록을 낸다. 장부도 같은 트랜잭션에서 접수 허가를 다시 본다(`intake_closed`). 맡기지 않을 실행기도 같은 두 자리에서 접수 다음에 다시 읽는다(아래).
+
+## 맡기지 않을 실행기
+
+장부가 어떤 실행기의 지금 점유를 반영하지 못한 동안 그 실행기에게 새 일을 시작시키면, 장부가 모르는 점유 위에 시작이 적힌다. 인사 처리기(`hello-answers.ts`)는 그런 실행기를 `withhold`(실행기 주체 이름)로 낸다. 이 박자는 그 이름들의 집합을 `withheld` 포트로 받아 두 자리에서 막는다. 배정 박자는 후보 포트를 새 부탁을 이을 때만 쓰고 이미 배정된 대기 실행은 장부 목록에서 따로 골라 `startRun`을 부르므로, 후보에서 빼기만 하면 그 실행기 앞의 `queued` 실행이 시작된다.
+
+- **잇기:** 그 집합의 실행기는 후보 연결에서 뺀다. 후보의 주체 이름은 `Candidate.principal`(연결 판단이 `sync.principal`을 해석한 값)에서 고르기가 장부에 적는 이름과 같은 조립(`executorName(역할, 인스턴스, 저장소)`)으로 만든다. 작업자 실행기 주체가 아니거나 이름을 만들 수 없는 후보는 빼지 않는다: 정상 후보면 고르기도 그 후보를 고르지 않으므로 기존 답이 그대로다. 집합이 비었거나, 거를 때 받은 후보 값이 배열이 아니거나, 후보 목록에 빈 자리가 있으면 거르지 않고 받은 값을 그대로 고르기에 넘긴다: 빈 자리를 건너뛰며 거르면 고르기의 검증이 `malformed_connections`로 거절할 목록이 정상 목록이 되고, 배열이 아닌 값을 거르려 하면 그 거절 대신 박자가 멈춘다(읽기 포트의 답이 검사할 때와 넘길 때 다른 값을 내는 접근자일 수 있다). 거르지 않았으면 빼고 고른 뒤 후보 목록의 길이를 다시 읽지 않는다. 고르기가 `assign`을 내면 고른 실행기(`executorId`)를 같은 집합과 한 번 더 대조하고, 걸리면 난수·잇기 전에 `withheld`·`listed`다(주체를 읽을 때마다 다른 값을 내는 후보는 거를 때 남고 고를 때 뽑힐 수 있다). 이 `listed`는 **고른 실행기 하나가 집합에 있었다**는 뜻이고 맞는 후보가 모두 막혔다는 뜻이 아니다: 같은 박자에서 그 실행기를 빼고 다시 고르지 않으므로, 집합에 없는 맞는 후보가 이미 있어도 이 박자에서는 잇지 않는다. 다음 박자가 다시 고른다. 다른 실행기에 맞는 부탁은 지금처럼 그 실행기로 잇는다.
+- **`withheld`와 `no_executor`를 구별한다.** 뺀 뒤의 고르기가 `no_executor`이고 실제로 뺀 후보가 있으면, 빼지 않은 후보로 고르기를 한 번 더 부른다(쓰지 않는다). 그 답이 `assign`이면 `withheld`·`listed`이고 `executorId`는 그 답이 고른 실행기다. 아니면 빼지 않은 고르기의 답을 `skipped`로 싣는다(뺀 실행기가 빼지 않았어도 맞지 않았거나, 자격·계획 등 다른 이유로 보류된다). 구별하는 이유: `no_executor`는 지금의 연결·정책 조합에 맞는 후보가 없다는 뜻이고 그 동안 계속된다(맞는 실행기가 연결되거나 기대 revision 같은 정책 값이 연결과 맞으면 풀린다). 이 자리의 `withheld`는 맞는 후보가 있지만 모두 맡기지 않을 실행기라는 뜻이고(고른 뒤의 대조에서 나온 `listed`는 위처럼 더 좁다), 그 실행기가 집합에서 빠지거나 집합에 없는 맞는 후보가 생기면 풀린다. 부르는 쪽의 기록·지표와 다시 부를 때가 다르다.
+- **시작:** `planNext`의 작업자 후보마다 `startRun` 직전에 집합을 다시 읽고, 그 실행의 지정 실행기(박자 처음에 읽은 `listRuns`의 `executorId`. 행은 시작 후보와 같은 실행 ID 값으로 찾고 행의 칸을 다시 읽지 않는다. 대기 실행의 지정 실행기는 배정 뒤 바뀌지 않는다)가 집합에 있으면 `startRun`을 부르지 않는다. 다시 읽기와 `startRun` 사이에는 `await`가 없다. 지금은 `planNext`가 작업자 후보를 하나만 내고 시작이 박자의 첫 쓰기라 박자 처음의 읽기와 이 읽기 사이에도 기다림이 없지만, 판정은 쓰기 자리에 둔다: 시작 후보가 늘거나 순서가 바뀌면 그 사이 비동기 포트를 기다리는 동안 붙들린 실행기가 생길 수 있고, 조립이 집합을 바꾸는 때는 이 박자가 정하지 않는다.
+- **모르면 닫는다.** 박자 처음의 읽기에서 포트가 없거나 던지거나, `known`이 불리언 `true`가 아니거나, `value`가 배열이 아니거나(`value`는 한 번만 읽고 그 값에 모든 검사를 건다), 항목 하나라도 작업자 실행기 주체 이름(계약의 `parsePrincipal`이 `worker_executor`로 읽는 이름)이 아니면 `read_unknown`·`withheld`이고 무엇도 쓰지 않는다. 빈 배열은 "맡기지 않을 실행기 없음"으로 유효하다. 빠뜨린 포트를 빈 집합으로 치지 않는다. 쓰기 직전의 다시 읽기가 모름이면 그 항목만 `withheld`·`withheld_unknown`이고 다음 항목을 본다(이미 쓴 것이 있을 수 있어 박자 전체를 `not_run`으로 바꿀 수 없다).
+- **지정 실행기를 확인할 수 없으면 시작하지 않는다.** 실행 줄의 `executorId`가 작업자 실행기 주체 이름이 아니면(빠짐, 빈 문자열, 꼴이 틀림, 읽다 던짐) 집합이 비어 있어도 `executor_unknown`이다. 이름을 모르면 그 실행기가 집합에 있는지 가릴 수 없고, 시작 지시를 받을 쪽도 모른다. 빈 집합의 박자는 이 입력이 없을 때와 같되 이 한 곳만 다르다: 이 입력이 없으면 그런 실행도 시작되지만, 여기서는 시작하지 않는다(닫는 쪽). 실제 장부는 작업자 실행에 그 역할의 작업자 실행기 이름만 적으므로(배정의 입력 검사) 정상 행에서는 달라지는 것이 없다.
+- **대기열의 맨 앞이 막히면 그 박자에는 어떤 작업자도 시작하지 않는다.** `planNext`는 작업자 슬롯 하나에 후보 하나를 낸다. 그 후보가 막히면(`withheld`) 이 박자는 그 실행을 건너뛰고, 대기열을 다시 계산해 다음 실행을 고르지 않는다. 그래서 그 실행이 시작 후보로 계속 뽑히는 동안 다른 실행기의 대기 실행도 시작되지 않는다(닫는 쪽). 그 실행기가 집합에서 빠지거나, 그 실행이 취소되는 등으로 `planNext`가 다른 후보를 내면 풀린다. 대기열의 순서 규칙은 `planNext`의 몫이라 이 박자가 바꾸지 않는다(아래 "남는 한계").
 
 ## 시각
 
@@ -115,6 +129,11 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 
 갱신·취소·확정·조회, 영수증 처리, 재전송, 연결 상실 반영, 자격 값 전달(계약 v1에 그 메시지가 없다. 시작 지시는 자격 참조만 싣는다), 세션 시작. 대기 부탁 목록은 소유자를 가리지 않는 감독 안쪽의 읽기라 본체의 도구 처리기(`scheduler/tools.ts`)의 포트에 잇지 않는다(이 모듈은 그 파일을 import하지 않는다).
 
+## 남는 한계
+
+- **시작을 장부에 적은 뒤 내보내기 포트가 기다리는 동안 그 실행기가 맡기지 않을 실행기 집합에 들어오면, 이미 만든 시작 봉투가 그 실행기에 실린다.** 이 박자의 판정은 `startRun` 직전이고 그때는 그 실행기가 집합에 없었다. 내보내기 포트를 부른 뒤 실제로 싣기까지의 사이는 이 박자가 보지 않으며, 포트를 부르기 전에 한 번 더 읽어도 그 사이는 남는다. 막는 자리는 내보내기 포트다(아래 "뒤 조각이 지킬 것").
+- **대기열 맨 앞이 막힌 실행기의 실행이면 그동안 어떤 작업자도 시작하지 않는다.** 시작 후보의 판단(`planNext`)이 작업자 후보를 하나만 내기 때문이다. 이 입력이 없으면 맨 앞 실행이 시작되어 슬롯을 쥐므로 뒤 실행이 기다리는 것은 같지만, 여기서는 아무 작업자도 시작하지 않은 채 기다린다. 막힌 후보 다음의 실행을 고를지는 뒤의 설계이고, 고른다면 같은 입력으로 공정성과 작업자 슬롯 하나의 보장을 함께 시험한다.
+
 ## 뒤 조각이 지킬 것
 
 - **박자를 되풀이해 부른다.** 이번 박자에 이은 실행은 다음 박자에 시작 후보가 된다. 결과에 `assigned`가 있으면 곧 다시 부른다.
@@ -126,3 +145,8 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 - **작업 자리는 종료 근거로만 푼다.** 시작을 받은 적 없는 실행을 D-90으로 풀려면 접수 영수증 없음, 추가 시작 송신 중단과 마지막 봉투의 만료, 그 뒤 전체 점유에서 부재가 함께 성립해야 한다. 기한 지난 대기 실행의 마감과 재시작 뒤 미응답 지시의 복원은 뒤 조각이다.
 - **`now`는 장부 시계와 같은 시계에서 박자마다 한 번 읽은 값이고 후퇴하지 않는다**(`planNext`의 조건).
 - **세션 후보(`not_worker`)는 세션 계약 작업이 연다.** 그 전에는 세션 대기 실행이 후보로 남아도 이 박자는 부르지 않는다.
+- **조립은 인사 처리기의 `withhold`를 실행기 전체 이름으로 모아 `withheld` 포트로 넘긴다.** `passHelloAnswer`·`retryHelloAnswer`가 `withhold`를 낸 실행기(`held`, `ledger_unsaved`, `ledger_failed`)를 넣는다. 포트는 부를 때마다(박자 처음과 박자 중의 다시 읽기마다) 그 순간의 최신 집합을 낸다. 읽기를 보장할 수 없으면 `known: false`를 내고 빈 배열로 대신하지 않는다(빈 배열은 "없음"이라 그 실행기에게 시작이 나간다). `listed`와 `no_executor`를 구별하려면 후보 포트(`connections`)에는 집합으로 거르기 전의 연결을 넘긴다(후보 포트가 미리 거르면 맞는 실행기가 맡기지 않을 실행기뿐인 부탁이 `no_executor`로 나온다).
+- **집합에서 빼는 때는 그 실행기의 붙든 답이 모두 반영되고 지금 연결의 인사가 반영된 뒤다.** 그 실행기의 붙든 답(`held`, `retry`가 있는 실패)을 받은 차례로 `applied`가 되게 하거나 `not_current`로 버리고, 그 뒤 그 실행기의 **현재 연결 인사**가 `applied`가 될 때까지 뺀다. 옛 연결의 `retry` 한 건이 성공해도 풀지 않는다. `input_rejected`(다시 넘길 값 없음)면 계속 뺀다. 마지막 `held`의 재처리를 현재 연결 인사의 반영으로 셀 조건은 조립이 명시한다(`hello-answers.md` "뒤 조각이 지켜야 할 것").
+- **영수증 처리기 쪽의 같은 종류의 실패를 같은 집합에 넣을지는 조립이 정한다.** 상태 보고(`forward`)를 장부에 반영하지 못한 실행기도 장부가 그 실행기의 점유를 모르는 상태다. 이 박자는 집합에 든 이름만 보고 그 이름이 어디서 왔는지 가리지 않는다.
+- **내보내기 포트는 실제로 싣는 순간에 받는 실행기가 맡기지 않을 실행기 집합에 있는지, 집합이 모름인지도 본다.** 그 순간은 마지막 비동기 기다림을 지난 자리다. 집합에 있거나 모름이면 싣지 않고, 이미 장부에 적힌 실행을 가리키는 "못 보냄"의 결과를 낸다. 같은 시작을 다시 싣는 재전송에도 같은 규칙이 필요하다. 포트를 부르기 전에만 한 번 더 읽어서는 막지 못한다(위 "남는 한계").
+- **`withheld` 결과는 "이 호출이 그 부탁을 잇지 않았다, 그 실행을 시작하지 않았다"는 뜻이다.** 그 부탁·실행의 지금 장부 단계를 보장하지 않는다(겹친 박자의 다른 호출이 이미 이었을 수 있다). 막힌 동안 박자마다 되풀이될 수 있으므로 반복 보류 지표는 실행 ID·부탁 참조로 묶어 한 번으로 세고, 재시도나 지표에 지금 단계가 필요하면 장부를 다시 읽는다.

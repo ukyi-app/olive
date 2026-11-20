@@ -58,6 +58,8 @@ interface World {
   setStopGeneration(value: number | null): void;
   setSend(next: () => Promise<SendOutcome>): void;
   setFacts(next: () => PreAssignFacts): void;
+  // 맡기지 않을 실행기 포트의 답. 기본은 빈 집합이다.
+  setWithheld(next: () => unknown): void;
   wrap(over: Partial<AssignLoopLedger>): void;
   enqueueRequest(expiresAt?: number): { owner: string; ref: string };
 }
@@ -84,6 +86,7 @@ function world(): World {
   let stopGeneration: number | null = 0;
   let send: () => Promise<SendOutcome> = async () => "sent";
   let facts: () => PreAssignFacts = () => CLEAR;
+  let withheld: () => unknown = () => ({ known: true, value: [] });
   let override: Partial<AssignLoopLedger> = {};
   const w: World = {
     ledger,
@@ -109,6 +112,9 @@ function world(): World {
     },
     setFacts: (next) => {
       facts = next;
+    },
+    setWithheld: (next) => {
+      withheld = next;
     },
     wrap: (over) => {
       override = over;
@@ -168,6 +174,7 @@ function world(): World {
     },
     intake: { intakeOpen: () => intake && ledger.intakeOpen(), stopGeneration: () => stopGeneration },
     connections: { candidates: () => ({ known: true, value: [CONNECTION] }) },
+    withheld: { executors: () => withheld() as never },
     facts: {
       facts: () => {
         hit("facts");
@@ -630,5 +637,364 @@ describe("장부에 쓴 뒤에는 무엇이 던져도 그때까지의 결과가 
     expect(result.halted).toBe("threw");
     expect(result.haltedAt).toEqual({ step: "assign", ref: a });
     expect(w.log).toEqual(["startRun", "seal", "send"]);
+  });
+});
+
+// 두 번째 실행기. 이름 순으로 EXECUTOR보다 뒤라, 둘 다 맞으면 고르기는 EXECUTOR를 고른다.
+const EXECUTOR2 = "executor/isolated_reader/r2/s2";
+const CONNECTION2: Candidate = { ...CONNECTION, connection: 2, principal: { kind: "worker_executor", role: "isolated_reader", instance: "r2", storage: "s2" }, keyId: "key-r2" };
+const POLICY2: AssignLoopPolicy = {
+  ...POLICY,
+  assignment: {
+    ...POLICY.assignment,
+    registrations: [...POLICY.assignment.registrations, { target: "reader", role: "isolated_reader", instance: "r2", storage: "s2", keyId: "key-r2", active: true }],
+  },
+};
+const listed = (...names: unknown[]) => () => ({ known: true, value: names });
+
+function withConnections(w: World, value: readonly Candidate[]): void {
+  w.ports = { ...w.ports, connections: { candidates: () => ({ known: true, value }) } };
+}
+
+function waitingRefs(ledger: Ledger): string[] {
+  const waiting = ledger.listWaitingToolRequests();
+  if (!waiting.known) throw new Error("대기 부탁을 읽지 못함");
+  return waiting.value.map((request) => request.ref);
+}
+
+// 실행기 EXECUTOR에 배정된 대기 실행 하나를 만들고 기록을 비운다.
+async function queuedOnExecutor(w: World): Promise<string> {
+  w.enqueueRequest();
+  const first = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+  const assigned = first.requests[0];
+  if (assigned?.outcome !== "assigned" || assigned.executorId !== EXECUTOR) throw new Error(`잇지 못함: ${JSON.stringify(first)}`);
+  w.log.length = 0;
+  return assigned.runId;
+}
+
+describe("맡기지 않을 실행기", () => {
+  test("인수 기준: 그 실행기의 대기 실행이 있고 그 실행기를 빼면 잇기·startRun·송신이 0이고 실행은 queued 그대로다. 빼기를 풀면 다음 박자에 시작된다", async () => {
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    // 그 실행기에만 맞는 대기 부탁도 하나 둔다: 그 실행기가 후보에서 빠졌다면 이 부탁은 이어지지 않는다.
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    w.setWithheld(listed(EXECUTOR));
+    expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({
+      kind: "ran",
+      starts: [{ runId, outcome: "withheld", reason: "listed", executorId: EXECUTOR }],
+      requests: [{ ref, outcome: "withheld", reason: "listed", executorId: EXECUTOR }],
+      halted: null,
+      haltedAt: null,
+    });
+    expect(w.log).toEqual([]);
+    expect(w.sent).toEqual([]);
+    expect(w.uuids).toBe(uuids);
+    expect(runStates(w.ledger)).toEqual(new Map([[runId, "queued"]]));
+    expect(waitingRefs(w.ledger)).toEqual([ref]);
+
+    w.setWithheld(listed());
+    const next = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(next.starts).toEqual([expect.objectContaining({ runId, outcome: "sent", executorId: EXECUTOR })]);
+    expect(next.requests).toEqual([expect.objectContaining({ ref, outcome: "assigned", executorId: EXECUTOR })]);
+    expect(runStates(w.ledger).get(runId)).toBe("preparing");
+    expect(w.sent.map((envelope) => envelope.header.recipient)).toEqual([EXECUTOR]);
+  });
+
+  test("시작의 판정은 startRun 직전에 다시 읽은 집합으로 한다. 그때 집합이 모름이면 시작도 잇기도 하지 않는다", async () => {
+    // 박자 처음의 읽기에는 비어 있고, 그 뒤의 읽기에 실행기가 들어온다.
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    let reads = 0;
+    w.setWithheld(() => {
+      reads += 1;
+      return { known: true, value: reads === 1 ? [] : [EXECUTOR] };
+    });
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(result.starts).toEqual([{ runId, outcome: "withheld", reason: "listed", executorId: EXECUTOR }]);
+    expect([w.log, w.sent.length, runStates(w.ledger).get(runId)]).toEqual([[], 0, "queued"]);
+
+    // 박자 처음에는 읽혔고 쓰기 직전의 읽기가 모름이다. 박자는 이미 돌았으므로 항목마다 구별된 결과로 남긴다.
+    const u = world();
+    const queued = await queuedOnExecutor(u);
+    const { ref } = u.enqueueRequest();
+    let count = 0;
+    u.setWithheld(() => {
+      count += 1;
+      return count === 1 ? { known: true, value: [] } : { known: false };
+    });
+    const unknown = ran(await assignAndStartTick(u.ports, POLICY, NOW));
+    expect(unknown.starts).toEqual([{ runId: queued, outcome: "withheld", reason: "withheld_unknown", executorId: null }]);
+    expect(unknown.requests).toEqual([{ ref, outcome: "withheld", reason: "withheld_unknown", executorId: null }]);
+    expect([u.log, u.sent.length, runStates(u.ledger).get(queued), waitingRefs(u.ledger)]).toEqual([[], 0, "queued", [ref]]);
+  });
+
+  test("다른 실행기에 맞는 부탁은 그 실행기로 잇고 그 실행기의 대기 실행은 시작된다. 뺀 실행기가 맞지 않았으면 기존의 no_executor다", async () => {
+    const w = world();
+    withConnections(w, [CONNECTION, CONNECTION2]);
+    w.setWithheld(listed(EXECUTOR));
+    const { ref } = w.enqueueRequest();
+    const first = ran(await assignAndStartTick(w.ports, POLICY2, NOW));
+    expect(first.requests).toEqual([{ ref, outcome: "assigned", runId: expect.any(String), executorId: EXECUTOR2 }]);
+    const runId = (first.requests[0] as { runId: string }).runId;
+    const second = ran(await assignAndStartTick(w.ports, POLICY2, NOW));
+    expect(second.starts).toEqual([expect.objectContaining({ runId, outcome: "sent", executorId: EXECUTOR2 })]);
+    expect(w.sent.map((envelope) => envelope.header.recipient)).toEqual([EXECUTOR2]);
+
+    // 연결된 실행기가 없으면 집합과 상관없이 기존 답 그대로다.
+    const none = world();
+    withConnections(none, []);
+    none.setWithheld(listed(EXECUTOR));
+    const lone = none.enqueueRequest().ref;
+    expect(ran(await assignAndStartTick(none.ports, POLICY, NOW)).requests).toEqual([{ ref: lone, outcome: "skipped", pick: { kind: "held", reason: "no_executor", holds: [] } }]);
+
+    // 뺀 실행기가 빼지 않았어도 맞지 않았다면(revision 불일치) 빼지 않은 고르기의 답을 그대로 싣는다.
+    const stale = world();
+    withConnections(stale, [{ ...CONNECTION, hello: { profile_revision: "prof-0", policy_revision: "pol-1" } }]);
+    stale.setWithheld(listed(EXECUTOR));
+    const old = stale.enqueueRequest().ref;
+    expect(ran(await assignAndStartTick(stale.ports, POLICY, NOW)).requests).toEqual([
+      { ref: old, outcome: "skipped", pick: { kind: "held", reason: "no_executor", holds: [{ connection: 1, reason: "profile_revision_mismatch" }] } },
+    ]);
+    expect([none.log, stale.log]).toEqual([[], []]);
+  });
+
+  test("집합의 입력이 없거나 꼴이 틀리면 쓰지 않고 read_unknown(withheld)이다. 빈 집합은 유효하다", async () => {
+    const holey: unknown[] = [];
+    holey[1] = EXECUTOR;
+    const answers: (() => unknown)[] = [
+      () => ({ known: false }),
+      () => ({ known: "true", value: [] }),
+      () => ({ known: true }),
+      () => ({ known: true, value: EXECUTOR }),
+      listed(EXECUTOR, "supervisor"),
+      listed("executor/session/x1/s1"),
+      listed("executor/isolated_reader/R1/s1"),
+      listed(42),
+      () => ({ known: true, value: holey }),
+      () => undefined,
+      (): never => {
+        throw new Error("집합 실패");
+      },
+    ];
+    for (const answer of answers) {
+      const w = world();
+      await assignThenStartSetup(w);
+      w.setWithheld(answer);
+      expect([String(answer), await assignAndStartTick(w.ports, POLICY, NOW)]).toEqual([String(answer), { kind: "not_run", reason: "read_unknown", read: "withheld" }]);
+      expect(w.log).toEqual([]);
+    }
+    // 포트를 빠뜨린 것은 빈 집합이 아니다.
+    const missing = world();
+    await assignThenStartSetup(missing);
+    missing.ports = { ...missing.ports, withheld: undefined as never };
+    expect(await assignAndStartTick(missing.ports, POLICY, NOW)).toEqual({ kind: "not_run", reason: "read_unknown", read: "withheld" });
+    expect(missing.log).toEqual([]);
+
+    const empty = world();
+    await assignThenStartSetup(empty);
+    empty.setWithheld(listed());
+    const result = ran(await assignAndStartTick(empty.ports, POLICY, NOW));
+    expect([result.starts.map((s) => s.outcome), result.requests.map((r) => r.outcome)]).toEqual([["sent"], ["assigned"]]);
+  });
+
+  test("대기 실행의 지정 실행기를 읽지 못하면 집합이 비어 있어도 시작하지 않는다. 정상 행으로 돌아오면 시작된다", async () => {
+    const withoutExecutor = (w: World) => () => {
+      const real = w.ledger.listRuns();
+      if (!real.known) throw new Error("읽지 못함");
+      return { known: true, value: real.value.map((run) => Object.fromEntries(Object.entries(run).filter(([key]) => key !== "executorId"))) };
+    };
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    w.wrap({ listRuns: withoutExecutor(w) as never });
+    w.setWithheld(listed(EXECUTOR2));
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(result.starts).toEqual([{ runId, outcome: "withheld", reason: "executor_unknown", executorId: null }]);
+    expect([w.log, w.sent.length, runStates(w.ledger).get(runId)]).toEqual([[], 0, "queued"]);
+
+    w.setWithheld(listed());
+    const empty = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(empty.starts).toEqual([{ runId, outcome: "withheld", reason: "executor_unknown", executorId: null }]);
+    expect([w.log, w.sent.length, runStates(w.ledger).get(runId)]).toEqual([[], 0, "queued"]);
+
+    w.wrap({});
+    const open = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(open.starts).toEqual([expect.objectContaining({ runId, outcome: "sent", executorId: EXECUTOR })]);
+  });
+
+  test("지정 실행기의 이름이 빈 문자열이거나 작업자 실행기 주체의 꼴이 아니면 집합과 상관없이 시작하지 않는다", async () => {
+    // 실제 장부는 이런 행을 내지 않으므로 listRuns 포트의 답에서 지정 실행기 칸만 바꾼다.
+    const renamed = (w: World, name: unknown) => () => {
+      const real = w.ledger.listRuns();
+      if (!real.known) throw new Error("읽지 못함");
+      return { known: true, value: real.value.map((run) => ({ ...run, executorId: name })) };
+    };
+    const cases: [unknown, string[]][] = [
+      ["", [EXECUTOR]],
+      ["", []],
+      ["executor/session/r1/s1", []],
+      ["executor/isolated_reader/R1/s1", [EXECUTOR2]],
+      [42, []],
+    ];
+    for (const [name, set] of cases) {
+      const w = world();
+      const runId = await queuedOnExecutor(w);
+      const uuids = w.uuids;
+      w.wrap({ listRuns: renamed(w, name) as never });
+      w.setWithheld(listed(...set));
+      const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+      expect([name, set, result.starts]).toEqual([name, set, [{ runId, outcome: "withheld", reason: "executor_unknown", executorId: null }]]);
+      expect([w.log, w.sent.length, w.uuids - uuids, runStates(w.ledger).get(runId)]).toEqual([[], 0, 0, "queued"]);
+    }
+  });
+
+  test("집합의 답은 value를 한 번만 읽고, 검사한 그 값으로 막는다", async () => {
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    // 한 답의 value가 첫 읽기에는 [EXECUTOR], 그 뒤 읽기에는 배열이 아닌 값을 낸다.
+    w.setWithheld(() => {
+      let reads = 0;
+      return {
+        known: true,
+        get value() {
+          reads += 1;
+          return reads === 1 ? [EXECUTOR] : {};
+        },
+      };
+    });
+    expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({
+      kind: "ran",
+      starts: [{ runId, outcome: "withheld", reason: "listed", executorId: EXECUTOR }],
+      requests: [{ ref, outcome: "withheld", reason: "listed", executorId: EXECUTOR }],
+      halted: null,
+      haltedAt: null,
+    });
+    expect([w.log, w.sent.length, w.uuids - uuids, runStates(w.ledger).get(runId), waitingRefs(w.ledger)]).toEqual([[], 0, 0, "queued", [ref]]);
+  });
+
+  test("시작 직전에 대조하는 행은 시작 후보와 같은 실행 ID 값으로 찾는다(행의 실행 ID 칸을 다시 읽지 않는다)", async () => {
+    const w = world();
+    const runId = await queuedOnExecutor(w);
+    const uuids = w.uuids;
+    // 실제 행 뒤에 세션 행 하나를 덧붙인다. 그 행의 실행 ID 칸은 첫 읽기에만 대기 실행의 ID를 내고, 지정 실행기는 막지 않은 실행기다.
+    w.wrap({
+      listRuns: (() => {
+        const real = w.ledger.listRuns();
+        if (!real.known) throw new Error("읽지 못함");
+        const queued = real.value.find((run) => run.runId === runId);
+        if (queued === undefined) throw new Error("대기 실행이 없음");
+        let reads = 0;
+        const other = id();
+        const decoy = {
+          ...queued,
+          kind: "session",
+          state: "not_started",
+          inputRequestId: null,
+          executorId: EXECUTOR2,
+          get runId() {
+            reads += 1;
+            return reads === 1 ? runId : other;
+          },
+        };
+        return { known: true, value: [...real.value, decoy] };
+      }) as never,
+    });
+    w.setWithheld(listed(EXECUTOR));
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(result.starts).toEqual([{ runId, outcome: "withheld", reason: "listed", executorId: EXECUTOR }]);
+    expect([w.log, w.sent.length, w.uuids - uuids, runStates(w.ledger).get(runId)]).toEqual([[], 0, 0, "queued"]);
+  });
+
+  test("빈 자리가 섞인 후보 목록은 집합이 비었든 아니든 고르기가 거절한 그대로이고 잇지 않는다", async () => {
+    const holey: Candidate[] = [CONNECTION];
+    holey.length = 2;
+    for (const set of [[], [EXECUTOR2]]) {
+      const w = world();
+      withConnections(w, holey);
+      w.setWithheld(listed(...set));
+      const { ref } = w.enqueueRequest();
+      const uuids = w.uuids;
+      const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+      expect([set, result.requests]).toEqual([set, [{ ref, outcome: "skipped", pick: { kind: "input_rejected", reason: "malformed_connections" } }]]);
+      expect([w.log, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([[], 0, 0, [ref]]);
+    }
+  });
+
+  test("후보의 주체를 거를 때 읽지 못했어도 고르기가 고른 실행기가 집합에 있으면 잇지 않는다", async () => {
+    let reads = 0;
+    // 주체 칸이 첫 읽기(거르기)에서만 던지고 그 뒤 읽기(고르기)에는 정상 주체를 낸다.
+    const flaky: Candidate = {
+      ...CONNECTION,
+      get principal() {
+        reads += 1;
+        if (reads === 1) throw new Error("주체 읽기 실패");
+        return CONNECTION.principal;
+      },
+    };
+    const w = world();
+    withConnections(w, [flaky]);
+    w.setWithheld(listed(EXECUTOR));
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    expect(ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests).toEqual([{ ref, outcome: "withheld", reason: "listed", executorId: EXECUTOR }]);
+    expect([reads > 1, w.log, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([true, [], 0, 0, [ref]]);
+  });
+
+  test("빈 집합이면 후보 목록의 길이를 거르기 때문에 더 읽지 않는다. 길이를 몇 번만 읽을 수 있는 목록도 기존 no_executor다", async () => {
+    let lengthReads = 0;
+    // 길이를 세 번까지만 0으로 주고 그 뒤에는 던지는 빈 목록.
+    const brittle = new Proxy([] as Candidate[], {
+      get(target, key, receiver) {
+        if (key === "length" && ++lengthReads > 3) throw new Error("길이 읽기 초과");
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const w = world();
+    withConnections(w, brittle);
+    w.setWithheld(listed());
+    const { ref } = w.enqueueRequest();
+    const uuids = w.uuids;
+    expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({
+      kind: "ran",
+      starts: [],
+      requests: [{ ref, outcome: "skipped", pick: { kind: "held", reason: "no_executor", holds: [] } }],
+      halted: null,
+      haltedAt: null,
+    });
+    expect([w.log, w.sent.length, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger)]).toEqual([[], 0, 0, 0, [ref]]);
+  });
+
+  test("후보의 답이 거를 때 배열이 아니면 거르지 않고 넘겨, 집합이 비었을 때처럼 부탁마다 고르기가 거절한다", async () => {
+    for (const set of [[], [EXECUTOR2]]) {
+      const w = world();
+      // 한 답의 value가 두 번째 읽기까지는 배열이고 그 뒤(읽기 포트가 넘기는 값)에는 배열이 아니다.
+      w.ports = {
+        ...w.ports,
+        connections: {
+          candidates: () => {
+            let reads = 0;
+            return {
+              known: true,
+              get value() {
+                reads += 1;
+                return reads <= 2 ? [CONNECTION] : {};
+              },
+            } as never;
+          },
+        },
+      };
+      w.setWithheld(listed(...set));
+      const first = w.enqueueRequest().ref;
+      const second = w.enqueueRequest().ref;
+      const uuids = w.uuids;
+      const rejected = { outcome: "skipped", pick: { kind: "input_rejected", reason: "malformed_connections" } } as const;
+      expect([set, await assignAndStartTick(w.ports, POLICY, NOW)]).toEqual([
+        set,
+        { kind: "ran", starts: [], requests: [{ ref: first, ...rejected }, { ref: second, ...rejected }], halted: null, haltedAt: null },
+      ]);
+      expect([w.log, w.sent.length, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger).length]).toEqual([[], 0, 0, 0, 2]);
+    }
   });
 });
