@@ -139,22 +139,24 @@ function apply(ledger: HelloAnswerLedger, answer: HelloRetry, now: number): Hell
   }
   const malformed: HelloAnswerOutcome = { kind: "ledger_failed", executorId, connection, failure: "malformed_answer", message: null, retry, withhold: executorId };
   // 답을 읽는 것도 포트의 값을 건드리는 일이다(접근자가 던질 수 있다). 꼴이 틀린 항목을 반영으로 세면 뒤 조각이 지어낸 실행을 닫는다.
+  // 칸마다 한 번만 읽고 그 값을 검사해 돌려준다: 접근자는 읽을 때마다 다른 값을 낼 수 있어, 다시 읽으면 검사하지 않은 값이 실린다.
   try {
     if (typeof result !== "object" || result === null) return malformed;
     const r = result as Record<string, unknown>;
-    if (r.ok === true) {
+    const ok = r.ok;
+    if (ok === true) {
       const moved = items(r.moved, lostRun);
       const deferred = items(r.deferred, deferredLoss);
       const outsideLedger = items(r.outsideLedger, runRef);
       if (moved === null || deferred === null || outsideLedger === null) return malformed;
       return { kind: "applied", executorId, connection, answeredAt: answer.answeredAt, moved, deferred, outsideLedger };
     }
-    if (r.ok === false && (REFUSALS as readonly unknown[]).includes(r.reason)) {
-      const unsavedSightings = items(r.unsavedSightings, runRef);
-      if (unsavedSightings === null) return malformed;
-      return { kind: "ledger_unsaved", executorId, connection, reason: r.reason as Refusal, unsavedSightings, retry, withhold: executorId };
-    }
-    return malformed;
+    if (ok !== false) return malformed;
+    const reason = r.reason;
+    if (!(REFUSALS as readonly unknown[]).includes(reason)) return malformed;
+    const unsavedSightings = items(r.unsavedSightings, runRef);
+    if (unsavedSightings === null) return malformed;
+    return { kind: "ledger_unsaved", executorId, connection, reason: reason as Refusal, unsavedSightings, retry, withhold: executorId };
   } catch {
     return malformed;
   }
@@ -173,21 +175,28 @@ function items<T>(value: unknown, read: (item: Record<string, unknown>) => T | n
   return out;
 }
 
+// 각 칸은 한 번만 읽는다(apply의 답 해석 주석). 칸 수는 이름만 세므로 접근자를 부르지 않는다.
 function runRef(item: Record<string, unknown>): { runId: string; runGeneration: number } | null {
-  if (Object.keys(item).length !== 2 || !isRunId(item.runId) || !isGeneration(item.runGeneration)) return null;
-  return { runId: item.runId, runGeneration: item.runGeneration };
+  if (Object.keys(item).length !== 2) return null;
+  const { runId, runGeneration } = item;
+  if (!isRunId(runId) || !isGeneration(runGeneration)) return null;
+  return { runId, runGeneration };
 }
 
 function lostRun(item: Record<string, unknown>): LostRun | null {
-  if (Object.keys(item).length !== 4 || !isRunId(item.runId) || !isGeneration(item.runGeneration) || !isLedgerState(item.before) || !isLedgerState(item.after)) return null;
-  return { runId: item.runId, runGeneration: item.runGeneration, before: item.before, after: item.after };
+  if (Object.keys(item).length !== 4) return null;
+  const { runId, runGeneration, before, after } = item;
+  if (!isRunId(runId) || !isGeneration(runGeneration) || !isLedgerState(before) || !isLedgerState(after)) return null;
+  return { runId, runGeneration, before, after };
 }
 
 const DEFER_WHY: readonly unknown[] = ["start_may_arrive", "answer_time_unknown"] satisfies DeferredLoss["why"][];
 
 function deferredLoss(item: Record<string, unknown>): DeferredLoss | null {
-  if (Object.keys(item).length !== 4 || !isRunId(item.runId) || !isGeneration(item.runGeneration) || !isLedgerState(item.state) || !DEFER_WHY.includes(item.why)) return null;
-  return { runId: item.runId, runGeneration: item.runGeneration, state: item.state, why: item.why as DeferredLoss["why"] };
+  if (Object.keys(item).length !== 4) return null;
+  const { runId, runGeneration, state, why } = item;
+  if (!isRunId(runId) || !isGeneration(runGeneration) || !isLedgerState(state) || !DEFER_WHY.includes(why)) return null;
+  return { runId, runGeneration, state, why: why as DeferredLoss["why"] };
 }
 
 function isRunId(value: unknown): value is string {

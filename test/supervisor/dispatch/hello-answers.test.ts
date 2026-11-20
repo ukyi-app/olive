@@ -484,6 +484,52 @@ describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
     }
   });
 
+  test("장부 답의 칸은 한 번만 읽고, 검사한 그 값을 돌려준다", async () => {
+    const ledger = ready(open(tempPath()));
+    const w = new World(ledger);
+    const { output } = await w.greet(K0, WORKER_EXECUTOR, [], SIGNED, RECEIVED);
+    // 읽을 때마다 다음 값을 내는 칸. 두 번째 값은 처음 값과 달라 다시 읽으면 결과나 분기에 드러난다.
+    const reads = new Map<string, number>();
+    function shifting<T extends object>(name: string, cells: Record<string, readonly [unknown, unknown]>): T {
+      const item = {};
+      for (const [key, values] of Object.entries(cells)) {
+        const label = `${name}.${key}`;
+        Object.defineProperty(item, key, {
+          enumerable: true,
+          get() {
+            const n = reads.get(label) ?? 0;
+            reads.set(label, n + 1);
+            return values[Math.min(n, 1)];
+          },
+        });
+      }
+      return item as T;
+    }
+    const answers = {
+      applied: shifting("applied", {
+        ok: [true, false],
+        moved: [[shifting("moved", { runId: ["m", ""], runGeneration: [1, 0], before: ["running", "nowhere"], after: ["unknown_running", "nowhere"] })], null],
+        deferred: [[shifting("deferred", { runId: ["d", ""], runGeneration: [2, 0], state: ["preparing", "nowhere"], why: ["start_may_arrive", "because"] })], null],
+        outsideLedger: [[shifting("outside", { runId: ["o", ""], runGeneration: [3, 0] })], null],
+      }),
+      unsaved: shifting("unsaved", {
+        ok: [false, true],
+        reason: ["ledger_unwritable", "CANARY"],
+        unsavedSightings: [[shifting("sighting", { runId: ["s", ""], runGeneration: [4, 0] })], null],
+      }),
+    };
+    const outcome = (answer: unknown) => passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger, intake: w.stop });
+    expect(outcome(answers.applied)).toMatchObject({
+      kind: "applied",
+      moved: [{ runId: "m", runGeneration: 1, before: "running", after: "unknown_running" }],
+      deferred: [{ runId: "d", runGeneration: 2, state: "preparing", why: "start_may_arrive" }],
+      outsideLedger: [{ runId: "o", runGeneration: 3 }],
+    });
+    expect(outcome(answers.unsaved)).toMatchObject({ kind: "ledger_unsaved", reason: "ledger_unwritable", unsavedSightings: [{ runId: "s", runGeneration: 4 }], withhold: WORKER_EXECUTOR });
+    expect(Object.fromEntries(reads)).toEqual(Object.fromEntries([...reads.keys()].map((label) => [label, 1])));
+    expect(reads.size).toBe(19);
+  });
+
   test("장부 포트가 던진 일반 예외의 원문은 결과에 싣지 않는다", async () => {
     const ledger = ready(open(tempPath()));
     const w = new World(ledger);
