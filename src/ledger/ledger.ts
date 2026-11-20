@@ -658,10 +658,12 @@ export interface UnansweredInstruction {
   // 그 실행의 지정 실행기(받는 쪽).
   executorId: string;
   runState: LedgerRunState;
-  // 이 지시를 적을 때의 정지 세대. 장부의 지금 정지 세대(UnansweredInstructions.stopGeneration)와 다르면 실행기는 이 머리를 받지 않는다
-  // (비상 정지의 종료만 높은 세대를 받는다). 둘을 가르는 것은 부르는 쪽이다.
+  // 이 지시를 적을 때의 정지 세대. 장부의 지금 정지 세대(UnansweredInstructions.stopGeneration)와 다르면 부르는 쪽은 보내지 않는다.
+  // 함정: 실행기가 받는지는 실행기가 적용한 세대에 달렸다. 새 세대를 적용한 뒤에는 받지 않지만(비상 정지의 종료만 높은 세대를 받는다),
+  // 적용하기 전이면 장부가 이미 넘어선 옛 세대의 지시를 받을 수 있다.
   stopGeneration: number;
   // 이 지시 줄에 적힌 발행 시각. 시작 지시는 머리의 issued_at에 그대로 싣는다(갱신 뒤의 instructionTimes.lease.issuedAt은 갱신의 시각이다).
+  // 취소·세션 정지·확정의 머리 issued_at은 봉하는 때의 시각이라 이 값과 다를 수 있다.
   issuedAt: number;
   // 본문을 다시 만들 칸. null이면 장부가 그 본문을 다시 만들 수 없다: 판 4 전에 적힌 줄, 칸을 넘기지 않고 적힌 줄, 세션 시작.
   rebuild: InstructionRebuild | null;

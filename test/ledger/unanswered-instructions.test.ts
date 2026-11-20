@@ -110,13 +110,22 @@ function redraft(item: UnansweredInstruction): Drafted<DraftAction> {
   }
 }
 
-// 같은 요청의 재전송: 받는 쪽·요청 ID·세대·본문 digest·본문이 같고 nonce만 새것이다.
+// 같은 요청의 재전송: 모든 동작에서 받는 쪽·요청 ID·두 세대·본문 digest·본문이 같고 nonce는 새것이다.
+// 머리의 두 시각은 동작마다 다르므로(envelopes.md "시각 규칙") 시험마다 따로 단언한다.
 function expectSameRequest(first: Envelope, again: Envelope): void {
   for (const field of ["recipient", "action", "request_id", "stop_generation", "run_generation", "body_digest"] as const) {
     expect(again.header[field], field).toBe(first.header[field]);
   }
   expect(again.body).toEqual(first.body);
   expect(again.header.nonce).not.toBe(first.header.nonce);
+}
+
+// 취소·세션 정지·확정은 봉하는 때의 시각을 머리에 싣는다. 같은 요청이지만 issued_at·expires_at은 각자 봉한 때의 값이다
+// (시한은 계약의 기본 수명 30000ms). 실행기는 같은 요청 ID를 본문 digest로 대조하므로 새 시각의 봉투도 같은 요청이다.
+function expectResealed(first: Envelope, again: Envelope, firstAt: number, againAt: number): void {
+  expectSameRequest(first, again);
+  expect([first.header.issued_at, first.header.expires_at]).toEqual([firstAt, firstAt + 30_000]);
+  expect([again.header.issued_at, again.header.expires_at]).toEqual([againAt, againAt + 30_000]);
 }
 
 // ---- 보장 3·1: 지시마다의 발행 시각과 본문 칸 ----
@@ -167,33 +176,37 @@ test("시작 지시: 갱신과 예산 감소 뒤에도 지시 줄의 발행 시�
   expect([rebuilt.header.issued_at, rebuilt.header.expires_at]).toEqual([first.header.issued_at, first.header.expires_at]);
 });
 
-test("종료·확정 지시: 기록에 넘긴 본문 칸으로 처음과 같은 봉투를 다시 만든다", () => {
+test("종료·확정 지시: 다시 연 뒤 같은 요청 ID·본문 digest·세대로 다시 봉하고, 두 시각은 다시 봉한 때의 값이다", () => {
   const path = tempPath();
   const ledger = openAt(path);
   const start = startWorker(ledger);
   must(ledger.applyReceipt(accepted(start.runId, start.requestId, "task_start"), start.from));
 
+  // 처음 +3000에 적고 봉한 취소를 다시 연 뒤 +60000에 다시 봉하면 시한은 +33000에서 +90000으로 옮는다.
   const cancel = id();
-  must(ledger.recordStopInstruction({ runId: start.runId, requestId: cancel, action: "task_cancel", stopGeneration: 0, now: NOW + 2_000, reason: "deadline" }));
-  const firstCancel = sealed(stopDraft({ action: "task_cancel", run: start.run, requestId: cancel, stopGeneration: 0, reason: "deadline" }), NOW + 2_000, 1);
-  const cancelItem = unanswered(ledger).instructions.find((i) => i.requestId === cancel) as UnansweredInstruction;
-  expect(cancelItem).toMatchObject({ action: "task_cancel", issuedAt: NOW + 2_000, runState: "stopping", rebuild: { action: "task_cancel", reason: "deadline" } });
-  expectSameRequest(firstCancel, sealed(redraft(cancelItem), NOW + 2_500, 99));
+  must(ledger.recordStopInstruction({ runId: start.runId, requestId: cancel, action: "task_cancel", stopGeneration: 0, now: NOW + 3_000, reason: "deadline" }));
+  const firstCancel = sealed(stopDraft({ action: "task_cancel", run: start.run, requestId: cancel, stopGeneration: 0, reason: "deadline" }), NOW + 3_000, 1);
+  ledger.close();
+
+  const reopened = ready(open(path, { clock }));
+  const cancelItem = unanswered(reopened).instructions.find((i) => i.requestId === cancel) as UnansweredInstruction;
+  expect(cancelItem).toMatchObject({ action: "task_cancel", issuedAt: NOW + 3_000, runState: "stopping", rebuild: { action: "task_cancel", reason: "deadline" } });
+  expectResealed(firstCancel, sealed(redraft(cancelItem), NOW + 60_000, 99), NOW + 3_000, NOW + 60_000);
 
   // 종료가 확인되면(이 시험은 completed) 결과 쪽으로 가고, 확정 지시의 본문은 넘긴 세 칸이다.
-  must(ledger.applyReceipt(stopped(start.runId, "completed"), start.from));
-  must(ledger.markResult({ runId: start.runId, resultDigest: RESULT, now: NOW + 3_000 }));
+  must(reopened.applyReceipt(stopped(start.runId, "completed"), start.from));
+  must(reopened.markResult({ runId: start.runId, resultDigest: RESULT, now: NOW + 61_000 }));
   const finalize = id();
-  const body = { outcome: "succeeded" as const, resultDigest: RESULT, storedAt: NOW + 2_900 };
-  must(ledger.recordFinalizeInstruction({ runId: start.runId, requestId: finalize, stopGeneration: 0, now: NOW + 3_000, ...body }));
-  const firstFinalize = sealed(finalizeDraft({ run: start.run, requestId: finalize, stopGeneration: 0, ...body }), NOW + 3_000, 2);
-  ledger.close();
+  const body = { outcome: "succeeded" as const, resultDigest: RESULT, storedAt: NOW + 60_900 };
+  must(reopened.recordFinalizeInstruction({ runId: start.runId, requestId: finalize, stopGeneration: 0, now: NOW + 61_000, ...body }));
+  const firstFinalize = sealed(finalizeDraft({ run: start.run, requestId: finalize, stopGeneration: 0, ...body }), NOW + 61_000, 2);
+  reopened.close();
 
   const value = unanswered(open(path, { clock }));
   expect(value.instructions.map((i) => i.requestId)).toEqual([finalize]);
   const finalizeItem = value.instructions[0] as UnansweredInstruction;
-  expect(finalizeItem).toMatchObject({ action: "result_finalize", issuedAt: NOW + 3_000, runState: "ready_result", rebuild: { action: "result_finalize", ...body } });
-  expectSameRequest(firstFinalize, sealed(redraft(finalizeItem), NOW + 3_500, 99));
+  expect(finalizeItem).toMatchObject({ action: "result_finalize", issuedAt: NOW + 61_000, runState: "ready_result", rebuild: { action: "result_finalize", ...body } });
+  expectResealed(firstFinalize, sealed(redraft(finalizeItem), NOW + 120_000, 98), NOW + 61_000, NOW + 120_000);
 });
 
 test("이은 부탁의 취소: 지시 줄의 본문 reason은 requested이고 답의 모양은 그대로다", () => {
@@ -236,7 +249,10 @@ test("이은 부탁의 취소: 지시 줄의 본문 reason은 requested이고 �
     phase: "stopping",
     instruction: { runId: run.runId, requestId: callId, stopGeneration: 0 },
   });
-  expect(unanswered(ledger).instructions.find((i) => i.requestId === callId)).toMatchObject({ action: "task_cancel", issuedAt: NOW + 1, rebuild: { action: "task_cancel", reason: "requested" } });
+  const item = unanswered(ledger).instructions.find((i) => i.requestId === callId) as UnansweredInstruction;
+  expect(item).toMatchObject({ action: "task_cancel", issuedAt: NOW + 1, rebuild: { action: "task_cancel", reason: "requested" } });
+  const first = sealed(stopDraft({ action: "task_cancel", run, requestId: callId, stopGeneration: 0, reason: "requested" }), NOW + 1, 1);
+  expectResealed(first, sealed(redraft(item), NOW + 60_000, 99), NOW + 1, NOW + 60_000);
 });
 
 test("본문 칸: 빼고 적은 지시는 다시 만들 수 없음이고, 계약이 받지 않는 칸은 적지 않고 던진다", () => {
@@ -405,7 +421,69 @@ test("이관: 판 1~3의 장부가 판 4로 올라가고 기존 지시 줄은 �
     expect(rawRows(path, `SELECT DISTINCT budget_left, reason, outcome, result_digest, stored_at FROM instructions ${mine}`)).toEqual([
       { budget_left: null, reason: null, outcome: null, result_digest: null, stored_at: null },
     ]);
+    // integrity_check는 CHECK 위반도 보고한다: 올라간 기존 줄이 판 4의 제약을 지난다.
+    expect(rawRows(path, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
   }
+});
+
+test("이관: 판 1~3에 적힌 확정 줄도 판 4의 제약을 지나 올라가고 다시 만들 수 없음으로 읽힌다", () => {
+  for (let version = 1; version < REBUILD_VERSION; version++) {
+    const path = tempPath();
+    const before = openAt(path, { migrations: loadMigrations().slice(0, version) });
+    const start = startWorker(before);
+    must(before.recordStopInstruction({ runId: start.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW }));
+    must(before.applyReceipt(stopped(start.runId, "cancelled"), start.from));
+    const finalize = id();
+    must(before.recordFinalizeInstruction({ runId: start.runId, requestId: finalize, stopGeneration: 0, now: NOW }));
+    before.close();
+
+    const upgraded = openLedger(path, { clock, mode: "reopen" });
+    expect(upgraded, `판 ${version}`).toMatchObject({ ok: true, migrated: { from: version, to: loadMigrations().length } });
+    if (!upgraded.ok) continue;
+    expect(unanswered(upgraded.ledger).instructions.map((i) => [i.action, i.requestId, i.rebuild])).toEqual([["result_finalize", finalize, null]]);
+    upgraded.ledger.close();
+    expect(rawRows(path, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+  }
+});
+
+test("이관: 본문 칸의 CHECK는 다시 만들 수 있는 완전한 꼴이거나 전부 빈 줄만 받는다", () => {
+  const path = tempPath();
+  const ledger = openAt(path);
+  const start = startWorker(ledger);
+  ledger.close();
+  const count = () => rawRows(path, "SELECT count(*) AS n FROM instructions");
+  const before = count();
+
+  // 공개 쓰기(finalizeFields·oneOf)가 먼저 막는 조합이다. SQL로 직접 넣어도 줄이 생기지 않는지 본다.
+  const rejected = [
+    // 결과 digest만 있는 확정: outcome이 NULL이면 `=` 비교는 NULL이고 CHECK는 NULL을 통과로 보므로 이관이 IS로 막는 조합이다.
+    { action: "result_finalize", result_digest: RESULT },
+    { action: "result_finalize", outcome: "failed" },
+    { action: "result_finalize", stored_at: NOW },
+    { action: "result_finalize", result_digest: RESULT, stored_at: NOW },
+    { action: "result_finalize", outcome: "succeeded", stored_at: NOW },
+    { action: "result_finalize", outcome: "failed", result_digest: RESULT, stored_at: NOW },
+    { action: "task_cancel", result_digest: RESULT },
+    { action: "task_cancel", budget_left: 1 },
+    { action: "task_cancel", reason: "daily_rotation" },
+    { action: "session_stop", reason: "requested" },
+    { action: "task_start", reason: "requested" },
+    { action: "task_start", budget_left: 0 },
+  ];
+  const raw = new Database(path);
+  try {
+    for (const row of rejected) {
+      const values = [id(), start.runId, row.action, 0, NOW, row.budget_left ?? null, row.reason ?? null, row.outcome ?? null, row.result_digest ?? null, row.stored_at ?? null];
+      const insert = () =>
+        raw
+          .query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at, budget_left, reason, outcome, result_digest, stored_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .run(...values);
+      expect(insert, JSON.stringify(row)).toThrow("CHECK constraint failed");
+    }
+  } finally {
+    raw.close();
+  }
+  expect(count()).toEqual(before);
 });
 
 test("이관: 판 4의 장부는 그 앞의 판 목록(옛 코드)으로 열지 않는다", () => {
@@ -424,6 +502,8 @@ test("불변: 같은 요청 ID로 다시 적으면 지금처럼 거절되고 적
     ok: false,
     reason: "invariant_violation",
   });
+  // 상태 검사가 먼저 걸리면 사유가 다르다: 같은 실행의 시작 재호출은 중복 INSERT 전에 transition_denied다.
+  expect(ledger.startRun({ runId: start.runId, requestId: start.requestId, stopGeneration: 0, now: NOW + 1 })).toEqual({ ok: false, reason: "transition_denied" });
   ledger.close();
   expect(rawRows(path, `SELECT reason, issued_at FROM instructions WHERE request_id = '${cancel}'`)).toEqual([{ reason: "requested", issued_at: NOW }]);
   const raw = new Database(path);

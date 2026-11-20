@@ -26,7 +26,7 @@
 | `0001-core` | 아래 "표"의 핵심 표와 그 트리거·인덱스·제약. `instructions.lease_until`은 판 2, `tool_requests`는 판 3, `instructions`의 본문 칸 다섯은 판 4가 만든다 |
 | `0002-renew-lease-end` | `instructions.lease_until`(INTEGER, NULL 허용) 칸 하나. 갱신 지시(`run_renew`)만 값을 가질 수 있고 그 값은 발행 시각보다 늦고 9007199254740991 이하다(CHECK). 칸만 더하므로 기존 줄은 NULL(끝 모름)이고 다른 칸의 값과 제약은 그대로다 |
 | `0003-tool-requests` | 표 `tool_requests`와 트리거 셋(`tool_requests_born_waiting`, `tool_requests_permanent`, `tool_requests_fixed`). 아래 "작업 부탁(배정 전 대기)". 새 표만 더하므로 기존 표·줄은 그대로다 |
-| `0004-instruction-rebuild` | `instructions`에 지시 본문을 다시 만들 칸 다섯(NULL 허용): `budget_left`(시작 지시만, 1 이상), `reason`(종료 지시만, 동작마다 계약 v1의 목록), `outcome`·`result_digest`·`stored_at`(확정 지시만, `outcome`과 `stored_at`은 함께, `result_digest`는 `succeeded`일 때만이고 그때는 반드시). 아래 "답을 받지 못한 지시". 칸만 더하므로 기존 줄은 NULL(다시 만들 수 없음)이고 다른 칸의 값과 제약·트리거(`instructions_fixed` 등)는 그대로다 |
+| `0004-instruction-rebuild` | `instructions`에 지시 본문을 다시 만들 칸 다섯(NULL 허용): `budget_left`(시작 지시만, 1 이상), `reason`(종료 지시만, 동작마다 계약 v1의 목록), `outcome`·`result_digest`·`stored_at`(확정 지시만, `outcome`과 `stored_at`은 함께, `result_digest`는 `succeeded`일 때만이고 그때는 반드시. 그래서 세 칸은 다시 만들 수 있는 완전한 꼴이거나 셋 다 비어 있고, `outcome` 없이 `result_digest`만 있는 줄도 CHECK가 막는다). 아래 "답을 받지 못한 지시". 칸만 더하므로 기존 줄은 NULL(다시 만들 수 없음)이고 다른 칸의 값과 제약·트리거(`instructions_fixed` 등)는 그대로다 |
 
 판 하나는 트랜잭션 하나라 도중에 실패하거나 끊기면 그 판 전체가 되돌려진다. 적용 기록은 `ledger_migrations(version, name, applied_at)`. 번호가 비거나, 이름과 번호가 다르거나, 폴더에 꼴이 다른 파일이 있거나, 장부의 판이 코드보다 높거나, 같은 번호의 이름이 다르면 열지 않는다. 호출자가 `migrations`로 넘긴 목록도 같은 검사를 파일을 열기 전에 자리마다 거친다(배열의 빈 자리 포함). 적용 시각으로 쓸 시계의 값도 파일을 건드리기 전에 확인한다.
 
@@ -150,9 +150,9 @@
 
 | 공개 함수 | 돌려주는 것 | 쓰는 곳 |
 |---|---|---|
-| `unansweredInstructions()` | `Read<UnansweredInstructions>`. `stopGeneration`(장부의 지금 정지 세대, 기록이 없으면 `null`)과 `instructions`(아래 판정에 걸린 지시 전부). 항목은 `requestId`, `action`, `runId`, `runGeneration`, `executorId`(지정 실행기), `runState`, `stopGeneration`(그 지시를 적을 때의 세대), `issuedAt`(그 지시 줄의 발행 시각), `rebuild`(본문을 다시 만들 칸, 못 만들면 `null`) | 재전송(뒤 작업), D-90의 "접수 영수증이 한 번도 없음" |
+| `unansweredInstructions()` | `Read<UnansweredInstructions>`. `stopGeneration`(장부의 지금 정지 세대, 기록이 없으면 `null`)과 `instructions`(아래 판정에 걸린 지시 전부). 항목은 `requestId`, `action`, `runId`, `runGeneration`, `executorId`(지정 실행기), `runState`, `stopGeneration`(그 지시를 적을 때의 세대), `issuedAt`(그 지시 줄의 발행 시각), `rebuild`(본문을 다시 만들 칸, 못 만들면 `null`) | 재전송(뒤 작업), D-90의 "접수 영수증이 한 번도 없음"의 장부 쪽 증거(점유 응답은 따로 본다, 아래 "뒤 작업이 알아야 할 것") |
 
-**판정.** 영수증은 `deliveries`의 받은 기록이다(낸 쪽이 그 실행의 지정 실행기이고 세대가 같을 때만 적힌다).
+**판정.** 영수증은 `deliveries`의 받은 기록이다(낸 쪽이 그 실행의 지정 실행기이고 세대가 같을 때만 적힌다). 예외는 세션 인수 영수증(`receipt_session_takeover`)이다: 앞 세션의 지정 실행기 말고 대기 중인 세션 실행의 지정 실행기가 낸 것도 적히고, 이 영수증이 가리키는 실행은 앞 세션이다("세션 증거").
 
 | 지시 | 답을 받지 못함 | 내지 않는 실행 |
 |---|---|---|
@@ -163,7 +163,9 @@
 
 - **시작은 접수 영수증만 보지 않는다.** 실행기는 시작 지시로만 실행을 알게 되므로 그 실행의 영수증·보고가 하나라도 있으면 시작을 받은 것이다. 접수 영수증만 보면 그것이 늦게 오는 동안 이미 도는 실행을 "받은 적 없음"으로 읽는다. 그래서 이 읽기에 시작이 나오면 그 실행의 접수 영수증도 한 번도 없었다(반대는 아니다: 접수 영수증만 빠진 실행은 나오지 않는다).
 - **순서:** 실행의 대기 순번, 그 안에서 시작 → 종료 → 확정, 발행 시각, 요청 ID. 종료의 발행 시각이 시작보다 일러도 같은 실행에서는 시작이 앞이다.
-- **본문 칸(`rebuild`):** 시작은 `role`·`profileRevision`·`policyRevision`·`snapshotDigest`·`inputDigest`·`deadlineAt`·`credential`(실행 줄, 시작 뒤 바뀌지 않음)과 `budgetLeft`(지시 줄, 시작 때의 남은 예산)다. 종료는 `reason`, 확정은 `outcome`·`resultDigest`·`storedAt`이다. 실행 ID·세대·지정 실행기·정지 세대·발행 시각은 항목에 있다. 자격은 참조 네 칸만이고 값·원문은 없다. 봉투 모듈(`src/supervisor/dispatch/envelopes.ts`)의 초안 입력으로는 시작이 `startDraft({ run: { runId, runGeneration, executorId, kind: "worker", ...rebuild }, requestId, stopGeneration, issuedAt })`, 종료가 `stopDraft({ action, run, requestId, stopGeneration, reason })`, 확정이 `finalizeDraft({ run, requestId, stopGeneration, outcome, resultDigest, storedAt })`다. 이렇게 만든 봉투는 처음 봉투와 받는 쪽·요청 ID·세대·본문 digest가 같고 nonce만 다르다(`test/ledger/unanswered-instructions.test.ts`).
+- **본문 칸(`rebuild`):** 시작은 `role`·`profileRevision`·`policyRevision`·`snapshotDigest`·`inputDigest`·`deadlineAt`·`credential`(실행 줄, 시작 뒤 바뀌지 않음)과 `budgetLeft`(지시 줄, 시작 때의 남은 예산)다. 종료는 `reason`, 확정은 `outcome`·`resultDigest`·`storedAt`이다. 실행 ID·세대·지정 실행기·정지 세대·발행 시각은 항목에 있다. 자격은 참조 네 칸만이고 값·원문은 없다. 봉투 모듈(`src/supervisor/dispatch/envelopes.ts`)의 초안 입력으로는 시작이 `startDraft({ run: { runId, runGeneration, executorId, kind: "worker", ...rebuild }, requestId, stopGeneration, issuedAt })`, 종료가 `stopDraft({ action, run, requestId, stopGeneration, reason })`, 확정이 `finalizeDraft({ run, requestId, stopGeneration, outcome, resultDigest, storedAt })`다.
+- **다시 봉한 봉투:** 위 초안으로 다시 봉한 봉투는 모든 동작에서 처음 봉투와 받는 쪽·요청 ID·본문 digest·본문·머리의 두 세대(정지·실행)가 같고 nonce·서명은 새것이다. 머리의 두 시각은 봉투 모듈의 시각 규칙(`src/supervisor/dispatch/envelopes.md`)대로 동작마다 다르다. **시작**은 항목의 `issuedAt`(지시 줄의 발행 시각)으로 봉하므로 `issued_at`·`expires_at`도 처음과 같다. **취소·세션 정지·확정**은 다시 봉하는 때의 시각으로 봉하므로 `issued_at`·`expires_at`이 달라진다(처음 발행 +3000ms, 다시 연 뒤 +60000ms에 봉하면 시한이 +33000ms에서 +90000ms로 옮는다). 실행기는 취소·확정의 재전송을 요청 ID와 본문 digest로 대조해 같으면 앞서 낸 영수증을 다시 보내므로(봉투 모듈 문서의 "종료·확정·조회·ack의 시각을 새로 두는 이유") 새 시각의 봉투도 같은 요청이다. 세션 실행기가 `session_stop`의 재전송을 같은 요청으로 처리하는지는 확인하지 않았다(봉투 모듈 문서와 같다). 시험은 `test/ledger/unanswered-instructions.test.ts`(세션 정지는 세션 시작이 닫혀 있어 공개 API로 만들 수 없다).
+- **같은 요청 ID로 다시 적기:** 지시 줄은 적은 뒤 바뀌지 않는다(`instructions_fixed`·`instructions_no_replace`). 같은 요청 ID의 줄을 다시 넣으려는 기록은 거절되고 기존 줄과 칸은 그대로다. 거절 사유는 상태 검사가 먼저 걸리는지에 따른다: 같은 실행의 `startRun` 재호출과, 종료가 확인됐거나 끝난 실행의 취소는 `transition_denied`이고, 중복 INSERT까지 닿은 직접 취소·이은 부탁 취소·확정은 `invariant_violation`이다. 그래서 빼고 적은 본문 칸을 같은 요청 ID로 나중에 채울 수 없다.
 - **지시마다의 발행 시각:** 항목의 `issuedAt`은 그 지시 줄의 값이다. 갱신이 적힌 뒤의 `instructionTimes(runId).lease.issuedAt`은 갱신의 시각이라 시작 지시를 다시 만드는 데 쓰지 않는다.
 - **다시 만들 수 없음(`rebuild: null`):** 판 4 전에 적힌 줄, 본문 칸을 넘기지 않고 적힌 줄(위 "쓰기 규칙"의 "지시의 본문 칸"), 세션 시작(세션 계약 전이라 적히지 않는다), 칸의 값이 계약 밖인 줄. 비어 있는 칸을 실행 줄의 지금 값(예: 줄어든 예산)이나 기본값으로 채우지 않는다.
 - **모름:** 읽기가 실패하면 `{ known: false }`이고 장부를 바꾸지 않는다(다른 읽기처럼 건강 상태만 "쓸 수 없음"이 된다).
@@ -391,11 +393,11 @@ v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느
   - **정책의 갱신 간격은 판단의 지연과 기록부터 송신까지의 시간을 갱신 구간에서 빼고 정한다.** `renewEveryMs = 17000`이면 구간이 0ms라, 정각에 판단·기록해도 싣기까지 1ms가 들면 송신 규칙으로 싣지 않는다(장부에는 발급한 끝이 남는다). 두 시간의 운영 상한은 정해지지 않았다.
   - 계속 실행할 수 있는 상태에서 임대 끝을 모르거나 여유가 없으면 같은 ID를 조회하고, 취소·기한·종료·결과 처리는 실행 상태에 따른다.
 - **재전송(답을 받지 못한 지시):** 장부는 `unansweredInstructions()`로 지시와 본문 칸을 낼 뿐 보내지 않는다. 다시 보내는 쪽이 지킬 것:
-  - **같은 요청 ID·같은 본문을 새 봉투에 담는다.** 실행기는 같은 nonce를 한 번만 받으므로 봉투를 그대로 다시 보내지 않는다. 재전송은 장부에 새 줄을 쓰지 않는다. 새 요청 ID로 다시 내면 지시 줄이 하나 더 생기고, 그때는 이번 발행 시각을 판단과 같은 시계로 적는다.
-  - **정지 세대가 오른 뒤의 옛 세대 지시는 실행기가 받지 않는다.** 머리의 정지 세대는 실행기의 값과 정확히 같아야 하고, 높은 세대를 받는 것은 비상 정지의 종료(`reason`이 `emergency_stop`)뿐이다. 항목의 `stopGeneration`과 결과의 `stopGeneration`(지금 값)이 다르면 그 지시는 다시 보내도 답이 없다. 종료 쪽은 새 세대의 비상 종료가, 확정은 새 세대·새 요청 ID의 확정이 덮어야 한다.
+  - **같은 요청 ID·같은 본문을 새 봉투에 담는다.** 실행기는 같은 nonce를 한 번만 받으므로 봉투를 그대로 다시 보내지 않는다. 시작은 장부의 발행 시각으로, 취소·세션 정지·확정은 봉하는 때의 시각으로 봉한다(위 "다시 봉한 봉투"). 재전송은 장부에 새 줄을 쓰지 않는다. 새 요청 ID로 다시 내면 지시 줄이 하나 더 생기고, 그때는 이번 발행 시각을 판단과 같은 시계로 적는다.
+  - **항목의 정지 세대가 장부의 지금 세대와 다르면 보내지 않는다.** 실행기가 그 지시를 받는지는 실행기가 적용한 세대에 달렸다. 머리의 정지 세대는 실행기의 값과 정확히 같아야 하고 높은 세대를 받는 것은 비상 정지의 종료(`reason`이 `emergency_stop`)뿐이라, 실행기가 새 세대를 적용한 뒤에는 옛 세대의 지시를 받지 않는다. 적용하기 전이면 받을 수 있고, 그러면 장부가 이미 넘어선 세대의 지시가 실행된다. 그래서 항목의 `stopGeneration`과 결과의 `stopGeneration`(지금 값)이 다르면 송신을 건너뛰고, 실행기와 세대를 맞춘 뒤 종료는 새 세대의 비상 종료로, 확정은 새 세대·새 요청 ID의 확정으로 낸다.
   - **시작은 시한 안에서만 다시 보낸다.** 시작은 장부의 발행 시각을 그대로 실으므로 봉투 시한(발행 + 기본 수명)이 지나면 다시 봉하지 못한다(`too_late_to_send`). 같은 실행에 시작과 종료가 함께 답이 없으면, 시작을 다시 보내면 실행이 열렸다가 곧 닫힌다. 모르는 실행의 종료는 실행기가 아무것도 하지 않으므로 종료만 보내면 답이 없다. 어느 쪽을 보낼지는 부르는 쪽이 정한다.
-  - **다시 만들 수 없는 지시(`rebuild: null`)는 보내지 않고 같은 실행 ID의 조회로 돌린다.** 그래서 종료·확정을 적을 때 본문 칸(`reason`, `outcome`·`resultDigest`·`storedAt`)을 늘 넘긴다.
-  - **D-90(받은 적 없는 실행의 자리):** 조건 셋 가운데 "접수 영수증이 한 번도 없음"은 이 읽기에 그 실행의 `task_start`가 나오는지로 판정할 수 있다(나오면 그 실행의 영수증·보고가 하나도 없다). "시작 지시를 더 보내지 않고 마지막 봉투의 시한이 지남"의 시각은 이 읽기로 정해진다: 실행 하나의 시작 지시는 하나이고(`startRun`은 `queued`에서만), 그 봉투는 다시 봉해도 장부의 발행 시각을 실어 시한이 모두 항목의 `issuedAt` + 기본 수명이다. "더 보내지 않음"은 보낸 기록이 장부에 없어 재전송하는 쪽이 지키고, "그 뒤의 전체 점유 답에 없음"은 연결의 일이다. 자리를 푸는 연산은 장부에 없다.
+  - **다시 만들 수 없는 지시(`rebuild: null`)는 보내지 않고 같은 실행 ID의 조회로 돌린다.** 그래서 종료·확정을 적을 때 본문 칸(`reason`, `outcome`·`resultDigest`·`storedAt`)을 **늘** 넘긴다. 빼고 적은 지시는 영영 다시 만들 수 없고, 같은 요청 ID로 나중에 채울 수도 없다(위 "같은 요청 ID로 다시 적기"). 조립 코드의 쓰기 포트는 본문 칸을 필수로 받고, 같은 인자를 처음 봉투와 장부에 넘긴다.
+  - **D-90(받은 적 없는 실행의 자리):** 조건 셋 가운데 "접수 영수증이 한 번도 없음"의 판정에 이 읽기만 쓰지 않는다. 이 읽기에 그 실행의 `task_start`가 나오면 장부에 저장된 그 실행의 영수증·보고가 하나도 없다는 뜻일 뿐이다. "그 실행기가 이 실행 ID를 안다고 한 적도 없다"는 결론에는 실행기의 과거 점유 응답(그 실행을 쥐고 있다고 답한 적이 있는가)도 따로 본다. 양성 점유 관측과 충돌하면 자동 해제를 보류하고, 부분 응답을 조건 (3)의 전체 점유 응답으로 쓰지 않는다. "시작 지시를 더 보내지 않고 마지막 봉투의 시한이 지남"의 시각은 이 읽기로 정해진다: 실행 하나의 시작 지시는 하나이고(`startRun`은 `queued`에서만), 그 봉투는 다시 봉해도 장부의 발행 시각을 실어 시한이 모두 항목의 `issuedAt` + 기본 수명이다. "더 보내지 않음"은 보낸 기록이 장부에 없어 재전송하는 쪽이 지키고, "그 뒤의 전체 점유 답에 없음"은 연결의 일이다. 자리를 푸는 연산은 장부에 없다.
 - **CLI 풀기(§7.6):** 장부 쪽은 `releaseStop({ generation })` 하나다. 풀면 접수가 닫히고 새 복원 시도가 끝까지 마쳐야 열린다. 새 실행 세대를 적는 연산은 아직 없다. 세대를 올리면 옛 세대의 대기 실행은 시작되지 않고(`run_generation_stale`, 5단계 `staleQueued`) 종료 기록만 된다. 확인 단계(`phase`)는 `applyStop`의 `phase`로 같은 세대에 덧붙인다.
 - **현관:** 권위 정지 기록의 답은 `{ generation, stopped }` 두 칸이어야 하고 다른 꼴은 모름이다. 게시 연결은 같은 작업 ID에 다른 후보를 다시 연결하지 않는다.
 

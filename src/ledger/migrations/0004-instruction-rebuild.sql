@@ -5,7 +5,9 @@
 -- - budget_left: 시작 지시(task_start) 본문의 budget_tokens. 실행 줄의 남은 예산은 시작 뒤 줄어들 수 있다(recordBudget).
 -- - reason: 종료 지시(task_cancel·session_stop) 본문의 reason. 허용 값은 계약 v1의 목록과 같다(시험이 대조한다).
 -- - outcome·result_digest·stored_at: 확정 지시(result_finalize) 본문의 같은 이름 칸. outcome과 stored_at은 함께 있거나 함께 없고,
---   result_digest는 outcome이 succeeded일 때만, 그리고 그때는 반드시 있다(계약의 parseResultFinalize와 같은 규칙).
+--   result_digest는 outcome이 succeeded일 때만, 그리고 그때는 반드시 있다(계약의 parseResultFinalize와 같은 규칙). 그래서 세 칸은
+--   다시 만들 수 있는 완전한 꼴이거나 셋 다 비어 있다.
+--   함정: outcome이 NULL이면 `outcome = 'succeeded'`도 NULL이고 CHECK는 NULL을 통과로 본다. 결과 digest만 있는 줄을 막으려고 IS로 비교한다.
 -- NULL은 장부가 그 지시의 본문을 다시 만들 수 없다는 뜻이다: 이 판을 적용하기 전에 적힌 줄, 칸을 넘기지 않고 적힌 줄, 이 칸을 쓰지 않는
 -- 동작(갱신은 lease_until을 쓰고, 세션 시작은 적히지 않는다). 칸만 더하고 기존 줄의 값은 바꾸지 않는다.
 -- 지시는 적은 뒤 바뀌지 않으므로(instructions_fixed) 나중에 채우지 않는다.
@@ -18,7 +20,7 @@ ALTER TABLE instructions ADD COLUMN reason TEXT
 ALTER TABLE instructions ADD COLUMN outcome TEXT
   CHECK (outcome IS NULL OR (action = 'result_finalize' AND outcome IN ('succeeded', 'failed', 'cancelled')));
 ALTER TABLE instructions ADD COLUMN result_digest TEXT
-  CHECK (result_digest IS NULL OR outcome = 'succeeded');
+  CHECK (result_digest IS NULL OR outcome IS 'succeeded');
 ALTER TABLE instructions ADD COLUMN stored_at INTEGER
   CHECK ((stored_at IS NULL) = (outcome IS NULL)
     AND (stored_at IS NULL OR stored_at BETWEEN 1 AND 9007199254740991)
