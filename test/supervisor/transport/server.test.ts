@@ -1,0 +1,474 @@
+// 감독 연결 서버의 보장 넷. 루프백(127.0.0.1)의 빈 포트에서 실제 상호 TLS로 연다. 인증서는 시험 안에서 메모리로 만든다
+// (test/transport/certs.ts, 파일을 쓰지 않는다). 실행기 쪽은 기존 tls-client.ts와 바이트 틀로 흉내 내고 봉투는 계약 v1로 실제 서명한다.
+// 서버의 시계는 시험이 쥔 값이다. nonce 저장소는 시험이 한 번씩 붙잡아 검증이 오래 걸리는 순간을 만든다.
+import { afterEach, describe, expect, test } from "bun:test";
+import { generateKeyPairSync, type KeyObject } from "node:crypto";
+import type * as tls from "node:tls";
+import { type Envelope, limits, type NonceStore, rawPublicKey, type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
+import type { ReplyTools } from "../../../src/supervisor/transport/connections.ts";
+import { type RegistrySettings, RegistryState } from "../../../src/supervisor/transport/registry.ts";
+import { type ConnectionServer, type ConnectionServerOptions, type Delivered, type ServerNote, startConnectionServer } from "../../../src/supervisor/transport/server.ts";
+import { createFrameDecoder, encodeFrame } from "../../../src/transport/framing.ts";
+import type { RawTlsMaterial } from "../../../src/transport/tls-policy.ts";
+import { createTlsClient } from "../../../src/transport/tls-client.ts";
+import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../../transport/certs.ts";
+
+const HOST = "127.0.0.1";
+const ANSWER = limits.STOP_SYNC_ANSWER_MAX_MS;
+const GENERATION = 3;
+const pki = makePki();
+
+const material = (leaf: Issued): RawTlsMaterial => ({ certificatePem: leaf.pem, privateKeyPem: leaf.keyPem, trustBundlePem: pki.ca.pem });
+
+const cleanup: (() => unknown)[] = [];
+afterEach(async () => {
+  for (const fn of cleanup.splice(0).reverse()) await fn();
+});
+
+async function until(cond: () => boolean, ms = 3000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("기다리던 상태가 오지 않았다");
+    await Bun.sleep(5);
+  }
+}
+
+// ---- 키·등록표(시험이 지어 넣는 자료) ----
+
+interface Keys {
+  readonly privateKey: KeyObject;
+  readonly raw: string;
+}
+function newKeys(): Keys {
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  return { privateKey, raw: rawPublicKey(publicKey) };
+}
+const SUP = newKeys();
+const K1 = newKeys();
+const K2 = newKeys();
+const K1B = newKeys();
+
+const R1 = "executor/isolated_reader/r1/s1";
+const R2 = "executor/isolated_reader/r2/s2";
+const RUN = "11111111-1111-4111-8111-111111111111";
+const running: RunStatus = { run_id: RUN, state: "running", run_generation: 1, last_receipt_id: null };
+
+const registrySettings: RegistrySettings = { environment: "home", targets: [{ target: "reader", namespace: "olive-reader", roles: ["isolated_reader"] }] };
+const row = (keys: Keys, instance: string, storage: string) => ({ target: "reader", role: "isolated_reader", instance, storage, public_key: keys.raw, active: true });
+const doc = (revision: number, executors: unknown[]) => new TextEncoder().encode(JSON.stringify({ environment: "home", revision, executors }));
+function firstRegistry(): RegistryState {
+  const outcome = RegistryState.start(registrySettings).apply({ kind: "content", content: doc(1, [row(K1, "r1", "s1"), row(K2, "r2", "s2")]) });
+  if (outcome.kind !== "applied") throw new Error("시험 등록표가 적용되지 않았다");
+  return outcome.state;
+}
+
+let counter = 0;
+const hex32 = () => (++counter).toString(16).padStart(32, "0");
+const uuid = () => `00000000-0000-4000-8000-${(++counter).toString(16).padStart(12, "0")}`;
+
+function seal(keys: Keys, sender: string, action: string, generation: number, at: number, body: unknown): Envelope {
+  return sealEnvelope(
+    { sender, recipient: "supervisor", action, request_id: uuid(), stop_generation: generation, run_generation: 0, issued_at: at, nonce: hex32(), body } as never,
+    keys.privateKey,
+  );
+}
+const syncRequest = (keys: Keys, sender: string, at: number) => seal(keys, sender, "stop_sync_request", 0, at, { challenge: hex32() });
+const hello = (keys: Keys, sender: string, at: number) =>
+  seal(keys, sender, "hello", GENERATION, at, { profile_revision: "profile-1", policy_revision: "policy-1", runs: [], unacked_ids: [] });
+const statusReport = (keys: Keys, sender: string, at: number) => seal(keys, sender, "status_report", GENERATION, at, { in_reply_to: uuid(), runs: [running] });
+
+// ---- 붙잡을 수 있는 nonce 저장소 ----
+
+function heldNonces() {
+  const seen = new Set<string>();
+  const calls: string[] = [];
+  let armed: { entered: boolean; release: () => void; promise: Promise<void> } | null = null;
+  const store: NonceStore = {
+    consume(sender, nonce) {
+      calls.push(nonce);
+      const key = `${sender} ${nonce}`;
+      const fresh = !seen.has(key);
+      seen.add(key);
+      const gate = armed;
+      if (gate === null) return fresh;
+      armed = null;
+      gate.entered = true;
+      return gate.promise.then(() => fresh);
+    },
+  };
+  return {
+    store,
+    calls,
+    // 다음 consume 하나를 release까지 붙잡는다.
+    hold() {
+      let release!: () => void;
+      const promise = new Promise<void>((resolve) => (release = resolve));
+      const gate = { entered: false, release, promise };
+      armed = gate;
+      return gate;
+    },
+  };
+}
+
+// ---- 서버와 실행기 흉내 ----
+
+interface Harness {
+  readonly server: ConnectionServer;
+  readonly clock: { t: number };
+  readonly delivered: Delivered[];
+  readonly notes: ServerNote[];
+  readonly nonces: ReturnType<typeof heldNonces>;
+  // 서명하는 동안 시간이 흐르게 하는 자리.
+  onSeal: () => void;
+  closedNotes(id: number): ServerNote[];
+}
+
+async function start(over: Partial<ConnectionServerOptions> = {}): Promise<Harness> {
+  const clock = { t: Date.now() };
+  const delivered: Delivered[] = [];
+  const notes: ServerNote[] = [];
+  const nonces = heldNonces();
+  const restorer = { stopGeneration: () => GENERATION };
+  const harness = { clock, delivered, notes, nonces, onSeal: () => {} } as Harness;
+  const reply: ReplyTools = {
+    seal: (input) => {
+      harness.onSeal();
+      return sealEnvelope(input, SUP.privateKey);
+    },
+    requestId: uuid,
+    nonce: hex32,
+  };
+  const result = await startConnectionServer({
+    host: HOST,
+    port: 0,
+    material: material(pki.supervisor()),
+    clock: () => clock.t,
+    registry: firstRegistry(),
+    restorer: () => restorer,
+    runGeneration: () => undefined,
+    nonces: nonces.store,
+    reply,
+    deliver: (output) => delivered.push(output),
+    observe: (note) => notes.push(note),
+    ...over,
+  });
+  if (!result.ok) throw new Error(`서버가 시작하지 않았다: ${result.failure.kind}`);
+  cleanup.push(() => result.server.close());
+  return Object.assign(harness, {
+    server: result.server,
+    closedNotes: (id: number) => notes.filter((n) => n.kind === "closed" && n.connection === id),
+  });
+}
+
+interface Peer {
+  readonly id: number;
+  readonly socket: tls.TLSSocket;
+  readonly frames: Envelope[];
+  closed(): boolean;
+  send(...envelopes: Envelope[]): void;
+  sendBytes(bytes: Uint8Array): void;
+}
+
+function frame(envelope: unknown): Uint8Array {
+  const encoded = encodeFrame(new TextEncoder().encode(JSON.stringify(envelope)));
+  if (!encoded.ok) throw new Error(encoded.reason);
+  return encoded.frame;
+}
+
+// 실행기 하나가 붙는다. 서버가 그 연결을 연결 표에 연 뒤에 돌려준다(TLS 1.3에서는 클라이언트 쪽이 먼저 끝난다).
+async function connect(h: Harness): Promise<Peer> {
+  const client = createTlsClient({ address: HOST, port: h.server.port, supervisorDnsName: SUPERVISOR_DNS, supervisorUri: SUPERVISOR_URI, material: material(pki.executor()), now: Date.now });
+  cleanup.push(() => client.close());
+  const before = h.notes.filter((n) => n.kind === "opened").length;
+  const conn = await client.connect();
+  const socket = conn.socket;
+  socket.on("error", () => {});
+  const frames: Envelope[] = [];
+  const decoder = createFrameDecoder();
+  socket.on("data", (chunk: Buffer) => {
+    for (const envelope of decoder.push(new Uint8Array(chunk)).envelopes) frames.push(envelope.value as Envelope);
+  });
+  let closed = false;
+  socket.once("close", () => (closed = true));
+  await until(() => h.notes.filter((n) => n.kind === "opened").length > before);
+  const opened = h.notes.filter((n) => n.kind === "opened").at(-1) as Extract<ServerNote, { kind: "opened" }>;
+  return {
+    id: opened.connection,
+    socket,
+    frames,
+    closed: () => closed,
+    send: (...envelopes) => socket.write(Buffer.concat(envelopes.map((e) => frame(e)))),
+    sendBytes: (bytes) => socket.write(bytes),
+  };
+}
+
+const phaseOf = (h: Harness, peer: Peer) => h.server.table().get(peer.id)?.phase;
+
+// 맞춤과 인사를 마친 연결.
+async function greet(h: Harness, keys: Keys, sender: string): Promise<Peer> {
+  const peer = await connect(h);
+  peer.send(syncRequest(keys, sender, h.clock.t));
+  await until(() => peer.frames.length === 1);
+  expect(peer.frames[0]!.header.action).toBe("stop_sync_reply");
+  peer.send(hello(keys, sender, h.clock.t));
+  await until(() => phaseOf(h, peer) === "greeted");
+  return peer;
+}
+
+describe("(1) 받은 순서·받은 시각·검증 뒤 판단", () => {
+  test("받은 시각: 검증을 기다린 시간과 상관없이 바이트가 온 순간의 시각을 판단에 넘긴다", async () => {
+    const h = await start();
+    // 검증에 3초가 걸려도 받은 시각은 그대로이고, 답은 그 뒤에 싣는다.
+    const a = await connect(h);
+    const T0 = h.clock.t;
+    const gate = h.nonces.hold();
+    a.send(syncRequest(K1, R1, T0));
+    await until(() => gate.entered);
+    h.clock.t = T0 + 3_000;
+    gate.release();
+    await until(() => a.frames.length === 1);
+    const sync = h.server.table().get(a.id)!.sync!;
+    expect(sync.receivedAt).toBe(T0);
+    expect(sync.answeredAt).toBe(T0 + 3_000);
+    expect(phaseOf(h, a)).toBe("answered");
+
+    // 받은 때부터 STOP_SYNC_ANSWER_MAX_MS가 된 뒤에 검증이 끝나면 답하지 않는다(처리한 시각으로 재면 답해 버린다).
+    const b = await connect(h);
+    const T1 = h.clock.t;
+    const late = h.nonces.hold();
+    b.send(syncRequest(K2, R2, T1));
+    await until(() => late.entered);
+    h.clock.t = T1 + ANSWER;
+    late.release();
+    await until(() => b.closed());
+    expect(b.frames).toEqual([]);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment" }]);
+    expect(h.server.table().get(b.id)).toBeUndefined();
+  });
+
+  test("받은 시각: 앞 봉투의 검증을 기다리며 줄을 선 봉투도 바이트가 온 순간의 시각으로 검증한다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const T = h.clock.t;
+    const first = statusReport(K1, R1, T);
+    const second = statusReport(K1, R1, T);
+    const gate = h.nonces.hold();
+    a.send(first, second);
+    await until(() => gate.entered);
+    // 앞 봉투를 검증하는 사이 봉투 수명(30초)이 지났다. 뒤 봉투를 꺼낸 시각으로 검증하면 expired로 닫힌다.
+    h.clock.t = T + limits.MESSAGE_TTL_MS;
+    gate.release();
+    const forwards = () => h.delivered.filter((o) => o.kind === "forward").length;
+    await until(() => forwards() === 2 || h.closedNotes(a.id).length > 0);
+    expect(h.closedNotes(a.id)).toEqual([]);
+    expect(forwards()).toBe(2);
+  });
+
+  test("차례: 한 연결의 다음 봉투는 앞 봉투의 check와 step이 끝난 뒤에 check한다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const first = statusReport(K1, R1, h.clock.t);
+    const second = statusReport(K1, R1, h.clock.t);
+    const gate = h.nonces.hold();
+    a.send(first, second);
+    await until(() => gate.entered);
+    await Bun.sleep(50);
+    // 앞 봉투의 검증이 끝나지 않았으므로 뒤 봉투는 아직 nonce에 닿지 않았다.
+    expect(h.nonces.calls.at(-1)).toBe(first.header.nonce);
+    expect(h.nonces.calls).not.toContain(second.header.nonce);
+    gate.release();
+    await until(() => h.delivered.filter((o) => o.kind === "forward").length === 2);
+    expect(h.nonces.calls.slice(-2)).toEqual([first.header.nonce, second.header.nonce]);
+    const after = h.delivered.filter((o) => o.kind === "forward" || o.kind === "occupancy").slice(-4);
+    expect(after.map((o) => o.kind)).toEqual(["occupancy", "forward", "occupancy", "forward"]);
+    const forwarded = after.filter((o) => o.kind === "forward").map((o) => (o.kind === "forward" ? o.verified.header.nonce : null));
+    expect(forwarded).toEqual([first.header.nonce, second.header.nonce]);
+  });
+
+  test("틀이 거절한 바이트(중복 키, 크기 상한)는 판단에 닿지 않고 그 연결을 닫는다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const request = syncRequest(K1, R1, h.clock.t);
+    const text = JSON.stringify(request);
+    const duplicated = `{"header":${JSON.stringify(request.header)},${text.slice(1)}`;
+    // 틀의 길이 접두는 맞고 본문에 같은 키가 두 번 있다.
+    const encoded = encodeFrame(new TextEncoder().encode(duplicated));
+    if (!encoded.ok) throw new Error(encoded.reason);
+    a.sendBytes(encoded.frame);
+    await until(() => a.closed());
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "frame", frame: "frame_duplicate_key" }]);
+
+    const b = await connect(h);
+    const tooLarge = new Uint8Array(4);
+    new DataView(tooLarge.buffer).setUint32(0, limits.MAX_MESSAGE_BYTES + 1, false);
+    b.sendBytes(tooLarge);
+    await until(() => b.closed());
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "frame", frame: "frame_too_large" }]);
+
+    expect(h.nonces.calls).toEqual([]);
+    expect(h.server.table().get(a.id)).toBeUndefined();
+    expect(h.server.table().get(b.id)).toBeUndefined();
+  });
+
+  test("답을 싣기 전에 받은 hello는 답을 실은 뒤 차례가 와도 판단에 넘기지 않고 연결을 닫는다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const gate = h.nonces.hold();
+    // 시계가 멈춰 있어 hello의 받은 시각과 답을 실은 시각이 같다. 판단은 같은 시각을 소켓 사건의 순서에 맡긴다.
+    a.send(syncRequest(K1, R1, h.clock.t), hello(K1, R1, h.clock.t));
+    await until(() => gate.entered);
+    await Bun.sleep(50);
+    gate.release();
+    await until(() => a.closed());
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "before_reply" }]);
+    expect(h.delivered.filter((o) => o.kind === "candidate")).toEqual([]);
+  });
+});
+
+describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => {
+  test("서명하는 사이 기한 정각이 되면 싣지 않고 판단이 그 연결을 닫는다. 정각 전이면 싣고 그 시각을 reply_sent로 넣는다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const T0 = h.clock.t;
+    const gate = h.nonces.hold();
+    a.send(syncRequest(K1, R1, T0));
+    await until(() => gate.entered);
+    h.clock.t = T0 + ANSWER - 1;
+    h.onSeal = () => (h.clock.t = T0 + ANSWER);
+    gate.release();
+    await until(() => a.closed());
+    expect(a.frames).toEqual([]);
+    expect(h.notes).toContainEqual({ kind: "reply_not_sent", connection: a.id, deadline: T0 + ANSWER, at: T0 + ANSWER });
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
+
+    const b = await connect(h);
+    const T1 = h.clock.t;
+    const next = h.nonces.hold();
+    b.send(syncRequest(K2, R2, T1));
+    await until(() => next.entered);
+    h.clock.t = T1 + ANSWER - 2;
+    h.onSeal = () => (h.clock.t = T1 + ANSWER - 1);
+    next.release();
+    await until(() => b.frames.length === 1);
+    expect(b.frames[0]!.header.action).toBe("stop_sync_reply");
+    expect(h.server.table().get(b.id)!.sync!.answeredAt).toBe(T1 + ANSWER - 1);
+    expect(phaseOf(h, b)).toBe("answered");
+  });
+});
+
+describe("(3) 닫힘과 교체", () => {
+  test("판단이 close를 내면 소켓을 닫고, 상대가 닫아도 closed를 한 번만 알린다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    a.send(hello(K1, R1, h.clock.t));
+    await until(() => a.closed());
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
+    expect(h.server.table().get(a.id)).toBeUndefined();
+
+    const b = await greet(h, K1, R1);
+    b.socket.destroy();
+    await until(() => h.closedNotes(b.id).length > 0);
+    await Bun.sleep(30);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "peer" }]);
+    expect(h.delivered.filter((o) => o.kind === "withdrawn")).toEqual([{ kind: "withdrawn", connection: b.id, principal: R1 }]);
+    expect(h.server.table().get(b.id)).toBeUndefined();
+
+    // 보내기만 끝낸 반쪽 닫힘도 닫힘이다.
+    const c = await greet(h, K2, R2);
+    c.socket.end();
+    await until(() => h.closedNotes(c.id).length > 0);
+    await Bun.sleep(30);
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "peer" }]);
+    expect(h.delivered.filter((o) => o.kind === "withdrawn" && o.connection === c.id)).toEqual([{ kind: "withdrawn", connection: c.id, principal: R2 }]);
+    expect(h.server.table().get(c.id)).toBeUndefined();
+  });
+
+  test("닫힌 연결의 늦게 끝난 검증 결과는 버리고, 같은 실행기의 새 연결을 바꾸지 않는다", async () => {
+    const h = await start();
+    const old = await greet(h, K1, R1);
+    const gate = h.nonces.hold();
+    old.send(statusReport(K1, R1, h.clock.t));
+    await until(() => gate.entered);
+    old.socket.destroy();
+    await until(() => h.closedNotes(old.id).length > 0);
+
+    const fresh = await greet(h, K1, R1);
+    const before = { state: h.server.table().get(fresh.id), delivered: h.delivered.length };
+    gate.release();
+    await Bun.sleep(50);
+    expect(h.delivered.length).toBe(before.delivered);
+    expect(h.server.table().get(fresh.id)).toBe(before.state!);
+    expect(fresh.closed()).toBe(false);
+    // 서버가 그 결과를 판단에 넘기지 않고 버렸다. 연결 판단도 지운 행의 결과를 쓰지 않으므로(connections.ts) 위 효과는 두 겹으로 막힌다.
+    expect(h.notes.filter((n) => n.kind === "late_dropped")).toEqual([{ kind: "late_dropped", connection: old.id }]);
+  });
+
+  test("검증을 기다리는 사이 다른 연결이 바꾼 상태를 되돌리지 않는다(step은 그때의 연결 표에 건다)", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const gate = h.nonces.hold();
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => gate.entered);
+    const b = await greet(h, K2, R2);
+    gate.release();
+    await until(() => a.frames.length === 1);
+    expect(phaseOf(h, a)).toBe("answered");
+    expect(phaseOf(h, b)).toBe("greeted");
+    expect(b.closed()).toBe(false);
+  });
+});
+
+describe("(4) 등록표가 바뀌면 판단에 알리고 더는 믿지 않는 연결을 끊는다", () => {
+  test("적용할 때마다 registry 사건을 넣는다. 행이 빠진 실행기의 연결은 끊고, 적용에 실패하면 남은 연결도 끊는다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const b = await greet(h, K2, R2);
+    const content = doc(2, [row(K2, "r2", "s2")]);
+    expect(h.server.applyRegistry({ kind: "content", content }).kind).toBe("applied");
+    // 적용한 뒤 부르는 쪽이 같은 배열을 다시 써도 서버가 믿는 판은 그대로다.
+    content.fill(0x20);
+    await until(() => a.closed());
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
+    expect(h.delivered).toContainEqual({ kind: "withdrawn", connection: a.id, principal: R1 });
+    expect(phaseOf(h, b)).toBe("greeted");
+    expect(h.server.registry().readout().revision).toBe(2);
+
+    expect(h.server.applyRegistry({ kind: "unreadable" }).kind).toBe("rejected");
+    await until(() => b.closed());
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment" }]);
+  });
+
+  test("봉투마다 지금의 등록표에서 키를 얻는다: 연결을 맺은 뒤 바뀐 키로만 맞춤이 통한다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const b = await connect(h);
+    expect(h.server.applyRegistry({ kind: "content", content: doc(2, [row(K1B, "r1", "s1"), row(K2, "r2", "s2")]) }).kind).toBe("applied");
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => a.closed());
+    expect(a.frames).toEqual([]);
+    b.send(syncRequest(K1B, R1, h.clock.t));
+    await until(() => b.frames.length === 1);
+    expect(phaseOf(h, b)).toBe("answered");
+  });
+});
+
+describe("시작", () => {
+  test("틀린 설정이나 쓸 수 없는 재료면 던지지 않고 구별된 실패를 돌려준다", async () => {
+    const base = {
+      host: HOST,
+      port: 0,
+      material: material(pki.supervisor()),
+      clock: Date.now,
+      registry: firstRegistry(),
+      restorer: () => ({ stopGeneration: () => GENERATION }),
+      runGeneration: () => undefined,
+      nonces: heldNonces().store,
+      reply: { seal: (input) => sealEnvelope(input, SUP.privateKey), requestId: uuid, nonce: hex32 } as ReplyTools,
+      deliver: () => {},
+    } satisfies ConnectionServerOptions;
+    const bad = await startConnectionServer({ ...base, settings: { helloWaitMs: 0 } });
+    expect(bad.ok ? null : bad.failure.kind).toBe("bad_settings");
+    const wrong = await startConnectionServer({ ...base, material: material(pki.executor()) });
+    expect(wrong.ok ? null : wrong.failure).toEqual({ kind: "no_material", reason: "certificate_shape" });
+  });
+});
