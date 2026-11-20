@@ -109,6 +109,10 @@ export const REFUSALS = [
   "budget_reduced",
   "snapshot_bound_unknown",
   "created_before_snapshot",
+  // closeRunByOperator(D-91 관리자 닫기)만 내는 거절(ledger.md "관리자가 실패로 닫기"). 앞 상태가 닫을 수 없는 나머지는 transition_denied다.
+  "run_not_worker",
+  "run_ended",
+  "stop_confirmed",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
 export type Refused = { ok: false; reason: Refusal };
@@ -169,6 +173,10 @@ export interface Run {
   stopReceiptId: string | null;
   cleanedReceiptId: string | null;
   resultDigest: string | null;
+  // listRuns만 not_started 줄에 싣는다: 관리자가 실패로 닫은 줄(operator_closures)인가. 스케줄러의 예산 상한이 읽는다
+  // (src/supervisor/scheduler/queue.ts의 budgetBar: false인 not_started 줄만 상한에서 빼고, 칸이 없으면 상한으로 센다).
+  // 다른 읽기와 다른 상태의 줄에는 이 칸이 없다.
+  closedByOperator?: boolean;
   createdAt: number;
   updatedAt: number;
 }
@@ -316,6 +324,27 @@ export interface UnreceivedClosureInput {
   now: number;
 }
 
+// D-91 관리자 닫기(closeRunByOperator)의 입력(D-93). checkedBy는 관리자가 확인한 방법(고정 목록 OPERATOR_CHECKS), podName은 확인한
+// 파드의 이름(Kubernetes 이름 규칙, POD_NAME), now는 닫는 시각이다. 장부는 확인을 다시 하지 않는다: 사람이 확인했다는 기록이다.
+export const OPERATOR_CHECKS = ["pod_replaced", "process_absent"] as const;
+export type OperatorCheck = (typeof OPERATOR_CHECKS)[number];
+export interface OperatorClosureInput {
+  runId: string;
+  checkedBy: OperatorCheck;
+  podName: string;
+  now: number;
+}
+
+// 관리자 닫기의 근거 줄 그대로(operator_closures). stopGeneration은 닫은 때의 정지 세대다.
+export interface OperatorClosure {
+  runId: string;
+  fromState: LedgerRunState;
+  checkedBy: OperatorCheck;
+  podName: string;
+  stopGeneration: number;
+  closedAt: number;
+}
+
 // 송신 표식의 입력. requestId는 그 실행의 시작 지시(task_start)의 요청 ID, now는 표식을 적는 시각이다.
 export interface StartDispatchInput {
   runId: string;
@@ -323,7 +352,7 @@ export interface StartDispatchInput {
   now: number;
 }
 
-// applyReceipt의 답에 싣는 경보. closed_run_started: 닫기 근거가 있는 not_started 실행에 시작 영수증이 왔다(겹침의 증거).
+// applyReceipt의 답에 싣는 경보. closed_run_started: 닫기 근거(D-90 또는 관리자)가 있는 not_started 실행에 닫은 뒤 시작 영수증이 왔다(겹침의 증거).
 // 장부는 그 종류의 자리를 다시 막는 점유를 적었다. 같은 영수증의 재전송(duplicate)에도 다시 싣는다.
 export type ReceiptAlarm = "closed_run_started";
 
@@ -551,6 +580,9 @@ export const TOOL_REQUEST_RUN_PHASES: Readonly<Record<LedgerRunState, ToolReques
   cleanup_pending: "cleanup_pending",
 };
 
+// 관리자가 실패로 닫은 실행(not_started + operator_closures 줄)의 단계. 이 표의 not_started 칸 대신 쓴다(toToolRequest).
+export const OPERATOR_CLOSED_PHASE: ToolRequestPhase = "failed_stopped";
+
 // 목적의 분류 코드. 처리기가 인자에서 받는 꼴과 같다(시험이 대조한다).
 export const PURPOSE = /^[a-z][a-z0-9_]{0,63}$/;
 
@@ -633,7 +665,10 @@ const assignedRunKey = (ref: string) => `tool_request:${ref}`;
 // 이은 실행 줄이 없거나(외래 키와 runs_permanent 트리거가 막으므로 제약을 지나친 파일에서만 생긴다) 그 상태가 장부의 상태가
 // 아니면 단계를 지어내지 않고 읽지 못한 것(corrupt)으로 닫는다. 대기로 답하면 본체가 오지 않을 진행을 기다리고, not_started로
 // 답하면 실행 중일 수 있는 일을 끝났다고 말하게 된다. 꼴이 어긋난 줄(스키마 CHECK를 지나친 파일)도 같다.
-function toToolRequest(row: ToolRequestRow): ToolRequest {
+// operatorClosed는 이은 실행이 관리자가 실패로 닫은 not_started인지다(Ledger의 #toolRequest가 근거 표에서 읽는다). 그 실행은 이미 일부
+// 돌았을 수 있어 not_started("시작 안 함")로 보이면 본체가 같은 일을 다시 맡길 수 있으므로 단계를 failed_stopped(실패)로 낸다.
+// D-90으로 닫힌 실행과 대기에서 취소된 실행은 not_started 그대로다.
+function toToolRequest(row: ToolRequestRow, operatorClosed: boolean): ToolRequest {
   const fits =
     UUID.test(row.ref) && UUID.test(row.owner) && (ROLES as readonly string[]).includes(row.role) && (TOOL_REQUEST_PHASES as readonly string[]).includes(row.phase);
   if (!fits) throw new LedgerUnavailableError("corrupt", "tool_requests: 꼴이 맞지 않는 줄");
@@ -643,7 +678,7 @@ function toToolRequest(row: ToolRequestRow): ToolRequest {
     if (row.phase !== "waiting_assignment" || state === null || !(LEDGER_RUN_STATES as readonly string[]).includes(state)) {
       throw new LedgerUnavailableError("corrupt", "tool_requests: 이은 실행 줄을 읽을 수 없는 부탁");
     }
-    phase = TOOL_REQUEST_RUN_PHASES[state as LedgerRunState];
+    phase = state === "not_started" && operatorClosed ? OPERATOR_CLOSED_PHASE : TOOL_REQUEST_RUN_PHASES[state as LedgerRunState];
   }
   return {
     ref: row.ref,
@@ -1365,6 +1400,15 @@ const START_UNREACHABLE_MS = Math.max(limits.RUN_LEASE_MAX_MS, limits.MESSAGE_TT
 // 송신 표식과 닫기 근거를 더한 판. 이 판을 적용하기 전에 시작한 실행은 표식 없이 실렸을 수 있어 닫지 않는다.
 const UNRECEIVED_CLOSURE_VERSION = 6;
 const UNRECEIVED_CLOSURE_FILE = "0006-unreceived-closure.sql";
+// 관리자 닫기(D-91)가 받는 앞 상태(작업자, 종료 확인 없음). 전이표의 두 줄(unknown_running·stopping → not_started)과 같다.
+// preparing·running은 믿는 임대가 있을 수 있어 받지 않는다: 끊김·답으로 unknown_running이 된 뒤 닫는다.
+const OPERATOR_CLOSABLE: readonly LedgerRunState[] = ["unknown_running", "stopping"];
+// 종료 확인 영수증이 적힌 뒤의 상태. 확정·정리의 정상 길이 있어 관리자 닫기를 받지 않는다(stop_confirmed).
+const STOP_CONFIRMED: readonly LedgerRunState[] = ["checking", "ready_result", "failed_stopped", "cleanup_pending"];
+// Kubernetes 이름 규칙(RFC 1123 DNS 서브도메인): 라벨은 소문자·숫자·'-'이고 영숫자로 시작하고 끝나며, 점으로 잇고, 전체 253자 이하.
+// 이관 0007의 트리거가 같은 규칙을 GLOB로 다시 본다.
+const POD_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+const POD_NAME_MAX = 253;
 
 // 실행을 맡을 수 있는 실행기 주체 이름(admitRun이 지정 실행기로 받는 것과 같은 판정). 그 밖의 이름은 잘못 넘긴 값이라,
 // 실행이 없는 유효한 이름의 빈 결과와 가른다.
@@ -1444,6 +1488,9 @@ export class Ledger {
   // 판 6(0006-unreceived-closure)의 닫기 근거 표. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 늦은 영수증의 처리는
   // 닫힌 실행이 없는 것으로 읽는다(그런 장부에서는 닫을 수도 없다). 기본 판 목록으로 연 장부에는 늘 있다.
   readonly #closures: boolean;
+  // 판 7(0007-operator-closure)의 관리자 닫기 근거 표. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 관리자가 닫은 실행이
+  // 없는 것으로 읽는다(그런 장부에서는 관리자 닫기를 거절한다). 기본 판 목록으로 연 장부에는 늘 있다.
+  readonly #operatorClosures: boolean;
   // 이 장부 객체의 열기 ID. 송신 표식이 "이 열기가 실었다"를 적는 값이다. 열 때마다(객체마다) 새로 만들어 다시 열면 달라진다.
   // 장부의 식별(ledger_id)·사본 ID와 같이 장부가 스스로 만드는 식별이라 crypto.randomUUID()로 만든다(업무 참조처럼 부르는 쪽이
   // 넘기게 하면 다시 연 객체가 앞 열기의 값을 쓸 수 있다). 파일에는 표식·닫기 근거 줄에만 남는다.
@@ -1458,6 +1505,7 @@ export class Ledger {
     this.#snapshots = sqlOf(db, "ledger_snapshots") !== null;
     this.#rebuildColumns = db.query("SELECT 1 AS x FROM pragma_table_info('instructions') WHERE name = 'budget_left'").get() !== null;
     this.#closures = sqlOf(db, "unreceived_closures") !== null;
+    this.#operatorClosures = sqlOf(db, "operator_closures") !== null;
     this.#openId = crypto.randomUUID();
   }
 
@@ -1945,7 +1993,7 @@ export class Ledger {
     const key = str(v.dedupeKey, REF, "dedupeKey");
     return this.#read(() => {
       const row = this.#toolRequestRow("dedupe_key", owner, key);
-      return row === null ? null : toToolRequest(row);
+      return row === null ? null : this.#toolRequest(row);
     });
   }
 
@@ -1955,7 +2003,7 @@ export class Ledger {
     const ref = str(v.ref, UUID, "ref");
     return this.#read(() => {
       const row = this.#toolRequestRow("ref", owner, ref);
-      return row === null ? null : toToolRequest(row);
+      return row === null ? null : this.#toolRequest(row);
     });
   }
 
@@ -2017,7 +2065,7 @@ export class Ledger {
     return this.#write("tool_request", "start", () => {
       const same = this.#toolRequestRow("dedupe_key", row.owner, row.dedupe_key);
       if (same !== null) {
-        const request = toToolRequest(same);
+        const request = this.#toolRequest(same);
         const sameContent = same.role === row.role && same.purpose === row.purpose && same.source_ref === row.source_ref && same.input_digest === row.input_digest;
         return { ok: true as const, outcome: sameContent ? ("existing" as const) : ("conflict" as const), request };
       }
@@ -2029,7 +2077,7 @@ export class Ledger {
         .run(row);
       const created = this.#toolRequestRow("ref", row.owner, row.ref);
       if (created === null) throw new Refuse("invariant_violation");
-      return { ok: true as const, outcome: "created" as const, request: toToolRequest(created) };
+      return { ok: true as const, outcome: "created" as const, request: this.#toolRequest(created) };
     });
   }
 
@@ -2044,7 +2092,7 @@ export class Ledger {
     return this.#write("tool_request_assign", "start", () => {
       const row = (this.#db.query(`${TOOL_REQUEST_SELECT} WHERE t.ref = ?`).get(ref) as ToolRequestRow | null) ?? null;
       if (row === null) throw new Refuse("unknown_run");
-      const request = toToolRequest(row);
+      const request = this.#toolRequest(row);
       if (row.run_id !== null) return { ok: true as const, outcome: "already_assigned" as const, run: toRun(this.#runRow(row.run_id) as RunRow) };
       if (request.phase !== "waiting_assignment") throw new Refuse("transition_denied");
       // 입력의 꼴과 실행기·역할의 맞음은 admitRun과 같은 함수가 본다. 역할은 부탁의 것이라 이 트랜잭션 안에서만 알 수 있다.
@@ -2103,7 +2151,7 @@ export class Ledger {
     return this.#write("tool_request_cancel", "continue", () => {
       const row = this.#toolRequestRow("ref", owner, ref);
       if (row === null) throw new Refuse("unknown_run");
-      const request = toToolRequest(row);
+      const request = this.#toolRequest(row);
       if (row.run_id !== null) {
         const run = this.#runRow(row.run_id) as RunRow;
         if (run.stop_receipt_id !== null || TERMINAL.includes(run.state)) throw new Refuse("transition_denied");
@@ -2623,11 +2671,86 @@ export class Ledger {
     });
   }
 
-  // 이 실행이 닫기 근거를 가진 not_started인가(시작한 뒤 닫힌 실행). 대기에서 취소돼 not_started가 된 실행은 아니다.
-  // 늦은 영수증·보고의 처리를 가르는 한 자리다. 다음 판의 관리자 닫기(D-91)도 근거 표를 더하면 여기서 함께 본다.
+  // D-91: 관리자가 확인한 뒤(D-93의 확인 방법 하나와 확인한 파드의 이름) 종료가 확인되지 않은 작업자 실행을 "실패로 끝남"으로 닫아
+  // 자리를 푼다. 상태는 not_started이고 근거 줄(operator_closures)이 관리자 닫기를 말한다. 본체가 보는 단계는 실패다(toToolRequest).
+  // 장부는 관리자의 확인을 다시 하지 않는다. 받는 것은 작업자의 unknown_running·stopping(종료 확인 없음)뿐이고, D-90이 좁혀 닫지 않는
+  // 실행(다른 열기의 표식, 사본 안·경계 모름, 판 이전의 시작, 예산 감액)도 이 상태면 받는다: 영수증·관측·표식·사본은 보지 않는다.
+  // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 작업자(run_not_worker) → 끝 상태 아님(run_ended) →
+  // 종료 확인 없음(stop_confirmed) → unknown_running·stopping(transition_denied) → 정지 기록 있음(stop_unknown).
+  // 확인 방법·파드 이름이 꼴 밖이면 트랜잭션을 열기 전에 LedgerInputError다(아무것도 쓰지 않는다).
+  // 쓰기 모드 new(풀기 releaseStop과 같은 묶음): 장부가 한 번이라도 실패했으면 거절하고, 사본 보류·정지·접수 닫힘은 막지 않는다.
+  // 관리자는 사본을 대조하는 주체이고, 닫기는 새 일을 열지 않고 자리만 푼다(시작은 여전히 시작의 전제를 지난다).
+  // 근거 줄과 not_started가 한 커밋이다. 근거 줄의 INSERT 트리거가 행으로 볼 수 있는 조건을 다시 본다(이관 0007의 주석).
+  closeRunByOperator(input: OperatorClosureInput): { ok: true; run: Run; closure: OperatorClosure } | Refused {
+    const v = exact(input, ["runId", "checkedBy", "podName", "now"], "closeRunByOperator");
+    const runId = str(v.runId, UUID, "runId");
+    if (!(OPERATOR_CHECKS as readonly unknown[]).includes(v.checkedBy)) throw new LedgerInputError("checkedBy: 확인 방법의 목록 밖이다");
+    const checkedBy = v.checkedBy as OperatorCheck;
+    if (typeof v.podName !== "string" || v.podName.length > POD_NAME_MAX || !POD_NAME.test(v.podName)) throw new LedgerInputError("podName: Kubernetes 이름 규칙 밖이다");
+    const podName = v.podName;
+    const now = time(v.now, "now");
+    return this.#write("operator_closure", "new", () => {
+      const row = this.#runRow(runId);
+      if (row === null) throw new Refuse("unknown_run");
+      if (row.kind !== "worker") throw new Refuse("run_not_worker");
+      if (TERMINAL.includes(row.state)) throw new Refuse("run_ended");
+      if (row.stop_receipt_id !== null || STOP_CONFIRMED.includes(row.state)) throw new Refuse("stop_confirmed");
+      if (!OPERATOR_CLOSABLE.includes(row.state)) throw new Refuse("transition_denied");
+      // 판 7의 기록이 없는 장부(판 목록을 그 앞에서 끊어 연 시험용 길)에는 근거 표가 없다.
+      if (!this.#operatorClosures) throw new Refuse("transition_denied");
+      const stop = this.#stopRow();
+      if (stop === null) throw new Refuse("stop_unknown");
+      this.#db
+        .query("INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(runId, row.state, checkedBy, podName, stop.generation, now);
+      this.#setState(row, "not_started", now);
+      const closure: OperatorClosure = { runId, fromState: row.state, checkedBy, podName, stopGeneration: stop.generation, closedAt: now };
+      return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow), closure };
+    });
+  }
+
+  // 관리자가 실패로 닫은 실행의 근거 줄. 없으면 null이다(닫지 않았거나 D-90으로 닫았거나 판 7 전의 장부).
+  operatorClosure(runId: string): Read<OperatorClosure | null> {
+    return this.#read(() => {
+      if (!this.#operatorClosures) return null;
+      const row = this.#db.query("SELECT run_id, from_state, checked_by, pod_name, stop_generation, closed_at FROM operator_closures WHERE run_id = ?").get(runId) as {
+        run_id: string;
+        from_state: string;
+        checked_by: string;
+        pod_name: string;
+        stop_generation: number;
+        closed_at: number;
+      } | null;
+      if (row === null) return null;
+      if (!OPERATOR_CLOSABLE.includes(row.from_state as LedgerRunState) || !(OPERATOR_CHECKS as readonly string[]).includes(row.checked_by)) {
+        throw new LedgerUnavailableError("corrupt", "operator_closures: 꼴이 맞지 않는 줄");
+      }
+      return {
+        runId: row.run_id,
+        fromState: row.from_state as LedgerRunState,
+        checkedBy: row.checked_by as OperatorCheck,
+        podName: row.pod_name,
+        stopGeneration: safe(row.stop_generation, "operator_closures.stop_generation"),
+        closedAt: safe(row.closed_at, "operator_closures.closed_at"),
+      };
+    });
+  }
+
+  #operatorClosed(runId: string): boolean {
+    return this.#operatorClosures && this.#db.query("SELECT 1 AS x FROM operator_closures WHERE run_id = ?").get(runId) !== null;
+  }
+
+  // 부탁 줄을 값으로 바꾼다. 이은 실행이 not_started면 관리자 닫기의 근거가 있는지 읽어 단계를 가른다(toToolRequest).
+  #toolRequest(row: ToolRequestRow): ToolRequest {
+    return toToolRequest(row, row.run_id !== null && row.run_state === "not_started" && this.#operatorClosed(row.run_id));
+  }
+
+  // 이 실행이 닫기 근거(D-90 또는 관리자)를 가진 not_started인가(시작한 뒤 닫힌 실행). 대기에서 취소돼 not_started가 된 실행은 아니다.
+  // 늦은 영수증·보고의 처리를 가르는 한 자리다.
   #closedAfterStart(row: RunRow): boolean {
-    if (row.state !== "not_started" || !this.#closures) return false;
-    return this.#db.query("SELECT 1 AS x FROM unreceived_closures WHERE run_id = ?").get(row.run_id) !== null;
+    if (row.state !== "not_started") return false;
+    if (this.#closures && this.#db.query("SELECT 1 AS x FROM unreceived_closures WHERE run_id = ?").get(row.run_id) !== null) return true;
+    return this.#operatorClosed(row.run_id);
   }
 
   getRun(runId: string): Read<Run | null> {
@@ -2638,7 +2761,11 @@ export class Ledger {
   }
 
   listRuns(): Read<Run[]> {
-    return this.#read(() => (this.#db.query("SELECT * FROM runs ORDER BY queue_seq").all() as RunRow[]).map(toRun));
+    return this.#read(() =>
+      (this.#db.query("SELECT * FROM runs ORDER BY queue_seq").all() as RunRow[]).map((row) =>
+        row.state === "not_started" ? { ...toRun(row), closedByOperator: this.#operatorClosed(row.run_id) } : toRun(row),
+      ),
+    );
   }
 
   // 실행의 지시 이력 시각. 없는 실행이면 null이다. 장부를 바꾸지 않는다.
@@ -2865,8 +2992,12 @@ export class Ledger {
       if (r.action === "receipt_session_takeover") this.#requireTakeoverSender(row, r.receiptId, sender);
       else this.#requireSender(row, sender);
       const seen = this.#redelivery(r.receiptId, r.bodyDigest, r.now);
-      // 닫힌 실행은 닫을 때 받은 기록이 0줄이었으므로 그 실행의 시작 영수증은 모두 닫은 뒤에 온 것이다. 앞의 답(경보)을 잃었을 수 있어 재전송에도 싣는다.
-      const alarm: { alarm?: ReceiptAlarm } = r.action === "receipt_started" && this.#closedAfterStart(row) ? { alarm: "closed_run_started" } : {};
+      // 닫힌 실행의 시작 영수증 가운데 닫은 뒤에 처음 온 것만 경보다. 앞의 답(경보)을 잃었을 수 있어 그 재전송에도 싣는다.
+      // 닫기 전에 받은 시작 영수증은 실행 줄의 started_receipt_id에 있다(닫은 뒤의 것은 그 칸에 적지 않는다, #effect). D-90 닫기는 받은
+      // 기록이 0줄일 때만 닫아 그 칸이 늘 비어 있다. 관리자 닫기는 시작 영수증을 받은 실행도 닫으므로, 닫기 전에 받은 그 영수증의
+      // 재전송(ack를 잃은 실행기)은 닫은 뒤의 시작이 아니라 경보 없이 다시 ack한다.
+      const lateStart = r.action === "receipt_started" && r.receiptId !== row.started_receipt_id && this.#closedAfterStart(row);
+      const alarm: { alarm?: ReceiptAlarm } = lateStart ? { alarm: "closed_run_started" } : {};
       if (seen === "duplicate") return { ok: true as const, delivery: "duplicate" as const, ack: r.receiptId, ...alarm };
       if (seen !== null) return seen;
       const instructionRequestId = "instructionRequestId" in r ? r.instructionRequestId : undefined;
