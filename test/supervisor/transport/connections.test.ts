@@ -454,8 +454,23 @@ describe("hello 누락 때 full 행 0", () => {
   test("hello는 full 행 하나다: 빈 목록은 쥔 것이 없다는 답이다", async () => {
     const w = new World();
     const id = await w.greet(READER, K1, R1, T);
-    expect(w.all.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "full", runs: [] } }]);
+    expect(w.all.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "full", runs: [] }, issuedAt: T + 1 }]);
     expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [] }]);
+  });
+
+  test("full 출력과 인사는 받은 시각이 아니라 실행기가 서명한 issued_at을 싣는다. partial과 occupancy(source)에는 칸이 없다", async () => {
+    const w = new World();
+    const { id } = await w.sync(READER, K1, R1, T);
+    // 실행기 시계가 감독보다 늦어 서명 시각이 받은 시각보다 이르다.
+    const out = await w.receive(id, hello(K1, R1, 0, T - 700, [running]), T + 300);
+    expect(out.filter((o) => o.kind === "occupancy")).toEqual([{ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "full", runs: [running] }, issuedAt: T - 700 }]);
+    expect(w.table.get(id)!.greeting).toEqual({ at: T + 300, issued_at: T - 700, profile_revision: "profile-1", policy_revision: "policy-1", runs: [running] });
+    const report = await w.receive(id, statusReport(K1, R1, 0, T + 400, [running]), T + 500);
+    const partial = report.find((o) => o.kind === "occupancy");
+    expect(partial).toEqual({ kind: "occupancy", connection: id, answer: { executorId: R1, coverage: "partial", runs: [running] } });
+    expect(Object.hasOwn(partial!, "issuedAt")).toBe(false);
+    expect(w.table.occupancy(w.stop)).toEqual([{ executorId: R1, coverage: "full", runs: [running] }]);
+    expect(Object.keys(w.table.occupancy(w.stop)[0]!)).toEqual(["executorId", "coverage", "runs"]);
   });
 
   test("status_report는 partial이고 full 행을 늘리지 않는다", async () => {
@@ -673,17 +688,22 @@ describe("등록표 교체 뒤의 무효", () => {
 });
 
 describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도 나간다", () => {
-  // 상태 보고는 장부를 부르지 않아야 한다. 불리면 시험이 드러나도록 기록한다.
+  // 상태 보고는 영수증·보고 연산을 부르지 않고, 대조된 답만 applyExecutorAnswer에 닿는다. 불린 것을 모두 기록한다.
   const ledgerCalls: string[] = [];
+  const answers: unknown[] = [];
   const ports: ReceiptPorts = {
     ledger: {
       applyReceipt: () => {
         ledgerCalls.push("applyReceipt");
-        throw new Error("상태 보고가 장부를 불렀다");
+        throw new Error("상태 보고가 영수증 연산을 불렀다");
       },
       recordReport: () => {
         ledgerCalls.push("recordReport");
-        throw new Error("상태 보고가 장부를 불렀다");
+        throw new Error("상태 보고가 보고 연산을 불렀다");
+      },
+      applyExecutorAnswer: (input, from) => {
+        answers.push({ input, from });
+        return { ok: true, moved: [], deferred: [], outsideLedger: [] };
       },
     },
     random: { bytes: (length) => new Uint8Array(length) },
@@ -708,19 +728,26 @@ describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도
     expect([forward.verified.header.sender, forward.verified.header.run_generation, forward.verified.header.stop_generation]).toEqual([R1, 0, 0]);
     expect(forward.verified.body).toEqual({ in_reply_to: query, runs: [running] });
 
-    const pending = [{ requestId: query, recipient: R1, runIds: [RUN] }];
-    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: pending }, ports)).toEqual({
+    // 조회는 이 연결에 실은 것이다.
+    const pending = [{ requestId: query, recipient: R1, runIds: [RUN], connection: id }];
+    // 지금 인정된 연결은 이 연결 하나다. now는 봉투의 issued_at(T + 2)과 다르게 둔다(answeredAt이 받은 시각이 아님을 가른다).
+    const links = { current: (connection: number, executor: string) => connection === id && executor === R1 };
+    expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: pending, links, backlog: [] }, ports)).toEqual({
       outcome: "status_matched",
       queryRequestId: query,
       executor: R1,
-      runs: [running],
-      ledger: "not_reflected",
+      connection: id,
+      settled: [{ settled: "applied", answer: { sender: R1, connection: id, coverage: "partial", runs: [running], answeredAt: T + 2 }, moved: [], deferred: [], outsideLedger: [] }],
+      backlog: [],
     });
-    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: [] }, ports)).toEqual({ outcome: "status_unmatched", reason: "unknown_query" });
-    expect(handleForward({ forward, now: T + 2, stopGeneration: 0, pendingQueries: [{ ...pending[0]!, requestId: uuid() }] }, ports)).toEqual({
+    expect(answers).toEqual([{ input: { coverage: "partial", runs: [running], answeredAt: T + 2, now: T + 3 }, from: { sender: R1 } }]);
+    // 맞지 않은 두 답은 장부를 부르지 않는다(applyExecutorAnswer 기록이 늘지 않는다).
+    expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: [], links, backlog: [] }, ports)).toEqual({ outcome: "status_unmatched", reason: "unknown_query" });
+    expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: [{ ...pending[0]!, requestId: uuid() }], links, backlog: [] }, ports)).toEqual({
       outcome: "status_unmatched",
       reason: "unknown_query",
     });
+    expect(answers).toHaveLength(1);
     expect(ledgerCalls).toEqual([]);
   });
 
