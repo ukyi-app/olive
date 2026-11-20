@@ -354,25 +354,25 @@ describe("보장 3: status_report는 감독이 낸 조회의 답일 때만 받�
   });
 });
 
-describe("보장 4: 결과 보고는 아직 받지 않는다", () => {
+describe("보장 4: 결과 보고는 보관 포트 없이 받지 않는다(보관·기록·ack는 receipts-results.test.ts)", () => {
   const result: Bodies["report_result"]["result"] = { role: "diagnosis", outcome: "completed", summary: "요약", items: [], refs: [] };
 
-  test("report_result는 장부에 넘기지 않고 ack도 없다(실제 장부)", async () => {
+  test("결과 포트가 없으면 report_result는 장부에 넘기지 않고 ack도 없다(실제 장부)", async () => {
     const { ledger, runId, generation } = realLedger();
     const reportId = id();
     const v = await verified("report_result", WORKER_EXECUTOR, { report_id: reportId, run_id: runId, result }, 1, generation);
     const random = fakeRandom();
     const outcome = handleForward(forward(v), { ledger, random });
-    expect(outcome).toEqual({ outcome: "result_not_supported_yet", id: reportId, runId });
+    expect(outcome).toEqual({ outcome: "result_unknown", id: reportId, runId, at: "ports" });
     expectNoAck(outcome);
     expect(random.calls).toBe(0);
     expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
   });
 
-  test("report_result는 장부 포트를 부르지 않는다(가짜 장부)", async () => {
+  test("결과 포트가 없으면 report_result는 장부 포트를 부르지 않는다(가짜 장부)", async () => {
     const v = await verified("report_result", WORKER_EXECUTOR, { report_id: id(), run_id: id(), result }, 1, () => 1);
     const spy = spyLedger();
-    expect(handleForward(forward(v), { ledger: spy, random: fakeRandom() }).outcome).toBe("result_not_supported_yet");
+    expect(handleForward(forward(v), { ledger: spy, random: fakeRandom() }).outcome).toBe("result_unknown");
     expect(spy.calls).toHaveLength(0);
   });
 
