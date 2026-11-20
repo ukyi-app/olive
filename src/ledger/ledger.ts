@@ -98,6 +98,15 @@ export const REFUSALS = [
   "session_start_closed",
   "snapshot_hold",
   "invariant_violation",
+  // closeUnreceivedRun(D-90 닫기)만 내는 거절. 조건마다 하나다(ledger.md "받은 적 없는 실행의 닫기").
+  "answer_time_unknown",
+  "answer_too_early",
+  "run_in_answer",
+  "receipt_seen",
+  "run_sighted",
+  "sent_by_other_open",
+  "started_before_migration",
+  "created_before_snapshot",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
 export type Refused = { ok: false; reason: Refusal };
@@ -290,6 +299,31 @@ export interface RunSightingObservation {
   // 복원기가 그 답을 처음 받은 시각(복원기의 시계). 적기를 다시 시도해도 received_at에 이 값을 쓴다.
   receivedAt: number;
 }
+
+// D-90 닫기(closeUnreceivedRun)의 입력. from.sender는 검증된 전체 답(hello) 봉투의 낸 쪽이다.
+// runs는 그 답의 runs 그대로다(계약 v1의 실행 상태 항목). "그 답에 이 실행이 없다"를 부르는 쪽의 말로 받지 않고 장부가 이 목록에서 직접 본다:
+// 부르는 쪽이 다른 답이나 부분 답을 잘못 고르면 닫는 쪽으로 틀릴 수 있는데, 목록을 받으면 그 실행이 실린 답으로는 닫히지 않는다.
+// 이 목록이 그 실행기가 쥔 전부(full)인지는 장부가 가를 수 없다: 부르는 쪽은 그 연결의 검증된 hello만 넘긴다.
+// answeredAt은 그 답 봉투의 issued_at(실행기 시계)이고 모르면 null(그러면 닫지 않는다), receivedAt은 감독이 그 답을 받은 시각,
+// now는 닫는 시각이다(둘 다 근거 줄에 적는다).
+export interface UnreceivedClosureInput {
+  runId: string;
+  runs: readonly RunStatus[];
+  answeredAt: number | null;
+  receivedAt: number;
+  now: number;
+}
+
+// 송신 표식의 입력. requestId는 그 실행의 시작 지시(task_start)의 요청 ID, now는 표식을 적는 시각이다.
+export interface StartDispatchInput {
+  runId: string;
+  requestId: string;
+  now: number;
+}
+
+// applyReceipt의 답에 싣는 경보. closed_run_started: 닫기 근거가 있는 not_started 실행에 시작 영수증이 왔다(겹침의 증거).
+// 장부는 그 종류의 자리를 다시 막는 점유를 적었다. 같은 영수증의 재전송(duplicate)에도 다시 싣는다.
+export type ReceiptAlarm = "closed_run_started";
 
 // 이 대기 실행 자체를 시작하면 안 되는 이유. 5단계의 후보 목록과 시작 트랜잭션이 같은 판정을 읽는다(접수·슬롯·예산은 시작 트랜잭션만 본다).
 export type StartBar = "run_generation_stale" | "run_blocked" | "input_cancelled" | "input_expired" | "deadline_passed";
@@ -1318,6 +1352,16 @@ const LEASE_TRUSTED: readonly LedgerRunState[] = ["preparing", "running"];
 const RENEWABLE_REPORTED: readonly RunState[] = ["preparing", "running"];
 const COVERAGES = ["full", "partial"] as const;
 
+// D-90 닫기가 받는 앞 상태(작업자). 전이표의 두 줄(preparing·unknown_running → not_started)과 같다.
+const UNRECEIVED_CLOSABLE: readonly LedgerRunState[] = ["preparing", "unknown_running"];
+// 실행기가 그 시작을 더는 받지도 띄우지도 못하는 때까지의 길이(시작 지시의 발행 시각부터, 실행기 시계). 실행기는 봉투 시한
+// (발행 + MESSAGE_TTL_MAX_MS) 뒤로는 시작을 받지 않고, 발행 + RUN_LEASE_MAX_MS부터는(정각 포함) 준비·자격·spawn 직전에 멈춘다.
+// v1에서 둘 다 30000ms이고, 하나가 커져도 닫는 쪽으로 틀리지 않게 큰 쪽을 쓴다. 이관 0006의 트리거에 같은 값(30000)이 숫자로 있다(시험이 대조한다).
+const START_UNREACHABLE_MS = Math.max(limits.RUN_LEASE_MAX_MS, limits.MESSAGE_TTL_MAX_MS);
+// 송신 표식과 닫기 근거를 더한 판. 이 판을 적용하기 전에 시작한 실행은 표식 없이 실렸을 수 있어 닫지 않는다.
+const UNRECEIVED_CLOSURE_VERSION = 6;
+const UNRECEIVED_CLOSURE_FILE = "0006-unreceived-closure.sql";
+
 // 실행을 맡을 수 있는 실행기 주체 이름(admitRun이 지정 실행기로 받는 것과 같은 판정). 그 밖의 이름은 잘못 넘긴 값이라,
 // 실행이 없는 유효한 이름의 빈 결과와 가른다.
 function runExecutor(value: unknown, where: string): string {
@@ -1393,6 +1437,13 @@ export class Ledger {
   // 판 4(0004-instruction-rebuild)의 지시 본문 칸. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 지시를 그 판 전의 꼴로 적고
   // 판 4 전에 적힌 줄처럼 다시 만들 수 없음으로 읽는다. 기본 판 목록으로 연 장부에는 늘 있다.
   readonly #rebuildColumns: boolean;
+  // 판 6(0006-unreceived-closure)의 닫기 근거 표. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 늦은 영수증의 처리는
+  // 닫힌 실행이 없는 것으로 읽는다(그런 장부에서는 닫을 수도 없다). 기본 판 목록으로 연 장부에는 늘 있다.
+  readonly #closures: boolean;
+  // 이 장부 객체의 열기 ID. 송신 표식이 "이 열기가 실었다"를 적는 값이다. 열 때마다(객체마다) 새로 만들어 다시 열면 달라진다.
+  // 장부의 식별(ledger_id)·사본 ID와 같이 장부가 스스로 만드는 식별이라 crypto.randomUUID()로 만든다(업무 참조처럼 부르는 쪽이
+  // 넘기게 하면 다시 연 객체가 앞 열기의 값을 쓸 수 있다). 파일에는 표식·닫기 근거 줄에만 남는다.
+  readonly #openId: string;
 
   constructor(key: symbol, db: Database, clock: () => number, faults: Faults, path = "") {
     if (key !== OPENED) throw new TypeError("Ledger는 openLedger로만 연다");
@@ -1402,6 +1453,8 @@ export class Ledger {
     this.#path = path;
     this.#snapshots = sqlOf(db, "ledger_snapshots") !== null;
     this.#rebuildColumns = db.query("SELECT 1 AS x FROM pragma_table_info('instructions') WHERE name = 'budget_left'").get() !== null;
+    this.#closures = sqlOf(db, "unreceived_closures") !== null;
+    this.#openId = crypto.randomUUID();
   }
 
   health(): { writable: true } | { writable: false; reason: UnavailableReason } {
@@ -2473,6 +2526,84 @@ export class Ledger {
     });
   }
 
+  // ---- 송신 표식과 받은 적 없는 실행의 닫기(D-90) ----
+
+  // 시작 봉투를 연결에 싣기 직전에 부른다: "이 장부 열기가 이 실행의 시작을 실었다"를 커밋한다. 싣는 쪽은 이 답이 ok일 때만 싣는다.
+  // 표식이 없는 실행은 한 번도 실리지 않았다는 것이 D-90 닫기의 전제라, 표식이 실패하면(거절·못 씀) 싣지 않는다(닫는 쪽으로 틀린다).
+  // 시작 봉투를 싣는 것은 새 일을 여는 일이라 시작(startRun)과 같은 전제(쓰기 모드 start)를 거친다.
+  // requestId는 그 실행의 시작 지시여야 하고(아니면 unknown_instruction), 끝났거나 종료가 확인된 실행에는 적지 않는다(transition_denied).
+  // 같은 열기에서 같은 실행을 다시 적으면 그대로다(created: false, 처음 시각을 덮지 않는다).
+  markStartDispatch(input: StartDispatchInput): { ok: true; created: boolean } | Refused {
+    const v = exact(input, ["runId", "requestId", "now"], "markStartDispatch");
+    const runId = str(v.runId, UUID, "runId");
+    const requestId = str(v.requestId, UUID, "requestId");
+    const now = time(v.now, "now");
+    return this.#write("start_dispatch", "start", () => {
+      const row = this.#runRow(runId);
+      if (row === null) throw new Refuse("unknown_run");
+      const start = this.#db.query("SELECT 1 AS x FROM instructions WHERE request_id = ? AND run_id = ? AND action = 'task_start'").get(requestId, runId);
+      if (start === null) throw new Refuse("unknown_instruction");
+      if (TERMINAL.includes(row.state) || row.stop_receipt_id !== null) throw new Refuse("transition_denied");
+      if (this.#db.query("SELECT 1 AS x FROM start_dispatches WHERE run_id = ? AND open_id = ?").get(runId, this.#openId) !== null) return { ok: true as const, created: false };
+      this.#db.query("INSERT INTO start_dispatches (run_id, request_id, open_id, marked_at) VALUES (?, ?, ?, ?)").run(runId, requestId, this.#openId, now);
+      return { ok: true as const, created: true };
+    });
+  }
+
+  // D-90: 실행기가 받은 적 없는 작업자 실행을 not_started로 닫아 자리를 푼다. 후보를 고르는 것은 부르는 쪽이고, 장부는 한 트랜잭션에서
+  // 모든 조건을 다시 본다. 하나라도 아니거나 확인할 수 없으면 구별된 거절이고 상태·자리는 그대로다(닫는 쪽으로만 틀린다).
+  // 조건과 거절의 순서(ledger.md "받은 적 없는 실행의 닫기"):
+  // 새 일을 여는 전제(쓰기 모드 start: 못 씀·사본 보류·정지 기록 없음·정지·접수 닫힘) → 실행 있음(unknown_run) → 작업자이고 preparing·
+  // unknown_running이고 종료 확인 없음(transition_denied) → 시작 지시가 하나(unknown_instruction) → 답을 낸 쪽이 지정 실행기(sender_mismatch) →
+  // 답의 시각을 앎(answer_time_unknown) → 답의 시각 >= 시작 발행 + 시한(answer_too_early) → 그 답에 이 실행이 없음(run_in_answer) →
+  // 영수증·보고 0(receipt_seen) → 양성 관측 0(run_sighted) → 점유 관측 0(run_blocked) → 이 판의 적용 뒤에 시작(started_before_migration) →
+  // 사본 시각 뒤에 만들고 시작(created_before_snapshot) → 송신 표식이 없거나 모두 이 열기의 것(sent_by_other_open).
+  // 닫으면 근거 줄과 not_started가 한 커밋이다. 근거 줄의 INSERT 트리거가 시각·열기·사본·판 밖의 행 조건을 다시 본다.
+  closeUnreceivedRun(input: UnreceivedClosureInput, from: { sender: string }): { ok: true; run: Run } | Refused {
+    const v = exact(input, ["runId", "runs", "answeredAt", "receivedAt", "now"], "closeUnreceivedRun");
+    const runId = str(v.runId, UUID, "runId");
+    const runs = answerRuns(v.runs, "full");
+    const answeredAt = v.answeredAt === null ? null : time(v.answeredAt, "answeredAt");
+    const receivedAt = time(v.receivedAt, "receivedAt");
+    const now = time(v.now, "now");
+    const sender = runExecutor(exact(from, ["sender"], "from").sender, "from.sender");
+    return this.#write("unreceived_closure", "start", () => {
+      const row = this.#runRow(runId);
+      if (row === null) throw new Refuse("unknown_run");
+      if (row.kind !== "worker" || !UNRECEIVED_CLOSABLE.includes(row.state) || row.stop_receipt_id !== null) throw new Refuse("transition_denied");
+      const starts = this.#db.query("SELECT issued_at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'session_start')").all(runId) as { issued_at: number }[];
+      if (starts.length !== 1) throw new Refuse("unknown_instruction");
+      const issuedAt = safe((starts[0] as { issued_at: number }).issued_at, "instructions.issued_at");
+      if (row.executor_id !== sender) throw new Refuse("sender_mismatch");
+      if (answeredAt === null) throw new Refuse("answer_time_unknown");
+      if (answeredAt < issuedAt + START_UNREACHABLE_MS) throw new Refuse("answer_too_early");
+      if (runs.some((run) => run.run_id === runId)) throw new Refuse("run_in_answer");
+      if (this.#db.query("SELECT 1 AS x FROM deliveries WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("receipt_seen");
+      if (this.#db.query("SELECT 1 AS x FROM run_sightings WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("run_sighted");
+      if (this.#db.query("SELECT 1 AS x FROM slot_holds WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("run_blocked");
+      const migration = this.#db.query("SELECT applied_at FROM ledger_migrations WHERE version = ? AND name = ?").get(UNRECEIVED_CLOSURE_VERSION, UNRECEIVED_CLOSURE_FILE) as { applied_at: number } | null;
+      if (migration === null || issuedAt < safe(migration.applied_at, "ledger_migrations.applied_at")) throw new Refuse("started_before_migration");
+      if (this.#snapshots) {
+        const taken = this.#db.query("SELECT MAX(taken_at) AS at FROM ledger_snapshots").get() as { at: number | null };
+        const takenAt = taken.at === null ? null : safe(taken.at, "ledger_snapshots.taken_at");
+        if (takenAt !== null && (row.created_at <= takenAt || issuedAt <= takenAt)) throw new Refuse("created_before_snapshot");
+      }
+      if (this.#db.query("SELECT 1 AS x FROM start_dispatches WHERE run_id = ? AND open_id <> ? LIMIT 1").get(runId, this.#openId) !== null) throw new Refuse("sent_by_other_open");
+      this.#db
+        .query("INSERT INTO unreceived_closures (run_id, from_state, answer_executor_id, answer_issued_at, answer_received_at, open_id, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(runId, row.state, sender, answeredAt, receivedAt, this.#openId, now);
+      this.#setState(row, "not_started", now);
+      return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow) };
+    });
+  }
+
+  // 이 실행이 닫기 근거를 가진 not_started인가(시작한 뒤 닫힌 실행). 대기에서 취소돼 not_started가 된 실행은 아니다.
+  // 늦은 영수증·보고의 처리를 가르는 한 자리다. 다음 판의 관리자 닫기(D-91)도 근거 표를 더하면 여기서 함께 본다.
+  #closedAfterStart(row: RunRow): boolean {
+    if (row.state !== "not_started" || !this.#closures) return false;
+    return this.#db.query("SELECT 1 AS x FROM unreceived_closures WHERE run_id = ?").get(row.run_id) !== null;
+  }
+
   getRun(runId: string): Read<Run | null> {
     return this.#read(() => {
       const row = this.#runRow(runId);
@@ -2577,25 +2708,25 @@ export class Ledger {
 
   // 재시작 복원 2단계가 적는다. (실행기, 실행, 세대)마다 한 줄이고, 같은 관측을 다시 보면 새 번호를 받는다.
   // 다시 본 관측은 슬롯 차단을 낮추지 않는다(끝났다는 보고만으로 슬롯을 풀지 않는다). 돌려준 번호가 지금의 관측이다.
-  // 줄을 지우는 곳은 같은 관측을 새 번호로 바꿔 적는 여기뿐이다. 그래서 한 번 적힌 실행 ID는 계속 시작하지 못한다.
+  // 줄을 지우는 곳은 같은 관측을 새 번호로 바꿔 적는 #hold뿐이다. 그래서 한 번 적힌 실행 ID는 계속 시작하지 못한다.
   holdSlots(key: symbol, observations: readonly SlotHoldObservation[], now: number): { ok: true; holds: SlotHold[] } | Refused {
     if (key !== RESTORE_KEY) throw new TypeError("점유 차단은 재시작 복원만 적는다");
     const when = time(now, "now");
-    return this.#write("slot_hold", "continue", () => {
-      const holds: SlotHold[] = [];
-      for (const seen of observations) {
-        const before = this.#db.query("SELECT holds_slot FROM slot_holds WHERE executor_id = ? AND run_id = ? AND run_generation = ?").get(seen.executorId, seen.runId, seen.runGeneration) as {
-          holds_slot: number;
-        } | null;
-        const holdsSlot = seen.holdsSlot || before?.holds_slot === 1;
-        this.#db.query("DELETE FROM slot_holds WHERE executor_id = ? AND run_id = ? AND run_generation = ?").run(seen.executorId, seen.runId, seen.runGeneration);
-        const row = this.#db
-          .query("INSERT INTO slot_holds (executor_id, run_id, kind, run_generation, holds_slot, why, held_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING observation")
-          .get(seen.executorId, seen.runId, seen.kind, seen.runGeneration, holdsSlot ? 1 : 0, seen.why, when) as { observation: number };
-        holds.push({ ...seen, holdsSlot, observation: safe(row.observation, "slot_holds.observation") });
-      }
-      return { ok: true as const, holds };
-    });
+    return this.#write("slot_hold", "continue", () => ({ ok: true as const, holds: observations.map((seen) => this.#hold(seen, when)) }));
+  }
+
+  // 점유 관측 하나를 적는 자리(holdSlots, 닫힌 실행의 늦은 시작 영수증). 같은 (실행기, 실행, 세대)의 줄은 새 번호로 바꿔 적고,
+  // 앞 줄이 슬롯을 막고 있었으면 계속 막는다.
+  #hold(seen: SlotHoldObservation, when: number): SlotHold {
+    const before = this.#db.query("SELECT holds_slot FROM slot_holds WHERE executor_id = ? AND run_id = ? AND run_generation = ?").get(seen.executorId, seen.runId, seen.runGeneration) as {
+      holds_slot: number;
+    } | null;
+    const holdsSlot = seen.holdsSlot || before?.holds_slot === 1;
+    this.#db.query("DELETE FROM slot_holds WHERE executor_id = ? AND run_id = ? AND run_generation = ?").run(seen.executorId, seen.runId, seen.runGeneration);
+    const row = this.#db
+      .query("INSERT INTO slot_holds (executor_id, run_id, kind, run_generation, holds_slot, why, held_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING observation")
+      .get(seen.executorId, seen.runId, seen.kind, seen.runGeneration, holdsSlot ? 1 : 0, seen.why, when) as { observation: number };
+    return { ...seen, holdsSlot, observation: safe(row.observation, "slot_holds.observation") };
   }
 
   // 지금 슬롯을 막고 있는 관측. 해제할 수 있는 것만 낸다(실행 ID만 막는 줄은 해제할 것이 없다).
@@ -2692,7 +2823,8 @@ export class Ledger {
   }
 
   // 순서: 발신자·실행·세대 → 이미 받은 id의 분류(같은 본문은 다시 ack, 다른 본문은 충돌 기록) → 새 id의 원 지시 대조와 효과.
-  applyReceipt(input: ReceiptInput, from: EnvelopeFrom): { ok: true; delivery: Delivery; ack: string } | Refused {
+  // 닫기 근거가 있는 not_started 실행(#closedAfterStart)의 시작 영수증은 겹침의 증거라 답에 경보(alarm)를 싣는다. 경보가 없는 답의 꼴은 그대로다.
+  applyReceipt(input: ReceiptInput, from: EnvelopeFrom): { ok: true; delivery: Delivery; ack: string; alarm?: ReceiptAlarm } | Refused {
     const r = validateReceipt(input);
     const sender = validateFrom(from);
     return this.#write("receipt", "continue", () => {
@@ -2702,14 +2834,16 @@ export class Ledger {
       if (r.action === "receipt_session_takeover") this.#requireTakeoverSender(row, r.receiptId, sender);
       else this.#requireSender(row, sender);
       const seen = this.#redelivery(r.receiptId, r.bodyDigest, r.now);
-      if (seen === "duplicate") return { ok: true as const, delivery: "duplicate" as const, ack: r.receiptId };
+      // 닫힌 실행은 닫을 때 받은 기록이 0줄이었으므로 그 실행의 시작 영수증은 모두 닫은 뒤에 온 것이다. 앞의 답(경보)을 잃었을 수 있어 재전송에도 싣는다.
+      const alarm: { alarm?: ReceiptAlarm } = r.action === "receipt_started" && this.#closedAfterStart(row) ? { alarm: "closed_run_started" } : {};
+      if (seen === "duplicate") return { ok: true as const, delivery: "duplicate" as const, ack: r.receiptId, ...alarm };
       if (seen !== null) return seen;
       const instructionRequestId = "instructionRequestId" in r ? r.instructionRequestId : undefined;
       if (instructionRequestId !== undefined) this.#instruction(instructionRequestId, row.run_id, r.action === "receipt_accepted" ? [r.instruction] : r.action === "receipt_started" ? ["task_start", "session_start"] : ["result_finalize"]);
       this.#insertDelivery(r.receiptId, r.action, runId, r.bodyDigest, r.now, { instructionRequestId });
       this.#faults.at("receipt:after_insert");
       this.#effect(row, r, sender);
-      return { ok: true as const, delivery: "new" as const, ack: r.receiptId };
+      return { ok: true as const, delivery: "new" as const, ack: r.receiptId, ...alarm };
     });
   }
 
@@ -2719,6 +2853,13 @@ export class Ledger {
   }
 
   #effect(row: RunRow, r: ReceiptInput, from: EnvelopeFrom): void {
+    // 닫기 근거가 있는 not_started 실행에 늦게 온 영수증: 받은 기록(위의 deliveries 줄)만 남기고 상태·증거 칸은 바꾸지 않는다(되살리지 않는다).
+    // 접수·종료 영수증은 띄운 것이 없다는 말이라 ack만 받는다. 시작 영수증은 그 실행이 실제로 떴다는 말이라 그 종류의 자리를 다시 막는다:
+    // 자리를 푼 뒤 같은 종류의 다른 실행이 시작됐을 수 있다(겹침). 막은 줄은 clearSlotHold로만 풀린다. 정리 영수증은 확정 지시가 없어 오기 전에 거절된다.
+    if (this.#closedAfterStart(row)) {
+      if (r.action === "receipt_started") this.#hold({ executorId: row.executor_id, runId: row.run_id, kind: row.kind, runGeneration: row.run_generation, holdsSlot: true, why: "ended_in_ledger" }, r.now);
+      return;
+    }
     switch (r.action) {
       case "receipt_accepted":
         if (row.state === "queued") throw new Refuse("transition_denied");
@@ -2813,7 +2954,9 @@ export class Ledger {
       const seen = this.#redelivery(reportId, digest, now);
       if (seen === "duplicate") return { ok: true as const, delivery: "duplicate" as const, ack: reportId };
       if (seen !== null) return seen;
-      const disposition = resultDigest === null ? "pending" : this.#resultDisposition(row, reportId, resultDigest, now);
+      // 닫기 근거가 있는 not_started 실행의 늦은 보고는 적고 ack하되 반영하지 않는다: 적자마자 마친 것으로 두고(applied_at) 실행 줄은 그대로다.
+      // 거절하면 실행기가 영영 다시 보내고, 미반영으로 두면 반영할 곳이 없는 보고가 pendingReports와 복원 3단계에 영영 남는다.
+      const disposition = this.#closedAfterStart(row) ? "settled" : resultDigest === null ? "pending" : this.#resultDisposition(row, reportId, resultDigest, now);
       if (typeof disposition === "object") return disposition;
       this.#insertDelivery(reportId, action, runId, digest, now, { storedRef, resultDigest, appliedAt: disposition === "settled" ? now : null });
       if (signal !== null) this.#insertSignal(reportId, signal);

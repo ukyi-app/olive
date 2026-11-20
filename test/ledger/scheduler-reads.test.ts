@@ -463,8 +463,11 @@ test("시작 전에 닫힌 줄은 상한이 아님", () => {
     const into = Object.entries(TRANSITIONS[kind])
       .filter(([, to]) => to?.includes("not_started"))
       .map(([from]) => from);
-    expect(into, kind).toEqual(["queued"]);
-    expect(startedReachesNotStarted(TRANSITIONS[kind]), kind).toBe(false);
+    // 예외는 작업자의 D-90 닫기 두 줄뿐이다: 장부 트리거가 실행기가 받은 적 없는(쓴 예산이 없는) 실행의 근거 줄이 있을 때만 허락한다.
+    const closure: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
+    expect(into, kind).toEqual(["queued", ...closure]);
+    const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
+    expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
     // 시작한 줄이 대기로 돌아가는 간선(running → queued)을 표의 사본에 더하면 이 검사가 잡는다.
     const requeue = { ...TRANSITIONS[kind], running: [...(TRANSITIONS[kind].running ?? []), "queued" as const] };
     expect(startedReachesNotStarted(requeue), kind).toBe(true);
