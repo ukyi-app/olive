@@ -80,6 +80,14 @@ export function sealSnapshot(image: Uint8Array, record: SnapshotRecord): Uint8Ar
     if (written.changes !== 1 || latest === null || latest.snapshotId !== record.snapshotId || latest.ledgerId !== record.ledgerId || latest.takenAt !== record.takenAt) {
       throw new SnapshotRefused("snapshot_unsupported", "사본 기록이 최신 미대조 기록으로 들어가지 않았다");
     }
+    // 사본의 경계(판 6): 이 그림에 든 실행의 queue_seq 최댓값. 되살린 장부의 자동 닫기가 사본 안의 실행을 시계 없이 가른다.
+    // 판 목록을 6 앞에서 끊은 장부에는 표가 없다. 표가 있는데 경계가 들어가지 않으면 그 사본은 경계를 모르는 사본이라 내지 않는다.
+    if (copy.query("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'snapshot_run_bounds'").get() !== null) {
+      const bounded = copy
+        .query("INSERT INTO snapshot_run_bounds (snapshot_id, queue_seq_bound) VALUES (?, (SELECT COALESCE(MAX(queue_seq), 0) FROM runs))")
+        .run(record.snapshotId);
+      if (bounded.changes !== 1) throw new SnapshotRefused("snapshot_unsupported", "사본의 경계가 들어가지 않았다");
+    }
     copy.run(`PRAGMA user_version = ${SNAPSHOT_UNOPENED}`);
     return copy.serialize();
   } finally {

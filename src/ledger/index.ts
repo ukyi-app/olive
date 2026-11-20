@@ -30,6 +30,7 @@ export {
   type PublicationAnswer,
   type QueuedInput,
   type Read,
+  type ReceiptAlarm,
   type ReceiptInput,
   type Refusal,
   REFUSALS,
@@ -50,6 +51,7 @@ export {
   type SnapshotRequest,
   type SnapshotResult,
   type StartBar,
+  type StartDispatchInput,
   STOP_PHASES,
   type StopInstructionInput,
   type StopRecord,
@@ -62,6 +64,7 @@ export {
   type ToolRequestPhase,
   type UnansweredInstruction,
   type UnansweredInstructions,
+  type UnreceivedClosureInput,
   type WaitingToolRequest,
 } from "./ledger.ts";
 export { loadMigrations, type Migration, MIGRATIONS_DIR } from "./migrate.ts";

@@ -162,13 +162,16 @@ describe("모르거나 꼴이 틀린 입력", () => {
   });
 
   test("시작 전에 닫힌 줄(not_started)의 배정액은 상한이 아니고, 소진과 시작한 줄의 잔액은 그대로 상한이다", () => {
-    // not_started로 들어오는 길이 queued뿐이고 시작한 줄이 여러 걸음으로도 not_started에 닿지 않는 동안만 성립한다.
-    // 표가 바뀌면 이 단언이 먼저 실패한다.
+    // not_started로 들어오는 길이 queued에서, 또는 닫기 근거가 있을 때(D-90, 시작 지시의 예산에서 감액이 없을 때만)뿐이고,
+    // 닫기 두 줄을 빼면 시작한 줄이 여러 걸음으로도 not_started에 닿지 않는 동안만 성립한다. 표가 바뀌면 이 단언이 먼저 실패한다.
     for (const kind of ["worker", "session"] as const) {
-      expect(Object.entries(TRANSITIONS[kind]).filter(([, to]) => to?.includes("not_started")).map(([from]) => from), kind).toEqual(["queued"]);
-      expect(startedReachesNotStarted(TRANSITIONS[kind]), kind).toBe(false);
-      // 시작한 줄이 대기로 돌아가는 간선(running → queued)을 표의 사본에 더하면 이 검사가 잡는다.
-      const requeue = { ...TRANSITIONS[kind], running: [...(TRANSITIONS[kind].running ?? []), "queued" as const] };
+      // 예외는 작업자의 D-90 닫기 두 줄뿐이다: 장부 트리거가 실행기가 받은 적 없는(쓴 예산이 없는) 실행의 근거 줄이 있을 때만 허락한다.
+      const closure: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
+      expect(Object.entries(TRANSITIONS[kind]).filter(([, to]) => to?.includes("not_started")).map(([from]) => from), kind).toEqual(["queued", ...closure]);
+      const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
+      expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
+      // 닫기 두 줄을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
+      const requeue = { ...withoutClosure, running: [...(withoutClosure.running ?? []), "queued" as const] };
       expect(startedReachesNotStarted(requeue), kind).toBe(true);
     }
     const current = run({ inputRequestId: "ns", budgetLeft: 10 });
