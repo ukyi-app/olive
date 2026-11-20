@@ -29,23 +29,25 @@ AssignLoopPolicy = {
 TickResult =
   | { kind: "not_run", reason: "malformed_now" | "intake_closed" | "stop_generation_unknown" | "policy_rejected" }
   | { kind: "not_run", reason: "read_unknown", read: LoopRead }
-  | { kind: "ran", starts: StartOutcome[], requests: RequestOutcome[], halted: "intake_closed" | null }
+  | { kind: "ran", starts: StartOutcome[], requests: RequestOutcome[], halted: "intake_closed" | "threw" | null, haltedAt: HaltedAt | null }
+
+HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 ```
 
-`LoopRead`는 `waiting_requests`, `candidates`, `queue_view`, `runs`, `slot_holds`, `inputs`다.
+`LoopRead`는 `waiting_requests`, `candidates`, `queue_view`, `runs`, `slot_holds`, `inputs`다. `halted`와 `haltedAt`은 아래 "박자가 멈출 때".
 
 | 부탁마다 (`RequestOutcome`) | 뜻 |
 |---|---|
 | `skipped` + `pick` | `pickAssignment`가 `assign`이 아닌 답을 냈다. 그 답을 그대로 싣는다 |
 | `assigned` + `runId`, `executorId` | 새 실행 ID로 이었다 |
 | `already_assigned` + `runId`, `executorId` | 이미 이어진 부탁이다. 장부가 돌려준 실행이고 새 실행 줄은 없다 |
-| `assign_refused` + `reason` | 장부가 거절했다(`input_cancelled`·`input_expired` 포함). 부탁은 대기 그대로다 |
+| `assign_refused` + `reason` | 장부가 거절했다(`input_cancelled`·`input_expired` 포함). 이번 호출이 새 실행을 잇지 않았다는 뜻이다. 부탁이 대기로 남는지는 장부가 정한다(그 사이 취소되어 장부가 이미 닫은 부탁이면 `transition_denied`이고 대기 목록에 없다) |
 | `assign_failed` + `failure` | `random_unavailable`(장부를 부르지 않음), `threw`, `malformed_answer` |
 
 | 실행마다 (`StartOutcome`) | 뜻 |
 |---|---|
 | `sent` + `requestId`, `issuedAt`, `executorId` | 시작을 적고 지시를 연결에 실었다(`sent`는 받았다는 뜻이 아니다) |
-| `recorded_not_sent` + `requestId`, `stopGeneration`, `issuedAt`, `executorId`, `reason`, `delivery` | 장부에는 시작이 적혔고 지시는 나가지 않았다. 아래 "내보내지 못했을 때" |
+| `recorded_not_sent` + `requestId`, `stopGeneration`, `issuedAt`, `executorId`, `reason`, `delivery` | 장부에는 시작이 적혔고 전송 성공을 확인하지 못했다. 연결에 실렸는지는 `delivery`로 읽는다(`unknown`이면 실렸을 수 있다). 아래 "내보내지 못했을 때" |
 | `start_refused` + `reason` | 장부가 거절했다. 지시를 만들지 않았다 |
 | `start_failed` + `failure` | `random_unavailable`(장부를 부르지 않음), `threw`, `malformed_answer`. 적혔는지 모르므로 지시를 만들지 않았다 |
 | `not_worker` | 세션 후보다. 세션 시작은 장부가 닫아 두었고(`session_start_closed`) 이 박자가 내지 않는다 |
@@ -55,12 +57,21 @@ TickResult =
 ## 한 박자의 순서
 
 1. `now`가 장부의 시각 꼴(양의 안전 정수 ms)이 아니면 `malformed_now`.
-2. **쓰기 전의 읽기.** 접수(`intakeOpen()`이 `true`가 아니면 `intake_closed`), 정지 세대(0 이상의 안전 정수가 아니면 `stop_generation_unknown`), 대기 부탁 목록, 후보 연결, 시작 판단의 읽기 넷(`queueView`, `listRuns`, `slotHolds`, `listInputs`)을 이 차례로 읽는다. 하나라도 `known: false`이거나 던지거나 꼴이 틀리면(배열이 아님, 객체가 아닌 항목) 그 이름으로 `read_unknown`이다. `listRuns`의 대기 실행에 `queueView`의 시작 불가 사유가 없으면(두 읽기가 어긋남) `queue_view`다.
+2. **쓰기 전의 읽기.** 접수(`intakeOpen()`이 `true`가 아니면 `intake_closed`), 정지 세대(0 이상의 안전 정수가 아니면 `stop_generation_unknown`), 대기 부탁 목록, 후보 연결, 시작 판단의 읽기 넷(`queueView`, `listRuns`, `slotHolds`, `listInputs`)을 이 차례로 읽는다. 하나라도 `known`이 불리언 `true`가 아니거나 던지거나 꼴이 틀리면(배열이 아님, 객체가 아닌 항목) 그 이름으로 `read_unknown`이다. `listRuns`의 대기 실행에 대한 `queueView`의 시작 불가 사유(`startBar`)는 명시적 `null`이거나 장부가 정한 이름(`StartBar`)이어야 하고, 줄이 없거나(두 읽기가 어긋남) 칸이 빠졌거나 다른 값이면 `queue_view`다.
 3. 그 읽기로 `planNext`의 입력을 만들어 부른다. 출처를 나누지 못한 입력(`originOf`가 `undefined`)은 넣지 않아 그 실행이 `input_unknown`으로 보류된다. `planNext`가 정책 검사에서 던지면 `policy_rejected`다.
-4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → `sink.send`.
+4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → `sink.send`. 거절·예외이면 지시를 만들지 않는다. 성공 답은 초안에 필요한 칸(실행 줄과 `issuedAt`)만 검증하고, 이 모듈이 쓰지 않는 칸(성공 답의 별도 `credential` 등)은 보지 않는다.
 5. **잇기.** 대기 부탁마다 목록의 순서로: 사실 포트, 자격 포트, `pickAssignment`. `assign`이면 난수 포트로 실행 ID를 만들어 `assignToolRequest`. 어느 답이든 그 부탁만의 결과이고 다음 부탁을 본다.
 
 2의 읽기에서 1~5의 어느 쓰기도 부르지 않는다. 읽기 하나라도 닫힘·모름·틀림이면 그 박자에는 잇기도 시작도 없다.
+
+### 박자가 멈출 때
+
+박자는 예외를 밖으로 내지 않는다. 장부에 쓰기가 한 번이라도 성공한 뒤에 예외가 박자 밖으로 나가면, 이미 적은 시작(`sent`·`recorded_not_sent`)과 이은 부탁의 결과를 부르는 쪽이 잃고 그 실행은 아무도 모르는 채 자리를 쥔다.
+
+- **포트의 예외는 그 항목의 결과다.** 난수 포트가 던지면 `start_failed`·`assign_failed`의 `random_unavailable`, 장부 포트가 던지면 `threw`(실제 장부는 자기 시계의 예외를 `ledger_unwritable` 거절로 바꾸고 접수를 닫으므로, 박자는 그 거절을 싣고 다음 쓰기 직전에 `intake_closed`로 멈춘다), 사실·자격 포트가 던지면 모름으로 넘겨 고르기가 보류, 서명·내보내기 포트가 던지면 `recorded_not_sent`(`seal_threw`·`send_threw`)다. 박자는 다음 항목을 본다.
+- **그 밖의 예상하지 못한 예외**(포트의 답을 읽다가 던지는 경우 등)는 남은 항목을 하지 않고 `halted: "threw"`로 멈춘다.
+- **`haltedAt`은 결과를 내지 못한 첫 항목**(시작 후보의 실행 ID, 또는 대기 부탁의 ref)이고, 그 항목은 목록에 없다. `threw`이면 그 항목에 장부 쓰기가 있었는지 이 결과로는 모르므로, 부르는 쪽은 그 실행·부탁을 장부에서 다시 읽는다. `intake_closed`이면 그 항목에는 쓰기를 부르지 않았다.
+- 멈춰도 그 전까지의 `starts`·`requests`는 모두 결과에 있다.
 
 ### 왜 시작 판단을 박자 처음의 읽기로 하는가
 
@@ -79,6 +90,7 @@ TickResult =
 - 판단(`pickAssignment`, `planNext`)과 장부 쓰기(`assignToolRequest`·`startRun`의 `now`)는 인자로 받은 `now` 하나를 쓴다.
 - 시작 지시의 머리 `issued_at`은 `startRun`이 돌려준 `issuedAt`이다(장부가 자기 시계로 정한 값, `envelopes.md` "시각 규칙").
 - **봉하는 시각은 `now`와 `issuedAt` 가운데 늦은 값이다.** 장부는 박자의 `now`를 읽은 뒤 같은 시계로 발행 시각을 정하므로 `issuedAt`이 `now`보다 늦을 수 있고, 그때 `now`로 봉하면 `sealDraft`가 `issued_in_future`로 막는다. 늦은 값도 같은 시계에서 읽은 값이다. 실제로 싣는 시각의 봉투 시한과 작업 기한의 여유는 내보내기 포트가 다시 잰다(`ports.ts`의 `InstructionSink`).
+- **실행 기한(`deadlineAt`)은 박자의 `now`부터 센다.** 잇기는 사실·자격 포트를 기다린 뒤 장부에 쓰지만 `now`는 박자 처음의 값이라, 기다리는 동안 흐른 시간만큼 실제 잇는 순간보다 기한이 먼저 흐르고, 조회가 길면 이은 직후에 이미 지나 있을 수 있다(그 실행은 `planNext`가 `deadline_passed`로 보류한다).
 
 ## 사실·자격·후보 연결
 
@@ -96,7 +108,7 @@ TickResult =
 | `no_connection`, `too_late_to_send` | `not_sent` |
 | `send_threw`, `send_answer_malformed` | `unknown`: 포트가 연결에 실었는지 모른다 |
 
-`requestId`, `runId`, `stopGeneration`, `issuedAt`(장부의 답에서 읽지 못했으면 `null`), `executorId`를 싣는다. 다시 보내는 쪽이 같은 요청 ID·같은 본문으로 다시 봉할 수 있는 값이다.
+`requestId`, `runId`, `stopGeneration`, `issuedAt`(장부의 답에서 읽지 못했으면 `null`), `executorId`를 싣는다. 이 값은 처음 지시를 가리키는 식별값이고, 본문을 다시 만들 재료는 아니다. 본문(예산 등)은 장부의 실행 줄에서 오므로 그 뒤 장부가 바뀌면 같은 식별값으로 다시 만든 본문이 처음과 다를 수 있다. 결과에는 본문이나 자격 참조를 싣지 않는다.
 
 ## 이 박자가 하지 않는 것
 
@@ -105,7 +117,10 @@ TickResult =
 ## 뒤 조각이 지킬 것
 
 - **박자를 되풀이해 부른다.** 이번 박자에 이은 실행은 다음 박자에 시작 후보가 된다. 결과에 `assigned`가 있으면 곧 다시 부른다.
-- **`recorded_not_sent`의 실행을 다시 보낸다.** 같은 요청 ID·같은 본문으로 새 봉투에 담는다. 시작 지시는 발행 시각이 고정이라 `issuedAt + 19000ms`까지만 다시 봉할 수 있다(`envelopes.md`). 그 뒤에는 같은 실행 ID를 조회한다. 결과 목록은 메모리에만 있으므로, 감독이 그 전에 죽으면 장부에서 보내지 않은 지시를 찾는 읽기가 필요하다(장부에 아직 없다).
-- **`delivery: "unknown"`은 보냈을 수도 있다.** 다시 보내도 실행기 쪽은 같은 요청 ID·같은 본문이면 멱등이다. 새 요청 ID로 다시 만들지 않는다.
+- **`recorded_not_sent`는 처음의 본문 또는 그와 같음을 대조할 근거가 있을 때만 재전송하고, 없으면 같은 실행을 조회한다.** 재전송은 같은 요청 ID·같은 본문·새 nonce로 새 봉투에 담는다. 시작 지시는 발행 시각이 고정이라 `issuedAt + 19000ms`까지만 다시 봉할 수 있고(`envelopes.md`), 작업 기한이 더 이르면 그만큼 앞당겨진다. 결과 목록은 메모리에만 있으므로, 감독이 그 전에 죽으면 장부에서 보내지 않은 지시를 찾는 읽기가 필요하다(장부에 아직 없다).
+- **`delivery: "unknown"`은 보냈을 수도 있다.** 같은 길이다. 새 요청 ID로 다시 만들지 않는다.
+- **`halted: "threw"`이면 `haltedAt`의 실행·부탁을 장부에서 다시 읽는다.** 그 항목에 쓰기가 있었는지 결과로는 모른다.
+- **내보내는 포트는 실제로 싣는 시점에 정지 세대와 접수를 다시 본다.** 이 박자는 `startRun` 직전에 접수를 다시 보지만, 내보내기 포트가 비동기로 기다리는 동안 정지가 들어오면 옛 세대의 봉투가 실린다(실행기는 새 세대에서 `stop_generation_mismatch`로 거절한다). 싣기 직전에 대조하거나, 대조부터 싣기까지를 동기적으로 끝낸다. 지정 실행기의 살아 있는 연결과 봉투·작업 기한의 남은 여유도 이 시점에 잰다.
+- **작업 자리는 종료 근거로만 푼다.** 시작을 받은 적 없는 실행을 D-90으로 풀려면 접수 영수증 없음, 추가 시작 송신 중단과 마지막 봉투의 만료, 그 뒤 전체 점유에서 부재가 함께 성립해야 한다. 기한 지난 대기 실행의 마감과 재시작 뒤 미응답 지시의 복원은 뒤 조각이다.
 - **`now`는 장부 시계와 같은 시계에서 박자마다 한 번 읽은 값이고 후퇴하지 않는다**(`planNext`의 조건).
 - **세션 후보(`not_worker`)는 세션 계약 작업이 연다.** 그 전에는 세션 대기 실행이 후보로 남아도 이 박자는 부르지 않는다.

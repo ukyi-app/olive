@@ -39,12 +39,20 @@ const CONNECTION: Candidate = {
 // 호출 순서를 한 줄로 적는다(장부 → 서명 → 내보내기 순서를 본다).
 type Log = string[];
 
+// 일부러 던지게 할 수 있는 포트. clock은 장부에 주입한 시계다(박자는 시계를 직접 받지 않는다).
+const FAULT_PORTS = ["random", "clock", "facts", "credentials", "signer", "sink"] as const;
+type FaultPort = (typeof FAULT_PORTS)[number];
+
 interface World {
   ledger: Ledger;
   ports: AssignLoopPorts;
   log: Log;
   sent: Envelope[];
   uuids: number;
+  // arm 뒤로 포트마다 불린 횟수.
+  calls: Record<FaultPort, number>;
+  // 그 포트의 nth번째 호출(arm 뒤로 1부터)만 던지게 하고, 호출 횟수를 0부터 다시 센다.
+  arm(port: FaultPort | null, nth?: number): void;
   setClock(at: number): void;
   setIntake(open: boolean): void;
   setStopGeneration(value: number | null): void;
@@ -56,7 +64,20 @@ interface World {
 
 function world(): World {
   let clockAt = NOW;
-  const ledger = ready(open(tempPath(), { clock: () => clockAt }));
+  const calls: Record<FaultPort, number> = { random: 0, clock: 0, facts: 0, credentials: 0, signer: 0, sink: 0 };
+  let fault: { port: FaultPort; nth: number } | null = null;
+  const hit = (port: FaultPort) => {
+    calls[port] += 1;
+    if (fault?.port === port && calls[port] === fault.nth) throw new Error(`${port} 포트 실패`);
+  };
+  const ledger = ready(
+    open(tempPath(), {
+      clock: () => {
+        hit("clock");
+        return clockAt;
+      },
+    }),
+  );
   const log: Log = [];
   const sent: Envelope[] = [];
   let intake = true;
@@ -69,6 +90,11 @@ function world(): World {
     log,
     sent,
     uuids: 0,
+    calls,
+    arm: (port, nth = 1) => {
+      for (const name of FAULT_PORTS) calls[name] = 0;
+      fault = port === null ? null : { port, nth };
+    },
     setClock: (at) => {
       clockAt = at;
     },
@@ -119,12 +145,14 @@ function world(): World {
   const random: Random = {
     bytes(length) {
       w.uuids += 1;
+      hit("random");
       return getRandomValues(new Uint8Array(length));
     },
   };
   const signer: Signer = {
     seal(input) {
       log.push("seal");
+      hit("signer");
       return sealEnvelope(input, keys.privateKey);
     },
   };
@@ -140,13 +168,24 @@ function world(): World {
     },
     intake: { intakeOpen: () => intake && ledger.intakeOpen(), stopGeneration: () => stopGeneration },
     connections: { candidates: () => ({ known: true, value: [CONNECTION] }) },
-    facts: { facts: () => facts() },
-    credentials: { reference: async () => ({ known: true, credential: { account: "acct-a", method: "api_key", revision: "cred-1", digest: CRED_DIGEST } }) },
+    facts: {
+      facts: () => {
+        hit("facts");
+        return facts();
+      },
+    },
+    credentials: {
+      reference: async () => {
+        hit("credentials");
+        return { known: true, credential: { account: "acct-a", method: "api_key", revision: "cred-1", digest: CRED_DIGEST } };
+      },
+    },
     random,
     signer,
     sink: {
       send: async (envelope) => {
         log.push("send");
+        hit("sink");
         const outcome = await send();
         if (outcome === "sent") sent.push(envelope);
         return outcome;
@@ -218,6 +257,26 @@ describe("보장 1: 닫혔거나 모르면 쓰지 않는다", () => {
       w.ports = { ...w.ports, connections: { candidates } };
       expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({ kind: "not_run", reason: "read_unknown", read: "candidates" });
       expect(w.log).toEqual([]);
+    }
+  });
+
+  test("형식이 틀린 큐 읽기(known이 불리언 true가 아님, 대기 실행의 startBar 칸이 빠짐)도 모름이다", async () => {
+    const malformed = [
+      (w: World) => () => ({ ...w.ledger.queueView(), known: "false" }),
+      (w: World) => () => {
+        const real = w.ledger.queueView();
+        if (!real.known) throw new Error("읽지 못함");
+        const runs = real.value.runs.map((run) => Object.fromEntries(Object.entries(run).filter(([key]) => key !== "startBar")));
+        return { known: true, value: { ...real.value, runs } };
+      },
+    ];
+    for (const make of malformed) {
+      const w = world();
+      await assignThenStartSetup(w);
+      w.wrap({ queueView: make(w) as never });
+      expect(await assignAndStartTick(w.ports, POLICY, NOW)).toEqual({ kind: "not_run", reason: "read_unknown", read: "queue_view" });
+      expect(w.log).toEqual([]);
+      expect(runCount(w.ledger)).toBe(1);
     }
   });
 
@@ -449,5 +508,127 @@ describe("보장 4: 내보내지 못해도 새로 만들지 않는다", () => {
     expect(text).not.toContain(CRED_DIGEST);
     expect(text).not.toContain((w.sent[0] as Envelope).signature);
     expect(text).not.toContain("nonce");
+  });
+});
+
+// 대기 실행 하나(이번 박자의 시작 후보)와 대기 부탁 둘을 만들고 기록을 비운다.
+async function startPlusTwo(w: World): Promise<{ runId: string; a: string; b: string }> {
+  w.enqueueRequest();
+  const first = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+  const runId = (first.requests[0] as { runId: string }).runId;
+  const a = w.enqueueRequest().ref;
+  const b = w.enqueueRequest().ref;
+  w.log.length = 0;
+  return { runId, a, b };
+}
+
+function runStates(ledger: Ledger): Map<string, string> {
+  const runs = ledger.listRuns();
+  if (!runs.known) throw new Error("실행 목록을 읽지 못함");
+  return new Map(runs.value.map((run) => [run.runId, run.state]));
+}
+
+describe("장부에 쓴 뒤에는 무엇이 던져도 그때까지의 결과가 돌아온다", () => {
+  test("no_connection 뒤 다음 부탁의 난수가 던져도 recorded_not_sent와 남은 부탁의 결과가 함께 돌아온다", async () => {
+    const w = world();
+    w.setSend(async () => "no_connection");
+    const { runId, a, b } = await startPlusTwo(w);
+    // 난수 호출 순서: 시작의 요청 ID(1), nonce(2), 부탁 a의 실행 ID(3), 부탁 b의 실행 ID(4). 셋째만 던진다.
+    w.arm("random", 3);
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(result.starts).toEqual([expect.objectContaining({ runId, outcome: "recorded_not_sent", reason: "no_connection", delivery: "not_sent" })]);
+    expect(result.requests).toEqual([
+      { ref: a, outcome: "assign_failed", failure: "random_unavailable" },
+      { ref: b, outcome: "assigned", runId: expect.any(String), executorId: EXECUTOR },
+    ]);
+    expect([result.halted, result.haltedAt]).toEqual([null, null]);
+    expect(w.log).toEqual(["startRun", "seal", "send", "assignToolRequest"]);
+  });
+
+  test("실제로 실은 뒤 내보내기 포트가 던지고 다음 부탁의 난수가 던져도 delivery unknown 결과가 돌아온다", async () => {
+    const w = world();
+    const { runId, a, b } = await startPlusTwo(w);
+    const loaded: Envelope[] = [];
+    w.ports = {
+      ...w.ports,
+      sink: {
+        send: async (envelope) => {
+          loaded.push(envelope);
+          throw new Error("실은 뒤 소켓 실패");
+        },
+      },
+    };
+    w.arm("random", 3);
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(loaded).toHaveLength(1);
+    expect(result.starts).toEqual([expect.objectContaining({ runId, outcome: "recorded_not_sent", reason: "send_threw", delivery: "unknown" })]);
+    expect(result.requests).toEqual([
+      { ref: a, outcome: "assign_failed", failure: "random_unavailable" },
+      { ref: b, outcome: "assigned", runId: expect.any(String), executorId: EXECUTOR },
+    ]);
+  });
+
+  test("난수·시계·사실·자격·서명·내보내기 포트가 어느 호출에서 던져도 박자는 던지지 않고, 장부에 적힌 시작과 이음이 모두 결과에 있다", async () => {
+    // 기준 박자(시작 하나, 잇기 둘)에서 포트마다 불린 횟수를 세고, 그 호출 하나하나를 던지게 해 본다(쓰기 전과 쓰기 뒤가 모두 들어간다).
+    const reference = world();
+    await startPlusTwo(reference);
+    reference.arm(null);
+    ran(await assignAndStartTick(reference.ports, POLICY, NOW));
+    const counts = { ...reference.calls };
+    for (const port of FAULT_PORTS) {
+      expect([port, counts[port] > 0]).toEqual([port, true]);
+      for (let nth = 1; nth <= counts[port]; nth += 1) {
+        const label = `${port}#${nth}`;
+        const w = world();
+        await startPlusTwo(w);
+        const before = runStates(w.ledger);
+        w.arm(port, nth);
+        const result = await assignAndStartTick(w.ports, POLICY, NOW);
+        w.arm(null);
+        if (result.kind === "not_run") {
+          // 쓰기 전의 읽기에서 던졌다(장부 시계). 쓰기 0.
+          expect([label, result]).toEqual([label, { kind: "not_run", reason: "read_unknown", read: expect.any(String) }]);
+          expect([label, w.log]).toEqual([label, []]);
+          continue;
+        }
+        // 포트의 예외는 그 항목의 결과가 되고 박자를 멈추지 않는다: 시작 하나와 부탁 둘이 모두 결과에 있다.
+        // 장부 시계가 쓰기 안에서 던지면 실제 장부가 접수를 닫으므로 그 뒤는 intake_closed로 멈춘다(멈춘 자리가 결과에 있다).
+        if (result.halted === "intake_closed") {
+          expect([label, result.haltedAt === null, result.starts.length + result.requests.length < 3]).toEqual([label, false, true]);
+        } else {
+          expect([label, result.halted, result.starts.length, result.requests.length]).toEqual([label, null, 1, 2]);
+        }
+        for (const [runId, state] of runStates(w.ledger)) {
+          if (!before.has(runId)) {
+            expect([label, result.requests]).toEqual([label, expect.arrayContaining([expect.objectContaining({ runId, outcome: "assigned" })])]);
+          } else if (before.get(runId) === "queued" && state !== "queued") {
+            expect([label, result.starts]).toEqual([label, [expect.objectContaining({ runId, outcome: expect.stringMatching(/^(sent|recorded_not_sent)$/) })]]);
+          }
+        }
+      }
+    }
+  });
+
+  test("포트 밖의 예외(사실 답의 칸을 읽다 던짐)는 박자를 멈추되, 그 전의 결과와 멈춘 자리를 낸다", async () => {
+    const w = world();
+    w.setSend(async () => "no_connection");
+    const { runId, a } = await startPlusTwo(w);
+    // await가 보는 then만 없다고 답하고, 고르기가 칸을 읽으면 던진다.
+    const throwing = new Proxy(
+      {},
+      {
+        get: (_target, key) => {
+          if (key === "then") return undefined;
+          throw new Error("사실 칸 읽기 실패");
+        },
+      },
+    );
+    w.setFacts(() => throwing as PreAssignFacts);
+    const result = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    expect(result.starts).toEqual([expect.objectContaining({ runId, outcome: "recorded_not_sent", reason: "no_connection" })]);
+    expect(result.requests).toEqual([]);
+    expect(result.halted).toBe("threw");
+    expect(result.haltedAt).toEqual({ step: "assign", ref: a });
+    expect(w.log).toEqual(["startRun", "seal", "send"]);
   });
 });

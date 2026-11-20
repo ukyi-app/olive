@@ -20,6 +20,7 @@ import {
   type Refusal as LedgerRefusal,
   type Restorer,
   type Run,
+  type StartBar,
   type WaitingToolRequest,
 } from "../../ledger/index.ts";
 import { type AccountRef, selectAccount } from "../accounts/fixed.ts";
@@ -119,6 +120,9 @@ export type StartOutcome =
   // 세션 후보. 세션 시작은 장부가 닫아 두었고(session_start_closed) 이 조각이 내지 않는다.
   | { readonly runId: string; readonly outcome: "not_worker" };
 
+// 박자가 멈춘 자리: 결과를 내지 못한 첫 항목(시작 후보의 실행, 또는 대기 부탁).
+export type HaltedAt = { readonly step: "start"; readonly runId: string } | { readonly step: "assign"; readonly ref: string };
+
 export type TickResult =
   | { readonly kind: "not_run"; readonly reason: "malformed_now" | "intake_closed" | "stop_generation_unknown" | "policy_rejected" }
   | { readonly kind: "not_run"; readonly reason: "read_unknown"; readonly read: LoopRead }
@@ -126,14 +130,29 @@ export type TickResult =
       readonly kind: "ran";
       readonly starts: readonly StartOutcome[];
       readonly requests: readonly RequestOutcome[];
-      // 박자 중에 접수가 닫혀 남은 쓰기를 부르지 않았다. 목록에는 그 전까지 한 것만 있다.
-      readonly halted: "intake_closed" | null;
+      // 남은 일을 하지 않고 멈춘 이유. intake_closed는 박자 중에 접수가 닫혀 남은 쓰기를 부르지 않은 것이고,
+      // threw는 항목을 처리하다 예상하지 못한 예외가 난 것이다. 목록에는 그 전까지 한 것이 모두 있다.
+      // 멈춘 자리의 항목은 목록에 없다. threw이면 그 항목에 장부 쓰기가 있었는지 이 값으로는 모른다.
+      readonly halted: "intake_closed" | "threw" | null;
+      readonly haltedAt: HaltedAt | null;
     };
 
 // 장부의 시각 꼴(양의 안전 정수 ms). pickAssignment·장부와 같은 조건이다.
 const isTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isRefusal = (value: unknown): value is LedgerRefusal => (LEDGER_REFUSALS as readonly unknown[]).includes(value);
+// 장부가 대기 실행에 붙이는 시작 불가 사유 전부. Record라 장부가 사유를 더하거나 빼면 타입 검사가 여기서 실패한다.
+const START_BARS: Record<StartBar, true> = { run_generation_stale: true, run_blocked: true, input_cancelled: true, input_expired: true, deadline_passed: true };
+const isStartBar = (value: unknown): value is StartBar => typeof value === "string" && Object.hasOwn(START_BARS, value);
+
+// 난수 포트가 던지면 null(random_unavailable)이다. 예외를 박자 밖으로 내면 앞서 장부에 적은 시작·잇기의 결과까지 부르는 쪽이 잃는다.
+function freshUuid(random: Random): string | null {
+  try {
+    return newUuid(random);
+  } catch {
+    return null;
+  }
+}
 
 // 읽기 포트의 답. 던지거나 꼴이 틀리면 모름이다. 항목은 모두 객체여야 한다: 칸을 읽다가 던지면 구별된 답 대신 예외가 된다.
 // 칸의 값은 여기서 보지 않는다(고르기·판단이 보고 보류한다).
@@ -175,8 +194,9 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
 
   let queue: unknown;
   try {
-    const answer = ledger.queueView();
-    queue = answer.known ? answer.value : null;
+    // 다른 읽기와 같이 불리언 true일 때만 안 것으로 친다("false" 같은 값은 참으로 읽히지 않게).
+    const answer: unknown = ledger.queueView();
+    queue = isObject(answer) && answer.known === true ? answer.value : null;
   } catch {
     queue = null;
   }
@@ -188,11 +208,13 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
   const inputs = readList<InputEntry>(() => ledger.listInputs());
   if (inputs === null) return { kind: "not_run", reason: "read_unknown", read: "inputs" };
 
-  // 대기 실행의 시작 불가 사유는 queueView만 준다. 두 읽기가 어긋나 대기 실행의 사유가 없으면 null(막지 않음)로 채우지 않고 모름이다.
-  const bars = new Map((queue.runs as { runId: string; startBar: SchedulerRun["startBar"] }[]).map((r) => [r.runId, r.startBar]));
+  // 대기 실행의 시작 불가 사유는 queueView만 준다. 대기 실행의 사유는 명시적 null이거나 장부가 정한 이름이어야 한다.
+  // 두 읽기가 어긋나 줄이 없거나, 칸이 빠졌거나(undefined) 다른 값이면 null(막지 않음)로 읽지 않고 모름이다.
+  const bars = new Map((queue.runs as Record<string, unknown>[]).map((r) => [r.runId, r.startBar]));
   const view: SchedulerRun[] = [];
   for (const run of runs) {
-    if (run.state === "queued" && !bars.has(run.runId)) return { kind: "not_run", reason: "read_unknown", read: "queue_view" };
+    const bar = bars.get(run.runId);
+    if (run.state === "queued" && bar !== null && !isStartBar(bar)) return { kind: "not_run", reason: "read_unknown", read: "queue_view" };
     view.push({
       runId: run.runId,
       kind: run.kind,
@@ -202,7 +224,7 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
       inputRequestId: run.inputRequestId,
       deadlineAt: run.deadlineAt,
       budgetLeft: run.budgetLeft,
-      startBar: bars.get(run.runId) ?? null,
+      startBar: isStartBar(bar) ? bar : null,
     });
   }
   // 출처를 나누지 못한 입력은 넣지 않는다. 그 입력의 실행은 planNext가 input_unknown으로 보류한다.
@@ -232,21 +254,31 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
 
   const starts: StartOutcome[] = [];
   const requests: RequestOutcome[] = [];
-  // 시작을 먼저 한다: 판단은 박자 처음의 읽기로 했으므로, 잇기의 비동기 포트를 기다리는 동안 그 판단과 봉투의 시각이 낡지 않게 한다.
-  for (const candidate of plan.candidates) {
-    if (candidate.kind !== "worker") {
-      starts.push({ runId: candidate.runId, outcome: "not_worker" });
-      continue;
+  let at: HaltedAt | null = null;
+  const halt = (halted: "intake_closed" | "threw"): TickResult => ({ kind: "ran", starts, requests, halted, haltedAt: at });
+  // 쓰기가 시작된 뒤에는 예외를 박자 밖으로 내지 않는다. 내면 이미 장부에 적은 시작(recorded_not_sent·sent)과 이은 부탁의 결과를
+  // 부르는 쪽이 잃고, 그 실행은 아무도 모르는 채 자리를 쥔다. 포트의 예외는 항목 안에서 구별된 결과가 되고, 이 catch는 그 밖의 예외를 받는다.
+  try {
+    // 시작을 먼저 한다: 판단은 박자 처음의 읽기로 했으므로, 잇기의 비동기 포트를 기다리는 동안 그 판단과 봉투의 시각이 낡지 않게 한다.
+    for (const candidate of plan.candidates) {
+      at = { step: "start", runId: candidate.runId };
+      if (candidate.kind !== "worker") {
+        starts.push({ runId: candidate.runId, outcome: "not_worker" });
+        continue;
+      }
+      if (!intakeOpen(ports.intake)) return halt("intake_closed");
+      starts.push(await startOne(ports, candidate.runId, snapshot.stopGeneration, now));
     }
-    if (!intakeOpen(ports.intake)) return { kind: "ran", starts, requests, halted: "intake_closed" };
-    starts.push(await startOne(ports, candidate.runId, snapshot.stopGeneration, now));
+    for (const request of snapshot.waiting) {
+      at = { step: "assign", ref: request.ref };
+      const outcome = await assignOne(ports, policy, snapshot.candidates, request, now);
+      if (outcome === "intake_closed") return halt("intake_closed");
+      requests.push(outcome);
+    }
+  } catch {
+    return halt("threw");
   }
-  for (const request of snapshot.waiting) {
-    const outcome = await assignOne(ports, policy, snapshot.candidates, request, now);
-    if (outcome === "intake_closed") return { kind: "ran", starts, requests, halted: "intake_closed" };
-    requests.push(outcome);
-  }
-  return { kind: "ran", starts, requests, halted: null };
+  return { kind: "ran", starts, requests, halted: null, haltedAt: null };
 }
 
 async function assignOne(
@@ -291,7 +323,7 @@ async function assignOne(
   if (picked.kind === "intake_closed") return "intake_closed";
   if (picked.kind !== "assign") return { ref, outcome: "skipped", pick: picked };
 
-  const runId = newUuid(ports.random);
+  const runId = freshUuid(ports.random);
   if (runId === null) return { ref, outcome: "assign_failed", failure: "random_unavailable" };
   let answer: unknown;
   try {
@@ -314,7 +346,7 @@ async function assignOne(
 }
 
 async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: number, now: number): Promise<StartOutcome> {
-  const requestId = newUuid(ports.random);
+  const requestId = freshUuid(ports.random);
   if (requestId === null) return { runId, outcome: "start_failed", failure: "random_unavailable" };
   let answer: unknown;
   try {
