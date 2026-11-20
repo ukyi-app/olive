@@ -32,8 +32,10 @@ import {
   ROLES,
   type RunState,
   SESSION_BROKEN_CAUSES,
+  SESSION_STOP_REASONS,
   stateAfterLoss,
   STOP_FAILURE_ERRORS,
+  TASK_CANCEL_REASONS,
 } from "../contract/v1/index.ts";
 import { classify, describe, type Faults, LedgerUnavailableError, NO_FAULTS, type UnavailableReason } from "./errors.ts";
 import {
@@ -275,12 +277,20 @@ export interface StartSessionInput extends StartRunInput {
   handoffDigest: string | null;
 }
 
+export type TaskCancelReason = (typeof TASK_CANCEL_REASONS)[number];
+export type SessionStopReason = (typeof SESSION_STOP_REASONS)[number];
+export const FINALIZE_OUTCOMES = ["succeeded", "failed", "cancelled"] as const;
+export type FinalizeOutcome = (typeof FINALIZE_OUTCOMES)[number];
+
 export interface StopInstructionInput {
   runId: string;
   requestId: string;
   action: "task_cancel" | "session_stop";
   stopGeneration: number;
   now: number;
+  // 본문의 reason(task_cancel이면 TASK_CANCEL_REASONS, session_stop이면 SESSION_STOP_REASONS). 지시 줄에 적혀 재전송의 본문이 된다.
+  // 함정: 넘기지 않아도 지시는 적히지만 그 지시는 다시 만들 수 없음으로 남는다(unansweredInstructions의 rebuild가 null).
+  reason?: TaskCancelReason | SessionStopReason;
 }
 
 export interface InstructionInput {
@@ -288,6 +298,14 @@ export interface InstructionInput {
   requestId: string;
   stopGeneration: number;
   now: number;
+}
+
+// 확정 지시. outcome·resultDigest·storedAt은 본문의 같은 칸이고 셋을 함께 넘기거나 함께 뺀다. 빼면 지시는 적히지만 다시 만들 수 없음으로 남는다.
+// resultDigest는 succeeded일 때만 값이고 그 밖은 null이다(계약 parseResultFinalize). 실행 줄의 result_digest와 같은지는 장부가 보지 않는다.
+export interface FinalizeInstructionInput extends InstructionInput {
+  outcome?: FinalizeOutcome;
+  resultDigest?: string | null;
+  storedAt?: number;
 }
 
 // 검증을 통과한 봉투에서 온 것: 낸 쪽(계약의 실행기 주체 이름)과 머리의 run_generation.
@@ -628,6 +646,109 @@ function renewChainOf(rows: readonly InstructionTime[], start: InstructionTimes[
     end = renew.leaseUntil as number;
   }
   return { issuedAt: lastAt, leaseUntil: end, timely };
+}
+
+// 답을 받지 못한 지시 하나(unansweredInstructions). 같은 요청 ID·같은 본문으로 새 봉투를 만들 값과, 만들 수 없을 때의 표시를 함께 낸다.
+// 자격은 참조(계정·방식·revision·digest)만 싣고 값과 원문은 싣지 않는다.
+export interface UnansweredInstruction {
+  requestId: string;
+  action: "task_start" | "session_start" | "task_cancel" | "session_stop" | "result_finalize";
+  runId: string;
+  runGeneration: number;
+  // 그 실행의 지정 실행기(받는 쪽).
+  executorId: string;
+  runState: LedgerRunState;
+  // 이 지시를 적을 때의 정지 세대. 장부의 지금 정지 세대(UnansweredInstructions.stopGeneration)와 다르면 부르는 쪽은 보내지 않는다.
+  // 함정: 실행기가 받는지는 실행기가 적용한 세대에 달렸다. 새 세대를 적용한 뒤에는 받지 않지만(비상 정지의 종료만 높은 세대를 받는다),
+  // 적용하기 전이면 장부가 이미 넘어선 옛 세대의 지시를 받을 수 있다.
+  stopGeneration: number;
+  // 이 지시 줄에 적힌 발행 시각. 시작 지시는 머리의 issued_at에 그대로 싣는다(갱신 뒤의 instructionTimes.lease.issuedAt은 갱신의 시각이다).
+  // 취소·세션 정지·확정의 머리 issued_at은 봉하는 때의 시각이라 이 값과 다를 수 있다.
+  issuedAt: number;
+  // 본문을 다시 만들 칸. null이면 장부가 그 본문을 다시 만들 수 없다: 판 4 전에 적힌 줄, 칸을 넘기지 않고 적힌 줄, 세션 시작.
+  rebuild: InstructionRebuild | null;
+}
+
+// 동작마다 본문을 다시 만들 칸. 시작 지시는 실행 줄의 값과 시작 때의 예산(budgetLeft = 본문 budget_tokens)이다.
+export type InstructionRebuild =
+  | {
+      action: "task_start";
+      role: string;
+      profileRevision: string;
+      policyRevision: string;
+      snapshotDigest: string;
+      inputDigest: string;
+      deadlineAt: number;
+      budgetLeft: number;
+      credential: CredentialRef;
+    }
+  | { action: "task_cancel"; reason: TaskCancelReason }
+  | { action: "session_stop"; reason: SessionStopReason }
+  | { action: "result_finalize"; outcome: FinalizeOutcome; resultDigest: string | null; storedAt: number };
+
+export interface UnansweredInstructions {
+  // 장부의 지금 정지 세대. 정지 기록이 없으면 null.
+  stopGeneration: number | null;
+  instructions: UnansweredInstruction[];
+}
+
+interface UnansweredRow {
+  request_id: string;
+  action: UnansweredInstruction["action"];
+  run_id: string;
+  stop_generation: number;
+  issued_at: number;
+  budget_left: number | null;
+  reason: string | null;
+  outcome: string | null;
+  result_digest: string | null;
+  stored_at: number | null;
+}
+
+// 칸이 모자라거나 계약 밖의 값이면 null이다(다시 만들 수 없음). 비어 있는 칸을 실행 줄의 지금 값이나 기본값으로 채우지 않는다.
+function rebuildOf(row: UnansweredRow, run: RunRow): InstructionRebuild | null {
+  switch (row.action) {
+    case "task_start":
+      if (row.budget_left === null || run.kind !== "worker" || run.role === null || run.snapshot_digest === null || run.input_digest === null) return null;
+      return {
+        action: "task_start",
+        role: run.role,
+        profileRevision: run.profile_revision,
+        policyRevision: run.policy_revision,
+        snapshotDigest: run.snapshot_digest,
+        inputDigest: run.input_digest,
+        deadlineAt: safe(run.deadline_at, "deadline_at"),
+        budgetLeft: safe(row.budget_left, "instructions.budget_left"),
+        credential: toRun(run).credential,
+      };
+    case "task_cancel": {
+      const reason = TASK_CANCEL_REASONS.find((r) => r === row.reason);
+      return reason === undefined ? null : { action: "task_cancel", reason };
+    }
+    case "session_stop": {
+      const reason = SESSION_STOP_REASONS.find((r) => r === row.reason);
+      return reason === undefined ? null : { action: "session_stop", reason };
+    }
+    case "result_finalize": {
+      const outcome = FINALIZE_OUTCOMES.find((o) => o === row.outcome);
+      if (outcome === undefined || row.stored_at === null || (outcome === "succeeded") !== (row.result_digest !== null)) return null;
+      return { action: "result_finalize", outcome, resultDigest: row.result_digest, storedAt: safe(row.stored_at, "instructions.stored_at") };
+    }
+    case "session_start":
+      return null;
+  }
+}
+
+// 확정 본문의 세 칸. 셋 다 빠지면 다시 만들 수 없는 지시로 적는다. 일부만 있거나 succeeded와 결과 digest의 있고 없음이 어긋나면
+// 계약이 받지 않는 본문이라(parseResultFinalize의 body_malformed) 적지 않고 던진다.
+function finalizeFields(v: Record<string, unknown>): { outcome: FinalizeOutcome | null; resultDigest: string | null; storedAt: number | null } {
+  const given = [v.outcome, v.resultDigest, v.storedAt].filter((value) => value !== undefined).length;
+  if (given === 0) return { outcome: null, resultDigest: null, storedAt: null };
+  if (given !== 3) throw new LedgerInputError("recordFinalizeInstruction: outcome·resultDigest·storedAt은 함께 넘긴다");
+  const outcome = oneOf(v.outcome, FINALIZE_OUTCOMES, "outcome");
+  const resultDigest = strOrNull(v.resultDigest, SHA256, "resultDigest");
+  if ((outcome === "succeeded") !== (resultDigest !== null)) throw new LedgerInputError("recordFinalizeInstruction: 결과 digest는 succeeded일 때만 있다");
+  return { outcome, resultDigest, storedAt: time(v.storedAt, "storedAt") };
 }
 
 // 세션에 아직 전하지 않은 입력. 처리 위치는 세션들이 적은 위치의 최댓값이고 그 뒤의 입력만 센다.
@@ -1170,6 +1291,9 @@ export class Ledger {
   readonly #path: string;
   // 호출자가 넘긴 판 목록으로 만든 장부에는 사본 기록의 표가 없을 수 있다.
   readonly #snapshots: boolean;
+  // 판 4(0004-instruction-rebuild)의 지시 본문 칸. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 지시를 그 판 전의 꼴로 적고
+  // 판 4 전에 적힌 줄처럼 다시 만들 수 없음으로 읽는다. 기본 판 목록으로 연 장부에는 늘 있다.
+  readonly #rebuildColumns: boolean;
 
   constructor(key: symbol, db: Database, clock: () => number, faults: Faults, path = "") {
     if (key !== OPENED) throw new TypeError("Ledger는 openLedger로만 연다");
@@ -1178,6 +1302,7 @@ export class Ledger {
     this.#faults = faults;
     this.#path = path;
     this.#snapshots = sqlOf(db, "ledger_snapshots") !== null;
+    this.#rebuildColumns = db.query("SELECT 1 AS x FROM pragma_table_info('instructions') WHERE name = 'budget_left'").get() !== null;
   }
 
   health(): { writable: true } | { writable: false; reason: UnavailableReason } {
@@ -1278,6 +1403,21 @@ export class Ledger {
       params[key] = value ?? null;
     }
     this.#db.query(`UPDATE runs SET ${sets.join(", ")} WHERE run_id = $run_id`).run(params);
+  }
+
+  // 갱신 밖의 지시 줄을 적는 자리. 본문 칸은 그 지시를 적는 트랜잭션 안에서 함께 적고, 줄은 그 뒤 바뀌지 않는다(instructions_fixed).
+  #insertInstruction(
+    head: { requestId: string; runId: string; action: "task_start" | "task_cancel" | "session_stop" | "result_finalize"; stopGeneration: number; issuedAt: number },
+    fields: { budgetLeft?: number; reason?: string | null; outcome?: string | null; resultDigest?: string | null; storedAt?: number | null } = {},
+  ): void {
+    const values = [head.requestId, head.runId, head.action, head.stopGeneration, head.issuedAt] as const;
+    if (!this.#rebuildColumns) {
+      this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, ?, ?, ?)").run(...values);
+      return;
+    }
+    this.#db
+      .query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at, budget_left, reason, outcome, result_digest, stored_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(...values, fields.budgetLeft ?? null, fields.reason ?? null, fields.outcome ?? null, fields.resultDigest ?? null, fields.storedAt ?? null);
   }
 
   #revokeIntake(): void {
@@ -1812,7 +1952,8 @@ export class Ledger {
         const run = this.#runRow(row.run_id) as RunRow;
         if (run.stop_receipt_id !== null || TERMINAL.includes(run.state)) throw new Refuse("transition_denied");
         const stop = this.#stopRow();
-        const after = this.#recordStop(run, callId, "task_cancel", stop?.generation ?? null, now);
+        // 소유한 세션이 낸 취소라 본문의 reason은 requested다. 답의 instruction에는 싣지 않고 지시 줄에만 적는다.
+        const after = this.#recordStop(run, callId, "task_cancel", stop?.generation ?? null, now, "requested");
         const phase = TOOL_REQUEST_RUN_PHASES[after.state];
         if (run.state === "queued" || stop === null) return { ok: true as const, phase };
         return { ok: true as const, phase, instruction: { runId: run.run_id, requestId: callId, stopGeneration: stop.generation } };
@@ -1919,7 +2060,8 @@ export class Ledger {
       const principal = parsePrincipal(row.executor_id);
       if (row.input_digest === null || row.budget_left < 1 || principal?.kind !== "worker_executor" || principal.role !== row.role) throw new Refuse("not_startable");
       this.#setState(row, "preparing", now);
-      this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'task_start', ?, ?)").run(requestId, runId, stopGeneration, now);
+      // 본문의 budget_tokens는 이 시각의 남은 예산이다. 실행 줄의 값은 뒤에 줄 수 있어 지시 줄에 따로 적는다.
+      this.#insertInstruction({ requestId, runId, action: "task_start", stopGeneration, issuedAt: now }, { budgetLeft: row.budget_left });
       const after = this.#runRow(runId) as RunRow;
       return { ok: true as const, run: toRun(after), credential: toRun(after).credential, issuedAt: now };
     });
@@ -1954,22 +2096,24 @@ export class Ledger {
   // 지시의 정지 세대는 장부의 지금 값과 같아야 한다. 장부를 쓸 수 없어 이 기록이 실패해도 호출자는 최선 노력의 종료를 보낼 수 있지만,
   // 그것은 "지금 세대로 발급하도록 기록한 지시"가 아니다.
   recordStopInstruction(input: StopInstructionInput): { ok: true; run: Run } | Refused {
-    const v = exact(input, ["runId", "requestId", "action", "stopGeneration", "now"], "recordStopInstruction");
+    const v = exact(input, ["runId", "requestId", "action", "stopGeneration", "now", "reason"], "recordStopInstruction");
     const runId = str(v.runId, UUID, "runId");
     const requestId = str(v.requestId, UUID, "requestId");
     const action = oneOf(v.action, ["task_cancel", "session_stop"] as const, "action");
     const stopGeneration = count(v.stopGeneration, "stopGeneration");
     const now = time(v.now, "now");
+    // 칸을 빼면 본문을 다시 만들 수 없는 지시로 적는다(기존 호출 그대로). 넘겼으면 그 동작의 계약 목록 안이어야 한다.
+    const reason = v.reason === undefined ? null : oneOf(v.reason, action === "task_cancel" ? TASK_CANCEL_REASONS : SESSION_STOP_REASONS, "reason");
     return this.#write("stop_instruction", "continue", () => {
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
-      return { ok: true as const, run: toRun(this.#recordStop(row, requestId, action, stopGeneration, now)) };
+      return { ok: true as const, run: toRun(this.#recordStop(row, requestId, action, stopGeneration, now, reason)) };
     });
   }
 
   // 종료 지시의 기록. 쓰기 트랜잭션 안에서만 부른다(recordStopInstruction, 이은 부탁의 cancelToolRequest).
-  // 대기 실행은 지시 없이 not_started로 닫고, 그 밖은 지금 정지 세대의 지시를 적는다(정지 기록이 없으면 stop_unknown).
-  #recordStop(row: RunRow, requestId: string, action: "task_cancel" | "session_stop", stopGeneration: number | null, now: number): RunRow {
+  // 대기 실행은 지시 없이 not_started로 닫고, 그 밖은 지금 정지 세대의 지시를 본문의 reason과 함께 적는다(정지 기록이 없으면 stop_unknown).
+  #recordStop(row: RunRow, requestId: string, action: "task_cancel" | "session_stop", stopGeneration: number | null, now: number, reason: string | null): RunRow {
     if ((action === "task_cancel") !== (row.kind === "worker")) throw new Refuse("invariant_violation");
     if (row.state === "queued") {
       this.#setState(row, "not_started", now);
@@ -1978,23 +2122,24 @@ export class Ledger {
     if (stopGeneration === null) throw new Refuse("stop_unknown");
     this.#requireStopGeneration(stopGeneration);
     if (["preparing", "running", "unknown_running"].includes(row.state)) this.#setState(row, "stopping", now);
-    this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, ?, ?, ?)").run(requestId, row.run_id, action, stopGeneration, now);
+    this.#insertInstruction({ requestId, runId: row.run_id, action, stopGeneration, issuedAt: now }, { reason });
     return this.#runRow(row.run_id) as RunRow;
   }
 
   // 결과 확정 지시. 결과 쪽 상태(종료 확인이 있는)에서만 적는다. 정리 영수증은 이 지시만 가리킬 수 있다.
-  recordFinalizeInstruction(input: InstructionInput): { ok: true } | Refused {
-    const v = exact(input, ["runId", "requestId", "stopGeneration", "now"], "recordFinalizeInstruction");
+  recordFinalizeInstruction(input: FinalizeInstructionInput): { ok: true } | Refused {
+    const v = exact(input, ["runId", "requestId", "stopGeneration", "now", "outcome", "resultDigest", "storedAt"], "recordFinalizeInstruction");
     const runId = str(v.runId, UUID, "runId");
     const requestId = str(v.requestId, UUID, "requestId");
     const stopGeneration = count(v.stopGeneration, "stopGeneration");
     const now = time(v.now, "now");
+    const fields = finalizeFields(v);
     return this.#write("finalize_instruction", "continue", () => {
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
       if (!["ready_result", "failed_stopped", "cleanup_pending"].includes(row.state)) throw new Refuse("transition_denied");
       this.#requireStopGeneration(stopGeneration);
-      this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'result_finalize', ?, ?)").run(requestId, runId, stopGeneration, now);
+      this.#insertInstruction({ requestId, runId, action: "result_finalize", stopGeneration, issuedAt: now }, fields);
       return { ok: true as const };
     });
   }
@@ -2149,6 +2294,51 @@ export class Ledger {
       // 갱신 뒤의 lease는 사슬의 모든 갱신이 여유를 두고 발행됐을 때만 발급한 끝이다(InstructionTimes.lease).
       const lease: InstructionTimes["lease"] = chain === null ? start : { issuedAt: chain.issuedAt, expiresAt: chain.timely ? chain.leaseUntil : "unknown" };
       return { runId, lease, renewIssued, lastStopAt: latest(["task_cancel", "session_stop"]), lastFinalizeAt: latest(["result_finalize"]) };
+    });
+  }
+
+  // 아직 맞는 영수증을 받지 못한 지시. 장부를 바꾸지 않는다. 판정(ledger.md "답을 받지 못한 지시"):
+  // - 시작(task_start·session_start): 그 실행에서 받은 영수증·보고가 하나도 없다. 실행기는 시작 지시로만 실행을 알게 되므로 그 실행의
+  //   영수증·보고가 하나라도 있으면 시작을 받은 것이다. 접수 영수증만 보면, 그것만 늦게 오는 동안 이미 도는 실행을 "받은 적 없음"으로 읽는다.
+  // - 종료(task_cancel·session_stop): 그 요청 ID의 접수 영수증도, 그 실행의 종료 확인도 없다.
+  // - 확정(result_finalize): 그 요청 ID의 정리 영수증이 없다.
+  // 갱신(run_renew)은 영수증이 없는 지시라 내지 않는다. 끝난 실행(finalized·not_started)과, 시작·종료는 종료가 확인된 실행의 것도 내지 않는다.
+  // 순서는 실행의 대기 순번, 그 안에서 시작 → 종료 → 확정, 발행 시각, 요청 ID다.
+  unansweredInstructions(): Read<UnansweredInstructions> {
+    return this.#read(() => {
+      const fields = this.#rebuildColumns
+        ? "i.budget_left, i.reason, i.outcome, i.result_digest, i.stored_at"
+        : "NULL AS budget_left, NULL AS reason, NULL AS outcome, NULL AS result_digest, NULL AS stored_at";
+      const rows = this.#db
+        .query(
+          `SELECT i.request_id, i.action, i.run_id, i.stop_generation, i.issued_at, ${fields}
+           FROM instructions i JOIN runs r ON r.run_id = i.run_id
+           WHERE r.state NOT IN ('finalized', 'not_started') AND (
+             (i.action IN ('task_start', 'session_start') AND r.stop_receipt_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = i.run_id))
+             OR (i.action IN ('task_cancel', 'session_stop') AND r.stop_receipt_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.instruction_request_id = i.request_id AND d.action = 'receipt_accepted'))
+             OR (i.action = 'result_finalize'
+               AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.instruction_request_id = i.request_id AND d.action = 'receipt_cleaned')))
+           ORDER BY r.queue_seq, CASE i.action WHEN 'task_start' THEN 0 WHEN 'session_start' THEN 0 WHEN 'result_finalize' THEN 2 ELSE 1 END,
+             i.issued_at, i.request_id`,
+        )
+        .all() as UnansweredRow[];
+      const instructions = rows.map((row): UnansweredInstruction => {
+        const run = this.#runRow(row.run_id) as RunRow;
+        return {
+          requestId: row.request_id,
+          action: row.action,
+          runId: row.run_id,
+          runGeneration: safe(run.run_generation, "run_generation"),
+          executorId: run.executor_id,
+          runState: run.state,
+          stopGeneration: safe(row.stop_generation, "instructions.stop_generation"),
+          issuedAt: safe(row.issued_at, "instructions.issued_at"),
+          rebuild: rebuildOf(row, run),
+        };
+      });
+      return { stopGeneration: this.#stopRow()?.generation ?? null, instructions };
     });
   }
 
