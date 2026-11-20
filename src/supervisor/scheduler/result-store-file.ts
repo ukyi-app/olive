@@ -148,7 +148,7 @@ export function createFileResultBackend(options: FileBackendOptions): FileBacken
   }
   if (!Number.isSafeInteger(maxRecordBytes) || maxRecordBytes < 1) return { status: "invalid", reason: "max_record_bytes" };
   const files = options.files ?? nodeFilePort;
-  // 링크 경로로 만들면 키 연산은 링크를 따라가 되고 목록은 no_dir가 되어 연산마다 답이 갈린다. 만들 때 거절한다.
+  // 보관 폴더는 링크가 아닌 실제 폴더만 받는다. 연산들도 시작할 때 같은 조건으로 보고(이미 바뀐 자리는 unknown(no_dir)), 처음부터 틀린 자리로는 만들지 않는다.
   if (dirStateOf(files, dir) !== "dir") return { status: "invalid", reason: "not_dir" };
   const at = (name: string) => join(dir, name);
 
