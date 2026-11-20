@@ -47,6 +47,7 @@ export {
   type ToolRequest,
   type ToolRequestInput,
   type ToolRequestPhase,
+  type WaitingToolRequest,
 } from "./ledger.ts";
 export { loadMigrations, type Migration, MIGRATIONS_DIR } from "./migrate.ts";
 export { SNAPSHOT_FAILURES, type SnapshotFailure } from "./snapshot.ts";

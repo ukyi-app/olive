@@ -76,7 +76,7 @@
 
 **일반 기록과 풀기는 다르다.** `applyStop`은 이미 정지인 장부를 풀지 못한다. 세대가 더 높은 해제 값이 와도 세대만 오르고 정지는 남으며, 푸는 길은 `releaseStop` 하나다. 권위 기록을 합치는 `mergeStop`은 더 높은 세대의 해제를 사실로 적지만, 세대가 바뀌므로 허가는 없어지고 복원을 다시 마쳐야 열린다.
 
-`startSession`은 이 전제를 지난 뒤 항상 `session_start_closed`로 거절한다("세션 증거" 참조). 작업자 시작(`startRun`)은 여기에 더해 지시의 정지 세대가 장부의 지금 값과 같고, 실행 줄의 세대가 지금 실행 세대(`run_epoch`)와 같고(`run_generation_stale`), 그 종류에 슬롯 차단(`slot_holds`의 `holds_slot`)도 자리를 쥔 실행도 없을 때(`slot_busy`)만 된다. 시작 트랜잭션 안에서 이 실행 자체도 다시 본다: 이 실행 ID의 점유 관측이 있으면 `run_blocked`, 연결된 입력이 취소됐으면 `input_cancelled`, 원문이 만료됐으면 `input_expired`, 실행 기한이 지났으면 `deadline_passed`다. 기한과 만료는 호출자가 넘긴 값이 아니라 장부에 주입한 시계로 재고, 트랜잭션마다 시계를 한 번만 읽어 판정과 발행 시각(`issued_at`)과 상태 변경에 같은 값을 쓴다. 작업자는 v1 `task_start`를 만들 수 있는 줄(입력 digest가 있고 예산이 1 이상, 역할과 지정 실행기가 맞음)만 자리를 잡는다(`not_startable`).
+`startSession`은 이 전제를 지난 뒤 항상 `session_start_closed`로 거절한다("세션 증거" 참조). 작업자 시작(`startRun`)은 여기에 더해 지시의 정지 세대가 장부의 지금 값과 같고, 실행 줄의 세대가 지금 실행 세대(`run_epoch`)와 같고(`run_generation_stale`), 그 종류에 슬롯 차단(`slot_holds`의 `holds_slot`)도 자리를 쥔 실행도 없을 때(`slot_busy`)만 된다. 시작 트랜잭션 안에서 이 실행 자체도 다시 본다: 이 실행 ID의 점유 관측이 있으면 `run_blocked`, 연결된 입력이 취소됐으면 `input_cancelled`, 원문이 만료됐으면 `input_expired`, 실행 기한이 지났으면 `deadline_passed`다. 기한과 만료는 호출자가 넘긴 값이 아니라 장부에 주입한 시계로 재고, 트랜잭션마다 시계를 한 번만 읽어 판정과 발행 시각(`issued_at`)과 상태 변경에 같은 값을 쓴다. 성공 답은 `{ ok: true, run, credential, issuedAt }`이고 `issuedAt`은 그 시작 지시에 적은 발행 시각이다(넘긴 `now`가 아니다. 갱신 전의 `instructionTimes(runId).lease.issuedAt`과 같다). 부르는 쪽은 이 값을 `task_start` 머리의 `issued_at`에 싣는다. 이미 시작한 실행을 다시 부르면 `transition_denied`라 발행 시각은 성공 답에만 있다. 작업자는 v1 `task_start`를 만들 수 있는 줄(입력 digest가 있고 예산이 1 이상, 역할과 지정 실행기가 맞음)만 자리를 잡는다(`not_startable`).
 
 종료 기록, 영수증·보고의 반영, 복원 자체의 쓰기, 조회는 이 전제 없이 된다. `Restorer.intakeOpen()`과 `Ledger.intakeOpen()`은 단계 결과가 아니라 지금의 장부(건강, 허가, 정지 기록)를 읽고, 읽지 못하면 `false`다. `Restorer.intakeOpen()`은 그 복원기가 낸 허가만 센다. 5단계의 `intakeMayOpen`은 허가를 낸 그 순간의 판정이라, 그 뒤에 정지가 걸리면 값은 `true`로 남아도 `intakeOpen()`은 `false`다.
 
@@ -151,6 +151,7 @@
 | `recordToolRequest(input)` | 쓰기 모드 `start`. `{ ok: true, outcome, request }`(`outcome`은 `created`·`existing`·`conflict`) 또는 거절 | `recordStart` |
 | `cancelToolRequest({ owner, ref, sessionId, callId, now })` | 쓰기 모드 `continue`. 대기 부탁은 `not_started`로, 이은 부탁은 그 실행의 취소로 적고 `{ ok: true, phase }`(지시를 적었으면 `instruction`도) 또는 거절 | `requestCancel` |
 | `assignToolRequest(input)` | 쓰기 모드 `start`. 대기 부탁을 새 실행 줄에 잇고 `{ ok: true, outcome, run }`(`outcome`은 `assigned`·`already_assigned`) 또는 거절 | 없음(배정기가 부른다) |
+| `listWaitingToolRequests()` | `Read<WaitingToolRequest[]>`. 대기이고 실행에 이어지지 않은 부탁 전부. 아래 "대기 부탁의 목록" | 없음(배정기가 읽는다) |
 
 `ToolRequest`는 `ref`, `owner`, `dedupeKey`, `role`, `purpose`, `sourceRef`, `inputDigest`, `phase`다. `phase`는 이어지지 않은 부탁이면 줄의 단계, 이은 부탁이면 이은 실행 줄의 지금 상태를 옮긴 단계다(아래 "이은 뒤의 단계"). 포트의 `WorkRecord`와는 이름만 다르다(`retryKey` ↔ `dedupeKey`, `content`의 네 칸 ↔ 펼친 네 칸). 장부의 입력 칸 이름은 `test/ledger/static.test.ts`가 막는 조각(`key`로 끝나는 이름은 `dedupe_key`뿐, `content`)을 쓰지 않는다. 그래서 포트를 채우는 어댑터는 이름을 옮기고, 새 참조의 후보를 넘기고, 거절을 포트의 꼴로 옮긴다: `stopped` → `stopped`, `intake_closed`·`snapshot_hold` → `intake_closed`, `transition_denied` → `already_ended`, 그 밖은 모름(`known: false`). 그 어댑터는 `test/ledger/tool-requests.test.ts`에 있다.
 
@@ -161,13 +162,24 @@
 - **단계:** 부탁 줄에 적는 단계는 배정 전의 둘이고(`TOOL_REQUEST_PHASES`), 처리기의 단계 이름(`PHASES`) 안에 있다. `waiting_assignment`는 대기, `not_started`는 배정 전에 취소돼 시작하지 않은 부탁이다. 대기 부탁의 취소는 한 번만 된다(다시 취소하면 `transition_denied`). 재시도 키는 논리 요청과 목적 분류로만 만들어지므로, 취소한 뒤 같은 부탁을 다시 내면 새 줄이 아니라 그 줄이 `not_started`로 나온다.
 - **배정 전 대기는 실행 줄이 아니다:** 기록과 대기 부탁의 취소는 `runs`·`slot_holds`·`instructions`에 아무것도 적지 않는다. 부탁은 슬롯을 쥐지 않고 실행기·자격·기한·예산을 갖지 않는다. 닫았다 다시 연 뒤에도 같은 참조와 단계로 읽힌다.
 
+### 대기 부탁의 목록(`listWaitingToolRequests`)
+
+배정기가 이을 부탁을 고르는 읽기다. 장부를 바꾸지 않는다.
+
+- **내는 줄:** 단계가 `waiting_assignment`이고 `run_id`가 빈 부탁만이다. 이은 부탁과 취소된 부탁(`not_started`)은 나오지 않는다. 소유자 입력이 취소됐거나 만료된 부탁은 뺄 근거가 장부 시계에 달려 있어 그대로 내고, 그 입력의 값을 함께 싣는다. 거르는 것은 고르는 쪽(`pick.ts`)과 잇기(아래 "배정"의 입력 재확인)다.
+- **순서:** 소유자 입력의 순번(`inputs.seq`), 부탁의 기록 시각(`created_at`), 참조 순이다. 기록 시각은 부르는 쪽이 넘긴 값이라 같거나 뒤집힐 수 있고, 표가 `WITHOUT ROWID`라 삽입 순서가 없으므로 참조로 끝까지 가른다. 같은 장부를 두 번 읽으면 같은 순서다.
+- **항목(`WaitingToolRequest`):** `ref`(잇기의 `ref`), `owner`(소유자 입력의 요청 ID), `role`, `inputDigest`, `input: { cancelled, expiresAt }`(소유자 입력의 취소 여부와 원문 만료 시각). `pick.ts`의 `WaitingRequest`가 읽는 칸에 `owner`를 더한 꼴이다. 원문·원문 참조·자격·세션 ID·호출 ID·재시도 키·목적은 싣지 않는다(`test/ledger/waiting-requests.test.ts`가 칸 이름 집합을 고정한다).
+- **모름:** 읽기가 실패하면 `{ known: false }`다. 소유자 입력 줄이 없거나 꼴이 어긋난 줄은 빼지 않고 `corrupt`로 닫는다. 빼면 그 부탁이 대기로 남은 채 영영 배정되지 않는다.
+- **소유자를 가리지 않는다:** 감독 안쪽(배정기)의 읽기이고 모든 소유자의 부탁을 낸다. 두 조회(`findToolRequest`·`readToolRequest`)의 소유자 대조는 그대로이고, 이 읽기를 도구 처리기(`src/supervisor/scheduler/tools.ts`)의 포트에 잇지 않는다. 이으면 본체가 남의 부탁의 참조와 존재를 알게 된다.
+
 ### 배정(`assignToolRequest`)
 
 `tool_requests.run_id`가 부탁을 실행 줄에 잇는 자리다(실행 하나에 부탁 하나, 대기 부탁만, 한 번만 채운다: CHECK와 트리거). 이 칸을 채우는 연산은 `assignToolRequest` 하나다.
 
 - **입력:** `{ ref, runId, snapshotDigest, profileRevision, policyRevision, executorId, credential, deadlineAt, budgetLeft, now }`. 실행기·자격 참조·기한·예산은 배정기가 고른 실제 값이고 `admitRun`의 같은 칸과 같은 검사(`#admitInput`)를 거친다. 역할·입력 digest·실행의 입력(`inputRequestId` = 소유자)은 부탁의 값이라 받지 않는다(받으면 모르는 칸으로 `LedgerInputError`). 대기 부탁을 새로 이을 때 실행기가 부탁의 역할을 맡을 수 없으면 `admitRun`과 같이 `LedgerInputError`다. 이미 이어진 부탁에는 이 검사보다 `already_assigned`가 먼저라, 역할이 맞지 않는 실행기와 새 실행 ID를 넘겨도 이은 그 실행이 돌아온다. 재시도는 돌려받은 실행의 실행기·실행 ID를 쓴다. 소유자는 받지 않는다: 부르는 쪽은 배정기 하나이고 참조는 표 전체에서 유일하다.
-- **한 트랜잭션:** 새 업무의 전제(위 "새 업무를 열어도 되는 조건") → 그 참조의 부탁을 다시 읽음 → 실행 줄 기록(`admitRun`과 같은 `#admit`) → `run_id` 채움이 한 트랜잭션이다. 커밋 전에 끊기면 실행 줄과 잇기가 함께 되돌려진다.
+- **한 트랜잭션:** 새 업무의 전제(위 "새 업무를 열어도 되는 조건") → 그 참조의 부탁을 다시 읽음 → 실행 줄 기록(`admitRun`과 같은 `#admit`) → 소유자 입력의 취소·만료 재확인 → `run_id` 채움이 한 트랜잭션이다. 커밋 전에 끊기면 실행 줄과 잇기가 함께 되돌려진다.
 - **답:** 처음 이으면 `{ ok: true, outcome: "assigned", run }`(`run.state`는 `queued`). 이미 이어진 부탁이면 새 실행 줄 없이 `{ ok: true, outcome: "already_assigned", run }`(이은 그 실행의 지금 값, 넘긴 `runId`는 쓰이지 않는다). 취소된 부탁(`not_started`)은 `transition_denied`, 없는 참조는 `unknown_run`이고 실행 줄이 생기지 않는다. 실행 줄의 접수가 장부의 기존 사유로 거절되면(정지, 접수 허가 없음, 사본 보류, 이미 쓰인 실행 ID의 `invariant_violation` 등) 부탁은 `waiting_assignment` 그대로다.
+- **입력의 취소·만료:** 위의 답과 거절이 모두 먼저이고, 그 밖에 이을 수 있는 부탁이면 소유자 입력을 같은 트랜잭션에서 다시 본다. 취소됐으면 `input_cancelled`, 원문 만료 시각이 장부 시계로 지났으면(정각 포함) `input_expired`다. `startRun`이 같은 조건에서 내는 이름·경계와 같다. 실행 줄은 되돌려져 남지 않고 부탁은 `waiting_assignment` 그대로다. 고른 직후 만료된 부탁이 시작할 수 없는 `queued` 실행 줄을 얻지 않게 한다. 이미 이어진 부탁은 입력이 취소·만료돼도 `already_assigned`이고, 그 실행의 시작은 `startRun`이 같은 이름으로 거절한다. `admitRun`은 이 검사를 하지 않는다(공유하는 `#admitInput`·`#admit`는 그대로다).
 - **실행의 중복 키:** 실행 줄의 `dedupe_key`는 `tool_request:<참조>`다. `runs.dedupe_key`는 소유자와 무관하게 전역 유일이라 부탁의 재시도 키를 그대로 쓰면 다른 소유자의 같은 키와 부딪혀 남의 실행이 돌아온다. 참조는 표 전체에서 유일하므로 이 키는 부탁마다 하나다. 이 키의 실행이 이미 있으면(잇는 연산 밖에서 만든 줄) 그 실행을 잇지 않고 `invariant_violation`이다.
 
 ### 이은 뒤의 단계
@@ -200,7 +212,7 @@
 
 **배정기와 조립 코드가 지킬 것:**
 
-1. 실행기·자격·기한·예산은 실제로 고른 값만 넘긴다. 맞는 실행기가 없으면 부르지 않고 부탁을 대기로 둔다. 대기 부탁의 목록을 읽는 연산은 아직 없다.
+1. 실행기·자격·기한·예산은 실제로 고른 값만 넘긴다. 맞는 실행기가 없으면 부르지 않고 부탁을 대기로 둔다. 이을 부탁은 `listWaitingToolRequests()`로 읽고, 고르는 쪽은 항목의 `input`(취소·만료)을 먼저 거른다. 장부의 잇기도 같은 조건을 다시 보므로 그 거절(`input_cancelled`·`input_expired`)은 부탁을 대기로 남긴 채 따른다.
 2. 배정한 실행의 시작(`startRun`)과 지시의 전송은 배정과 따로다. `assigned`의 실행은 `queued`이고 시작 보장이 아니다.
 3. 이은 부탁의 취소가 돌려준 `instruction`을 그 값(요청 ID, 정지 세대) 그대로 실은 `task_cancel`로 보낸다. 장부에는 보내지 않은 지시를 찾는 읽기가 없다. 보내기 전에 끊긴 실행은 장부를 단순히 다시 열면 `stopping`으로 남고 스케줄러(`nextIntent`)는 답을 기다린 뒤 조회를 낸다. 재시작 복원의 3단계(`markLost`)를 거치면 `unknown_running`이 되고 그 실행의 상태 조회(`statusQueries`)가 바로 나온다. 어느 쪽이든 슬롯은 쥔 채다. 장부의 기록만으로는 지시가 전달됐는지 알 수 없으므로, 조립 코드는 장부가 돌려준 식별값을 보존하고 중단 뒤 같은 실행의 전달·종료 여부를 대조해 필요하면 다시 보낼 방법을 정한다.
 4. 호출 ID는 호출마다 새 UUID여야 한다. 이은 부탁의 취소에서 지시의 요청 ID로 쓰인다.
