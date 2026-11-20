@@ -285,6 +285,7 @@ export class Restorer {
         } catch (error) {
           throw new RestoreStepError(2, `이웃의 판이나 점유를 모름(${String(error)})`);
         }
+        const receivedAt = this.clock();
         this.#requireCurrent(2);
         const runs = this.ledger.listRuns();
         if (!runs.known) throw new RestoreStepError(2, `장부의 실행을 읽지 못함(${runs.reason})`);
@@ -364,7 +365,9 @@ export class Restorer {
               continue;
             }
             // 지정 실행기가 같은 세대로 이 실행을 안다고 답했다: 운영 중의 답과 같은 표에 첫 관측으로 남긴다(아래 판정과 무관하다).
-            sightings.push({ executorId, coverage, status });
+            // 칸을 복사해 붙든다: 포트가 같은 객체를 다음 답에 다시 쓰면 다시 적을 때 다른 실행의 답이 된다.
+            // 받은 시각도 함께 붙들어, 다시 적어도 received_at은 처음 받은 때다.
+            sightings.push({ executorId, coverage, status: { ...status }, receivedAt });
             if (queued) {
               out.occupancyMismatches.push({ executorId, runId: known.runId, why: "state" });
               observe("state");
@@ -405,7 +408,7 @@ export class Restorer {
         }
         // 관측을 잃으면 뒤의 자동 해제(D-90)가 실행기가 안다고 했던 실행의 자리를 풀 수 있어, 적지 못하면 이 단계를 실패로 끝낸다.
         if (pending.length > 0) {
-          const sighted = this.ledger.recordRunSightings(RESTORE_KEY, pending, this.clock());
+          const sighted = this.ledger.recordRunSightings(RESTORE_KEY, pending);
           if (!sighted.ok) throw new RestoreStepError(2, `양성 관측을 적지 못함(${sighted.reason})`);
         }
         this.#unsavedSightings = [];

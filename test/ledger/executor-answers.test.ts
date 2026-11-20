@@ -339,7 +339,7 @@ const LEDGER_CASES = [
   { ledgerState: "running", at: CHECK_AT, make: (ledger: Ledger) => trustedRunning(ledger) },
 ] as const;
 
-test("보장 3: 장부가 preparing·running이면 갱신을 받는 답만 그대로 두고 그 밖의 답은 unknown_running으로 옮긴다(자리는 쥔 채, 갱신 없음)", () => {
+test("보장 3: 장부가 preparing·running이면 갱신을 받는 답만 그대로 두고 그 밖의 유세대 양성 답은 unknown_running으로 옮기며 이른 not_known은 보류한다(자리는 쥔 채, 갱신 없음)", () => {
   for (const { ledgerState, at, make } of LEDGER_CASES) {
     for (const reported of RUN_STATES) {
       const label = `장부 ${ledgerState} × 답 ${reported}`;
@@ -539,21 +539,56 @@ test("F2: 복원 2단계는 적지 못한 양성 관측을 붙들고, 다시 물
   });
   const live = startedWorker(ledger);
   let reported: RunStatus[] = [status(live.runId, "preparing")];
-  const restorer = new Restorer(ledger, ports(async () => [{ executorId: WORKER_EXECUTOR, coverage: "full", runs: reported }]), clock, { requiredPeers: ["front-door"] });
+  // 복원기의 시계는 시도마다 앞으로 간다. 적힌 received_at은 처음 받은 NOW여야 한다.
+  let at = NOW;
+  const restorer = new Restorer(ledger, ports(async () => [{ executorId: WORKER_EXECUTOR, coverage: "full", runs: reported }]), () => at, { requiredPeers: ["front-door"] });
   await restorer.step1();
   fail = true;
   await expect(restorer.step2()).rejects.toThrow("양성 관측을 적지 못함");
   // 다시 물은 답은 빈 전체 목록이다. 앞의 관측을 적지 못하는 동안 단계는 통과하지 않는다.
   reported = [];
+  at = NOW + MAX + 1;
   await expect(restorer.step2()).rejects.toThrow("양성 관측을 적지 못함");
   expect(sighted(ledger, live.runId)).toBe(false);
   fail = false;
+  at = NOW + 90_000;
   await restorer.step2();
   expect(sighted(ledger, live.runId)).toBe(true);
   ledger.close();
   expect(rawRows(path, `SELECT ${SIGHTING_COLUMNS} FROM run_sightings`)).toEqual([
     { run_id: live.runId, executor_id: WORKER_EXECUTOR, run_generation: 1, reported_state: "preparing", last_receipt_id: null, answered_at: null, received_at: NOW, coverage: "full" },
   ]);
+});
+
+test("F2: 복원기가 붙든 관측은 포트가 같은 항목 객체를 다른 실행의 답에 다시 써도 앞 실행의 답으로 남는다", async () => {
+  let fail = false;
+  const path = tempPath();
+  const ledger = open(path, {
+    faults: {
+      at(point) {
+        if (fail && point === "run_sighting:before_commit") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
+      },
+    },
+  });
+  const live = startedWorker(ledger);
+  const waiting = must(ledger.admitRun(worker())).run.runId;
+  const entry = status(live.runId, "preparing");
+  const restorer = new Restorer(ledger, ports(async () => [{ executorId: WORKER_EXECUTOR, coverage: "full", runs: [entry] }]), clock, { requiredPeers: ["front-door"] });
+  await restorer.step1();
+  fail = true;
+  await expect(restorer.step2()).rejects.toThrow("양성 관측을 적지 못함");
+  // 포트가 같은 객체를 다음 답(대기 실행의 running)에 다시 쓴다.
+  Object.assign(entry, status(waiting, "running"));
+  fail = false;
+  await restorer.step2();
+  expect([sighted(ledger, live.runId), sighted(ledger, waiting)]).toEqual([true, true]);
+  ledger.close();
+  expect(rawRows(path, `SELECT run_id, reported_state FROM run_sightings ORDER BY run_id`)).toEqual(
+    [
+      { run_id: live.runId, reported_state: "preparing" },
+      { run_id: waiting, reported_state: "running" },
+    ].sort((a, b) => (a.run_id < b.run_id ? -1 : 1)),
+  );
 });
 
 test("F2: 운영 중 관측을 적지 못한 답은 양성 항목을 실은 실패로 구별되고, 같은 답으로 다시 넘기면 남는다", () => {

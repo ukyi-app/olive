@@ -287,6 +287,8 @@ export interface RunSightingObservation {
   executorId: string;
   coverage: "full" | "partial";
   status: RunStatus;
+  // 복원기가 그 답을 처음 받은 시각(복원기의 시계). 적기를 다시 시도해도 received_at에 이 값을 쓴다.
+  receivedAt: number;
 }
 
 // 이 대기 실행 자체를 시작하면 안 되는 이유. 5단계의 후보 목록과 시작 트랜잭션이 같은 판정을 읽는다(접수·슬롯·예산은 시작 트랜잭션만 본다).
@@ -2438,12 +2440,12 @@ export class Ledger {
   }
 
   // 재시작 복원 2단계가 받은 실행기의 답 가운데 지정 실행기·같은 세대·not_known 밖의 것을 같은 표에 적는다. 복원의 판정은 바꾸지 않는다.
-  // 포트가 답 봉투의 시각을 싣지 않아 answered_at은 비워 둔다.
-  recordRunSightings(key: symbol, observations: readonly RunSightingObservation[], now: number): { ok: true } | Refused {
+  // 포트가 답 봉투의 시각을 싣지 않아 answered_at은 비워 둔다. received_at은 관측마다 복원기가 처음 받은 시각이다.
+  recordRunSightings(key: symbol, observations: readonly RunSightingObservation[]): { ok: true } | Refused {
     if (key !== RESTORE_KEY) throw new TypeError("복원 밖의 양성 관측은 applyExecutorAnswer로 적는다");
-    const when = time(now, "now");
+    const checked = observations.map((seen) => ({ ...seen, receivedAt: time(seen.receivedAt, "receivedAt") }));
     return this.#write("run_sighting", "continue", () => {
-      for (const seen of observations) this.#sight(seen.executorId, seen.status, seen.coverage, null, when);
+      for (const seen of checked) this.#sight(seen.executorId, seen.status, seen.coverage, null, seen.receivedAt);
       return { ok: true as const };
     });
   }
@@ -2461,7 +2463,8 @@ export class Ledger {
   // 그 실행의 지정 실행기가 그 실행을 안다고 답한 적이 있는가(양성 관측이 하나라도 있는가). 없는 실행이면 null이다. 장부를 바꾸지 않는다.
   // 함정: false(0행)는 저장에 실패한 양성 관측이 없었을 때만 "본 적 없음"이다. 저장에 실패한 답은 같은 프로세스 안에서만 다시 넘길 수 있고
   // (applyExecutorAnswer의 unsavedSightings, 복원기가 붙든 항목), 프로세스가 다시 뜨거나 장부를 다시 열면 그 답은 어디에도 없다.
-  // 자리를 푸는 쪽은 이 값만으로 판정하지 않고, 저장 공백을 걸친 실행을 자동 해제에서 빼는 조건을 스스로 갖춰야 한다.
+  // 읽기 실패도 같은 공백이다: 같은 복원기 객체에서도 양성 답을 받은 뒤 2단계의 실행 목록 읽기가 실패하면 그 답은 붙들리지 않고 사라진다.
+  // 자리를 푸는 쪽은 이 값만으로 판정하지 않고, 이 공백(저장 실패, 읽기 실패, 재시작)을 걸친 실행을 자동 해제에서 빼는 조건을 스스로 갖춰야 한다.
   // D-90의 조건 1을 보는 쪽은 이 값과 unansweredInstructions()의 "영수증·보고 없음"을 함께 본다. 닫는 판단은 같은 트랜잭션에서 다시 본다.
   hasRunSighting(runId: string): Read<boolean | null> {
     return this.#read(() => {
