@@ -7,13 +7,14 @@
 // 1. 같은 요청으로만 다시 낸다. 요청 ID·본문·정지 세대·실행 세대·받는 쪽은 장부 항목의 값이고, 시작은 발행 시각도 항목의 값이다.
 //    새 요청 ID를 만들지 않는다. 본문을 다시 만들 수 없는 항목(rebuild: null)은 내보내지 않고 구별된 결과를 낸다.
 // 2. 보낼 수 없는 것은 보내지 않는다. 시작은 발행 + START_LAST_SEAL_MS 뒤에 봉하지 않는다(시한이 지난 시작, 새 시각으로 되살리지 않음).
-//    시작은 연결 확인 뒤와 내보내기 직전에 시계를 다시 읽어 한도를 다시 본다. 지키는 것은 "마지막으로 읽은 시각에 봉할 수 있었다"까지이고,
-//    실제로 싣는 순간의 한도는 내보내기 포트가 지킨다.
+//    시작은 연결 확인 뒤와 내보내기 직전에 시계를 다시 읽어 발행 + START_LAST_SEAL_MS 한도를 다시 본다. 마지막 읽기가 보는 것은 이 한도뿐이다.
+//    작업 기한의 여유는 봉할 때(sealDraft)와 실제로 싣는 순간의 내보내기 포트가 보고, 싣는 순간의 시작 한도도 그 포트가 지킨다.
 //    항목의 정지 세대가 장부의 지금 세대와 다르거나, 연결이 지시를 낼 수 없거나, 읽기가 모름이면 봉하지 않는다.
 // 3. 두드리지 않는다. 같은 요청 ID는 max(항목의 발행 시각, 부르는 쪽이 넘긴 마지막 송신 시각)부터 정책의 간격이 지나야 다시 낸다.
-//    마지막 송신 시각은 결과의 at(내보내기 포트가 돌아온 뒤 읽은 시각)이다.
-// 4. 한 항목의 실패는 그 항목의 결과이고 다음 항목을 본다. 그래도 항목 처리 밖으로 예외가 나오면(포트 묶음의 속성 접근이 던지는 등)
-//    그때까지의 결과와 함께 halted다.
+//    마지막 송신 시각은 결과의 at(내보내기 포트가 돌아온 뒤 읽은 시각)이다. 전달이 모름(포트가 던짐)일 때 이 값이 실은 시각의 상한인 것은
+//    내보내기 포트가 돌아오기 전에 맡은 쓰기를 끝냈거나 거둔 경우뿐이다(InstructionSink를 조립할 때의 조건).
+// 4. 한 항목의 실패는 그 항목의 결과이고 다음 항목을 본다. 항목 안에서 ports.ledger·ports.intake·ports.links의 접근이 던지면
+//    그때까지의 결과와 함께 halted다. 그 밖의 포트(시계·난수·서명·내보내기)를 얻다 던지면 그 항목의 실패 결과다.
 import { ACTION_SPECS, type Envelope, limits } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger, type Restorer, type UnansweredInstruction } from "../../ledger/index.ts";
 import { type Drafted, type DraftAction, finalizeDraft, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, stopDraft } from "./envelopes.ts";
@@ -67,7 +68,8 @@ export const START_LAST_SEAL_MS = START_LIFETIME_MS - limits.DELIVERY_MAX_MS - l
 
 type Head = { readonly requestId: string; readonly runId: string; readonly action: UnansweredInstruction["action"] };
 
-// 다시 내지 않은 이유 가운데 봉하기 전의 것.
+// 다시 내지 않은 이유. 모두 내보내기 포트를 부르지 않았다는 뜻이다. 대부분 봉하기 전의 것이고, clock_unavailable은
+// 시작의 마지막 시계 읽기(서명 뒤)에서도 나며 그때는 이미 서명한 봉투를 버린다.
 // session_run: 세션 실행의 지시. stop_recorded: 같은 실행에 종료가 적힌 시작(열자마자 닫힐 실행을 열지 않는다).
 // read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸(머리 칸과 본문을 다시 만들 칸)이 처음 읽은 것과 다르다.
 export type Withheld = "session_run" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown";
@@ -89,8 +91,15 @@ export type ResendOutcome =
   | (Head & { readonly outcome: "withheld"; readonly reason: Withheld })
   // 봉투를 만들지 못했다. 실리지 않았다.
   | (Head & { readonly outcome: "not_sealed"; readonly reason: DraftRefusalReason | "draft_threw" | "seal_threw"; readonly field?: string; readonly sealReason?: string })
-  // 봉했지만 실은 것을 확인하지 못했다. 포트가 확실히 싣지 않았다고 답했으면 delivery가 not_sent다.
-  | (Head & { readonly outcome: "not_sent"; readonly reason: "no_connection" | "too_late_to_send"; readonly delivery: "not_sent"; readonly executorId: string; readonly sealedAt: number })
+  // 봉했지만 실은 것을 확인하지 못했다. 포트가 확실히 싣지 않았다고 답했거나(no_connection·too_late_to_send),
+  // 내보내기 포트의 send를 얻다 던지거나 함수가 아니어서 포트를 부르지 않았으면(sink_unavailable) delivery가 not_sent다.
+  | (Head & {
+      readonly outcome: "not_sent";
+      readonly reason: "no_connection" | "too_late_to_send" | "sink_unavailable";
+      readonly delivery: "not_sent";
+      readonly executorId: string;
+      readonly sealedAt: number;
+    })
   // 실렸을 수 있다. at은 resent의 at과 같은 규칙의 시각이고 부르는 쪽은 이 값을 lastResends에 넣는다.
   | (Head & {
       readonly outcome: "not_sent";
@@ -352,7 +361,8 @@ export async function resendTick(ports: ResendPorts, policy: ResendPolicy, input
   } catch {
     return { kind: "not_run", reason: "read_unknown" };
   }
-  if (!isObject(key)) return { kind: "not_run", reason: "read_unknown" };
+  // 읽기 메서드를 붙인 함수도 장부 포트다(WeakSet은 함수도 키로 받는다). 메서드가 없거나 던지면 readUnanswered가 모름으로 낸다.
+  if (!isObject(key) && typeof key !== "function") return { kind: "not_run", reason: "read_unknown" };
   if (IN_FLIGHT.has(key)) return { kind: "not_run", reason: "tick_in_progress" };
   IN_FLIGHT.add(key);
   try {
@@ -438,8 +448,9 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   const link = linkVerdict(ctx.ports.links, item.executorId, action);
   if (link !== null) return withheld(link);
 
-  // 시작은 판단한 뒤에도 연결·서명 포트 안에서 시각이 흐른다. 봉하기 직전과 내보내기 직전에 다시 읽어 한도를 다시 본다.
-  // 함정: 마지막으로 읽은 뒤에도 시각은 흐르므로 실제로 싣는 순간의 한도는 내보내기 포트가 지킨다(InstructionSink의 조건).
+  // 시작은 판단한 뒤에도 연결·서명 포트 안에서 시각이 흐른다. 봉하기 직전과 내보내기 직전에 다시 읽어 발행 + 한도를 다시 본다.
+  // 함정: 이 읽기는 작업 기한의 여유를 보지 않는다(sealDraft만 그 규칙을 갖고, 다시 부르면 다시 서명한다). 그 여유와
+  // 마지막으로 읽은 뒤에 흐른 시간은 실제로 싣는 순간의 내보내기 포트가 본다(InstructionSink의 조건).
   const startStillSealable = (): ResendOutcome | number => {
     const checked = readClock(ctx.ports, ctx.floor);
     if (checked === null) return withheld("clock_unavailable");
@@ -478,13 +489,24 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   } catch {
     return { ...head, outcome: "not_sealed", reason: "draft_threw" };
   }
+  // 받는 쪽과 봉투 시한은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과는 바뀌지 않는다.
+  const executorId = item.executorId;
+  const expiresAt = envelope.header.expires_at;
+  // 내보내기 포트의 수신 객체와 함수는 시작의 마지막 시계 읽기 전에 얻는다. 그 읽기 뒤에 포트의 접근자(get send() 등)가 돌면
+  // 그 안에서 흐른 시간만큼 한도가 지난 시작이 포트에 닿는다. 얻다 던지거나 함수가 아니면 포트를 부르지 않은 그 항목의 실패다.
+  let target: unknown;
+  let send: unknown;
+  try {
+    target = ctx.ports.sink;
+    send = (target as InstructionSink).send;
+  } catch {
+    send = undefined;
+  }
   if (action === "task_start") {
     const checked = startStillSealable();
     if (typeof checked !== "number") return checked;
   }
-  // 받는 쪽과 봉투 시한은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과는 바뀌지 않는다.
-  const executorId = item.executorId;
-  const expiresAt = envelope.header.expires_at;
+  if (typeof send !== "function") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };
   const mayBeLoaded = (reason: "send_threw" | "send_answer_malformed", loadedBy: number): ResendOutcome => ({
     ...head,
     outcome: "not_sent",
@@ -498,7 +520,8 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   let sent: unknown;
   let threw = false;
   try {
-    sent = await ctx.ports.sink.send(envelope);
+    // 마지막 시계 읽기 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
+    sent = await Reflect.apply(send, target, [envelope]);
   } catch {
     threw = true;
   }

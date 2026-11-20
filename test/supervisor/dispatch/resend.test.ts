@@ -283,6 +283,29 @@ describe("보장 2: 보낼 수 없는 것은 보내지 않는다", () => {
     expect((w.sent[0] as Envelope).header.issued_at).toBe(NOW);
   });
 
+  test("시작은 내보내기 포트의 send를 얻는 동안 한도가 지나도 포트에 닿지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    const last = NOW + START_LAST_SEAL_MS;
+    const real = w.ports.sink;
+    // 정각에 판단·봉하고, 송신 함수를 돌려주는 접근자 안에서 1ms가 지난다.
+    const ports = {
+      ...w.ports,
+      sink: {
+        get send() {
+          w.setClock(last + 1);
+          return real.send;
+        },
+      },
+    } as ResendPorts;
+    w.setClock(last);
+    expect(outcomes(await resendTick(ports, { resendEveryMs: EVERY }, { lastResends: [] }))).toEqual([
+      { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "start_expired", issuedAt: NOW, expiresAt: NOW + 30_000 },
+    ]);
+    expect(w.log).toEqual(["seal"]);
+    expect(w.sent).toEqual([]);
+  });
+
   test("시작의 다시 읽은 시계를 읽지 못하면 내보내지 않는다", async () => {
     const w = world();
     const s = started(w);
@@ -573,6 +596,46 @@ describe("보장 4: 실패는 결과를 지우지 않는다", () => {
       haltedAt: b.requestId,
     });
     expect(w.sent.map((e) => e.header.request_id)).toEqual([a.requestId]);
+  });
+
+  test("내보내기 포트의 send를 얻지 못하면 포트를 부르지 않은 그 항목의 실패이고, 얻은 함수는 수신 객체를 this로 부른다", async () => {
+    const w = world();
+    const { s, a, b } = twoCancels(w);
+    w.setClock(NOW + 60_000);
+    let sinkReads = 0;
+    const real = w.ports.sink;
+    const ports = {
+      ...w.ports,
+      get sink() {
+        if (++sinkReads === 1) throw new Error("포트 묶음 실패");
+        // 메서드가 this로 자기 상태를 본다. 수신 객체 없이 부르면 던져 send_threw가 된다.
+        return {
+          real,
+          send(this: { real: typeof real }, envelope: Envelope) {
+            return this.real.send(envelope);
+          },
+        };
+      },
+    } as ResendPorts;
+    const result = ran(await resendTick(ports, { resendEveryMs: EVERY }, { lastResends: [] }));
+    expect(result.instructions).toEqual([
+      { requestId: a.requestId, runId: s.runId, action: "task_cancel", outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId: s.run.executorId, sealedAt: NOW + 60_000 },
+      { requestId: b.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 60_000, at: NOW + 60_000 },
+    ]);
+    expect(result.halted).toBeNull();
+    expect(w.log).toEqual(["seal", "seal", "send"]);
+    expect(w.sent.map((e) => e.header.request_id)).toEqual([b.requestId]);
+  });
+
+  test("읽기 메서드를 붙인 함수도 장부 포트로 받는다", async () => {
+    const w = world();
+    const s = started(w);
+    w.setClock(NOW + 6_000);
+    const ledger = Object.assign(() => undefined, { unansweredInstructions: w.ports.ledger.unansweredInstructions });
+    expect(outcomes(await resendTick({ ...w.ports, ledger }, { resendEveryMs: EVERY }, { lastResends: [] }))).toEqual([
+      { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 6_000, at: NOW + 6_000 },
+    ]);
+    expect(w.log).toEqual(["seal", "send"]);
   });
 
   test("박자 처음에 장부 포트를 얻지 못하면 예외 대신 읽지 못한 것이다", async () => {
