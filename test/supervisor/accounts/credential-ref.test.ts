@@ -1,5 +1,6 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { credentialMatches } from "../../../src/executor/profile.ts";
@@ -21,7 +22,8 @@ const SAMPLE = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode("to
 // printf '\xef\xbb\xbftok-\xce\xb1\r\n' | sha256sum
 const SAMPLE_DIGEST = "e5d4c5f0606822cb75621a4bdfeef3390f68baa195bbc34ea94e880f005845f3";
 // 소문자 16진·별칭·방식·revision 어디에도 나올 수 없는 대문자 값이라, 결과에 조각이 섞이면 바로 보인다.
-const SECRET = "QXJ-SECRET-VALUE-9Z";
+// 시험 소스의 이름(SECRET 등)과 네 글자도 겹치지 않게 지었다: 실패 출력의 코드 조각에 이름이 찍혀도 값의 조각으로 잡히지 않는다.
+const SECRET = "QXJ-W8ZK-PV3-9Z";
 
 const roots: string[] = [];
 afterAll(() => {
@@ -54,10 +56,31 @@ function bytesOf(text: string): Uint8Array {
 }
 
 // 결과를 JSON으로 펼쳐 값 전체와 네 글자 조각이 하나도 없는지 본다.
+// 이 단언이 실패해도 출력에 값이 실리지 않게, 포함 여부를 불리언으로 먼저 계산하고 실패 메시지와 차이에는 조각의 시작 위치만 둔다.
+// 결과 객체를 통째로 비교하는 단언보다 먼저 부른다: 그쪽이 먼저 실패하면 값이 든 객체가 차이로 찍힌다.
 function expectNoSecret(answer: unknown): void {
-  const text = JSON.stringify(answer);
-  expect(text.includes(SECRET)).toBe(false);
-  for (let i = 0; i + 4 <= SECRET.length; i += 1) expect(text.includes(SECRET.slice(i, i + 4)), SECRET.slice(i, i + 4)).toBe(false);
+  const text = JSON.stringify(answer) ?? "";
+  const leakedAt: number[] = [];
+  for (let i = 0; i + 4 <= SECRET.length; i += 1) if (text.includes(SECRET.slice(i, i + 4))) leakedAt.push(i);
+  expect(leakedAt, "값의 네 글자 조각이 결과에 있다(배열은 조각의 시작 위치)").toEqual([]);
+}
+
+// 실제 구현이 연 파일 핸들의 read·close 호출 수를 센다. 구현은 연 핸들마다 finally에서 한 번 닫으므로 close 수가 연 횟수다.
+async function countHandles<T>(run: () => Promise<T>): Promise<{ result: T; reads: number; closes: number }> {
+  const dir = tempAccounts();
+  writeFileSync(join(dir, "probe"), "x");
+  const probe = await open(join(dir, "probe"), "r");
+  const proto = Object.getPrototypeOf(probe);
+  await probe.close();
+  const reads = spyOn(proto, "read");
+  const closes = spyOn(proto, "close");
+  try {
+    const result = await run();
+    return { result, reads: reads.mock.calls.length, closes: closes.mock.calls.length };
+  } finally {
+    reads.mockRestore();
+    closes.mockRestore();
+  }
 }
 
 describe("지문은 정확한 바이트로", () => {
@@ -87,12 +110,74 @@ describe("지문은 정확한 바이트로", () => {
   });
 });
 
+describe("고른 계정의 폴더 안의 파일만 읽는다", () => {
+  const choice = { account: "claude-sub", method: "subscription" };
+  // 다른 계정의 자격. 이것의 지문이 claude-sub의 참조로 나가면 계정이 섞인 것이다.
+  const OTHER = bytesOf("other-account-cred");
+
+  test("별칭이 같은 루트의 다른 계정 폴더를 가리키는 링크면 outside_account이고 파일을 열지 않는다", async () => {
+    const dir = tempAccounts();
+    mkdirSync(join(dir, "normal"));
+    writeFileSync(join(dir, "normal", KEY), OTHER);
+    symlinkSync("normal", join(dir, "claude-sub"));
+    const seen = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir), choice));
+    expect(seen.result).toEqual({ ok: false, reason: "outside_account" });
+    expect([seen.reads, seen.closes]).toEqual([0, 0]);
+    expect(await credentialPort(nodeCredentialFiles, policy(dir)).reference(choice)).toEqual({ known: false });
+  });
+
+  test("별칭이 루트 밖의 실제 파일이 있는 폴더를 가리키는 링크면 outside_account이고 파일을 열지 않는다", async () => {
+    const dir = tempAccounts();
+    const outside = tempAccounts();
+    writeFileSync(join(outside, KEY), OTHER);
+    symlinkSync(outside, join(dir, "claude-sub"));
+    const seen = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir), choice));
+    expect(seen.result).toEqual({ ok: false, reason: "outside_account" });
+    expect([seen.reads, seen.closes]).toEqual([0, 0]);
+  });
+
+  test("키 파일이나 ..data의 링크가 계정 폴더 밖으로 나가면 outside_account이고 파일을 열지 않는다", async () => {
+    // 키 → 같은 루트의 다른 계정 파일
+    const dir = tempAccounts();
+    mkdirSync(join(dir, "normal"));
+    writeFileSync(join(dir, "normal", KEY), OTHER);
+    mkdirSync(join(dir, "claude-sub"));
+    symlinkSync(join("..", "normal", KEY), join(dir, "claude-sub", KEY));
+    const viaKey = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir), choice));
+    expect(viaKey.result).toEqual({ ok: false, reason: "outside_account" });
+    expect([viaKey.reads, viaKey.closes]).toEqual([0, 0]);
+
+    // 키 → ..data/<키> 이지만 ..data가 루트 밖의 폴더를 가리킴
+    const dir2 = tempAccounts();
+    const outside = tempAccounts();
+    writeFileSync(join(outside, KEY), OTHER);
+    mkdirSync(join(dir2, "claude-sub"));
+    symlinkSync(outside, join(dir2, "claude-sub", "..data"));
+    symlinkSync(join("..data", KEY), join(dir2, "claude-sub", KEY));
+    const viaData = await countHandles(() => resolveCredentialRef(nodeCredentialFiles, policy(dir2), choice));
+    expect(viaData.result).toEqual({ ok: false, reason: "outside_account" });
+    expect([viaData.reads, viaData.closes]).toEqual([0, 0]);
+  });
+
+  test("상한이 런타임의 배열 한도보다 커서 버퍼를 만들지 못해도 연 파일을 한 번 닫고 failed다", async () => {
+    const dir = tempAccounts();
+    mkdirSync(join(dir, "claude-sub"));
+    writeFileSync(join(dir, "claude-sub", KEY), new Uint8Array(8).fill(0x41));
+    // maxBytes + 1 길이의 배열은 만들 수 없어 바로 RangeError가 난다(실제로 큰 메모리를 잡지 않는다).
+    const seen = await countHandles(() =>
+      nodeCredentialFiles.read({ dir, account: "claude-sub", key: KEY }, Number.MAX_SAFE_INTEGER - 1).catch(() => ({ kind: "threw" })),
+    );
+    expect(seen.result).toEqual({ kind: "failed" });
+    expect([seen.reads, seen.closes]).toEqual([0, 1]);
+  });
+});
+
 describe("값은 결과·거절에 실리지 않는다", () => {
   test("성공한 참조는 네 칸뿐이고 값의 조각이 없으며, 받은 버퍼를 0으로 채운다", async () => {
     const bytes = bytesOf(SECRET);
     const answer = await resolveCredentialRef(fakeFiles(() => ({ kind: "bytes", bytes })), policy("/accounts"), { account: "claude-sub", method: "subscription" });
-    expect(answer.ok && Object.keys(answer.credential).sort()).toEqual(["account", "digest", "method", "revision"]);
     expectNoSecret(answer);
+    expect(answer.ok && Object.keys(answer.credential).sort()).toEqual(["account", "digest", "method", "revision"]);
     expect(bytes.every((byte) => byte === 0)).toBe(true);
   });
 
@@ -102,16 +187,16 @@ describe("값은 결과·거절에 실리지 않는다", () => {
       account: "claude-sub",
       method: "subscription",
     });
-    expect(answer).toEqual({ ok: false, reason: "too_large" });
     expectNoSecret(answer);
+    expect(answer).toEqual({ ok: false, reason: "too_large" });
     expect(bytes.every((byte) => byte === 0)).toBe(true);
   });
 
   test("배정기 포트의 답에도 값이 없다", async () => {
     const port = credentialPort(fakeFiles(() => ({ kind: "bytes", bytes: bytesOf(SECRET) })), policy("/accounts"));
     const answer = await port.reference({ account: "claude-sub", method: "subscription" });
-    expect(answer.known).toBe(true);
     expectNoSecret(answer);
+    expect(answer.known).toBe(true);
     expect(await credentialPort(fakeFiles(() => ({ kind: "missing" })), policy("/accounts")).reference({ account: "claude-sub", method: "subscription" })).toEqual({
       known: false,
     });
@@ -148,15 +233,17 @@ describe("모르면 닫는다", () => {
   test("읽기 실패와 던지는 포트는 read_failed이고 빈 값의 지문을 내지 않는다", async () => {
     for (const files of [fakeFiles(() => ({ kind: "failed" })), fakeFiles(() => Promise.reject(new Error(SECRET))), fakeFiles(() => ({ kind: "odd" }) as never)]) {
       const answer = await resolveCredentialRef(files, policy("/accounts"), choice);
-      expect(answer).toEqual({ ok: false, reason: "read_failed" });
       expectNoSecret(answer);
+      expect(answer).toEqual({ ok: false, reason: "read_failed" });
     }
   });
 
   test("별칭이 꼴에 맞지 않거나 경로를 벗어나면 파일을 열지 않고 account_malformed", async () => {
     for (const account of ["../claude-sub", "claude-sub/../x", "..", ".", "a/b", "Claude", "", "x".repeat(33), 1, null, undefined]) {
       const files = fakeFiles(() => ({ kind: "bytes", bytes: bytesOf(SECRET) }));
-      expect(await resolveCredentialRef(files, policy("/accounts"), { account, method: "subscription" })).toEqual({ ok: false, reason: "account_malformed" });
+      const answer = await resolveCredentialRef(files, policy("/accounts"), { account, method: "subscription" });
+      expectNoSecret(answer);
+      expect(answer).toEqual({ ok: false, reason: "account_malformed" });
       expect(files.calls).toBe(0);
     }
   });
@@ -174,7 +261,9 @@ describe("모르면 닫는다", () => {
     ];
     for (const [given, method, reason] of cases) {
       const files = fakeFiles(() => ({ kind: "bytes", bytes: bytesOf(SECRET) }));
-      expect(await resolveCredentialRef(files, given, { account: "claude-sub", method })).toEqual({ ok: false, reason } as never);
+      const answer = await resolveCredentialRef(files, given, { account: "claude-sub", method });
+      expectNoSecret(answer);
+      expect(answer).toEqual({ ok: false, reason } as never);
       expect(files.calls).toBe(0);
     }
   });
@@ -192,14 +281,27 @@ describe("모르면 닫는다", () => {
     for (const revisionOf of revisions) {
       const files = fakeFiles(() => ({ kind: "bytes", bytes: bytesOf(SECRET) }));
       const answer = await resolveCredentialRef(files, policy("/accounts", { revisionOf }), choice);
+      expectNoSecret(answer);
       expect(answer).toEqual({ ok: false, reason: "revision_unknown" });
       expect(files.calls).toBe(0);
     }
   });
 
-  test("거절 사유 목록은 위 사례가 쓰는 열 가지다", () => {
+  test("거절 사유 목록은 위 사례가 쓰는 열한 가지다", () => {
     expect<string[]>([...CREDENTIAL_REF_REJECTIONS].sort()).toEqual(
-      ["account_malformed", "empty", "method_not_configured", "method_unknown", "missing", "not_a_file", "policy_invalid", "read_failed", "revision_unknown", "too_large"].sort(),
+      [
+        "account_malformed",
+        "empty",
+        "method_not_configured",
+        "method_unknown",
+        "missing",
+        "not_a_file",
+        "outside_account",
+        "policy_invalid",
+        "read_failed",
+        "revision_unknown",
+        "too_large",
+      ].sort(),
     );
   });
 });

@@ -2,9 +2,9 @@
 // 값은 참조에도 거절에도 싣지 않는다. 값을 실행기에 나르는 일은 이 모듈이 아니다.
 // 파일 읽기는 주입받은 포트로만 한다. 실제 파일을 여는 코드는 아래 nodeCredentialFiles 하나뿐이다.
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
-import { join } from "node:path";
+import { constants, type Stats } from "node:fs";
+import { type FileHandle, lstat, open, realpath, stat } from "node:fs/promises";
+import { join, sep } from "node:path";
 import type { CredentialRef } from "../../ledger/index.ts";
 import type { CredentialPort } from "../dispatch/ports.ts";
 import { AUTH_METHODS, type AuthMethod } from "../roles/policy.ts";
@@ -13,10 +13,12 @@ import { ACCOUNT_NAME } from "./fixed.ts";
 
 // 계정 폴더 안의 파일 하나를 읽는 포트. 경로를 잇는 일과 파일 시스템 오류의 분류는 구현이 한다.
 // maxBytes를 넘으면 그 바이트를 돌려주지 않고 too_large다. 돌려준 bytes는 부른 쪽이 지문을 낸 뒤 0으로 채운다.
+// outside_account: 별칭 자리가 실제 폴더가 아닌 링크이거나, 키 파일이 그 폴더 밖으로 이어진다. 그 파일의 바이트를 돌려주지 않는다.
 export type CredentialRead =
   | { readonly kind: "bytes"; readonly bytes: Uint8Array }
   | { readonly kind: "missing" }
   | { readonly kind: "not_a_file" }
+  | { readonly kind: "outside_account" }
   | { readonly kind: "too_large" }
   | { readonly kind: "failed" };
 
@@ -43,6 +45,7 @@ export const CREDENTIAL_REF_REJECTIONS = [
   "revision_unknown",
   "missing",
   "not_a_file",
+  "outside_account",
   "read_failed",
   "empty",
   "too_large",
@@ -103,6 +106,7 @@ export async function resolveCredentialRef(
   }
   if (read?.kind === "missing") return refuse("missing");
   if (read?.kind === "not_a_file") return refuse("not_a_file");
+  if (read?.kind === "outside_account") return refuse("outside_account");
   if (read?.kind === "too_large") return refuse("too_large");
   if (read?.kind !== "bytes" || !(read.bytes instanceof Uint8Array)) return refuse("read_failed");
 
@@ -131,23 +135,60 @@ export function credentialPort(files: CredentialFiles, policy: CredentialRefPoli
   };
 }
 
+function fsFailure(error: unknown): CredentialRead {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR" ? { kind: "missing" } : { kind: "failed" };
+}
+
+function sameEntry(a: Stats, b: Stats): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
 // 실제 파일을 읽는 얇은 구현. 이 모듈에서 파일 시스템을 부르는 곳은 여기뿐이다.
-// - 심볼릭 링크는 따라간다: Kubernetes Secret 볼륨의 키 파일은 ..data/<키>를 가리키는 링크다. 별칭과 키의 꼴이 이미 슬래시·점을 막는다.
-// - O_NONBLOCK으로 연다: 그 자리에 FIFO가 있으면 쓰는 쪽이 올 때까지 open이 멈추기 때문이다. 일반 파일에는 영향이 없다.
+// - 고른 계정의 폴더 안의 파일만 읽는다. 별칭 자리는 루트 바로 아래의 실제 폴더여야 한다(링크면 어디를 가리키든 거절).
+//   키 파일은 링크를 따라가되 끝까지 푼 실제 경로가 그 폴더 안이어야 한다: Secret 볼륨의 키는 폴더 안의 ..data/<키>를 가리키는 상대 링크다.
+// - Node에는 openat이 없어 "검사한 폴더 안에서 연다"를 커널에 맡길 수 없다. 그래서 검사 → 실제 경로를 링크 없이 열기 →
+//   연 핸들의 (dev, ino)를 같은 검사를 다시 한 결과와 대조하는 순서로 좁힌다. 남는 틈은 credential-ref.md "계정 폴더의 배치"에 적는다.
+// - O_NONBLOCK으로 연다: 그 자리에 FIFO가 있으면 쓰는 쪽이 올 때까지 열기가 멈추기 때문이다. 일반 파일에는 영향이 없다.
 // - 크기는 fstat 값을 믿지 않고 maxBytes + 1바이트까지 실제로 읽어 본다(읽는 사이 파일이 바뀔 수 있다).
 export const nodeCredentialFiles: CredentialFiles = {
   async read(location, maxBytes) {
-    const path = join(location.dir, location.account, location.key);
-    let handle: Awaited<ReturnType<typeof open>>;
+    // 검사와 열기가 같은 문자열을 보도록 경로를 한 번만 만든다.
+    const accountDir = join(location.dir, location.account);
+    const keyPath = join(accountDir, location.key);
+    let folder: Stats;
+    let target: string;
     try {
-      handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+      folder = await lstat(accountDir);
+      if (folder.isSymbolicLink()) return { kind: "outside_account" };
+      if (!folder.isDirectory()) return { kind: "missing" };
+      const home = await realpath(accountDir);
+      target = await realpath(keyPath);
+      // 접두사는 구분자까지 본다. ..data·..<시각> 같은 폴더 안의 이름도 ".."으로 시작하므로 상대 경로의 ".."로 판정하면 안 된다.
+      if (!target.startsWith(home + sep)) return { kind: "outside_account" };
     } catch (error) {
-      const code = (error as { code?: unknown } | null)?.code;
-      return code === "ENOENT" || code === "ENOTDIR" ? { kind: "missing" } : { kind: "failed" };
+      return fsFailure(error);
     }
-    const buffer = new Uint8Array(maxBytes + 1);
+
+    let handle: FileHandle;
     try {
-      if (!(await handle.stat()).isFile()) return { kind: "not_a_file" };
+      // 푼 실제 경로의 끝이 그 사이 링크로 바뀌었으면 따라가지 않고 실패한다(ELOOP → failed).
+      handle = await open(target, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    } catch (error) {
+      return fsFailure(error);
+    }
+    // 연 바로 다음부터 닫기는 finally가 맡는다: 버퍼를 만들다 실패해도(상한이 런타임의 배열 한도보다 크면) 핸들이 남지 않는다.
+    let buffer: Uint8Array | undefined;
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile()) return { kind: "not_a_file" };
+      // 연 것이 검사한 것과 같은 대상인지 다시 본다. 별칭 자리가 처음 본 그 폴더이고, 키가 같은 실제 경로로 풀리고, 그 경로의 파일이 연 핸들과 같아야 한다.
+      // 중간 경로가 다른 계정의 폴더로 바뀌었다가 돌아와도 연 파일의 (dev, ino)가 달라 여기서 걸린다.
+      const again = await lstat(accountDir);
+      if (again.isSymbolicLink() || !sameEntry(again, folder)) return { kind: "outside_account" };
+      if ((await realpath(keyPath)) !== target || !sameEntry(await stat(target), opened)) return { kind: "outside_account" };
+
+      buffer = new Uint8Array(maxBytes + 1);
       let length = 0;
       while (length < buffer.length) {
         const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
@@ -161,7 +202,7 @@ export const nodeCredentialFiles: CredentialFiles = {
       // 사본을 만들지 않고 같은 버퍼의 앞부분을 넘긴다. 부른 쪽이 그 부분을 0으로 채운다.
       return { kind: "bytes", bytes: buffer.subarray(0, length) };
     } catch {
-      buffer.fill(0);
+      buffer?.fill(0);
       return { kind: "failed" };
     } finally {
       await handle.close().catch(() => undefined);
