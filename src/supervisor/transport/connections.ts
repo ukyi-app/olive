@@ -20,11 +20,12 @@
 // 맞춤과 hello는 권한이 아니다. 낼 것(Output)에는 접수 열기·자격·실행 허가·슬롯 해제가 없다. greeted는 배정 후보라는 표시까지이고,
 // 배정은 roles/assign.ts의 판단(두 revision 대조 포함)과 장부의 시작 트랜잭션을 따로 지나야 한다.
 //
-// 실행기 → 감독 봉투가 내는 것(greeted이고, 맞춤에 답한 복원기가 지금의 복원기이며 그 세대를 아는 연결에서만. 아니면 닫거나 버린다):
-//   hello          occupancy(full) + candidate. full은 이 hello의 runs로만 만든다(occupancy(source)도 같은 값).
-//   status_report  occupancy(partial) + forward(검증된 봉투 그대로). 조회 대조는 forward를 받은 handleForward가 한다.
-//                  status_report는 인사의 runs를 바꾸지 않으므로 full 행·candidates·occupancy(source)에 들어가지 않는다.
-//   영수증·보고    forward.
+// 실행기 → 감독 봉투가 내는 것(맞춤에 답한 복원기가 지금의 복원기이며 그 세대를 아는 연결에서만. 아니면 닫거나 버린다):
+//   hello          answered → greeted. 맞춤에 답한 단계에서 받는 첫 인사이고, 그 밖의 단계에서 오면 out_of_order로 닫는다.
+//                  occupancy(full) + candidate. full은 이 hello의 runs로만 만든다(occupancy(source)도 같은 값).
+//   status_report  greeted인 연결에서만. occupancy(partial) + forward(검증된 봉투 그대로). 조회 대조는 forward를 받은
+//                  handleForward가 한다. status_report는 인사의 runs를 바꾸지 않으므로 full 행·candidates·occupancy(source)에 들어가지 않는다.
+//   영수증·보고    greeted인 연결에서만. forward.
 // 인정되지 않은 연결의 status_report는 새 출력이 없다: 맞춤·인사 전은 검증 없이 out_of_order로 닫고, 옛 복원기로 맞춘 연결은
 // restore_changed로 닫고, 닫혔거나(닫는 중 포함) 지운 연결·밀려난 연결의 것은 버린다.
 // 맞춤 요청은 작업자 실행기 주체만 받는다(syncRequest). 세션 실행기의 영수증·보고·status_report는 지금 이 판단을 지나 forward로 오지 않는다.
