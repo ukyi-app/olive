@@ -143,12 +143,11 @@ test("미발행과 모름이 다른 값", () => {
   expect(ledger.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW, expiresAt: NOW + limits.RUN_LEASE_MAX_MS }, lastStopAt: null } });
   expect(nextIntent(lifecycle(ledger, runId, NOW + 10_000), LIFE).intent).toBe("renew_lease");
 
-  // 갱신 지시 뒤 판단이 쓰는 임대의 끝은 모름이다: 발행 시각은 알고, 실행기가 그 갱신을 적용했는지는 모른다.
-  // 모르는 임대는 갱신하지 않고 같은 ID로 조회한다.
+  // 앞 임대의 끝보다 전달 여유 이상 앞서 낸 갱신이라 판단이 쓰는 임대는 그 갱신이 발급한 끝이고, 다음 주기에 다시 갱신한다.
   must(ledger.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 10_000 }));
-  expect(ledger.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW + 10_000, expiresAt: "unknown" } } });
-  expect(nextIntent(lifecycle(ledger, runId, NOW + 20_000), LIFE).intent).toBe("query");
-  // 감독이 발급한 끝(본문의 lease_until = 발행 시각 + RUN_LEASE_MAX_MS)은 lease와 다른 칸인 발급 기록으로만 읽힌다.
+  expect(ledger.instructionTimes(runId)).toMatchObject({ value: { lease: { issuedAt: NOW + 10_000, expiresAt: NOW + 10_000 + limits.RUN_LEASE_MAX_MS } } });
+  expect(nextIntent(lifecycle(ledger, runId, NOW + 20_000), LIFE).intent).toBe("renew_lease");
+  // 감독이 발급한 끝(본문의 lease_until = 발행 시각 + RUN_LEASE_MAX_MS)은 발급 기록으로도 읽힌다.
   expect(ledger.instructionTimes(runId)).toMatchObject({ value: { renewIssued: { issuedAt: NOW + 10_000, leaseUntil: NOW + 10_000 + limits.RUN_LEASE_MAX_MS } } });
 
   // 종료 지시를 냈으면 그 시각이 마지막 종료 지시다. 답을 기다릴 시간이 지나면 같은 ID로 조회한다.
@@ -224,7 +223,7 @@ function ledgerBeforeLeaseEnd(renewAt: number) {
   return { path, runId, renewId };
 }
 
-test("갱신한 실행의 발급 기록이 저장되고 임대는 모름으로 남는다", () => {
+test("제때 갱신한 실행의 발급 기록이 저장되고 임대는 발급한 끝이다", () => {
   const path = tempPath();
   const first = ready(open(path));
   const requestId = enqueue(first, "admin-dm", NOW);
@@ -235,19 +234,19 @@ test("갱신한 실행의 발급 기록이 저장되고 임대는 모름으로 �
   expect(first.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 10_000 })).toEqual({ ok: true, leaseUntil: NOW + 10_000 + MAX });
   first.close();
 
-  // 발급한 끝은 재개방 뒤에도 발급 기록으로 읽힌다. 실행기가 그 끝을 적용했다는 근거는 장부에 없어 판단이 쓰는 임대는 모름이다.
+  // 발급한 끝은 재개방 뒤에도 발급 기록으로 읽힌다. 앞 임대의 끝보다 전달 여유 이상 앞서 낸 갱신이라 판단이 쓰는 임대도 그 끝이다.
   const second = ready(open(path));
   expect(second.instructionTimes(runId)).toEqual({
     known: true,
     value: {
       runId,
-      lease: { issuedAt: NOW + 10_000, expiresAt: "unknown" },
+      lease: { issuedAt: NOW + 10_000, expiresAt: NOW + 10_000 + MAX },
       renewIssued: { issuedAt: NOW + 10_000, leaseUntil: NOW + 10_000 + MAX },
       lastStopAt: null,
       lastFinalizeAt: null,
     },
   });
-  expect(nextIntent(lifecycle(second, runId, NOW + 15_000), LIFE).intent).toBe("query");
+  expect(nextIntent(lifecycle(second, runId, NOW + 15_000), LIFE).intent).toBe("wait");
   // 갱신 기록은 임대 끝을 보지 않아 더 적을 수 있고, 그 발급 기록도 이어서 저장된다.
   must(second.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: NOW + 20_000 }));
   second.close();
@@ -255,10 +254,10 @@ test("갱신한 실행의 발급 기록이 저장되고 임대는 모름으로 �
   const ledger = ready(open(path));
   expect(ledger.instructionTimes(runId)).toMatchObject({
     known: true,
-    value: { lease: { issuedAt: NOW + 20_000, expiresAt: "unknown" }, renewIssued: { issuedAt: NOW + 20_000, leaseUntil: NOW + 20_000 + MAX } },
+    value: { lease: { issuedAt: NOW + 20_000, expiresAt: NOW + 20_000 + MAX }, renewIssued: { issuedAt: NOW + 20_000, leaseUntil: NOW + 20_000 + MAX } },
   });
-  // 발급 기록의 끝 안이어도 갱신하지 않고 같은 ID로 조회한다.
-  expect(nextIntent(lifecycle(ledger, runId, NOW + MAX), LIFE).intent).toBe("query");
+  // 시작 임대가 끝난 시각에도 두 번째 갱신의 임대 안이라 다시 갱신한다.
+  expect(nextIntent(lifecycle(ledger, runId, NOW + MAX), LIFE).intent).toBe("renew_lease");
 });
 
 // 갱신을 앞 임대 만료 1ms 전에 발급했다. 실행기가 같은 순간에 받았으면 임대가 늘고, 만료 정각에 받았으면 연장하지 않고 실패로 닫는다.
@@ -269,7 +268,8 @@ test("만료 1ms 전에 발급한 갱신을 실행기가 만료 정각에 받는
   const runId = must(first.admitRun(worker({ inputRequestId: enqueue(first, "admin-dm", NOW) }))).run.runId;
   must(first.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
   const issuedAt = NOW + MAX - 1;
-  expect(nextIntent(lifecycle(first, runId, issuedAt), LIFE).intent).toBe("renew_lease");
+  // 판단은 여유가 없는 이 시각에 갱신을 내지 않는다. 아래는 다른 호출자가 그래도 기록한 경우다.
+  expect(nextIntent(lifecycle(first, runId, issuedAt), LIFE).intent).toBe("query");
   expect(first.recordRenewInstruction({ runId, requestId: id(), stopGeneration: 0, now: issuedAt })).toEqual({ ok: true, leaseUntil: issuedAt + MAX });
   first.close();
 
@@ -354,10 +354,10 @@ test("어긋난 시각의 갱신은 틀린 발급 기록을 내지 않는다", (
   expect(late.lease).toEqual({ issuedAt: NOW + MAX, expiresAt: "unknown" });
   expect(nextIntent(lifecycle(late.ledger, late.runId, NOW + MAX + 10_000), LIFE).intent).toBe("query");
 
-  // 시각 순서대로 기록한 갱신 여럿은 마지막 갱신의 발급 기록이다(대조군). 판단이 쓰는 임대는 여전히 모름이다.
+  // 시각 순서대로 기록한 갱신 여럿은 마지막 갱신의 발급 기록이다(대조군). 모두 앞 임대의 끝보다 전달 여유 이상 앞서 냈으므로 판단이 쓰는 임대도 그 끝이다.
   const ordered = renewedInOrder([NOW + 10_000, NOW + 20_000]);
   expect(ordered.issued).toEqual({ issuedAt: NOW + 20_000, leaseUntil: NOW + 20_000 + MAX });
-  expect(ordered.lease).toEqual({ issuedAt: NOW + 20_000, expiresAt: "unknown" });
+  expect(ordered.lease).toEqual({ issuedAt: NOW + 20_000, expiresAt: NOW + 20_000 + MAX });
 
   // 끝을 적지 않은 것은 순서가 어긋난 갱신뿐이다. 시각 순서대로 적힌 갱신의 끝은 남아 있다.
   const ends = (c: { path: string; runId: string; ledger: Ledger }) => {
