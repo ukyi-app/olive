@@ -457,8 +457,9 @@ function startedReachesNotStarted(table: Partial<Record<LedgerRunState, readonly
 }
 
 test("시작 전에 닫힌 줄은 상한이 아님", () => {
-  // 장부에서 not_started로 들어오는 길은 queued에서뿐이고, 시작한 줄은 대기로 돌아가지 않는다. 그 줄은 시작한 적이 없어
-  // 숫자가 쓰고 남긴 잔액이 아니다.
+  // 장부에서 not_started로 들어오는 길은 queued에서, 또는 닫기 근거가 있을 때(D-90)이고, 시작한 줄은 대기로 돌아가지 않는다.
+  // queued에서 닫힌 줄은 시작한 적이 없고, D-90으로 닫힌 줄은 시작 지시에 고정된 예산에서 감액이 적히지 않았을 때만 닫혀서
+  // 어느 쪽이든 숫자가 쓰고 남긴 잔액이 아니다.
   for (const kind of ["worker", "session"] as const) {
     const into = Object.entries(TRANSITIONS[kind])
       .filter(([, to]) => to?.includes("not_started"))
@@ -468,8 +469,8 @@ test("시작 전에 닫힌 줄은 상한이 아님", () => {
     expect(into, kind).toEqual(["queued", ...closure]);
     const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
     expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
-    // 시작한 줄이 대기로 돌아가는 간선(running → queued)을 표의 사본에 더하면 이 검사가 잡는다.
-    const requeue = { ...TRANSITIONS[kind], running: [...(TRANSITIONS[kind].running ?? []), "queued" as const] };
+    // 닫기 두 줄을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
+    const requeue = { ...withoutClosure, running: [...(withoutClosure.running ?? []), "queued" as const] };
     expect(startedReachesNotStarted(requeue), kind).toBe(true);
   }
 

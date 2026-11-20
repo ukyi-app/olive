@@ -6,9 +6,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { limits, type RunStatus } from "../../src/contract/v1/index.ts";
 import { type Ledger, LEDGER_RUN_STATES, loadMigrations, MIGRATIONS_DIR, openLedger, type Refusal, type UnreceivedClosureInput } from "../../src/ledger/index.ts";
-import { RESTORE_KEY } from "../../src/ledger/ledger.ts";
+import { RESTORE_KEY, type SlotHoldObservation } from "../../src/ledger/ledger.ts";
 import { type LifecyclePolicy, nextIntent } from "../../src/supervisor/scheduler/lifecycle.ts";
-import { clock, digest, id, must, NOW, open, ready, startedWorker, tempDir, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
+import { clock, digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, startedWorker, tempDir, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
 
 // ID·digest·시각은 이 시험이 고른 값이다. 운영값이 아니다. 시험의 장부 시계는 늘 NOW라 시작 지시의 발행 시각도 NOW다.
 const FILE = "0006-unreceived-closure.sql";
@@ -67,6 +67,17 @@ function stoppedReceipt(runId: string) {
 
 function resultReport(runId: string) {
   return { reportId: id(), action: "report_result" as const, runId, bodyDigest: digest("result"), storedRef: `results/${id()}`, resultDigest: digest("r"), now: SHUT + 20 };
+}
+
+// 코드를 거치지 않고 넣는 닫기 근거 줄(답의 시각, 열기 'o'). 트리거만으로 막히는지 본다.
+const RAW_CLOSURE = "INSERT INTO unreceived_closures (run_id, from_state, answer_executor_id, answer_issued_at, answer_received_at, open_id, closed_at) VALUES (?, 'preparing', ?, ?, 1, 'o', 1)";
+
+// 시험의 고정 시계(NOW)와 다른 시각에 실행을 만들고 시작한다. 실행 생성·시작 발행 = at.
+function startedAt(ledger: Ledger, at: number) {
+  const runId = must(ledger.admitRun(worker({ now: at }))).run.runId;
+  const requestId = id();
+  must(ledger.startRun({ runId, requestId, stopGeneration: 0, now: at }));
+  return { runId, requestId };
 }
 
 // ---- 보장 1: 송신 표식 ----
@@ -249,6 +260,149 @@ test("보장 2: 사본에서 되살린 장부는 보류 중에 닫지 않고, �
   expect(run(copy, live.runId).state).toBe("preparing");
 });
 
+test("사본의 경계: 사본을 만들 때 시계가 1ms 뒤로 가도, 원본에서 끝까지 간 사본 안의 실행은 되살린 장부에서 닫지 않는다(코드와 트리거)", () => {
+  const dir = tempDir();
+  const copyPath = join(dir, "copy.db");
+  let now = NOW;
+  const original = ready(open(join(dir, "ledger.db"), { clock: () => now }));
+  const live = startedWorker(original);
+  now = NOW - 1;
+  const snapshot = original.createSnapshot({ path: copyPath, maxBytes: 10_000_000 });
+  if (!snapshot.ok) throw new Error(`사본: ${snapshot.reason}`);
+  expect(snapshot.takenAt).toBe(NOW - 1);
+  now = NOW;
+  // 원본에서는 표식을 적고 실었고, 실행기가 받아 띄우고 끝냈다. 사본에는 이 기록이 하나도 없다.
+  must(original.markStartDispatch({ runId: live.runId, requestId: live.requestId, now: NOW }));
+  must(original.applyReceipt(accepted(live), live.from));
+  must(original.applyReceipt(startedReceipt(live), live.from));
+  must(original.applyReceipt({ ...stoppedReceipt(live.runId), exit: "completed" }, live.from));
+  original.close();
+  expect(rows(copyPath, "SELECT snapshot_id, queue_seq_bound FROM snapshot_run_bounds")).toEqual([{ snapshot_id: snapshot.snapshotId, queue_seq_bound: 1 }]);
+  expect(rows(copyPath, "SELECT (SELECT count(*) FROM deliveries) + (SELECT count(*) FROM start_dispatches) AS n")).toEqual([{ n: 0 }]);
+  const copy = open(copyPath);
+  must(copy.confirmSnapshotReconciled({ snapshotId: snapshot.snapshotId, now: NOW }));
+  ready(copy);
+  expect(close(copy, live.runId)).toEqual({ ok: false, reason: "created_before_snapshot" });
+  expect(run(copy, live.runId).state).toBe("preparing");
+  expect(slotFree(copy)).toBe(false);
+  copy.close();
+  expect(() => rawWrite(copyPath, RAW_CLOSURE, live.runId, WORKER_EXECUTOR, SHUT)).toThrow("unreceived_closure_unproven");
+  // 경계는 고치거나 지우거나 대조가 끝난 사본 기록에 다시 붙이지 못한다.
+  expect(() => rawWrite(copyPath, "UPDATE snapshot_run_bounds SET queue_seq_bound = 0")).toThrow("snapshot_bound_fixed");
+  expect(() => rawWrite(copyPath, "DELETE FROM snapshot_run_bounds")).toThrow("snapshot_bound_fixed");
+  expect(() => rawWrite(copyPath, "INSERT OR REPLACE INTO snapshot_run_bounds (snapshot_id, queue_seq_bound) VALUES (?, 0)", snapshot.snapshotId)).toThrow("snapshot_bound_fixed");
+  expect(rows(copyPath, "SELECT queue_seq_bound FROM snapshot_run_bounds")).toEqual([{ queue_seq_bound: 1 }]);
+});
+
+test("사본의 경계: 적고 보내기 전에 죽은 실행은 사본이 없으면, 또는 되살린 장부가 사본 뒤에 만든 실행이면 닫힌다", () => {
+  // 사본 없음: 시작을 적고(표식 없음) 장부 객체를 닫아 감독이 죽은 것을 대신한다. 다시 연 장부가 닫는다.
+  const plainPath = tempPath();
+  const first = ready(open(plainPath));
+  const plain = startedWorker(first);
+  first.close();
+  const reopened = ready(open(plainPath));
+  expect(close(reopened, plain.runId)).toMatchObject({ ok: true, run: { state: "not_started" } });
+
+  // 사본 뒤에 만든 실행: 사본에는 대기 실행 하나(순번 1)만 있다. 되살린 장부의 새 실행은 순번 2라 경계 밖이다.
+  const dir = tempDir();
+  const copyPath = join(dir, "copy.db");
+  const original = ready(open(join(dir, "ledger.db")));
+  const inCopy = must(original.admitRun(worker())).run.runId;
+  const snapshot = original.createSnapshot({ path: copyPath, maxBytes: 10_000_000 });
+  if (!snapshot.ok) throw new Error(`사본: ${snapshot.reason}`);
+  original.close();
+  // 되살린 장부의 시계는 사본 시각 뒤다(시작 지시의 발행 시각은 장부 시계에서 온다).
+  const later = { clock: () => NOW + 1 };
+  const restored = open(copyPath, later);
+  must(restored.confirmSnapshotReconciled({ snapshotId: snapshot.snapshotId, now: NOW + 1 }));
+  ready(restored);
+  const fresh = startedAt(restored, NOW + 1);
+  restored.close();
+  const again = ready(open(copyPath, later));
+  expect(close(again, fresh.runId, { answeredAt: SHUT + 1 })).toMatchObject({ ok: true, run: { state: "not_started" } });
+  // 사본에 대기로 들어 있던 실행은 되살린 장부에서 시작해도 경계 안이라 닫지 않는다.
+  must(again.startRun({ runId: inCopy, requestId: id(), stopGeneration: 0, now: NOW + 1 }));
+  expect(close(again, inCopy, { answeredAt: SHUT + 1 })).toEqual({ ok: false, reason: "created_before_snapshot" });
+});
+
+test("사본의 경계: 경계가 없는 사본 기록(판 6 전에 만든 사본)이 있는 장부에서는 사본 뒤에 만든 실행도 닫지 않는다(코드와 트리거)", () => {
+  const dir = tempDir();
+  const copyPath = join(dir, "copy.db");
+  const before = ready(open(join(dir, "ledger.db"), { migrations: loadMigrations().slice(0, VERSION - 1) }));
+  const snapshot = before.createSnapshot({ path: copyPath, maxBytes: 10_000_000 });
+  if (!snapshot.ok) throw new Error(`사본: ${snapshot.reason}`);
+  before.close();
+  // 시계는 사본 시각 뒤다: 시각의 비교로는 이 실행을 사본 뒤의 것으로 읽는다.
+  const copy = open(copyPath, { clock: () => NOW + 1 });
+  must(copy.confirmSnapshotReconciled({ snapshotId: snapshot.snapshotId, now: NOW + 1 }));
+  ready(copy);
+  const fresh = startedAt(copy, NOW + 1);
+  expect(close(copy, fresh.runId, { answeredAt: SHUT + 1 })).toEqual({ ok: false, reason: "snapshot_bound_unknown" });
+  expect(run(copy, fresh.runId).state).toBe("preparing");
+  copy.close();
+  expect(rows(copyPath, "SELECT count(*) AS n FROM snapshot_run_bounds")).toEqual([{ n: 0 }]);
+  expect(() => rawWrite(copyPath, RAW_CLOSURE, fresh.runId, WORKER_EXECUTOR, SHUT + 1)).toThrow("unreceived_closure_unproven");
+  // 대조가 끝난 옛 사본 기록에 경계를 뒤에 붙여 "모름"을 값으로 바꾸지 못한다.
+  expect(() => rawWrite(copyPath, "INSERT INTO snapshot_run_bounds (snapshot_id, queue_seq_bound) VALUES (?, 1)", snapshot.snapshotId)).toThrow("snapshot_bound_fixed");
+});
+
+test("판 이전의 시작: 판 5에서 낸 시작은 판 6의 적용과 같은 밀리초여도 닫지 않는다(코드와 트리거)", () => {
+  const path = tempPath();
+  const before = ready(open(path, { migrations: loadMigrations().slice(0, VERSION - 1) }));
+  const old = startedWorker(before);
+  before.close();
+  const after = ready(open(path));
+  expect(close(after, old.runId)).toEqual({ ok: false, reason: "started_before_migration" });
+  expect(run(after, old.runId).state).toBe("preparing");
+  after.close();
+  expect(rows(path, "SELECT applied_at FROM ledger_migrations WHERE version = ?", VERSION)).toEqual([{ applied_at: NOW }]);
+  expect(rows(path, "SELECT issued_at FROM instructions WHERE request_id = ?", old.requestId)).toEqual([{ issued_at: NOW }]);
+  expect(rows(path, "SELECT run_id, request_id FROM starts_before_closure")).toEqual([{ run_id: old.runId, request_id: old.requestId }]);
+  expect(() => rawWrite(path, RAW_CLOSURE, old.runId, WORKER_EXECUTOR, SHUT)).toThrow("unreceived_closure_unproven");
+  // 그 집합은 판의 트랜잭션 뒤로는 늘거나 바뀌거나 줄지 않는다.
+  expect(() => rawWrite(path, "INSERT INTO starts_before_closure (run_id, request_id) VALUES (?, ?)", old.runId, old.requestId)).toThrow("starts_before_closure_fixed");
+  expect(() => rawWrite(path, "UPDATE starts_before_closure SET request_id = request_id")).toThrow("starts_before_closure_fixed");
+  expect(() => rawWrite(path, "DELETE FROM starts_before_closure")).toThrow("starts_before_closure_fixed");
+});
+
+test("판 이전의 시작: 판 6을 적용한 뒤 새로 낸 시작은 적용과 같은 밀리초여도 닫히고, 처음부터 판 6인 장부의 집합은 비어 있다", () => {
+  const path = tempPath();
+  const before = ready(open(path, { migrations: loadMigrations().slice(0, VERSION - 1) }));
+  const waiting = must(before.admitRun(worker())).run.runId;
+  before.close();
+  const after = ready(open(path));
+  const requestId = id();
+  must(after.startRun({ runId: waiting, requestId, stopGeneration: 0, now: NOW }));
+  expect(close(after, waiting)).toMatchObject({ ok: true, run: { state: "not_started" } });
+  after.close();
+  expect(rows(path, "SELECT applied_at FROM ledger_migrations WHERE version = ?", VERSION)).toEqual([{ applied_at: NOW }]);
+  expect(rows(path, "SELECT count(*) AS n FROM starts_before_closure")).toEqual([{ n: 0 }]);
+  const fresh = tempPath();
+  const created = ready(open(fresh));
+  startedWorker(created);
+  created.close();
+  expect(rows(fresh, "SELECT count(*) AS n FROM starts_before_closure")).toEqual([{ n: 0 }]);
+});
+
+test("예산: 시작 뒤 감액이 적힌 실행은 닫지 않고(코드와 트리거), 시작 전에 줄인 예산은 막지 않는다", () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const live = startedWorker(ledger);
+  must(ledger.recordBudget({ runId: live.runId, budgetLeft: 3, now: NOW }));
+  expect(close(ledger, live.runId)).toEqual({ ok: false, reason: "budget_reduced" });
+  expect(run(ledger, live.runId)).toMatchObject({ state: "preparing", budgetLeft: 3 });
+  expect(slotFree(ledger)).toBe(false);
+  ledger.close();
+  expect(() => rawWrite(path, RAW_CLOSURE, live.runId, WORKER_EXECUTOR, SHUT)).toThrow("unreceived_closure_unproven");
+
+  // 대기 중에 줄인 예산은 시작 지시에 그대로 고정되므로 감액이 아니다.
+  const second = ready(open(tempPath()));
+  const queued = must(second.admitRun(worker())).run.runId;
+  must(second.recordBudget({ runId: queued, budgetLeft: 7, now: NOW }));
+  must(second.startRun({ runId: queued, requestId: id(), stopGeneration: 0, now: NOW }));
+  expect(close(second, queued)).toMatchObject({ ok: true, run: { state: "not_started", budgetLeft: 7 } });
+});
+
 test("보장 3: 근거 줄 없이는 queued 밖에서 not_started로 가지 못하고, 근거 표의 트리거는 코드 없이도 받은 흔적이 있는 실행을 막는다", () => {
   const path = tempPath();
   const ledger = ready(open(path));
@@ -375,6 +529,41 @@ test("보장 4: 대기에서 취소돼 not_started가 된 실행의 지금 동�
   expect(slotFree(ledger)).toBe(true);
 });
 
+test("보장 4: 닫힌 작업자를 앞 실행으로 가리키는 세션 인수 영수증은 닫히지 않은 작업자처럼 종류 검사에서 거절되고 아무것도 적지 않는다", () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const closed = startedWorker(ledger);
+  must(close(ledger, closed.runId));
+  const cancelled = must(ledger.admitRun(worker())).run.runId;
+  must(ledger.recordStopInstruction({ runId: cancelled, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW, reason: "requested" }));
+  // 인수 영수증을 낼 수 있는 쪽: 대기 중인 세션 실행의 지정 실행기.
+  must(ledger.admitRun(session()));
+  const receipts = [closed.runId, cancelled].map((previousRunId) => ({
+    action: "receipt_session_takeover" as const,
+    receiptId: id(),
+    previousRunId,
+    newGenerationMarkerDigest: digest("marker"),
+    startPermitId: id(),
+    takenOverAt: SHUT + 20,
+    bodyDigest: digest("takeover"),
+    now: SHUT + 20,
+  }));
+  for (const receipt of receipts) expect(ledger.applyReceipt(receipt, { sender: SESSION_EXECUTOR, runGeneration: 1 }), receipt.previousRunId).toEqual({ ok: false, reason: "invariant_violation" });
+  ledger.close();
+  expect(rows(path, "SELECT (SELECT count(*) FROM deliveries WHERE action = 'receipt_session_takeover') + (SELECT count(*) FROM session_takeovers) AS n")).toEqual([{ n: 0 }]);
+});
+
+test("복원의 점유 기록: 관측 배열에 빈 자리가 있으면 거래 전체가 되돌아가고 성공을 내지 않는다", () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const live = startedWorker(ledger);
+  const observations: SlotHoldObservation[] = new Array(2);
+  observations[0] = { executorId: WORKER_EXECUTOR, runId: live.runId, kind: "worker", runGeneration: 1, holdsSlot: true, why: "state" };
+  expect(ledger.holdSlots(RESTORE_KEY, observations, NOW)).toEqual({ ok: false, reason: "ledger_unwritable" });
+  ledger.close();
+  expect(rows(path, "SELECT count(*) AS n FROM slot_holds")).toEqual([{ n: 0 }]);
+});
+
 // ---- 기존 장부 ----
 
 test("이관: 판 1~5의 장부가 판 6으로 올라가고 기존 줄은 그대로이며, 판 6의 장부는 옛 코드로 열지 않는다", () => {
@@ -396,7 +585,9 @@ test("이관: 판 1~5의 장부가 판 6으로 올라가고 기존 줄은 그대
     const now = kept();
     expect(now.slice(0, -1), `판 ${version}`).toEqual(old.slice(0, -1));
     expect((now.at(-1) as unknown[]).length, `판 ${version}`).toBe((old.at(-1) as unknown[]).length + 2);
-    expect(rows(path, "SELECT (SELECT count(*) FROM start_dispatches) + (SELECT count(*) FROM unreceived_closures) AS n")).toEqual([{ n: 0 }]);
+    expect(rows(path, "SELECT (SELECT count(*) FROM start_dispatches) + (SELECT count(*) FROM unreceived_closures) + (SELECT count(*) FROM snapshot_run_bounds) AS n")).toEqual([{ n: 0 }]);
+    // 적용 때 있던 시작 지시는 모두 판 이전의 시작으로 남는다.
+    expect(rows(path, "SELECT run_id, request_id FROM starts_before_closure"), `판 ${version}`).toEqual([{ run_id: live.runId, request_id: live.requestId }]);
     expect(rows(path, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
   }
   const path = tempPath();

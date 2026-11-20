@@ -28,11 +28,11 @@
 | `0003-tool-requests` | 표 `tool_requests`와 트리거 셋(`tool_requests_born_waiting`, `tool_requests_permanent`, `tool_requests_fixed`). 아래 "작업 부탁(배정 전 대기)". 새 표만 더하므로 기존 표·줄은 그대로다 |
 | `0004-instruction-rebuild` | `instructions`에 지시 본문을 다시 만들 칸 다섯(NULL 허용): `budget_left`(시작 지시만, 1 이상), `reason`(종료 지시만, 동작마다 계약 v1의 목록), `outcome`·`result_digest`·`stored_at`(확정 지시만, `outcome`과 `stored_at`은 함께, `result_digest`는 `succeeded`일 때만이고 그때는 반드시. 그래서 세 칸은 다시 만들 수 있는 완전한 조합이거나 셋 다 비어 있고, `outcome` 없이 `result_digest`만 있는 줄도 CHECK가 막는다). 이 CHECK는 칸의 조합과 `reason`·`outcome`의 목록, 정수의 범위만 본다. 값의 형식(결과 digest가 계약의 소문자 16진수 64자리인가 등)은 장부의 공개 쓰기가 검사한다. 아래 "답을 받지 못한 지시". 칸만 더하므로 기존 줄은 NULL(다시 만들 수 없음)이고 다른 칸의 값과 제약·트리거(`instructions_fixed` 등)는 그대로다 |
 | `0005-run-sightings` | 표 `run_sightings`와 트리거 셋(`run_sightings_first_only`, `run_sightings_fixed`, `run_sightings_permanent`). 아래 "실행기의 답". 새 표만 더하므로 기존 표·줄·트리거는 그대로이고 올라간 장부의 표는 비어 있다(지난 답은 거슬러 적지 않는다) |
-| `0006-unreceived-closure` | 전이 두 줄(`run_transitions`에 작업자의 `preparing → not_started`, `unknown_running → not_started`), 표 `start_dispatches`(송신 표식)와 트리거 셋(`start_dispatches_start_only`, `start_dispatches_fixed`, `start_dispatches_permanent`), 표 `unreceived_closures`(D-90 닫기 근거)와 트리거 셋(`unreceived_closures_proven`, `unreceived_closures_fixed`, `unreceived_closures_permanent`), `runs`의 트리거 `runs_not_started_needs_closure`. 아래 "받은 적 없는 실행의 닫기". 새 표·트리거·전이 줄만 더하므로 기존 줄은 그대로이고 올라간 장부의 두 표는 비어 있다 |
+| `0006-unreceived-closure` | 전이 두 줄(`run_transitions`에 작업자의 `preparing → not_started`, `unknown_running → not_started`), 표 `start_dispatches`(송신 표식)와 트리거 셋(`start_dispatches_start_only`, `start_dispatches_fixed`, `start_dispatches_permanent`), 표 `starts_before_closure`(이 판을 적용할 때 이미 있던 시작 지시)와 트리거 셋(`starts_before_closure_sealed`, `starts_before_closure_fixed`, `starts_before_closure_permanent`), 표 `snapshot_run_bounds`(사본의 경계)와 트리거 셋(`snapshot_run_bounds_sealed`, `snapshot_run_bounds_fixed`, `snapshot_run_bounds_permanent`), 표 `unreceived_closures`(D-90 닫기 근거)와 트리거 셋(`unreceived_closures_proven`, `unreceived_closures_fixed`, `unreceived_closures_permanent`), `runs`의 트리거 `runs_not_started_needs_closure`. 새 표 넷의 모든 칸은 `NOT NULL`이다. 아래 "받은 적 없는 실행의 닫기". 새 표·트리거·전이 줄만 더하므로 기존 줄은 그대로다. 올라간 장부에서 `start_dispatches`·`snapshot_run_bounds`·`unreceived_closures`는 비어 있고, `starts_before_closure`에는 적용하는 트랜잭션에 있던 `instructions`의 시작 지시(`task_start`·`session_start`)가 모두 들어간다. 그 뒤로는 줄이 늘지 않는다(트리거). 이 줄 옮기기는 기존 행을 읽지만 결과 스키마는 행과 무관하다(빈 DB에 재생하면 같은 스키마에 0줄) |
 
 판 하나는 트랜잭션 하나라 도중에 실패하거나 끊기면 그 판 전체가 되돌려진다. 적용 기록은 `ledger_migrations(version, name, applied_at)`. 번호가 비거나, 이름과 번호가 다르거나, 폴더에 꼴이 다른 파일이 있거나, 장부의 판이 코드보다 높거나, 같은 번호의 이름이 다르면 열지 않는다. 호출자가 `migrations`로 넘긴 목록도 같은 검사를 파일을 열기 전에 자리마다 거친다(배열의 빈 자리 포함). 적용 시각으로 쓸 시계의 값도 파일을 건드리기 전에 확인한다.
 
-**지원하는 판의 범위: 모든 판은 식별 행이 없는 빈 DB에서 번호 순서대로 재생할 수 있어야 한다. 기존 행에 기대는 판(데이터 이관이 필요한 판)은 이 장부가 아직 지원하지 않는다.** 재개방은 코드의 판을 빈 메모리 DB에 재생한 스키마와 장부를 대조하기 때문이다. 판을 올리는 `reopen`과 `create`는 실제 판을 커밋하기 전에 목록 전체를 재생해 보고, 재생하지 못하면 장부를 바꾸지 않고 `migration_failed`로 거절한다. 판이 하나도 없는 목록의 `create`는 재개방이 대조할 적용 기록이 남지 않으므로 파일을 만들지 않고 `migration_mismatch`로 거절한다. 재생은 되지만 실제 장부의 행에 따라 다른 스키마를 남기는 판(행이 있을 때만 통계 표를 만드는 `PRAGMA optimize` 등)은 미리 가르지 못한다. 판의 결과 스키마는 데이터에 따라 달라지면 안 된다.
+**지원하는 판의 범위: 모든 판은 식별 행이 없는 빈 DB에서 번호 순서대로 재생할 수 있어야 한다. 기존 행에 기대는 판(데이터 이관이 필요한 판)은 이 장부가 아직 지원하지 않는다.** 판 6이 기존 시작 지시를 새 표로 옮기는 것은 스키마가 행에 기대지 않아(빈 DB에서는 0줄) 이 범위 안이다. 재개방은 코드의 판을 빈 메모리 DB에 재생한 스키마와 장부를 대조하기 때문이다. 판을 올리는 `reopen`과 `create`는 실제 판을 커밋하기 전에 목록 전체를 재생해 보고, 재생하지 못하면 장부를 바꾸지 않고 `migration_failed`로 거절한다. 판이 하나도 없는 목록의 `create`는 재개방이 대조할 적용 기록이 남지 않으므로 파일을 만들지 않고 `migration_mismatch`로 거절한다. 재생은 되지만 실제 장부의 행에 따라 다른 스키마를 남기는 판(행이 있을 때만 통계 표를 만드는 `PRAGMA optimize` 등)은 미리 가르지 못한다. 판의 결과 스키마는 데이터에 따라 달라지면 안 된다.
 
 이 장부는 아직 어디에도 배포되지 않아 리뷰 반영을 `0001-core.sql`에 직접 고쳤다. **첫 배포 뒤에는 기존 번호를 고치지 않고 다음 번호로 더한다.**
 
@@ -40,14 +40,14 @@
 
 ## 표
 
-`instructions.lease_until`은 `0002-renew-lease-end`, `tool_requests`는 `0003-tool-requests`, `run_sightings`는 `0005-run-sightings`, `start_dispatches`·`unreceived_closures`는 `0006-unreceived-closure`이고 나머지는 모두 `0001-core`다(`instructions`의 본문 칸 다섯은 `0004`).
+`instructions.lease_until`은 `0002-renew-lease-end`, `tool_requests`는 `0003-tool-requests`, `run_sightings`는 `0005-run-sightings`, `start_dispatches`·`starts_before_closure`·`snapshot_run_bounds`·`unreceived_closures`는 `0006-unreceived-closure`이고 나머지는 모두 `0001-core`다(`instructions`의 본문 칸 다섯은 `0004`).
 
 | 묶음 | 표 | 요지 |
 |---|---|---|
 | 정지·일시 중지 | `stop_state`, `diagnosis_pause` | 정지 세대(0 포함, 줄이 없으면 아직 적지 않음), 정지 여부, 확인 단계, 진단 일시 중지의 끝 |
 | 실행·슬롯·예산 | `runs`, `run_epoch`, `run_transitions`, `instructions`, `slot_holds` | 실행 ID·세대·역할·revision 둘·snapshot·실행기·자격 네 칸·기한·남은 예산·상태·영수증 id들. 낸 지시(v1 여섯, 적은 뒤 불변)와 갱신 지시가 발급한 임대 끝("스케줄러가 쓰는 읽기"의 "발급한 갱신의 끝"), 지시 본문을 다시 만들 칸("답을 받지 못한 지시"). 점유가 맞지 않은 관측: (실행기, 실행, 세대)마다 한 줄이고 관측 번호를 가진다. 줄이 있으면 그 실행 ID를 영영 시작하지 않고, `holds_slot`이면 그 종류의 슬롯도 막는다 |
 | 양성 관측 | `run_sightings` | 실행기가 그 실행을 안다고(`not_known` 밖으로) 답한 첫 관측. (실행, 실행기, 세대)마다 한 줄이고 그 셋은 실행 줄의 실행·지정 실행기·실행 세대와 같아야 한다. 답한 상태, 답의 시각(실행기 시계, 복원 경로는 없음), 받은 시각, `full`·`partial`. 지우거나 고치거나 덮지 않는다 |
-| 송신 표식·닫기 근거 | `start_dispatches`, `unreceived_closures` | 시작 봉투를 실은 장부 열기: (실행, 열기 ID)마다 한 줄, 그 실행의 시작 지시의 요청 ID와 적은 시각. D-90으로 닫은 실행의 근거: 실행마다 한 줄, 앞 상태, 그 실행을 싣지 않은 전체 답의 낸 쪽·서명 시각(실행기 시계)·받은 시각, 닫은 열기 ID, 닫은 시각. 둘 다 지우거나 고치지 않는다 |
+| 송신 표식·닫기 근거 | `start_dispatches`, `starts_before_closure`, `snapshot_run_bounds`, `unreceived_closures` | 시작 봉투를 실었을 수 있는 장부 열기: (실행, 열기 ID)마다 한 줄, 그 실행의 시작 지시의 요청 ID와 적은 시각. 판 6을 적용할 때 이미 있던 시작 지시: (실행, 요청 ID)마다 한 줄, 판의 트랜잭션에서만 들어간다. 사본의 경계: 사본 기록마다 한 줄, 사본을 봉할 때의 `runs.queue_seq` 최댓값. D-90으로 닫은 실행의 근거: 실행마다 한 줄, 앞 상태, 그 실행을 싣지 않은 전체 답의 낸 쪽·서명 시각(실행기 시계)·받은 시각, 닫은 열기 ID, 닫은 시각. 넷 다 지우거나 고치지 않는다 |
 | 입력·대기열 | `inputs` | 요청 ID, 인증된 출처, 원문 참조(`<저장소>/<UUID>`)와 만료, 순번, 취소 |
 | 작업 부탁 | `tool_requests` | 오케스트레이터의 `start_worker` 부탁: 참조(UUID), 소유자(논리 요청, `inputs`의 외래 키), 재시도 키(`dedupe_key`), 역할·목적 분류·원본 참조·입력 digest, 기록한 세션·호출 ID, 단계(`waiting_assignment`·`not_started`), 이은 실행(`run_id`, 배정 전에는 비어 있음), 기록·취소 시각과 취소한 세션·호출 ID. (소유자, 재시도 키)마다 한 줄 |
 | 영수증·보고 | `deliveries`, `receipt_conflicts`, `report_signals` | 받은 id와 본문 digest, 속한 실행(외래 키), 가리킨 지시, 결과 보고의 저장 자리·digest·반영 시각. 같은 id에 다른 digest의 기록(같은 충돌은 한 줄). 훅·세션 깨짐 보고의 구조화 칸(사건 종류, `session_id`, 턴 ID, 오류 종류, 원인, 표식 digest, 관측 시각) |
@@ -127,7 +127,8 @@
   - **표의 제약:** `run_sightings`의 CHECK는 정수의 범위, 상태(계약 v1의 실행 상태에서 `not_known`을 뺀 열)와 `coverage`의 목록, NULL 허용(`answered_at`·`last_receipt_id`만)을 본다. 값의 형식(UUID, 실행기 주체 이름)은 공개 쓰기가 검사한다. INSERT 트리거는 (실행, 실행기, 세대)가 실행 줄의 실행·지정 실행기·실행 세대와 같지 않거나 같은 열쇠의 줄이 이미 있으면 막는다(`INSERT OR REPLACE`도). 비교 값에 NULL이 섞이면 맞는 실행이 없는 것으로 읽혀 막힌다. UPDATE·DELETE는 모두 막는다. 실행 줄의 세 칸은 바뀌지 않으므로(`runs_evidence`) 적은 줄은 계속 그 실행의 지정 실행기·세대의 것이다.
 - **받은 적 없는 실행의 닫기(D-90, 판 6):** 실행기가 받은 적 없는 작업자 실행을 `not_started`로 닫아 자리를 푼다. 하나라도 맞지 않으면 지금대로 자리를 쥔 채 모름이다.
   - **송신 표식(`markStartDispatch({ runId, requestId, now })`):** 시작 봉투를 연결에 싣기 직전에 부른다. 이 장부 객체의 열기 ID와 함께 `start_dispatches`에 한 줄을 커밋하고 `{ ok: true, created }`를 낸다. 열기 ID는 `openLedger`가 장부 객체를 만들 때마다 `crypto.randomUUID()`로 새로 만든다(장부 ID·사본 ID처럼 장부가 스스로 만드는 식별이다. 부르는 쪽이 넘기게 하면 다시 연 객체가 앞 열기의 값을 쓸 수 있다). 같은 열기에서 같은 실행을 다시 적으면 그대로다(`created: false`, 처음 시각을 덮지 않는다). 그 실행의 시작 지시(`task_start`)의 요청 ID가 아니면 `unknown_instruction`, 없는 실행이면 `unknown_run`, 끝났거나(`finalized`·`not_started`) 종료가 확인된 실행이면 `transition_denied`다. 시작 봉투를 싣는 것은 새 일을 여는 일이라 쓰기 모드는 `start`다(못 씀·사본 보류·정지 기록 없음·정지·접수 닫힘이면 거절). 표는 트리거로 시작 지시를 가리키는 줄만 받고, 고치기·지우기·같은 (실행, 열기)의 교체를 막는다.
-  - **싣는 쪽이 지킬 것(이 판에는 부르는 코드가 없다):** 시작 봉투를 싣는 모든 길(배정 순환, 뒤에 생길 재전송)은 이 표식이 `ok`로 커밋된 뒤에만 싣고, 표식이 거절·실패하면 싣지 않는다. 그래야 "표식 없음 = 한 번도 실리지 않음"이 선다. 어기면 실린 시작을 장부가 실리지 않은 것으로 읽고 닫을 수 있다.
+  - **표식의 뜻:** 표식은 "이 열기에서 그 시작을 실었을 수 있다"는 증거이지 실었다는 증거가 아니다. 표식을 커밋한 직후 실제로 싣기 전에 감독이 죽어도 표식은 남고, 다시 연 장부에서는 다른 열기의 표식이라 자동으로 닫지 않는다(`sent_by_other_open`, 손 닫기로 간다). 반대로 "표식이 없다"를 "한 번도 실리지 않았다"로 읽는 것은 아래 셋이 모두 맞을 때뿐이다: 싣는 쪽이 아래 조건을 지켰다, 그 시작이 판 6을 적용한 뒤에 낸 것이다(`starts_before_closure`에 없다), 그 실행이 사본의 경계 밖이다(사본에서 되살린 장부라면 사본 뒤에 만든 실행이다).
+  - **싣는 쪽이 지킬 것(이 판에는 부르는 코드가 없다):** 시작 봉투를 싣는 모든 길(배정 순환, 뒤에 생길 재전송)은 이 표식이 `ok`로 커밋된 뒤에만 싣고, 표식이 거절·실패하면 싣지 않는다. 그래야 위의 "표식 없음 = 한 번도 실리지 않음"이 선다. 어기면 실린 시작을 장부가 실리지 않은 것으로 읽고 닫을 수 있다.
   - **닫기(`closeUnreceivedRun({ runId, runs, answeredAt, receivedAt, now }, { sender })`):** `sender`는 검증된 전체 답(`hello`) 봉투의 낸 쪽, `runs`는 그 답의 `runs` 그대로(계약 v1의 실행 상태 항목, `applyExecutorAnswer`와 같은 꼴 검사), `answeredAt`은 그 봉투의 `issued_at`(실행기 시계, 모르면 `null`), `receivedAt`은 감독이 그 답을 받은 시각, `now`는 닫는 시각이다. 꼴이 틀리면 `LedgerInputError`다. **"그 답에 이 실행이 없다"는 부르는 쪽의 판단으로 받지 않고 답의 목록을 받아 장부가 직접 본다:** 부르는 쪽이 다른 답을 잘못 고르면 그 실행이 실린 답으로 닫을 수 있는데, 목록을 받으면 실린 답(`not_known`으로 실린 것 포함)으로는 닫히지 않는다. 그 목록이 전체 답인지는 장부가 가를 수 없다(부르는 쪽이 그 연결의 검증된 `hello`만 넘긴다). 성공 답은 `{ ok: true, run }`(`run.state`는 `not_started`)이다. 쓰기 모드는 `start`다(새 일을 여는 쪽과 같은 전제, 정지 중에는 닫지 않는다).
   - **조건(한 트랜잭션에서 위에서부터 보고, 처음 걸린 거절을 낸다. 거절이면 아무것도 적지 않는다):**
 
@@ -144,13 +145,28 @@
     | 그 실행의 영수증·보고(`deliveries`)가 0줄이다 | `receipt_seen` |
     | 양성 관측(`run_sightings`)이 0줄이다 | `run_sighted` |
     | 점유 관측(`slot_holds`)이 0줄이다 | `run_blocked` |
-    | 시작 지시의 발행 시각 ≥ 판 6의 적용 시각(`ledger_migrations.applied_at`, 같은 장부 시계). 판 6 기록이 없으면 맞지 않음 | `started_before_migration` |
-    | 사본 기록이 있으면 실행의 생성 시각과 시작 지시의 발행 시각이 모두 사본 기록의 가장 늦은 `taken_at`보다 늦다(대조가 끝난 뒤에도) | `created_before_snapshot` |
+    | 판 6의 적용 기록이 있고, 그 실행의 시작이 `starts_before_closure`(판 6을 적용할 때 이미 있던 시작 지시)에 없고, 시작 지시의 발행 시각 ≥ 판 6의 적용 시각(`ledger_migrations.applied_at`, 같은 장부 시계) | `started_before_migration` |
+    | 시작 지시에 고정된 예산(`instructions.budget_left`)이 있고 실행의 지금 남은 예산(`runs.budget_left`)과 같다(시작 뒤 `recordBudget`의 감액이 적히지 않았다) | `budget_reduced` |
+    | 사본 기록(`ledger_snapshots`)마다 경계(`snapshot_run_bounds`)가 있다. 판 6 전에 만든 사본의 기록에는 경계가 없어 그 장부에서는 이 조건이 맞지 않는다 | `snapshot_bound_unknown` |
+    | 실행의 `queue_seq`가 모든 사본의 경계보다 크고, 실행의 생성 시각과 시작 지시의 발행 시각이 모두 사본 기록의 가장 늦은 `taken_at`보다 늦다(대조가 끝난 뒤에도) | `created_before_snapshot` |
     | 송신 표식이 없거나 모두 이 장부 객체의 열기 ID다 | `sent_by_other_open` |
 
+    **판 이전의 시작과 사본 안의 실행은 시계와 무관한 값으로 가른다.** `starts_before_closure`는 판 6을 적용한 트랜잭션에서만 채워져 그 뒤로 늘지 않고, 사본의 경계는 사본을 봉한 그림의 `queue_seq` 최댓값이다(`queue_seq`는 새 실행마다 최댓값 + 1이고 실행 줄은 지우거나 순번을 고칠 수 없어 뒤로 가지 않는다). 그래서 같은 밀리초에 낸 판 5의 시작, 시계가 뒤로 간 사본 안의 실행도 막힌다. 같은 두 행의 시각 비교(적용 시각, 사본 시각)는 판정의 근거가 아니라 **더 막기만 하는 보조**다: 빼면 시계가 뒤로 간 장부에서 값으로는 판 이후·사본 뒤인 실행이 닫히게 되어 지금보다 닫히는 경우가 늘어난다. 그런 실행은 지금처럼 자리를 쥔다.
+    **예산 감액을 막는 이유:** 닫힌 `not_started`의 숫자는 같은 입력의 다음 실행의 상한에서 빠진다(`src/supervisor/scheduler/queue.ts`의 `budgetBar`). 시작 뒤에 감액이 적힌 실행을 닫으면 그 감액을 잊고 다음 실행이 원래 예산으로 시작한다. 그래서 감액이 적힌 실행은 자동으로 닫지 않는다(실제 토큰 소비와 무관하게 닫는 쪽으로 틀린다). 대기 중에 줄인 예산은 시작 지시에 그대로 고정되므로 막지 않는다.
+
   - **닫으면:** `unreceived_closures`에 근거 줄(앞 상태, 답의 낸 쪽·시각·받은 시각, 열기 ID, 닫은 시각)을 넣고 같은 트랜잭션에서 `not_started`로 옮긴다. 자리가 풀려 같은 종류의 새 실행이 시작된다. 같은 실행 ID는 다시 시작하지 않는다(`startRun`은 `queued`에서만, `not_started`는 끝 상태). `unansweredInstructions()`에도 더 나오지 않고 수명 판단(`nextIntent`)은 `wait`다.
-  - **DB 수준의 이중 확인:** 근거 표의 INSERT 트리거(`unreceived_closures_proven`)가 열기가 지금 객체의 것인지·건강·사본 보류·정지를 뺀 위 조건을 행으로 다시 본다(작업자, 앞 상태, 종료 확인 없음, 지정 실행기, 영수증·관측·점유 0줄, 시작 지시가 있고 모든 시작의 발행 + 30000 ≤ 답의 시각, 근거 줄의 열기가 아닌 표식 없음, 판 6 기록과 그 뒤의 시작, 사본 시각 뒤의 생성·시작). 그래서 코드의 검사가 빠져도 받은 흔적이 있는 실행은 닫히지 않는다(`invariant_violation`). 상태 트리거(`runs_not_started_needs_closure`)는 근거 줄 없이 `queued` 밖에서 `not_started`로 가는 모든 갱신을 막는다. 대기 실행의 취소(`queued → not_started`)는 그대로다.
-  - **D-90의 글자보다 좁힌 것(자동으로 닫지 않고 지금대로 자리를 쥔다. 관리자 닫기 D-91로 간다):** 실은 뒤 감독이 다시 뜬 실행(다른 열기의 표식), 사본에서 되살린 장부의 옛 실행, 판 6 이전에 시작한 실행. 장부 쪽 관측 공백(재시작·저장 실패·읽기 실패)을 걸친 실행을 빼는 장치가 이 셋이다: 같은 열기의 표식만 있고 장부가 건강하면 그 열기는 연 뒤로 관측을 잃은 적이 없다(쓰기·읽기가 한 번 실패하면 다시 열 때까지 `start` 모드가 거절된다).
+  - **누가 무엇을 확인하는가:**
+    - **부르는 쪽이 보증하는 것:** 넘긴 `runs`가 그 실행기가 쥔 전부(그 연결의 검증된 `hello`)라는 것, `answeredAt`이 그 봉투의 서명된 `issued_at`이라는 것. 장부는 받은 목록이 전체 답인지, 진짜인지 가르지 못한다.
+    - **코드(`closeUnreceivedRun`)가 확인하는 것:** 위 표의 조건 전부. 이 가운데 아래 SQL이 보지 않는 것은 코드만 본다: 받은 목록에 그 실행이 없음(세대를 불문하고 같은 ID, `not_known`으로 실린 것 포함), 시작 지시가 정확히 하나, 접수 허가, 열기 ID가 지금 장부 객체의 것, 장부가 건강함, 사본 보류가 아님, 정지 기록이 있고 정지가 아님.
+    - **SQL(근거 표의 INSERT 트리거 `unreceived_closures_proven`)이 코드 없이도 막는 것:** 이미 근거가 있음, 작업자가 아님, 지금 상태가 근거 줄의 앞 상태가 아니거나 `preparing`·`unknown_running`이 아님, 종료 확인이 있음, 답을 낸 쪽이 지정 실행기가 아님, 영수증·보고·양성 관측·점유 관측이 한 줄이라도 있음, 시작 지시(`task_start`)가 없음, 답의 시각이 어느 시작 지시의 발행 + 30000보다 이름, 시작 지시의 예산과 지금 남은 예산이 다름(`IS NOT`이라 판 4 전의 빈 칸도 다름), 근거 줄의 열기가 아닌 열기의 표식이 있음, 그 실행의 시작이 `starts_before_closure`에 있음, 판 6 기록이 없거나 그보다 이른 발행, 경계 없는 사본 기록이 있음, 사본의 경계 이하의 순번, 사본 시각 이하의 생성·발행. 근거 줄에는 답의 목록이 없어 SQL은 "그 답에 이 실행이 없다"를 보지 않는다. 시작 지시의 개수도 보지 않는다. 그래서 코드의 검사가 빠져도 받은 흔적·판 이전의 시작·사본 안의 실행·감액이 있는 실행은 닫히지 않지만(`invariant_violation`), 원 SQL로 유효한 행 조건만 맞춘 근거 줄은 들어간다. 상태 트리거(`runs_not_started_needs_closure`)는 근거 줄 없이 `queued` 밖에서 `not_started`로 가는 모든 갱신을 막는다. 대기 실행의 취소(`queued → not_started`)는 그대로다. 근거 줄과 상태 갱신을 한 커밋으로 묶고 그 사이 다른 쓰기를 막는 것은 공개 연산의 `immediate` 트랜잭션이다.
+  - **D-90의 글자보다 좁힌 것(자동으로 닫지 않고 지금대로 자리를 쥔다. 관리자 닫기 D-91로 간다):**
+    - **다른 열기의 표식이 있는 실행:** 실은 뒤 감독이 다시 뜬 실행, 그리고 표식을 커밋한 직후 실제로 싣기 전에 감독이 죽은 실행(실제로는 실리지 않았어도)이다.
+    - **사본의 경계 안의 실행, 경계를 모르는 사본 기록이 있는 장부의 모든 실행:** 사본에서 되살린 장부의 옛 실행은 영수증 0이 거짓일 수 있고, 전체 답은 실행기가 이미 끝낸 실행을 싣지 않는다. 판 6 전에 만든 사본에서 뜬 장부는 어느 실행이 사본에 있었는지 몰라 그 장부에서는 자동으로 닫지 않는다.
+    - **판 6을 적용할 때 이미 있던 시작:** 표식이 없던 판에서 실렸을 수 있다(적용과 같은 밀리초에 낸 시작 포함).
+    - **시작 뒤 예산 감액이 적힌 실행:** 닫으면 그 감액이 다음 실행의 상한에서 빠진다.
+    - **시계가 뒤로 간 장부에서 사본 시각·적용 시각 이하로 적힌 실행:** 값으로는 닫을 수 있어도 보조 시각 비교가 막는다(위 "판 이전의 시작과 사본 안의 실행").
+
+    장부 쪽 관측 공백(재시작·저장 실패·읽기 실패)을 걸친 실행을 빼는 장치가 앞의 셋이다: 같은 열기의 표식만 있고 장부가 건강하면 그 열기는 연 뒤로 관측을 잃은 적이 없다(쓰기·읽기가 한 번 실패하면 다시 열 때까지 `start` 모드가 거절된다).
   - **닫힌 실행에 늦게 온 것(닫기 근거가 있는 `not_started`에만. 대기에서 취소돼 `not_started`가 된 실행은 지금 동작 그대로다):**
 
     | 늦게 온 것 | 처리 |
@@ -159,8 +175,8 @@
     | `receipt_started` | 받은 기록을 남기고 ack, 답에 `alarm: "closed_run_started"`를 싣고, `slot_holds`에 `why = 'ended_in_ledger'`, `holds_slot = 1`로 그 종류의 자리를 다시 막는다(같은 트랜잭션). 같은 영수증의 재전송(`duplicate`)에도 경보를 싣는다. 막은 자리는 `clearSlotHold`로만 풀린다 |
     | 결과·훅·세션 깨짐 보고 | 적고 ack하되 반영하지 않는다: 적자마자 마친 것으로 두고(`applied_at` = 받은 시각) 실행 줄은 그대로다. `pendingReports()`와 복원 3단계에 나오지 않는다 |
 
-    대기에서 취소된 `not_started`는 지금처럼 `receipt_stopped`·결과 보고가 `transition_denied`(ack 없음), 접수 영수증은 `accepted_receipt_id`를 채우고 ack, 경보 없음이다. 판을 그 앞에서 끊어 연 장부(시험용 길)에는 근거 표가 없어 늦은 영수증은 모두 지금 동작이다.
-  - **다음 판(D-91 관리자 닫기)이 더하기만 해서 쓰는 꼴:** 원인별로 표를 나눴고(이 판은 D-90의 표 하나), 모든 칸이 `NOT NULL`이고, 늘어날 수 있는 집합(닫을 수 있는 앞 상태)은 CHECK가 아니라 트리거에 있다. 다음 판은 자기 근거 표(관리자 닫기)와 전이 한 줄(`('worker', 'stopping', 'not_started')`)을 더하고, `runs_not_started_needs_closure`를 `DROP` 뒤 "두 근거 표 가운데 하나에 같은 앞 상태의 줄이 있으면"으로 다시 `CREATE`한다. 이 판의 표·칸·다른 트리거는 바꾸지 않는다. 늦은 영수증의 처리는 `ledger.ts`의 `#closedAfterStart` 한 자리에 그 표를 더하면 같이 쓴다.
+    대기에서 취소된 `not_started`는 지금처럼 `receipt_stopped`·결과 보고가 `transition_denied`(ack 없음), 접수 영수증은 `accepted_receipt_id`를 채우고 ack, 경보 없음이다. 위 표의 영수증 처리는 그 실행 자신의 세 영수증(`receipt_accepted`·`receipt_stopped`·`receipt_started`)에만 건다. 닫힌 작업자를 앞 실행으로 가리키는 세션 인수 영수증(`receipt_session_takeover`)은 원래 분기의 종류 검사에서 `invariant_violation`이고 아무것도 적지 않는다(닫히지 않은 작업자와 같다). 판을 그 앞에서 끊어 연 장부(시험용 길)에는 근거 표가 없어 늦은 영수증은 모두 지금 동작이다.
+  - **다음 판(D-91 관리자 닫기)이 더하기만 해서 쓰는 꼴:** 원인별로 표를 나눴고(이 판은 D-90의 표 하나), 모든 칸이 `NOT NULL`이고, 늘어날 수 있는 집합(닫을 수 있는 앞 상태)은 CHECK가 아니라 트리거에 있다. 다음 판은 자기 근거 표(관리자 닫기)와 전이 한 줄(`('worker', 'stopping', 'not_started')`)을 더하고, `runs_not_started_needs_closure`를 `DROP` 뒤 "두 근거 표 가운데 하나에 같은 앞 상태의 줄이 있으면"으로 다시 `CREATE`한다. 이 판의 표 다섯(`start_dispatches`·`starts_before_closure`·`snapshot_run_bounds`·`unreceived_closures`, 전이 줄)·칸·다른 트리거는 바꾸지 않는다. 판 6을 올린 장부에 그 모양의 판 7(관리자 근거 표, 전이 한 줄, 상태 트리거 다시 만들기)을 판 목록에 더해 열어 본 결과, 판 6이 만든 표·트리거의 정의는 그대로였고, 근거 없는 `stopping → not_started`는 막히고 관리자 근거 뒤에는 되었으며, D-90 닫기도 그대로 되었다. 늦은 영수증의 처리는 `ledger.ts`의 `#closedAfterStart` 한 자리에 그 표를 더하면 같이 쓴다. 다만 D-90 닫기의 늦은 시작 영수증 처리는 "닫을 때 받은 기록 0줄"에 기대므로(재전송에도 경보), 닫기 전에 시작 영수증을 받았을 수 있는 관리자 닫기에 그대로 쓰려면 그 판이 이 분기를 다시 본다.
 - **슬롯:** 작업자 하나, 세션 하나(부분 유일 인덱스). `queued`·`finalized`·`not_started` 밖은 모두 자리를 쥔다. 그래서 `unknown_running`·`cleanup_pending`이 있으면 새 실행은 `slot_busy`다. 슬롯을 막는 관측(`holds_slot`)이 있는 종류도 `slot_busy`다.
 - **점유 관측:** "이 슬롯이 사용 중"과 "이 실행 ID는 이미 쓰였다"를 따로 둔다. 끝났다고 답한 대기 줄과 장부 밖 실행은 슬롯을 막지 않고 그 실행 ID만 막으므로 관계없는 다른 일은 시작한다. `clearSlotHold({ executorId, runId, runGeneration, observation })`은 확인한 그 세대와 번호의 줄의 **슬롯만 돌려준다.** 줄은 남고 그 실행 ID는 영영 시작하지 못한다(`run_blocked`, 나중에 같은 ID를 접수해도 같다). 다시 할 일은 새 실행 ID를 받는다. 옛 세대의 종료 확인이나 다시 관측되기 전의 확인은 `reference_mismatch`이고 지금의 차단은 그대로다. `slotHolds()`는 슬롯을 막고 있는 관측만 낸다. 자동으로 푸는 경로는 없다.
 - **정지:** 0도 줄로 적는다. 낮은 세대로 덮지 않는다(코드와 트리거 둘 다, 트리거는 UPDATE·UPSERT·INSERT OR REPLACE·DELETE 모두). `applyStop`은 합치기다: 이미 정지면 세대가 높아도 정지로 남고, 확인 단계를 생략하면 같은 세대에서는 이미 적은 단계를 남긴다(새 세대는 `none`). 일반 기록으로는 정지가 풀리지 않는다. 푸는 연산은 관리자 풀기의 `releaseStop({ generation })` 하나이고 같은 세대만 푼다(권위의 더 높은 해제는 `mergeStop`이 사실로 적지만 접수는 복원을 다시 마칠 때까지 닫혀 있다).
@@ -342,7 +358,7 @@ v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느
 
 `ledger.createSnapshot({ path, maxBytes })`가 지금까지 커밋된 장부의 사본 파일 하나를 만든다. 원본에는 아무것도 적지 않는다. 성공하면 `snapshotId`, `ledgerId`, `takenAt`, `path`, `bytes`, `sha256`, `blockedMs`를 돌려준다.
 
-**방법.** 장부를 쥔 연결의 `serialize()`로 커밋된 그림을 메모리에 받고, 그 그림을 메모리 DB로 열어 사본 기록을 넣은 뒤, 그 바이트를 임시 이름에 쓰고 fsync하고 `link`로 최종 이름을 붙인다. 사본 기록이 없는 온전한 장부가 디스크에 놓이는 순간이 없다. 다른 연결은 `locking_mode=EXCLUSIVE`인 장부를 읽지도 못하므로(`SQLITE_BUSY`) 장부를 쥔 연결이 만들어야 한다.
+**방법.** 장부를 쥔 연결의 `serialize()`로 커밋된 그림을 메모리에 받고, 그 그림을 메모리 DB로 열어 사본 기록을 넣은 뒤(판 6부터는 같은 그림에 사본의 경계 `snapshot_run_bounds`(그 그림의 `runs.queue_seq` 최댓값)도 넣는다. 들어가지 않으면 `snapshot_unsupported`), 그 바이트를 임시 이름에 쓰고 fsync하고 `link`로 최종 이름을 붙인다. 사본 기록이 없는 온전한 장부가 디스크에 놓이는 순간이 없다. 다른 연결은 `locking_mode=EXCLUSIVE`인 장부를 읽지도 못하므로(`SQLITE_BUSY`) 장부를 쥔 연결이 만들어야 한다.
 
 **버린 방법.** 파일 복사는 살아 있는 장부의 FD를 열었다 닫아 잠금을 푼다. `VACUUM INTO`는 이미 있는 빈 파일을 덮고 끊어진 링크를 따라가며, 끝난 파일에 사본 기록을 넣기 전까지 원본과 구별되지 않는 파일이 디스크에 남는다. 온라인 백업 API는 `bun:sqlite`에 없다.
 
@@ -353,7 +369,7 @@ v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느
 | `too_large` | 장부나 사본이 `maxBytes`보다 크다 |
 | `in_transaction` | 열린 트랜잭션 안에서 불렀다. 그 연결의 그림에는 커밋되지 않은 페이지가 보인다 |
 | `snapshot_hold` | 대조가 끝나지 않은 장부다. 사본의 출처가 흐려지므로 만들지 않는다 |
-| `snapshot_unsupported` | 호출자가 넘긴 판 목록이 사본을 지원하지 않는다: 사본 기록의 표가 없거나, 사본 기록이 최신 미대조 기록으로 들어가지 않거나, 판이 사본 표식의 칸(`user_version`)을 쓴다 |
+| `snapshot_unsupported` | 호출자가 넘긴 판 목록이 사본을 지원하지 않는다: 사본 기록의 표가 없거나, 사본 기록이 최신 미대조 기록으로 들어가지 않거나, 경계의 표가 있는데 경계가 들어가지 않거나, 판이 사본 표식의 칸(`user_version`)을 쓴다 |
 | `ledger_unwritable` | 장부가 닫혔거나 실패했거나, 시계를 읽지 못했거나 그 값을 믿을 수 없다 |
 | `io` | 사본 파일을 쓰지 못했다. 장부는 계속 쓸 수 있고 임시 파일은 지운다 |
 
@@ -475,10 +491,11 @@ v1의 인수 영수증과 규칙 확인에는 다음 실행 ID가 없어, 어느
   - **`deferred`면 같은 ID를 다시 조회한다.** 보류한 실행은 그대로 `preparing`·`running`이다. 시작 영수증이 오면 정상으로 이어지고, 시작 발행 + `RUN_LEASE_MAX_MS` 뒤에 만든 `not_known`이 오면 옮긴다.
   - **자리를 푸는 근거로 쓰지 않는다.** 옮긴 실행은 자리를 쥔 `unknown_running`이고, 답이 돌려준 `outsideLedger`의 세대는 닫는 지시에만 쓴다. 운영 중 `queued` 실행의 양성 관측은 시작을 막지 않는다(복원의 `slot_holds`와 뜻이 다르다). 끊김으로 이미 `unknown_running`이 된 실행은 D-92대로 갱신하지 않고, 종료·정리 뒤 필요하면 새 실행 ID로 맡긴다(누가 언제 다시 맡기는지는 관리자 미결정).
 - **D-90의 닫기를 부르는 쪽(판 6의 `markStartDispatch`·`closeUnreceivedRun`, 부르는 감독 코드는 아직 없다)이 지킬 것:**
-  - **시작 봉투는 표식 뒤에만 싣는다.** `task_start`를 내보내는 모든 길은 같은 장부 객체의 `markStartDispatch`가 `ok`인 뒤에만 싣고, 거절·실패면 싣지 않는다. 싣는 곳이 하나뿐인지는 그 조각의 정적 시험이 지킨다.
-  - **후보를 고르는 것은 부르는 쪽이다.** 시한이 지난 시작(`unansweredInstructions()`의 시작 항목)의 실행기에서 그 시한 뒤에 만든 검증된 `hello`를 받으면 그 답의 `runs`·`issued_at`·받은 시각을 그대로 넘긴다. 부분 답(`status_report`)·`outsideLedger`·다른 연결의 답은 넘기지 않는다. 같은 답은 `applyExecutorAnswer({ coverage: "full" })`에도 넘겨 양성 관측을 남긴다(닫기보다 먼저).
-  - **거절은 그대로 둔다.** 거절된 실행은 자리를 쥔 채이고, 장부의 거절을 우회해 자리를 풀지 않는다. 다른 열기의 표식·사본 출신·판 이전 실행은 관리자 닫기(D-91)로 간다.
-  - **경보를 밖으로 낸다.** `applyReceipt`의 답에 `alarm: "closed_run_started"`가 있으면 ack와 별도로 관리자에게 알린다(지금 영수증 처리기는 이 칸을 넘기지 않는다). 자리는 장부가 이미 다시 막았다.
+  - **시작 봉투는 표식 뒤에만 싣는다.** 모든 최초 송신과 재전송은 같은 장부 객체의 `markStartDispatch`가 성공(`ok`)한 직후에만 `task_start`를 내보낸다. 표식이 거절·실패하면 보내지 않는다. 실제로 보내는 지점이 하나뿐임을 그 조각의 정적 시험으로 고정한다.
+  - **후보를 고르는 것은 부르는 쪽이고, 넘기는 답은 그 연결의 검증된 `hello` 원본이다.** 시한이 지난 시작(`unansweredInstructions()`의 시작 항목)의 실행기에서 그 시한 뒤에 만든 검증된 `hello`를 받으면 그 원본의 `sender`·`runs`·`issued_at`·받은 시각을 함께 넘긴다. 양성 답은 받은 순서대로 보존하고, 같은 전체 답을 `applyExecutorAnswer({ coverage: "full" })`에 닫기보다 먼저 반영한다. 부분 답(`status_report`)·오래된(대체된) 연결의 답·`outsideLedger`를 빈 전체 답으로 바꿔 넘기지 않는다. 실행기가 자기 기록만 잃고 프로세스가 남은 경우(R1)는 장부가 막지 못한다: 실행기 저장소의 유실 감사와 프로세스 생존 보증의 몫이다.
+  - **거절이면 지금 상태를 유지한다.** 거절된 실행은 자리를 쥔 채이고, 장부의 거절을 우회해 자리를 풀지 않는다. `unknown_running`의 임대는 되살리지 않는다(D-92). 다른 열기의 표식·사본 안·경계 모름·판 이전·예산 감액으로 거절된 실행은 관리자 닫기(D-91)로 간다. D-91은 관리자가 종료 근거를 확인한 뒤 별도 표에 적는다. D-91에서는 닫기 전에 이미 받은 시작 영수증의 재전송이 올 수 있으므로, "D-90 닫기 당시 받은 기록 0줄"에 기대는 중복 경보 분기(재전송에도 경보)를 그 판이 다시 본다.
+  - **경보를 밖으로 낸다.** `applyReceipt`의 답에 `alarm: "closed_run_started"`가 있으면 ack와 별도로 관리자에게 전달한다(지금 영수증 처리기는 이 칸을 넘기지 않는다). 재전송(`duplicate`)의 경보도 처리한다. 자리는 장부가 이미 다시 막았고, `clearSlotHold`는 같은 관측 번호에 대한 종료 확인 뒤에만 쓴다. 운영 중 양성 답만 먼저 온 때의 대응은 아래 "닫힌 실행이 아직 돈다는 운영 답"과 함께 정한다.
+  - **닫힌 실행이 아직 돈다는 운영 답은 관측만 남는다(경보 없음).** 닫은 뒤 지정 실행기가 같은 ID·세대를 `running`으로 답해도(`full`·`partial` 모두) `applyExecutorAnswer`는 `ok`에 `moved`·`deferred`·`outsideLedger`가 비고 경보가 없다. 양성 관측 한 줄만 남고 점유는 적지 않아 다음 시작은 된다. 이 연산은 본래 상태 관측이고 이 판이 보장한 경보 입력은 늦은 시작 영수증뿐이다. 닫힌 실행의 양성 관측을 감지해 점유·관리자 경보로 이을지는 뒤 조각이 정한다.
 - **D-90의 닫기(판 6)가 판 5에서 이어받은 조건:** 양성 관측은 판 5부터 쌓인다. 판 5 전에 받은 답은 표에 없으므로 그 전에 시작한 실행에는 "관측 없음"이 "안다고 한 적 없음"의 증거가 아니다(판 5를 적용하기 전에 받은 답은 어디에도 적히지 않았다. 감독은 배포된 적이 없어 지금 이런 실행은 없다). 닫는 트랜잭션 안에서 `run_sightings`에 그 실행의 줄이 하나도 없음과 그 실행의 영수증·보고가 없음을 다시 본다(`hasRunSighting`의 읽은 값을 넘겨받지 않는다). `full` 답이 그 실행을 빼먹은 것은 이 표에 남지 않으므로(관측은 `not_known` 밖만 적는다) 닫는 근거는 그 조각이 따로 남긴다. 표의 칸·트리거는 바꾸지 않고 쓴다(이관은 병합 뒤 고칠 수 없다. 필요한 표나 칸은 그 조각의 이관이 더한다).
   - **0행만으로 판정하지 않는다.** 0행은 저장에 실패한 관측이 없었을 때만 "본 적 없음"이다. 양성 관측의 저장에 실패한 뒤 프로세스가 다시 떠 원래 답을 다시 넘길 수 없으면 0행이 거짓이 된다. 같은 복원기 객체에서도 양성 답을 받은 뒤 2단계의 실행 목록 읽기가 실패하면 그 답은 붙들리지 않고 사라져 0행이 거짓이 된다. 그 조각은 이 공백(저장 실패, 읽기 실패, 재시작)을 걸친 실행을 자동 해제에서 빼는 조건을 스스로 갖춘다. 판 5 전의 실행, 사본에서 되살린 뒤 확인할 수 없는 기간도 같다.
   - **증거를 한 번에 본다.** 지정 실행기·세대, 영수증·보고 0, 양성 관측 0(위 조건을 갖춘 이력), 시작 재송신 중단, 실행기 시계로 시작 발행 + 30000ms 이후에 만든 전체 답에 그 실행이 없음을 같은 트랜잭션에서 확인하고 닫은 근거를 같은 커밋에 남긴다. 부분 답·`outsideLedger`·읽기 실패에는 해제 권한이 없다.

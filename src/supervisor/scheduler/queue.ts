@@ -133,8 +133,9 @@ function budgetBar(view: SchedulerView, run: SchedulerRun): HoldReason | null {
   // 모름보다 먼저 본다.
   if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
   if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
-  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. not_started 행은 뺀다: 장부의 전이 표에서
-  // not_started로 가는 길은 queued뿐이라 그 숫자는 시작하지 않은 줄의 배정액이고 쓰고 남긴 잔액이 아니다. 시험이 표를 읽어
+  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. not_started 행은 뺀다: 장부에서 not_started로 가는 길은
+  // queued에서, 또는 닫기 근거가 있을 때(D-90)뿐이다. queued에서 닫힌 줄의 숫자는 시작하지 않은 줄의 배정액이고, D-90으로 닫힌 줄은
+  // 장부가 시작 지시에 고정된 예산에서 감액이 적히지 않았을 때만 닫으므로 그 숫자도 쓰고 남긴 잔액이 아니다. 시험이 표를 읽어
   // 이 전제를 지킨다. 잔액 0의 not_started는 위의 소진 검사가 이미 막는다.
   const bounds = others.filter((other) => other.state !== "not_started" && (other.queueSeq < run.queueSeq || other.state !== "queued"));
   if (bounds.some((other) => run.budgetLeft > other.budgetLeft)) return "budget_replenished";

@@ -106,6 +106,8 @@ export const REFUSALS = [
   "run_sighted",
   "sent_by_other_open",
   "started_before_migration",
+  "budget_reduced",
+  "snapshot_bound_unknown",
   "created_before_snapshot",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
@@ -1354,6 +1356,8 @@ const COVERAGES = ["full", "partial"] as const;
 
 // D-90 닫기가 받는 앞 상태(작업자). 전이표의 두 줄(preparing·unknown_running → not_started)과 같다.
 const UNRECEIVED_CLOSABLE: readonly LedgerRunState[] = ["preparing", "unknown_running"];
+// 닫기 근거가 있는 not_started 실행에 늦게 와도 ack하는 영수증(계약의 실행기 영수증 셋). 나머지 동작은 닫힌 실행에도 원래 분기를 탄다.
+const CLOSED_RUN_RECEIPTS: readonly ReceiptInput["action"][] = ["receipt_accepted", "receipt_stopped", "receipt_started"];
 // 실행기가 그 시작을 더는 받지도 띄우지도 못하는 때까지의 길이(시작 지시의 발행 시각부터, 실행기 시계). 실행기는 봉투 시한
 // (발행 + MESSAGE_TTL_MAX_MS) 뒤로는 시작을 받지 않고, 발행 + RUN_LEASE_MAX_MS부터는(정각 포함) 준비·자격·spawn 직전에 멈춘다.
 // v1에서 둘 다 30000ms이고, 하나가 커져도 닫는 쪽으로 틀리지 않게 큰 쪽을 쓴다. 이관 0006의 트리거에 같은 값(30000)이 숫자로 있다(시험이 대조한다).
@@ -2556,9 +2560,12 @@ export class Ledger {
   // 새 일을 여는 전제(쓰기 모드 start: 못 씀·사본 보류·정지 기록 없음·정지·접수 닫힘) → 실행 있음(unknown_run) → 작업자이고 preparing·
   // unknown_running이고 종료 확인 없음(transition_denied) → 시작 지시가 하나(unknown_instruction) → 답을 낸 쪽이 지정 실행기(sender_mismatch) →
   // 답의 시각을 앎(answer_time_unknown) → 답의 시각 >= 시작 발행 + 시한(answer_too_early) → 그 답에 이 실행이 없음(run_in_answer) →
-  // 영수증·보고 0(receipt_seen) → 양성 관측 0(run_sighted) → 점유 관측 0(run_blocked) → 이 판의 적용 뒤에 시작(started_before_migration) →
-  // 사본 시각 뒤에 만들고 시작(created_before_snapshot) → 송신 표식이 없거나 모두 이 열기의 것(sent_by_other_open).
-  // 닫으면 근거 줄과 not_started가 한 커밋이다. 근거 줄의 INSERT 트리거가 시각·열기·사본·판 밖의 행 조건을 다시 본다.
+  // 영수증·보고 0(receipt_seen) → 양성 관측 0(run_sighted) → 점유 관측 0(run_blocked) → 이 판을 적용한 뒤에 낸 시작(started_before_migration) →
+  // 시작 뒤 적힌 예산 감액 없음(budget_reduced) → 사본 기록마다 경계가 있음(snapshot_bound_unknown) → 사본에 없던 실행(created_before_snapshot) →
+  // 송신 표식이 없거나 모두 이 열기의 것(sent_by_other_open).
+  // 판 이전의 시작과 사본 안의 실행은 시계와 무관한 값(starts_before_closure, 사본 경계의 queue_seq)으로 가른다. 함께 보는 시각의 비교
+  // (적용 시각, 사본 시각)는 시계가 뒤로 간 장부에서 더 막기만 한다: 빼면 그런 장부에서 닫히는 경우가 늘어난다.
+  // 닫으면 근거 줄과 not_started가 한 커밋이다. 근거 줄의 INSERT 트리거가 행으로 볼 수 있는 조건을 다시 본다(이관 0006의 주석).
   closeUnreceivedRun(input: UnreceivedClosureInput, from: { sender: string }): { ok: true; run: Run } | Refused {
     const v = exact(input, ["runId", "runs", "answeredAt", "receivedAt", "now"], "closeUnreceivedRun");
     const runId = str(v.runId, UUID, "runId");
@@ -2571,9 +2578,13 @@ export class Ledger {
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
       if (row.kind !== "worker" || !UNRECEIVED_CLOSABLE.includes(row.state) || row.stop_receipt_id !== null) throw new Refuse("transition_denied");
-      const starts = this.#db.query("SELECT issued_at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'session_start')").all(runId) as { issued_at: number }[];
+      const starts = this.#db.query("SELECT request_id, issued_at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'session_start')").all(runId) as {
+        request_id: string;
+        issued_at: number;
+      }[];
       if (starts.length !== 1) throw new Refuse("unknown_instruction");
-      const issuedAt = safe((starts[0] as { issued_at: number }).issued_at, "instructions.issued_at");
+      const start = starts[0] as { request_id: string; issued_at: number };
+      const issuedAt = safe(start.issued_at, "instructions.issued_at");
       if (row.executor_id !== sender) throw new Refuse("sender_mismatch");
       if (answeredAt === null) throw new Refuse("answer_time_unknown");
       if (answeredAt < issuedAt + START_UNREACHABLE_MS) throw new Refuse("answer_too_early");
@@ -2581,9 +2592,22 @@ export class Ledger {
       if (this.#db.query("SELECT 1 AS x FROM deliveries WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("receipt_seen");
       if (this.#db.query("SELECT 1 AS x FROM run_sightings WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("run_sighted");
       if (this.#db.query("SELECT 1 AS x FROM slot_holds WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("run_blocked");
+      // 판 6의 기록이 없는 장부(판 목록을 그 앞에서 끊어 연 시험용 길)에는 아래 표·칸이 없다. 그 확인이 먼저다.
       const migration = this.#db.query("SELECT applied_at FROM ledger_migrations WHERE version = ? AND name = ?").get(UNRECEIVED_CLOSURE_VERSION, UNRECEIVED_CLOSURE_FILE) as { applied_at: number } | null;
-      if (migration === null || issuedAt < safe(migration.applied_at, "ledger_migrations.applied_at")) throw new Refuse("started_before_migration");
+      if (migration === null) throw new Refuse("started_before_migration");
+      if (this.#db.query("SELECT 1 AS x FROM starts_before_closure WHERE run_id = ? LIMIT 1").get(runId) !== null) throw new Refuse("started_before_migration");
+      if (issuedAt < safe(migration.applied_at, "ledger_migrations.applied_at")) throw new Refuse("started_before_migration");
+      // 시작 지시에 고정된 예산과 지금 남은 예산이 다르면 시작 뒤 감액이 적힌 실행이다. 닫으면 not_started의 숫자는 다음 실행의
+      // 상한에서 빠지므로(scheduler/queue.ts의 budgetBar) 그 감액을 잊는다. 판 4 전의 시작 지시는 칸이 비어(null) 같은지 모른다.
+      const fixed = this.#db.query("SELECT budget_left FROM instructions WHERE request_id = ?").get(start.request_id) as { budget_left: number | null };
+      if (fixed.budget_left === null || safe(fixed.budget_left, "instructions.budget_left") !== row.budget_left) throw new Refuse("budget_reduced");
       if (this.#snapshots) {
+        // 경계가 없는 사본 기록(판 6 전에 만든 사본)이 하나라도 있으면 그 사본에 어느 실행이 들어 있었는지 모른다.
+        if (this.#db.query("SELECT 1 AS x FROM ledger_snapshots p WHERE NOT EXISTS (SELECT 1 FROM snapshot_run_bounds b WHERE b.snapshot_id = p.snapshot_id) LIMIT 1").get() !== null) {
+          throw new Refuse("snapshot_bound_unknown");
+        }
+        const bound = this.#db.query("SELECT MAX(queue_seq_bound) AS seq FROM snapshot_run_bounds").get() as { seq: number | null };
+        if (bound.seq !== null && row.queue_seq <= safe(bound.seq, "snapshot_run_bounds.queue_seq_bound")) throw new Refuse("created_before_snapshot");
         const taken = this.#db.query("SELECT MAX(taken_at) AS at FROM ledger_snapshots").get() as { at: number | null };
         const takenAt = taken.at === null ? null : safe(taken.at, "ledger_snapshots.taken_at");
         if (takenAt !== null && (row.created_at <= takenAt || issuedAt <= takenAt)) throw new Refuse("created_before_snapshot");
@@ -2712,7 +2736,12 @@ export class Ledger {
   holdSlots(key: symbol, observations: readonly SlotHoldObservation[], now: number): { ok: true; holds: SlotHold[] } | Refused {
     if (key !== RESTORE_KEY) throw new TypeError("점유 차단은 재시작 복원만 적는다");
     const when = time(now, "now");
-    return this.#write("slot_hold", "continue", () => ({ ok: true as const, holds: observations.map((seen) => this.#hold(seen, when)) }));
+    return this.#write("slot_hold", "continue", () => {
+      // for…of는 배열의 빈 자리도 undefined로 돌아 #hold에서 던지고 거래 전체가 되돌아간다. map은 빈 자리를 건너뛰어 일부만 적고 성공을 낸다.
+      const holds: SlotHold[] = [];
+      for (const seen of observations) holds.push(this.#hold(seen, when));
+      return { ok: true as const, holds };
+    });
   }
 
   // 점유 관측 하나를 적는 자리(holdSlots, 닫힌 실행의 늦은 시작 영수증). 같은 (실행기, 실행, 세대)의 줄은 새 번호로 바꿔 적고,
@@ -2855,8 +2884,10 @@ export class Ledger {
   #effect(row: RunRow, r: ReceiptInput, from: EnvelopeFrom): void {
     // 닫기 근거가 있는 not_started 실행에 늦게 온 영수증: 받은 기록(위의 deliveries 줄)만 남기고 상태·증거 칸은 바꾸지 않는다(되살리지 않는다).
     // 접수·종료 영수증은 띄운 것이 없다는 말이라 ack만 받는다. 시작 영수증은 그 실행이 실제로 떴다는 말이라 그 종류의 자리를 다시 막는다:
-    // 자리를 푼 뒤 같은 종류의 다른 실행이 시작됐을 수 있다(겹침). 막은 줄은 clearSlotHold로만 풀린다. 정리 영수증은 확정 지시가 없어 오기 전에 거절된다.
-    if (this.#closedAfterStart(row)) {
+    // 자리를 푼 뒤 같은 종류의 다른 실행이 시작됐을 수 있다(겹침). 막은 줄은 clearSlotHold로만 풀린다.
+    // 이 처리는 그 실행 자신의 세 영수증에만 건다. 세션 인수 영수증은 닫힌 작업자를 앞 실행으로 가리켜도 아래의 종류 검사로 가야 하고,
+    // 정리 영수증은 닫힌 실행에 확정 지시가 없어 여기 오기 전에 거절된다.
+    if (CLOSED_RUN_RECEIPTS.includes(r.action) && this.#closedAfterStart(row)) {
       if (r.action === "receipt_started") this.#hold({ executorId: row.executor_id, runId: row.run_id, kind: row.kind, runGeneration: row.run_generation, holdsSlot: true, why: "ended_in_ledger" }, r.now);
       return;
     }
