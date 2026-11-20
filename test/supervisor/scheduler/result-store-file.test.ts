@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Result, resultDigest } from "../../../src/contract/v1/index.ts";
@@ -95,11 +95,19 @@ class SpyPort implements FilePort {
   shortWrites = false;
   // read가 이 바이트 수 뒤부터 0을 내는 포트(읽는 사이 잘림).
   readCap: number | null = null;
+  // write·read가 1바이트만 처리하고 요청한 길이보다 1 큰 개수를 돌려주는 고장 난 포트.
+  overCount = false;
+  // 폴더의 fsync만 이 코드로 계속 실패시킨다. 파일의 fsync는 그대로다.
+  dirFsyncFault: string | null = null;
+  readonly dirSyncs = { tried: 0, done: 0 };
+  // 이 경로의 unlink를 EACCES로 계속 실패시킨다.
+  denyUnlink: ((path: string) => boolean) | null = null;
   beforeWrite: (() => void) | null = null;
   beforeFsync: (() => void) | null = null;
   beforeLink: ((from: string, to: string) => void) | null = null;
   mapLstat: ((path: string, stat: FileStat) => FileStat) | null = null;
   readonly #count = new Map<Op, number>();
+  readonly #dirFds = new Set<number>();
 
   // 그 연산의 다음 호출에서 던진다(앞선 호출의 수를 세지 않아도 되게).
   failNext(op: Op, code: string, after = 0): void {
@@ -114,15 +122,19 @@ class SpyPort implements FilePort {
   }
   open(path: string, flags: number, mode?: number) {
     this.#hit("open");
-    return nodeFilePort.open(path, flags, mode);
+    const fd = nodeFilePort.open(path, flags, mode);
+    if ((flags & constants.O_DIRECTORY) !== 0) this.#dirFds.add(fd);
+    return fd;
   }
   write(fd: number, bytes: Uint8Array, offset: number, length: number) {
     this.#hit("write");
     this.beforeWrite?.();
+    if (this.overCount) return nodeFilePort.write(fd, bytes, offset, Math.min(1, length)) + length;
     return nodeFilePort.write(fd, bytes, offset, this.shortWrites ? Math.max(1, Math.floor(length / 2)) : length);
   }
   read(fd: number, bytes: Uint8Array, offset: number, length: number, position: number) {
     this.#hit("read");
+    if (this.overCount) return nodeFilePort.read(fd, bytes, offset, Math.min(1, length), position) + length;
     if (this.readCap !== null) {
       if (position >= this.readCap) return 0;
       return nodeFilePort.read(fd, bytes, offset, Math.min(length, this.readCap - position), position);
@@ -130,12 +142,17 @@ class SpyPort implements FilePort {
     return nodeFilePort.read(fd, bytes, offset, length, position);
   }
   fsync(fd: number) {
+    const isDir = this.#dirFds.has(fd);
+    if (isDir) this.dirSyncs.tried += 1;
     this.#hit("fsync");
     this.beforeFsync?.();
+    if (isDir && this.dirFsyncFault !== null) throw injected("fsync", this.dirFsyncFault);
     nodeFilePort.fsync(fd);
+    if (isDir) this.dirSyncs.done += 1;
   }
   close(fd: number) {
     this.#hit("close");
+    this.#dirFds.delete(fd);
     nodeFilePort.close(fd);
   }
   fstat(fd: number) {
@@ -154,6 +171,7 @@ class SpyPort implements FilePort {
   }
   unlink(path: string) {
     this.#hit("unlink");
+    if (this.denyUnlink?.(path)) throw injected("unlink", "EACCES");
     nodeFilePort.unlink(path);
   }
   readdir(path: string) {
@@ -165,7 +183,10 @@ class SpyPort implements FilePort {
 function spied(options: { maxRecordBytes?: number } = {}) {
   const dir = tempDir();
   const port = new SpyPort();
-  return { dir, port, backend: fileBackend(dir, { ...options, files: port }) };
+  const backend = fileBackend(dir, { ...options, files: port });
+  // 만들기가 폴더를 확인한 호출은 지운다. 시험은 연산이 부른 것만 본다.
+  port.calls.splice(0);
+  return { dir, port, backend };
 }
 
 // ---- 공통 시험: 판단이 기대는 포트의 계약 ----
@@ -344,6 +365,67 @@ describe("보장 1: 원자적 새로 두기", () => {
     expect(backend.putNew(KEY_A, bytesOf("본문"))).toEqual({ status: "unknown", reason: "io" });
     expect(backend.read(KEY_A)).toEqual({ status: "ok", bytes: bytesOf("본문") });
     expect(backend.putNew(KEY_A, bytesOf("본문"))).toEqual({ status: "exists" });
+    // 다음 넣기의 exists는 폴더를 다시 내린 뒤의 답이다.
+    expect(port.dirSyncs).toEqual({ tried: 2, done: 1 });
+  });
+
+  test("판단을 거친 재보관: 폴더를 내리지 못하는 동안은 참조가 나가지 않고, 내리기가 처음 성공한 뒤에만 stored(created: false)다", () => {
+    const dir = tempDir();
+    const port = new SpyPort();
+    port.dirFsyncFault = "EIO";
+    const r = result("폴더를 내리지 못한 결과");
+    const input = { runId: RUN_A, owner: OWNER, digest: resultDigest(r), body: resultBody(r), now: NOW };
+    const first = fileBackend(dir, { files: port });
+    expect(storeResult(first, input)).toEqual({ status: "unknown" });
+    expect(storeResult(first, input)).toEqual({ status: "unknown" });
+    // 다시 뜬 프로세스(같은 폴더의 새 백엔드)도 앞선 실패를 기억하지 않고 같은 답이다.
+    const restarted = fileBackend(dir, { files: port });
+    expect(storeResult(restarted, input)).toEqual({ status: "unknown" });
+    expect(port.dirSyncs).toEqual({ tried: 3, done: 0 });
+    port.dirFsyncFault = null;
+    const stored = storeResult(restarted, input);
+    expect(stored).toMatchObject({ status: "stored", created: false });
+    expect(port.dirSyncs).toEqual({ tried: 4, done: 1 });
+    if (stored.status !== "stored") throw new Error("보관 실패");
+    const read = readStored({ backend: restarted, gate: open }, { ref: stored.ref, owner: OWNER, digest: resultDigest(r) });
+    expect(read.status === "ok" ? read.bytes : read).toEqual(resultBody(r));
+  });
+
+  test("게시할 때 이미 있는 이름도 일반 파일이고 폴더를 내린 뒤에만 exists다", () => {
+    const { dir, port, backend } = spied();
+    port.beforeLink = (_from, to) => writeFileSync(to, "먼저 온 것");
+    port.dirFsyncFault = "EIO";
+    expect(backend.putNew(KEY_A, bytesOf("늦게 온 것"))).toEqual({ status: "unknown", reason: "io" });
+    expect(port.dirSyncs).toEqual({ tried: 1, done: 0 });
+    expect(readFileSync(join(dir, NAME_A), "utf8")).toBe("먼저 온 것");
+    expect(listing(dir)).toEqual([NAME_A]);
+    port.dirFsyncFault = null;
+    port.beforeLink = (_from, to) => mkdirSync(to);
+    expect(backend.putNew(KEY_B, bytesOf("늦게 온 것"))).toEqual({ status: "unknown", reason: "not_file" });
+    expect(listing(dir)).toEqual([NAME_A, NAME_B]);
+  });
+
+  test("게시한 뒤 지우지 못한 임시 이름: stored이고, 같은 키의 다시 넣기(exists)가 다시 지워 본다", () => {
+    const { dir, port, backend } = spied();
+    const tempName = `.${NAME_A}.partial`;
+    port.denyUnlink = (path) => path === join(dir, tempName);
+    expect(backend.putNew(KEY_A, bytesOf("본문"))).toEqual({ status: "stored" });
+    expect(listing(dir)).toEqual([tempName, NAME_A]);
+    // 지우지 못하는 동안에도 키는 온전하다. 임시 이름 정리는 넣기의 답을 바꾸지 않는다.
+    expect(backend.putNew(KEY_A, bytesOf("다른 본문"))).toEqual({ status: "exists" });
+    expect(listing(dir)).toEqual([tempName, NAME_A]);
+    port.denyUnlink = null;
+    expect(backend.putNew(KEY_A, bytesOf("다른 본문"))).toEqual({ status: "exists" });
+    expect(listing(dir)).toEqual([NAME_A]);
+    expect(backend.read(KEY_A)).toEqual({ status: "ok", bytes: bytesOf("본문") });
+  });
+
+  test("파일 포트가 요청보다 큰 쓰기 개수를 돌려주면 게시하기 전에 멈추고 unknown이다", () => {
+    const { dir, port, backend } = spied();
+    port.overCount = true;
+    expect(backend.putNew(KEY_A, bytesOf("01234567"))).toEqual({ status: "unknown", reason: "io" });
+    expect(port.calls).not.toContain("link");
+    expect(listing(dir)).toEqual([]);
   });
 
   test("이름을 붙이기 직전에 다른 것이 그 이름을 차지하면 exists이고 그것을 덮지 않는다", () => {
@@ -404,8 +486,11 @@ describe("보장 1: 원자적 새로 두기", () => {
 // ---- 보장 2: 읽기 실패는 "없음"이 아니다 ----
 
 describe("보장 2: 없음과 모름을 가른다", () => {
-  test("폴더가 없으면 모든 연산이 unknown이다(absent가 아니다)", () => {
-    const backend = fileBackend(join(tempDir(), "gone"));
+  test("만든 뒤 폴더가 사라지면 모든 연산이 unknown이다(absent가 아니다)", () => {
+    const dir = join(tempDir(), "gone");
+    mkdirSync(dir);
+    const backend = fileBackend(dir);
+    rmSync(dir, { recursive: true });
     expect(backend.read(KEY_A)).toEqual({ status: "unknown", reason: "no_dir" });
     expect(backend.readRange(KEY_A, 0, 4)).toEqual({ status: "unknown", reason: "no_dir" });
     expect(backend.has(KEY_A)).toEqual({ status: "unknown", reason: "no_dir" });
@@ -414,11 +499,13 @@ describe("보장 2: 없음과 모름을 가른다", () => {
     expect(backend.putNew(KEY_A, bytesOf("x")).status).toBe("unknown");
   });
 
-  test("폴더 자리에 파일이 있으면 absent가 아니다", () => {
+  test("만든 뒤 폴더 자리가 파일로 바뀌면 absent가 아니다", () => {
     const parent = tempDir();
     const notDir = join(parent, "file");
-    writeFileSync(notDir, "폴더가 아님");
+    mkdirSync(notDir);
     const backend = fileBackend(notDir);
+    rmSync(notDir, { recursive: true });
+    writeFileSync(notDir, "폴더가 아님");
     for (const answer of [backend.read(KEY_A), backend.has(KEY_A), backend.remove(KEY_A), backend.keys("")]) expect(answer.status).toBe("unknown");
   });
 
@@ -446,6 +533,14 @@ describe("보장 2: 없음과 모름을 가른다", () => {
     expect(backend.read(KEY_A)).toEqual({ status: "unknown", reason: "changed" });
     expect(backend.readRange(KEY_A, 2, 6)).toEqual({ status: "unknown", reason: "changed" });
     expect(backend.readRange(KEY_A, 0, 5)).toEqual({ status: "ok", bytes: bytesOf("01234") });
+  });
+
+  test("파일 포트가 요청보다 큰 읽기 개수를 돌려주면 unknown이다(채워지지 않은 바이트를 내지 않는다)", () => {
+    const { port, backend } = spied();
+    backend.putNew(KEY_A, bytesOf("01234567"));
+    port.overCount = true;
+    expect(backend.read(KEY_A)).toEqual({ status: "unknown", reason: "io" });
+    expect(backend.readRange(KEY_A, 1, 5)).toEqual({ status: "unknown", reason: "io" });
   });
 
   test("판단을 거친 읽기: 읽기 실패는 absent가 아니라 unknown이다", () => {
@@ -514,13 +609,54 @@ describe("보장 2: 없음과 모름을 가른다", () => {
     expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "io" });
   });
 
+  test("지운 뒤 폴더를 내리지 못하면 같은 지우기의 absent도 폴더를 내린 뒤에만 나온다", () => {
+    const { dir, port, backend } = spied();
+    backend.putNew(KEY_A, bytesOf("본문"));
+    port.dirFsyncFault = "EIO";
+    expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "io" });
+    expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "io" });
+    expect(deleteStored(backend, `results/${NAME_A}`)).toEqual({ status: "unknown" });
+    port.dirFsyncFault = null;
+    expect(backend.remove(KEY_A)).toEqual({ status: "absent" });
+    expect(listing(dir)).toEqual([]);
+  });
+
+  test("지우기는 그 키의 임시 이름(본문의 사본)까지 지운 뒤에만 removed·absent다", () => {
+    const { dir, port, backend } = spied();
+    const tempName = `.${NAME_A}.partial`;
+    port.denyUnlink = (path) => path === join(dir, tempName);
+    expect(backend.putNew(KEY_A, bytesOf("본문"))).toEqual({ status: "stored" });
+    expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "io" });
+    expect(listing(dir)).toEqual([tempName]);
+    expect(readFileSync(join(dir, tempName), "utf8")).toBe("본문");
+    // 키가 이미 없어도 사본이 남는 동안은 absent가 아니다.
+    expect(backend.remove(KEY_A)).toEqual({ status: "unknown", reason: "io" });
+    port.denyUnlink = null;
+    expect(backend.remove(KEY_A)).toEqual({ status: "absent" });
+    expect(listing(dir)).toEqual([]);
+    // 게시 뒤 남은 임시 이름은 키를 지울 때 함께 지운다.
+    port.denyUnlink = (path) => path === join(dir, tempName);
+    expect(backend.putNew(KEY_A, bytesOf("본문"))).toEqual({ status: "stored" });
+    port.denyUnlink = null;
+    expect(backend.remove(KEY_A)).toEqual({ status: "removed" });
+    expect(listing(dir)).toEqual([]);
+  });
+
   test("파일 포트가 예상 밖으로 던져도 밖으로 내보내지 않는다", () => {
+    let broken = false;
     const throwing = new Proxy(nodeFilePort, {
-      get: () => () => {
-        throw new TypeError("예상 밖");
-      },
+      get: (target, op) =>
+        broken
+          ? () => {
+              throw new TypeError("예상 밖");
+            }
+          : target[op as keyof FilePort],
     });
-    const backend = fileBackend(tempDir(), { files: throwing });
+    const dir = tempDir();
+    const backend = fileBackend(dir, { files: throwing });
+    broken = true;
+    // 만들기도 던지지 않고 거절한다.
+    expect(createFileResultBackend({ dir, maxRecordBytes: MAX, files: throwing })).toEqual({ status: "invalid", reason: "not_dir" });
     expect(backend.putNew(KEY_A, bytesOf("x")).status).toBe("unknown");
     expect(backend.read(KEY_A).status).toBe("unknown");
     expect(backend.readRange(KEY_A, 0, 1).status).toBe("unknown");
@@ -567,6 +703,7 @@ describe("보장 3: 키의 꼴", () => {
     mkdirSync(dir);
     const port = new SpyPort();
     const backend = fileBackend(dir, { files: port });
+    port.calls.splice(0);
     const refused = { status: "unknown", reason: "invalid_key" } as const;
     for (const key of badKeys as string[]) {
       expect(backend.putNew(key, bytesOf("x"))).toEqual(refused);
@@ -598,6 +735,26 @@ describe("보장 3: 키의 꼴", () => {
     for (const maxRecordBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "16" as never]) {
       expect(createFileResultBackend({ dir: "/x", maxRecordBytes })).toEqual({ status: "invalid", reason: "max_record_bytes" });
     }
-    expect(createFileResultBackend({ dir: "/x", maxRecordBytes: 1 }).status).toBe("ok");
+    expect(createFileResultBackend({ dir: tempDir(), maxRecordBytes: 1 }).status).toBe("ok");
+  });
+
+  test("만들기: 보관 폴더는 링크가 아닌 실제 폴더여야 한다. 아니거나 확인하지 못하면 invalid(not_dir)", () => {
+    const parent = tempDir();
+    const real = join(parent, "store");
+    mkdirSync(real);
+    const linked = join(parent, "linked");
+    symlinkSync(real, linked);
+    const file = join(parent, "file");
+    writeFileSync(file, "폴더가 아님");
+    const refused = { status: "invalid", reason: "not_dir" } as const;
+    for (const dir of [linked, file, join(parent, "gone"), join(file, "below")]) expect(createFileResultBackend({ dir, maxRecordBytes: 16 })).toEqual(refused);
+    const port = new SpyPort();
+    port.failNext("lstat", "EACCES");
+    expect(createFileResultBackend({ dir: real, maxRecordBytes: 16, files: port })).toEqual(refused);
+    // 실제 경로로 만든 백엔드는 키 연산과 목록이 같은 폴더를 본다.
+    const backend = fileBackend(real);
+    expect(backend.putNew(KEY_A, bytesOf("a"))).toEqual({ status: "stored" });
+    expect(backend.keys("result/")).toEqual({ status: "ok", keys: [KEY_A] });
+    expect(listing(real)).toEqual([NAME_A]);
   });
 });
