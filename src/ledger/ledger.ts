@@ -453,6 +453,17 @@ export interface ToolRequest {
   phase: ToolRequestPhase;
 }
 
+// 배정을 기다리는 부탁 한 건(listWaitingToolRequests). 배정 고르기(pick.ts의 WaitingRequest)와 잇기(assignToolRequest의 ref)에
+// 필요한 칸만 싣는다. 원문·자격·세션 ID·호출 ID·재시도 키·목적·원본 참조는 싣지 않는다(시험이 칸 이름 집합을 고정한다).
+// input은 소유자 입력 줄의 지금 값이다. 취소·만료된 입력의 부탁도 내고 거르는 것은 고르는 쪽과 잇기다.
+export interface WaitingToolRequest {
+  ref: string;
+  owner: string;
+  role: Role;
+  inputDigest: string;
+  input: { cancelled: boolean; expiresAt: number };
+}
+
 // 새 부탁의 기록(recordToolRequest). ref는 새 줄을 만들 때만 쓰는 후보다. 장부는 난수를 직접 부르지 않으므로 부르는 쪽이 UUID를
 // 넘기고, 같은 (owner, dedupeKey)의 줄이 이미 있으면 그 줄의 참조를 돌려주고 후보는 버린다.
 export interface ToolRequestInput {
@@ -1652,6 +1663,44 @@ export class Ledger {
     });
   }
 
+  // 배정을 기다리는 부탁 전부(대기이고 실행에 이어지지 않은 줄). 소유자를 가리지 않는 감독 안쪽의 읽기라 도구 처리기의 포트에
+  // 잇지 않는다(남의 부탁의 참조가 나온다). 순서는 소유자 입력의 순번, 부탁의 기록 시각, 참조 순이다. 기록 시각은 부르는 쪽이
+  // 넘긴 값이라 같거나 뒤집힐 수 있어 참조로 끝까지 가른다(표가 WITHOUT ROWID라 삽입 순서는 없다).
+  // 소유자 입력 줄이 없거나 꼴이 어긋난 줄은 빼지 않고 읽지 못한 것(corrupt)으로 닫는다: 빼면 그 부탁이 영영 배정되지 않는다.
+  listWaitingToolRequests(): Read<WaitingToolRequest[]> {
+    return this.#read(() =>
+      (
+        this.#db
+          .query(
+            `SELECT t.ref, t.owner, t.role, t.input_digest, i.request_id AS input_id, i.source_expires_at, i.cancelled_at
+               FROM tool_requests t LEFT JOIN inputs i ON i.request_id = t.owner
+              WHERE t.phase = 'waiting_assignment' AND t.run_id IS NULL
+              ORDER BY i.seq, t.created_at, t.ref`,
+          )
+          .all() as {
+          ref: string;
+          owner: string;
+          role: string;
+          input_digest: string;
+          input_id: string | null;
+          source_expires_at: number | null;
+          cancelled_at: number | null;
+        }[]
+      ).map((row) => {
+        const fits =
+          UUID.test(row.ref) && UUID.test(row.owner) && (ROLES as readonly string[]).includes(row.role) && SHA256.test(row.input_digest) && row.input_id !== null;
+        if (!fits) throw new LedgerUnavailableError("corrupt", "tool_requests: 꼴이 맞지 않는 대기 부탁");
+        return {
+          ref: row.ref,
+          owner: row.owner,
+          role: row.role as Role,
+          inputDigest: row.input_digest,
+          input: { cancelled: row.cancelled_at !== null, expiresAt: safe(row.source_expires_at, "inputs.source_expires_at") },
+        };
+      }),
+    );
+  }
+
   // 배정 전 대기의 기록. 실행 줄·슬롯·실행기·자격을 만들지 않는다. 새 업무라 같은 트랜잭션에서 정지와 접수 허가를 다시 본다(쓰기 모드 start).
   // 같은 (소유자, 키)의 줄이 있으면 새 줄을 만들지 않고 그 줄을 돌려준다: 내용(역할·목적·원본·digest)이 같으면 existing, 다르면 conflict.
   // 다른 소유자의 같은 키는 보지 않는다. 소유자가 접수한 입력이 아니면 외래 키가 막는다(invariant_violation).
@@ -1691,7 +1740,8 @@ export class Ledger {
   // 배정: 대기 부탁을 새 실행 줄에 한 트랜잭션으로 잇는다. 새 업무라 같은 트랜잭션에서 정지와 접수 허가를 다시 본다(쓰기 모드 start).
   // 실행 줄은 admitRun과 같은 검사·기록(#admitInput, #admit)으로 적고, 그 거절이면 부탁은 대기 그대로다. 부탁이 지금도 대기이고
   // 이어지지 않았는지 이 트랜잭션에서 다시 본다: 이미 이어졌으면 새 실행 줄 없이 그 실행(already_assigned), 취소됐으면
-  // transition_denied, 없으면 unknown_run. 부르는 쪽은 배정기 하나라 소유자를 받지 않는다(참조는 표 전체에서 유일하다).
+  // transition_denied, 없으면 unknown_run. 소유자 입력이 취소·만료됐으면 input_cancelled·input_expired이고 부탁은 대기 그대로다.
+  // 부르는 쪽은 배정기 하나라 소유자를 받지 않는다(참조는 표 전체에서 유일하다).
   assignToolRequest(input: AssignToolRequestInput): { ok: true; outcome: "assigned" | "already_assigned"; run: Run } | Refused {
     const v = exact(input, ["ref", "runId", "snapshotDigest", "profileRevision", "policyRevision", "executorId", "credential", "deadlineAt", "budgetLeft", "now"], "assignToolRequest");
     const ref = str(v.ref, UUID, "ref");
@@ -1722,6 +1772,15 @@ export class Ledger {
       );
       // 이 부탁의 키를 가진 실행이 이미 있다면 잇는 연산 밖에서 만든 줄이다. 남이 만든 실행을 이 부탁에 잇지 않는다.
       if (!admitted.created) throw new Refuse("invariant_violation");
+      // 소유자 입력의 취소·만료는 startRun과 같은 이름·같은 경계(장부 시계, 만료 시각 정각부터)로 본다. 고른 뒤 만료된 부탁이
+      // 시작할 수 없는 실행 줄을 얻지 않게 한다. 기존 거절이 모두 먼저라 이 검사는 잇기가 성공할 자리만 거절로 바꾼다.
+      // 여기서 던지면 트랜잭션이 되돌려져 위에서 적은 실행 줄도 남지 않는다.
+      const owner = this.#db.query("SELECT cancelled_at, source_expires_at FROM inputs WHERE request_id = ?").get(request.owner) as {
+        cancelled_at: number | null;
+        source_expires_at: number;
+      } | null;
+      if (owner === null || owner.cancelled_at !== null) throw new Refuse("input_cancelled");
+      if (owner.source_expires_at <= this.#ledgerNow()) throw new Refuse("input_expired");
       const linked = this.#db.query("UPDATE tool_requests SET run_id = ? WHERE ref = ? AND run_id IS NULL AND phase = 'waiting_assignment'").run(admitted.run.runId, ref).changes;
       if (linked !== 1) throw new Refuse("invariant_violation");
       return { ok: true as const, outcome: "assigned" as const, run: admitted.run };
@@ -1844,7 +1903,9 @@ export class Ledger {
 
   // 작업 시작 지시를 내기 직전에 부른다. 자리(작업자 슬롯)를 잡고 지시를 적은 커밋이 끝난 뒤에만 지시를 보낸다.
   // 돌려준 credential이 자격 발급의 근거다. 접수가 닫혔거나 정지 중이거나 세대가 다르면 주지 않는다.
-  startRun(input: StartRunInput): { ok: true; run: Run; credential: CredentialRef } | Refused {
+  // issuedAt은 이 시작 지시에 적은 발행 시각(장부 시계)이고 넘긴 now가 아니다. task_start 머리의 issued_at에 그대로 싣는다.
+  // 이미 시작한 실행을 다시 부르면 transition_denied라 발행 시각은 성공 답에만 있다.
+  startRun(input: StartRunInput): { ok: true; run: Run; credential: CredentialRef; issuedAt: number } | Refused {
     const v = exact(input, ["runId", "requestId", "stopGeneration", "now"], "startRun");
     const runId = str(v.runId, UUID, "runId");
     const requestId = str(v.requestId, UUID, "requestId");
@@ -1860,7 +1921,7 @@ export class Ledger {
       this.#setState(row, "preparing", now);
       this.#db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'task_start', ?, ?)").run(requestId, runId, stopGeneration, now);
       const after = this.#runRow(runId) as RunRow;
-      return { ok: true as const, run: toRun(after), credential: toRun(after).credential };
+      return { ok: true as const, run: toRun(after), credential: toRun(after).credential, issuedAt: now };
     });
   }
 
