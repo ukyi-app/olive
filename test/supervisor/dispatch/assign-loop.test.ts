@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
 import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
@@ -45,6 +46,10 @@ type FaultPort = (typeof FAULT_PORTS)[number];
 
 interface World {
   ledger: Ledger;
+  // 장부 파일. 송신 표식(start_dispatches)을 원 SQL로 읽는다.
+  path: string;
+  // 장부의 끊김 지점(Faults.at)에 거는 고리. 기본은 아무것도 하지 않는다.
+  setLedgerFault(next: ((point: string) => void) | null): void;
   ports: AssignLoopPorts;
   log: Log;
   sent: Envelope[];
@@ -72,12 +77,15 @@ function world(): World {
     calls[port] += 1;
     if (fault?.port === port && calls[port] === fault.nth) throw new Error(`${port} 포트 실패`);
   };
+  let ledgerFault: ((point: string) => void) | null = null;
+  const path = tempPath();
   const ledger = ready(
-    open(tempPath(), {
+    open(path, {
       clock: () => {
         hit("clock");
         return clockAt;
       },
+      faults: { at: (point) => ledgerFault?.(point) },
     }),
   );
   const log: Log = [];
@@ -90,6 +98,10 @@ function world(): World {
   let override: Partial<AssignLoopLedger> = {};
   const w: World = {
     ledger,
+    path,
+    setLedgerFault: (next) => {
+      ledgerFault = next;
+    },
     log,
     sent,
     uuids: 0,
@@ -171,6 +183,7 @@ function world(): World {
       slotHolds: port("slotHolds"),
       listInputs: port("listInputs"),
       startRun: port("startRun"),
+      markStartDispatch: port("markStartDispatch"),
     },
     intake: { intakeOpen: () => intake && ledger.intakeOpen(), stopGeneration: () => stopGeneration },
     connections: { candidates: () => ({ known: true, value: [CONNECTION] }) },
@@ -995,6 +1008,128 @@ describe("맡기지 않을 실행기", () => {
         { kind: "ran", starts: [], requests: [{ ref: first, ...rejected }, { ref: second, ...rejected }], halted: null, haltedAt: null },
       ]);
       expect([w.log, w.sent.length, w.uuids - uuids, runCount(w.ledger), waitingRefs(w.ledger).length]).toEqual([[], 0, 0, 0, 2]);
+    }
+  });
+});
+
+// 장부 파일의 송신 표식. 공개 읽기가 없어 원 SQL로 읽는다. 열린 장부 객체가 파일을 잠그므로 먼저 닫는다(그 뒤로 그 객체는 쓰지 않는다).
+function marks(w: World): { run_id: string; request_id: string; marked_at: number }[] {
+  w.ledger.close();
+  const raw = new Database(w.path, { readonly: true });
+  try {
+    return raw.query("SELECT run_id, request_id, marked_at FROM start_dispatches ORDER BY marked_at").all() as { run_id: string; request_id: string; marked_at: number }[];
+  } finally {
+    raw.close();
+  }
+}
+
+// 표식 포트를 부를 때 기록에 남긴다(장부 → 서명 → 표식 → 내보내기의 차례를 본다).
+function logMarks(w: World): void {
+  w.wrap({
+    markStartDispatch: (input) => {
+      w.log.push("markStartDispatch");
+      return w.ledger.markStartDispatch(input);
+    },
+  });
+}
+
+describe("송신 표식: 시작 봉투는 표식이 ok인 뒤에만 내보내기 포트에 닿는다", () => {
+  test("표식은 봉한 뒤 송신 직전에 그 실행·그 요청 ID로 장부(start_dispatches)에 커밋된다", async () => {
+    const w = world();
+    logMarks(w);
+    const { runId, second } = await assignThenStart(w);
+    const start = second.starts[0];
+    if (start?.outcome !== "sent") throw new Error(JSON.stringify(second));
+    expect(w.log).toEqual(["assignToolRequest", "startRun", "seal", "markStartDispatch", "send"]);
+    expect((w.sent[0] as Envelope).header.request_id).toBe(start.requestId);
+    expect(marks(w)).toEqual([{ run_id: runId, request_id: start.requestId, marked_at: NOW }]);
+  });
+
+  test("표식을 적지 못하는 장부(못 씀)에서는 송신이 0이고, 장부에 적힌 시작은 그대로 남아 재전송 대상이다", async () => {
+    const w = world();
+    logMarks(w);
+    // 표식의 커밋 직전에 디스크가 실패한다. 실제 장부는 그 쓰기를 되돌리고 못 씀(ledger_unwritable)으로 답한다.
+    w.setLedgerFault((point) => {
+      if (point === "start_dispatch:before_commit") throw new Error("디스크 실패");
+    });
+    const { runId, second } = await assignThenStart(w);
+    expect(second.starts).toEqual([
+      {
+        runId,
+        outcome: "recorded_not_sent",
+        requestId: expect.any(String),
+        stopGeneration: 0,
+        issuedAt: NOW,
+        executorId: EXECUTOR,
+        reason: "start_unmarked",
+        delivery: "not_sent",
+        markReason: "ledger_unwritable",
+      },
+    ]);
+    expect(w.log).toEqual(["assignToolRequest", "startRun", "seal", "markStartDispatch"]);
+    expect(w.sent).toEqual([]);
+    expect(marks(w)).toEqual([]);
+    // 다시 연 장부에서 그 실행은 preparing이고 시작 지시는 답을 기다리는 지시로 남는다(재전송 박자가 다시 시도한다).
+    const reopened = open(w.path);
+    const run = reopened.getRun(runId);
+    expect(run.known && run.value?.state).toBe("preparing");
+    const unanswered = reopened.unansweredInstructions();
+    if (!unanswered.known) throw new Error("읽지 못함");
+    expect(unanswered.value.instructions.map((i) => [i.runId, i.action, i.requestId])).toEqual([[runId, "task_start", (second.starts[0] as { requestId: string }).requestId]]);
+  });
+
+  test("표식 포트가 던지거나 거절하거나 꼴이 틀린 답을 내면 싣지 않고 그 이유를 싣는다", async () => {
+    const cases: [string, () => unknown][] = [
+      [
+        "threw",
+        () => {
+          throw new Error("표식 포트 실패");
+        },
+      ],
+      ["intake_closed", () => ({ ok: false, reason: "intake_closed" })],
+      ["malformed_answer", () => ({ ok: true })],
+      ["malformed_answer", () => ({ ok: false, reason: "made_up" })],
+      ["malformed_answer", () => "ok"],
+    ];
+    for (const [markReason, answer] of cases) {
+      const w = world();
+      w.wrap({ markStartDispatch: answer as never });
+      const { runId, second } = await assignThenStart(w);
+      expect([markReason, second.starts]).toEqual([markReason, [expect.objectContaining({ runId, outcome: "recorded_not_sent", reason: "start_unmarked", delivery: "not_sent", markReason })]]);
+      expect([markReason, w.log.includes("send"), w.sent.length]).toEqual([markReason, false, 0]);
+    }
+  });
+
+  test("표식은 장부가 시작을 승인하고 봉한 뒤에만 부른다. 거절·봉하기 실패·포트를 얻지 못함에는 표식이 없다", async () => {
+    // 장부의 거절(정지 세대가 다름).
+    const refused = world();
+    logMarks(refused);
+    refused.enqueueRequest();
+    ran(await assignAndStartTick(refused.ports, POLICY, NOW));
+    refused.setStopGeneration(1);
+    refused.log.length = 0;
+    expect(ran(await assignAndStartTick(refused.ports, POLICY, NOW)).starts).toEqual([expect.objectContaining({ outcome: "start_refused" })]);
+    expect(refused.log).toEqual(["startRun"]);
+    // 봉하기 실패.
+    const unsealed = world();
+    logMarks(unsealed);
+    unsealed.ports = {
+      ...unsealed.ports,
+      signer: {
+        seal() {
+          throw new Error("키 없음");
+        },
+      },
+    };
+    expect((await assignThenStart(unsealed)).second.starts).toEqual([expect.objectContaining({ outcome: "recorded_not_sent", reason: "seal_threw" })]);
+    // 내보내기 포트를 얻지 못함(수신 객체의 send가 함수가 아님).
+    const sinkless = world();
+    logMarks(sinkless);
+    sinkless.ports = { ...sinkless.ports, sink: { send: undefined } as never };
+    expect((await assignThenStart(sinkless)).second.starts).toEqual([expect.objectContaining({ outcome: "recorded_not_sent", reason: "sink_unavailable", delivery: "not_sent" })]);
+    for (const w of [refused, unsealed, sinkless]) {
+      expect(w.log.includes("markStartDispatch")).toBe(false);
+      expect(marks(w)).toEqual([]);
     }
   });
 });
