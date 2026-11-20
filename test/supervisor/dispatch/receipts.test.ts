@@ -18,9 +18,9 @@ import {
   EXECUTOR_ACTION_HANDLING,
   type ForwardInput,
   handleForward,
-  type PendingQuery,
   type ReceiptLedger,
   type ReceiptOutcome,
+  type SentQuery,
 } from "../../../src/supervisor/dispatch/receipts.ts";
 import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, startedWorker, tempPath, WORKER_EXECUTOR } from "../../ledger/helpers.ts";
 
@@ -309,7 +309,8 @@ describe("보장 3: status_report는 감독이 낸 조회의 답일 때만 받�
     const { ledger, runId, generation } = realLedger();
     const drafted = statusQueryDraft({ recipient: WORKER_EXECUTOR, stopGeneration: 0, runIds: [runId] }, fakeRandom(9));
     if (!drafted.ok) throw new Error(drafted.reason);
-    const pending: PendingQuery = { requestId: drafted.draft.requestId, recipient: drafted.draft.recipient, runIds: drafted.draft.body.run_ids };
+    // 조회를 실은 연결은 forward()의 연결(1)이다.
+    const pending: SentQuery = { requestId: drafted.draft.requestId, recipient: drafted.draft.recipient, runIds: drafted.draft.body.run_ids, connection: 1 };
     const runs: RunStatus[] = [{ run_id: runId, state: "running", run_generation: 1, last_receipt_id: null }];
     return { ledger, runId, generation, pending, runs };
   }
@@ -318,7 +319,7 @@ describe("보장 3: status_report는 감독이 낸 조회의 답일 때만 받�
     const { ledger, runId, generation, pending, runs } = await setup();
     const v = await verified("status_report", WORKER_EXECUTOR, { in_reply_to: pending.requestId, runs }, 0, generation);
     const outcome = handleForward(forward(v, { pendingQueries: [pending] }), { ledger, random: fakeRandom() });
-    const answer = { sender: WORKER_EXECUTOR, coverage: "partial" as const, runs, answeredAt: NOW };
+    const answer = { sender: WORKER_EXECUTOR, connection: 1, coverage: "partial" as const, runs, answeredAt: NOW };
     expect(outcome).toEqual({
       outcome: "status_matched",
       queryRequestId: pending.requestId,
@@ -456,7 +457,7 @@ describe("동작별 처리 표와 구별된 거절", () => {
   test("입력 객체를 바꾸지 않는다", async () => {
     const { ledger, runId, requestId, generation } = realLedger();
     const v = await verified("receipt_started", WORKER_EXECUTOR, { receipt_id: id(), run_id: runId, instruction_request_id: requestId, started_at: NOW }, 1, generation);
-    const pending: PendingQuery = { requestId: id(), recipient: WORKER_EXECUTOR, runIds: [runId] };
+    const pending: SentQuery = { requestId: id(), recipient: WORKER_EXECUTOR, runIds: [runId], connection: 1 };
     const input = deepFreeze(forward(v, { pendingQueries: [pending] }));
     const before = JSON.stringify(input);
     expect(handleForward(input, { ledger, random: fakeRandom() }).outcome).toBe("ack");

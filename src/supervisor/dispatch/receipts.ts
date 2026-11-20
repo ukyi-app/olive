@@ -8,14 +8,16 @@
 //    세션 인수 영수증은 앞 세션 또는 대기 중인 세션 실행의 지정 실행기도 낼 수 있다(인수의 ack는 증거 저장의 확인일 뿐이다).
 // 2. 장부가 ok를 돌려준 것에만, 장부가 돌려준 id로 ack 초안을 만든다. 거절·예외·꼴이 틀린 답이면 ack가 없어 실행기가 다시 보낸다.
 //    장부가 duplicate를 돌려주면(이미 반영함) 정지 세대를 알고 초안 생성에 성공할 때 ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다.
-// 3. status_report는 감독이 낸 조회의 답이고 그 조회를 받은 실행기가 보냈을 때만 받는다. 대조된 답은 그 답이 온 연결이
-//    지금도 낸 쪽의 인정된 연결일 때만 장부의 applyExecutorAnswer에 partial로 넘긴다. sender·runs·answeredAt은 검증된 봉투의 값이다.
+// 3. status_report는 감독이 낸 조회의 답이고 그 조회를 받은 실행기가 그 조회를 실은 연결로 보냈을 때만 받는다. 대조된 답은
+//    장부를 부를 때마다 그 직전에 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 보고, 맞을 때만 applyExecutorAnswer에
+//    partial로 넘긴다. sender·runs·answeredAt은 검증된 봉투의 값이다.
 //    그 실행기의 밀린 답(저장되지 않은 앞 답)이 있으면 받은 순서대로 먼저 넘기고, 앞 답이 저장되지 않으면 뒤 답은 넘기지 않는다.
 // 4. 결과 보고(report_result)는 결과 보관(S6) 전에는 받지 않는다. 장부에 넘기지 않고 ack도 만들지 않는다.
 import {
   type DeferredLoss,
   type Delivery,
   type EnvelopeFrom,
+  LEDGER_RUN_STATES,
   REFUSALS as LEDGER_REFUSALS,
   type Ledger,
   type LostRun,
@@ -34,15 +36,18 @@ export type ReceiptLedger = Pick<Ledger, "applyReceipt" | "recordReport" | "appl
 // 답이 온 연결이 지금도 그 실행기의 인정된 연결인가. 이 모듈은 연결 표를 들여다보지 않고 이 포트에만 묻는다.
 // 조립은 부르는 순간에 쥔 연결 표와 지금의 복원기로 답한다(receipts.md "옛 연결의 답"). 동기여야 한다: 이 답과 장부 호출 사이에
 // await가 없어야 그 사이에 연결이 바뀌지 않는다. 던지거나 true·false 밖의 답은 모름이고 장부를 부르지 않는다.
+// 장부 호출마다 그 직전에 다시 묻는다: 앞선 장부 쓰기(저장 실패 등)가 같은 동기 구간에서 그 연결의 인정을 끝낼 수 있다.
 export interface AnswerLinks {
   current(connection: number, executorId: string): boolean;
 }
 
-// applyExecutorAnswer에 넘기는 값 그대로. 다시 넘길 때 이 값을 바꾸지 않는다(now만 그때의 장부 시각이다).
+// connection 밖의 칸은 applyExecutorAnswer에 넘기는 값 그대로다. 다시 넘길 때 이 값을 바꾸지 않는다(now만 그때의 장부 시각이다).
 // 상태 보고는 실행기가 다시 보내지 않으므로 저장되지 않은 답은 이 사본이 유일하다.
 export interface ExecutorAnswerCopy {
   // 검증된 답 봉투의 낸 쪽.
   readonly sender: string;
+  // 그 답이 온 연결(forward.connection). 장부에는 넘기지 않고, 넘기기 직전마다 이 연결이 아직 인정된 연결인지 links에 묻는다.
+  readonly connection: number;
   // 조회의 답은 늘 partial이다. full(그 실행기가 쥔 전부)로 넘기는 길이 이 모듈에 없다.
   readonly coverage: "partial";
   // 검증된 본문의 runs(사본).
@@ -71,6 +76,8 @@ export type AnswerSettlement =
     }
   // 장부가 던졌거나 답이 꼴에 맞지 않는다. 적었는지 모른다.
   | { readonly settled: "ledger_failed"; readonly answer: ExecutorAnswerCopy; readonly failure: "threw" | "malformed_answer" }
+  // 넘기기 직전에 본 그 답의 연결이 지금 인정된 연결이 아니거나(not_current) 그것을 모른다(unknown). 장부를 부르지 않았다.
+  | { readonly settled: "not_current"; readonly answer: ExecutorAnswerCopy; readonly link: "not_current" | "unknown" }
   // 앞의 밀린 답이 저장되지 않아 넘기지 않았다(받은 순서를 지킨다).
   | { readonly settled: "held"; readonly answer: ExecutorAnswerCopy };
 
@@ -90,6 +97,12 @@ export interface PendingQuery {
   readonly runIds: readonly string[];
 }
 
+// 기다리는 조회를 그 조회를 실제로 실은 연결에 묶은 항목. 답은 이 연결에서 와야 한다. 연결 번호는 싣는 쪽(내보내기 포트)만
+// 안다: 수명 박자가 돌려주는 PendingQuery에는 없으므로 조립이 더한다(receipts.md "뒤 조각이 지킬 것").
+export interface SentQuery extends PendingQuery {
+  readonly connection: number;
+}
+
 export interface ForwardInput {
   // 연결 판단(connections.ts)의 forward 출력. verified는 계약 v1의 verifyEnvelope를 통과한 봉투, connection은 그 봉투가 온 연결이다.
   readonly forward: Pick<Extract<Output, { kind: "forward" }>, "verified" | "connection">;
@@ -97,8 +110,8 @@ export interface ForwardInput {
   readonly now: number;
   // ack 머리에 실을 감독의 지금 정지 세대(복원기의 stopGeneration()). null이면 모름이라 ack를 만들지 않는다.
   readonly stopGeneration: number | null;
-  readonly pendingQueries: readonly PendingQuery[];
-  // status_report에서만, 대조된 뒤에 묻는다.
+  readonly pendingQueries: readonly SentQuery[];
+  // status_report에서만, 대조된 뒤에 묻는다(장부 호출마다 그 직전에 다시).
   readonly links: AnswerLinks;
   // 그 status_report를 낸 실행기의 밀린 답(앞 결과의 backlog 그대로, 받은 순서). 대조되고 연결이 맞은 status_report에서만 읽는다.
   readonly backlog: readonly ExecutorAnswerCopy[];
@@ -109,6 +122,8 @@ export interface BacklogInput {
   readonly backlog: readonly ExecutorAnswerCopy[];
   // 장부 기록에 넘길 지금 시각(장부 시계).
   readonly now: number;
+  // 사본마다 그 답이 온 연결을 장부 호출 직전에 묻는다.
+  readonly links: AnswerLinks;
 }
 
 export type BacklogOutcome =
@@ -159,6 +174,8 @@ export const STATUS_UNMATCHED_REASONS = [
   "other_executor",
   // 답의 실행 ID 집합이 물은 실행 ID 집합과 다르다
   "runs_mismatch",
+  // 그 조회를 실은 연결이 아닌 연결에서 왔다(조회 항목의 연결 번호가 없거나 꼴이 틀려도 이것이다)
+  "other_connection",
 ] as const;
 export type StatusUnmatchedReason = (typeof STATUS_UNMATCHED_REASONS)[number];
 
@@ -344,18 +361,29 @@ function copyRuns(runs: readonly RunStatus[]): RunStatus[] {
 }
 
 // 상태 보고를 기다리는 조회와 대조한다. 장부를 부르지 않는다. 맞으면 조회의 요청 ID와 runs의 사본을 돌려준다.
-function matchStatus(sender: string, body: Record<string, unknown>, pending: readonly PendingQuery[]): ReceiptOutcome | { readonly queryRequestId: string; readonly runs: RunStatus[] } {
+function matchStatus(
+  sender: string,
+  body: Record<string, unknown>,
+  pending: readonly SentQuery[],
+  connection: unknown,
+): ReceiptOutcome | { readonly queryRequestId: string; readonly runs: RunStatus[] } {
   const inReplyTo = body.in_reply_to;
   const runs = body.runs;
   if (!isText(inReplyTo)) return reject("body_malformed", "in_reply_to");
   if (!Array.isArray(runs) || runs.some((run) => !isRecord(run) || !isText(run.run_id))) return reject("body_malformed", "runs");
   if (!Array.isArray(pending)) return reject("input_malformed", "pendingQueries");
-  const query = pending.find((q) => isRecord(q) && q.requestId === inReplyTo);
+  // 같은 초안을 다른 연결로 다시 실으면 같은 요청 ID의 항목이 연결마다 있다. 답이 온 연결의 항목을 먼저 고른다.
+  const asking = pending.filter((q) => isRecord(q) && q.requestId === inReplyTo);
+  const query = asking.find((q) => q.connection === connection) ?? asking[0];
   if (query === undefined) return { outcome: "status_unmatched", reason: "unknown_query" };
   if (query.recipient !== sender) return { outcome: "status_unmatched", reason: "other_executor" };
   const asked = new Set(Array.isArray(query.runIds) ? query.runIds : []);
   const answered = new Set((runs as RunStatus[]).map((run) => run.run_id));
   if (asked.size !== answered.size || [...answered].some((runId) => !asked.has(runId))) return { outcome: "status_unmatched", reason: "runs_mismatch" };
+  if (!Number.isSafeInteger(connection)) return reject("input_malformed", "forward.connection");
+  // 답이 온 연결이 지금 인정된 연결이어도, 그 연결에 내지 않은 조회의 답은 받지 않는다: 같은 주체의 새 연결이 옛 연결에 낸
+  // 조회에 답하면 지금 실행의 임대를 거둘 수 있다. 연결 번호가 없거나 꼴이 틀린 항목은 어느 연결과도 맞지 않는다.
+  if (query.connection !== connection) return { outcome: "status_unmatched", reason: "other_connection" };
   return { queryRequestId: inReplyTo, runs: copyRuns(runs as RunStatus[]) };
 }
 
@@ -372,11 +400,13 @@ function linkVerdict(links: AnswerLinks, connection: number, executorId: string)
 const isPositive = (run: RunStatus): boolean => run.state !== "not_known";
 
 // 밀린 답 하나를 읽는다. 앞 결과의 사본이어야 하고 그 실행기(sender)의 것이어야 한다. 실행 항목의 꼴은 장부가 다시 본다.
+// 연결 번호가 없는 사본은 넘기기 직전에 연결을 볼 수 없으므로 꼴이 틀린 것이다.
 function readCopy(value: unknown, sender: string): ExecutorAnswerCopy | null {
   if (!isRecord(value) || value.sender !== sender || value.coverage !== "partial" || !Array.isArray(value.runs)) return null;
+  if (!Number.isSafeInteger(value.connection)) return null;
   if (value.runs.some((run) => !isRecord(run) || !isText(run.run_id))) return null;
   if (value.answeredAt !== null && !isTime(value.answeredAt)) return null;
-  return { sender, coverage: "partial", runs: copyRuns(value.runs as RunStatus[]), answeredAt: value.answeredAt as number | null };
+  return { sender, connection: value.connection as number, coverage: "partial", runs: copyRuns(value.runs as RunStatus[]), answeredAt: value.answeredAt as number | null };
 }
 
 function readBacklog(value: unknown, sender: string): ExecutorAnswerCopy[] | null {
@@ -387,6 +417,16 @@ function readBacklog(value: unknown, sender: string): ExecutorAnswerCopy[] | nul
 
 const isPair = (item: unknown): boolean => isRecord(item) && isText(item.runId) && Number.isSafeInteger(item.runGeneration);
 
+const DEFERRED_WHY: readonly unknown[] = ["start_may_arrive", "answer_time_unknown"] as const satisfies readonly DeferredLoss["why"][];
+// 보류는 "같은 실행 ID를 다시 조회하라"는 뜻이라 꼴이 틀린 보류를 성공으로 세면 양성 사본을 버리고도 반영된 것으로 보인다.
+// 사유는 장부가 정한 두 값, 상태는 장부의 실행 상태, 세대는 1 이상만 받는다.
+const isDeferred = (item: unknown): boolean =>
+  isPair(item) &&
+  isRecord(item) &&
+  (item.runGeneration as number) >= 1 &&
+  (LEDGER_RUN_STATES as readonly unknown[]).includes(item.state) &&
+  DEFERRED_WHY.includes(item.why);
+
 // 장부의 applyExecutorAnswer 답이 약속한 꼴인가. 칸을 읽다 던지는 값도 꼴이 틀린 답이다.
 function readExecutorAnswer(answer: unknown, copy: ExecutorAnswerCopy): AnswerSettlement | null {
   try {
@@ -394,7 +434,7 @@ function readExecutorAnswer(answer: unknown, copy: ExecutorAnswerCopy): AnswerSe
     if (answer.ok === true) {
       const { moved, deferred, outsideLedger } = answer;
       if (!Array.isArray(moved) || !moved.every((m) => isPair(m) && isText(m.before) && isText(m.after))) return null;
-      if (!Array.isArray(deferred) || !deferred.every((d) => isPair(d) && isText(d.state) && isText(d.why))) return null;
+      if (!Array.isArray(deferred) || !deferred.every(isDeferred)) return null;
       if (!Array.isArray(outsideLedger) || !outsideLedger.every(isPair)) return null;
       return {
         settled: "applied",
@@ -428,13 +468,23 @@ function passAnswer(copy: ExecutorAnswerCopy, ledger: Pick<ReceiptLedger, "apply
 // 넘기지 않고 backlog로 돌려준다: 다시 넘길 때 그 답이 뒤 답보다 먼저여야 "안다고 한 적이 있다"가 뒤 답에 묻히지 않는다.
 // not_known만 실은 답의 실패는 붙들 관측이 없어 backlog에 넣지 않는다(부르는 쪽은 그 실행을 다시 조회한다).
 // 다시 넘기는 것은 같은 값이라 겹쳐도 해가 없다: 장부는 첫 관측만 적고, 이미 옮긴 실행은 다시 옮기지 않는다.
-function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<ReceiptLedger, "applyExecutorAnswer">, now: number) {
+function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<ReceiptLedger, "applyExecutorAnswer">, links: AnswerLinks, now: number) {
   const settled: AnswerSettlement[] = [];
   const backlog: ExecutorAnswerCopy[] = [];
   for (const copy of queue) {
     if (backlog.length > 0) {
       settled.push({ settled: "held", answer: copy });
       backlog.push(copy);
+      continue;
+    }
+    // 장부를 부를 때마다 그 직전에 본다. 밀린 사본의 연결은 받은 뒤 닫혔을 수 있고, 같은 루프의 앞선 장부 쓰기가 실패하며
+    // 그 연결의 인정을 끝낼 수 있다(await가 없어도 바뀐다). 인정이 끝난 연결의 답은 임대를 바꾸지 못한다.
+    const link = linkVerdict(links, copy.connection, copy.sender);
+    if (link !== "current") {
+      settled.push({ settled: "not_current", answer: copy, link });
+      // 임대를 건드리지 않고 관측만 적는 운영 중 장부 연산이 없어 "안다"는 항목은 이 사본으로만 남는다. 버리지 않으므로
+      // 그 실행기의 뒤 답은 이 사본 뒤에 막힌다(막힌 동안 임대를 거두지 못한다: 닫는 쪽이다).
+      if (copy.runs.some(isPositive)) backlog.push(copy);
       continue;
     }
     const result = passAnswer(copy, ledger, now);
@@ -445,25 +495,24 @@ function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<Receip
 }
 
 function handleStatus(input: ForwardInput, sender: string, issuedAt: unknown, body: Record<string, unknown>, ledger: ReceiptLedger): ReceiptOutcome {
-  const matched = matchStatus(sender, body, input.pendingQueries);
+  const matched = matchStatus(sender, body, input.pendingQueries, input.forward.connection);
   if ("outcome" in matched) return matched;
   const connection = input.forward.connection;
-  if (!Number.isSafeInteger(connection)) return reject("input_malformed", "forward.connection");
-  const answer: ExecutorAnswerCopy = { sender, coverage: "partial", runs: matched.runs, answeredAt: isTime(issuedAt) ? issuedAt : null };
+  const answer: ExecutorAnswerCopy = { sender, connection, coverage: "partial", runs: matched.runs, answeredAt: isTime(issuedAt) ? issuedAt : null };
   const base = { queryRequestId: matched.queryRequestId, executor: sender, connection };
-  // 연결을 묻는 것은 장부를 부르기 직전이다. 연결 판단이 forward를 낸 뒤 그 연결이 밀려났거나 닫혔으면 그 답은 지금 실행의 임대를
-  // 바꾸지 못한다.
+  // 연결 판단이 forward를 낸 뒤 그 연결이 밀려났거나 닫혔으면 그 답은 지금 실행의 임대를 바꾸지 못한다. 여기서 먼저 보고(밀린 답도
+  // 넘기지 않는다), 넘기는 루프가 장부 호출마다 다시 본다.
   const link = linkVerdict(input.links, connection, sender);
   if (link !== "current") return { outcome: "status_not_current", ...base, link, answer };
   if (!isTime(input.now)) return reject("input_malformed", "now");
   const backlog = readBacklog(input.backlog, sender);
   if (backlog === null) return reject("input_malformed", "backlog");
-  const result = settleInOrder([...backlog, answer], ledger, input.now);
+  const result = settleInOrder([...backlog, answer], ledger, input.links, input.now);
   return { outcome: "status_matched", ...base, settled: result.settled, backlog: result.backlog };
 }
 
-// 새 답 없이 한 실행기의 밀린 답을 받은 순서대로 다시 넘긴다. 처리는 handleForward의 status_report와 같다.
-// 입력을 바꾸지 않는다. 밀린 답의 연결은 처음 넘길 때 대조했으므로 다시 묻지 않는다.
+// 새 답 없이 한 실행기의 밀린 답을 받은 순서대로 다시 넘긴다. 처리는 handleForward의 status_report와 같다(사본마다 그 답이 온
+// 연결을 장부 호출 직전에 links에 묻는다). 입력을 바꾸지 않는다.
 export function replayBacklog(input: BacklogInput, ports: { readonly ledger: Pick<ReceiptLedger, "applyExecutorAnswer"> }): BacklogOutcome {
   if (!isRecord(input) || !Array.isArray(input.backlog)) return { outcome: "rejected", reason: "input_malformed", field: "backlog" };
   if (input.backlog.length === 0) return { outcome: "backlog_settled", settled: [], backlog: [] };
@@ -471,7 +520,7 @@ export function replayBacklog(input: BacklogInput, ports: { readonly ledger: Pic
   const backlog = isRecord(first) && isText(first.sender) ? readBacklog(input.backlog, first.sender) : null;
   if (backlog === null) return { outcome: "rejected", reason: "input_malformed", field: "backlog" };
   if (!isTime(input.now)) return { outcome: "rejected", reason: "input_malformed", field: "now" };
-  return { outcome: "backlog_settled", ...settleInOrder(backlog, ports.ledger, input.now) };
+  return { outcome: "backlog_settled", ...settleInOrder(backlog, ports.ledger, input.links, input.now) };
 }
 
 // forward 하나를 처리한다. 입력을 바꾸지 않는다.

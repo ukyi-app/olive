@@ -1,17 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, type KeyObject } from "node:crypto";
 import { executorName, limits, type RunStatus, sealEnvelope, type Verified, verifyEnvelope } from "../../../src/contract/v1/index.ts";
-import type { ExecutorAnswerInput, Ledger } from "../../../src/ledger/index.ts";
+import type { DeferredLoss, ExecutorAnswerInput, Ledger } from "../../../src/ledger/index.ts";
 import type { Random } from "../../../src/supervisor/dispatch/ports.ts";
 import {
   type AnswerLinks,
   type ExecutorAnswerCopy,
   type ForwardInput,
   handleForward,
-  type PendingQuery,
   type ReceiptLedger,
   type ReceiptOutcome,
   replayBacklog,
+  type SentQuery,
   type StatusUnmatchedReason,
 } from "../../../src/supervisor/dispatch/receipts.ts";
 import { id, NOW, open, startedWorker, tempPath, WORKER_EXECUTOR } from "../../ledger/helpers.ts";
@@ -50,10 +50,11 @@ const status = (runId: string, state: RunStatus["state"], generation: number | n
   run_generation: state === "not_known" ? null : generation,
   last_receipt_id: null,
 });
-const query = (runIds: string[], recipient = WORKER_EXECUTOR): PendingQuery => ({ requestId: id(), recipient, runIds });
+// 조회는 그 조회를 실은 연결에 묶는다. 기본은 input()의 forward.connection(7)이다.
+const query = (runIds: string[], recipient = WORKER_EXECUTOR, connection = 7): SentQuery => ({ requestId: id(), recipient, runIds, connection });
 const current: AnswerLinks = { current: () => true };
 
-function input(v: Verified, pending: PendingQuery[], extra: Partial<ForwardInput> = {}): ForwardInput {
+function input(v: Verified, pending: SentQuery[], extra: Partial<ForwardInput> = {}): ForwardInput {
   // now는 답의 서명 시각과 일부러 다르게 둔다(answeredAt을 받은 시각으로 대신하면 드러난다).
   return { forward: { verified: v, connection: 7 }, now: NOW + 500_000, stopGeneration: 0, pendingQueries: pending, links: current, backlog: [], ...extra };
 }
@@ -102,6 +103,20 @@ function realLedger() {
   return { ledger, fault, generation, state, ...started };
 }
 
+// 실제 장부를 감싸 applyExecutorAnswer에 넘긴 runs의 상태만 순서대로 적는다. after는 장부의 답을 본 뒤 부른다.
+function recordingLedger(ledger: Ledger, order: string[], after: (answer: ReturnType<Ledger["applyExecutorAnswer"]>) => void = () => {}): ReceiptLedger {
+  return {
+    applyReceipt: (i, f) => ledger.applyReceipt(i, f),
+    recordReport: (i, f) => ledger.recordReport(i, f),
+    applyExecutorAnswer(i, f) {
+      order.push(i.runs.map((r) => r.state).join(","));
+      const answer = ledger.applyExecutorAnswer(i, f);
+      after(answer);
+      return answer;
+    },
+  };
+}
+
 describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", () => {
   test("sender·runs·answeredAt은 검증된 봉투의 값이고 coverage는 partial이다(answeredAt은 issued_at, 받은 시각이 아니다)", async () => {
     const runId = id();
@@ -110,7 +125,7 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
     const spy = answerSpy();
     const outcome = matched(handleForward(input(await report(WORKER_EXECUTOR, pending.requestId, runs, NOW + 40_000), [pending]), { ledger: spy.ledger, random }));
     expect(spy.calls).toEqual([{ input: { coverage: "partial", runs, answeredAt: NOW + 40_000, now: NOW + 500_000 }, from: { sender: WORKER_EXECUTOR } }]);
-    expect(outcome.settled.map((s) => s.answer)).toEqual([{ sender: WORKER_EXECUTOR, coverage: "partial", runs, answeredAt: NOW + 40_000 }]);
+    expect(outcome.settled.map((s) => s.answer)).toEqual([{ sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs, answeredAt: NOW + 40_000 }]);
     expect([outcome.queryRequestId, outcome.executor, outcome.connection]).toEqual([pending.requestId, WORKER_EXECUTOR, 7]);
   });
 
@@ -139,6 +154,31 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
     expect(spy.calls).toEqual([]);
   });
 
+  test("연결 1에만 낸 조회에 연결 2가 답하면 장부 호출 0회, 연결 2에 낸 조회의 답만 넘어간다(실제 장부)", async () => {
+    const { ledger, generation, state, runId } = realLedger();
+    const order: string[] = [];
+    const recording = recordingLedger(ledger, order);
+    // 지금 인정된 연결은 같은 주체의 연결 2다. 연결 1에 낸 조회의 요청 ID로 연결 2가 종료 답을 서명해 보낸다.
+    const onTwo: AnswerLinks = { current: (connection, executorId) => connection === 2 && executorId === WORKER_EXECUTOR };
+    const viaOne = query([runId], WORKER_EXECUTOR, 1);
+    const ended = await report(WORKER_EXECUTOR, viaOne.requestId, [status(runId, "finalized")], NOW + MAX, generation);
+    const fromTwo = (v: Verified, pending: SentQuery[]) => input(v, pending, { forward: { verified: v, connection: 2 }, links: onTwo });
+    expect(handleForward(fromTwo(ended, [viaOne]), { ledger: recording, random })).toEqual({ outcome: "status_unmatched", reason: "other_connection" });
+    // 연결 번호가 없거나 꼴이 틀린 항목은 맞는 것으로 치지 않는다.
+    for (const loose of [{ ...viaOne, connection: undefined }, { ...viaOne, connection: "2" }]) {
+      expect(handleForward(fromTwo(ended, [loose as unknown as SentQuery]), { ledger: recording, random })).toEqual({ outcome: "status_unmatched", reason: "other_connection" });
+    }
+    expect(order).toEqual([]);
+    expect(state(runId)).toBe("preparing");
+    // 연결 2에 새로 낸 조회의 답은 넘어간다. 같은 초안을 두 연결에 실어 항목이 둘이어도 답이 온 연결의 항목과 대조한다.
+    const viaTwo = query([runId], WORKER_EXECUTOR, 2);
+    const alive = await report(WORKER_EXECUTOR, viaTwo.requestId, [status(runId, "running")], NOW + MAX + 1, generation);
+    const outcome = matched(handleForward(fromTwo(alive, [{ ...viaTwo, connection: 1 }, viaTwo]), { ledger: recording, random }));
+    expect([outcome.connection, outcome.settled.map((s) => s.settled)]).toEqual([2, ["applied"]]);
+    expect(order).toEqual(["running"]);
+    expect(state(runId)).toBe("preparing");
+  });
+
   test("답이 온 연결이 지금 인정된 연결이 아니거나 그것을 모르면 장부에 넘기지 않는다(옛 연결의 답)", async () => {
     const runId = id();
     const pending = query([runId]);
@@ -146,7 +186,7 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
     const v = await report(WORKER_EXECUTOR, pending.requestId, runs, NOW + 40_000);
     const asked: [number, string][] = [];
     const spy = answerSpy();
-    const answer: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, coverage: "partial", runs, answeredAt: NOW + 40_000 };
+    const answer: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs, answeredAt: NOW + 40_000 };
     const base = { outcome: "status_not_current" as const, queryRequestId: pending.requestId, executor: WORKER_EXECUTOR, connection: 7, answer };
     const stale: AnswerLinks = {
       current(connection, executorId) {
@@ -176,9 +216,9 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
     const pending = query([runId]);
     const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "running")], NOW);
     const spy = answerSpy();
-    const own: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW };
+    const own: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW };
     expect(handleForward(input(v, [pending], { now: 0 }), { ledger: spy.ledger, random })).toEqual({ outcome: "rejected", reason: "input_malformed", field: "now" });
-    for (const backlog of [[{ ...own, sender: OTHER }], [{ ...own, coverage: "full" }], [{ ...own, answeredAt: -1 }], null]) {
+    for (const backlog of [[{ ...own, sender: OTHER }], [{ ...own, coverage: "full" }], [{ ...own, answeredAt: -1 }], [{ ...own, connection: undefined }], [{ ...own, connection: "7" }], null]) {
       expect(handleForward(input(v, [pending], { backlog: backlog as unknown as ExecutorAnswerCopy[] }), { ledger: spy.ledger, random })).toEqual({
         outcome: "rejected",
         reason: "input_malformed",
@@ -200,7 +240,7 @@ describe("보장 2: 장부의 답을 그대로 구별해 돌려준다", () => {
     expect(deferred.settled).toEqual([
       {
         settled: "applied",
-        answer: { sender: WORKER_EXECUTOR, coverage: "partial", runs: early, answeredAt: NOW + 1_000 },
+        answer: { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: early, answeredAt: NOW + 1_000 },
         moved: [],
         deferred: [{ runId, runGeneration: 1, state: "preparing", why: "start_may_arrive" }],
         outsideLedger: [{ runId: outside, runGeneration: 2 }],
@@ -214,7 +254,7 @@ describe("보장 2: 장부의 답을 그대로 구별해 돌려준다", () => {
     expect(moved.settled).toEqual([
       {
         settled: "applied",
-        answer: { sender: WORKER_EXECUTOR, coverage: "partial", runs: ended, answeredAt: NOW + 2_000 },
+        answer: { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: ended, answeredAt: NOW + 2_000 },
         moved: [{ runId, runGeneration: 1, before: "preparing", after: "unknown_running" }],
         deferred: [],
         outsideLedger: [],
@@ -230,7 +270,7 @@ describe("보장 2: 장부의 답을 그대로 구별해 돌려준다", () => {
     const runs = [status(runId, "finalized")];
     fault.failCommit = true;
     const outcome = matched(handleForward(input(await report(WORKER_EXECUTOR, pending.requestId, runs, NOW + MAX, generation), [pending]), { ledger, random }));
-    const answer: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, coverage: "partial", runs, answeredAt: NOW + MAX };
+    const answer: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs, answeredAt: NOW + MAX };
     expect(outcome.settled).toEqual([{ settled: "unsaved", answer, reason: "ledger_unwritable", unsavedSightings: [{ runId, runGeneration: 1 }] }]);
     expect(outcome.backlog).toEqual([answer]);
     expect(state(runId)).toBe("preparing");
@@ -260,6 +300,23 @@ describe("보장 2: 장부의 답을 그대로 구별해 돌려준다", () => {
     }
   });
 
+  test("보류 항목의 사유·상태·세대가 장부가 정한 값이 아니면 성공이 아니고 '안다'는 답이 밀린 답으로 남는다", async () => {
+    const runId = id();
+    const pending = query([runId]);
+    const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "running")], NOW);
+    const ok = (deferred: unknown) => ({ ok: true, moved: [], outsideLedger: [], deferred: [deferred] });
+    const good = { runId, runGeneration: 1, state: "running", why: "start_may_arrive" };
+    for (const deferred of [{ ...good, why: "undefined_reason" }, { ...good, state: "flying" }, { ...good, runGeneration: 0 }]) {
+      const outcome = matched(handleForward(input(v, [pending]), { ledger: answerSpy([ok(deferred)]).ledger, random }));
+      expect(outcome.settled.map((s) => (s.settled === "ledger_failed" ? s.failure : s.settled))).toEqual(["malformed_answer"]);
+      expect(outcome.backlog.map((b) => b.runs)).toEqual([[status(runId, "running")]]);
+    }
+    // 대조군: 장부가 정한 값이면 그대로 싣는다.
+    const outcome = matched(handleForward(input(v, [pending]), { ledger: answerSpy([ok(good)]).ledger, random }));
+    expect(outcome.settled.map((s) => s.settled === "applied" && s.deferred)).toEqual([[good] as unknown as DeferredLoss[]]);
+    expect(outcome.backlog).toEqual([]);
+  });
+
   test("양성 항목이 없는 답의 실패는 밀린 답으로 남기지 않는다(붙들 관측이 없다)", async () => {
     const runId = id();
     const pending = query([runId]);
@@ -277,7 +334,7 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
     const firstRuns = [status(runId, "running")];
     const spy = answerSpy([{ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId, runGeneration: 1 }] }]);
     const failed = matched(handleForward(input(await report(WORKER_EXECUTOR, first.requestId, firstRuns, NOW + 10), [first]), { ledger: spy.ledger, random }));
-    expect(failed.backlog).toEqual([{ sender: WORKER_EXECUTOR, coverage: "partial", runs: firstRuns, answeredAt: NOW + 10 }]);
+    expect(failed.backlog).toEqual([{ sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: firstRuns, answeredAt: NOW + 10 }]);
     const second = query([runId]);
     const after = matched(
       handleForward(input(await report(WORKER_EXECUTOR, second.requestId, [status(runId, "not_known")], NOW + MAX), [second], { backlog: failed.backlog, now: NOW + 600_000 }), {
@@ -296,30 +353,30 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
 
   test("밀린 답이 또 저장되지 않으면 이번 답은 넘기지 않고 그 뒤에 줄 세운다", async () => {
     const runId = id();
-    const backlog: ExecutorAnswerCopy[] = [{ sender: WORKER_EXECUTOR, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 }];
+    const backlog: ExecutorAnswerCopy[] = [{ sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 }];
     const pending = query([runId]);
     const spy = answerSpy([{ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId, runGeneration: 1 }] }]);
     const newer = [status(runId, "finalized")];
     const outcome = matched(handleForward(input(await report(WORKER_EXECUTOR, pending.requestId, newer, NOW + MAX), [pending], { backlog }), { ledger: spy.ledger, random }));
     expect(spy.calls).toHaveLength(1);
     expect(outcome.settled.map((s) => s.settled)).toEqual(["unsaved", "held"]);
-    expect(outcome.backlog).toEqual([...backlog, { sender: WORKER_EXECUTOR, coverage: "partial", runs: newer, answeredAt: NOW + MAX }]);
+    expect(outcome.backlog).toEqual([...backlog, { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: newer, answeredAt: NOW + MAX }]);
   });
 
   test("replayBacklog는 새 답 없이 밀린 답을 같은 값으로 순서대로 넘기고, 꼴이 틀린 목록은 장부를 부르지 않는다", () => {
     const runId = id();
-    const a: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 };
-    const b: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, coverage: "partial", runs: [status(runId, "stopping")], answeredAt: null };
+    const a: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 };
+    const b: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "stopping")], answeredAt: null };
     const spy = answerSpy();
-    const outcome = replayBacklog({ backlog: [a, b], now: NOW + 700_000 }, { ledger: spy.ledger });
+    const outcome = replayBacklog({ backlog: [a, b], now: NOW + 700_000, links: current }, { ledger: spy.ledger });
     expect(outcome.outcome === "backlog_settled" && [outcome.settled.map((s) => s.settled), outcome.backlog]).toEqual([["applied", "applied"], []]);
     expect(spy.calls.map((c) => [c.input, c.from])).toEqual([
       [{ coverage: "partial", runs: a.runs, answeredAt: NOW + 10, now: NOW + 700_000 }, { sender: WORKER_EXECUTOR }],
       [{ coverage: "partial", runs: b.runs, answeredAt: null, now: NOW + 700_000 }, { sender: WORKER_EXECUTOR }],
     ]);
-    expect(replayBacklog({ backlog: [], now: NOW }, { ledger: spy.ledger })).toEqual({ outcome: "backlog_settled", settled: [], backlog: [] });
-    expect(replayBacklog({ backlog: [a, { ...b, sender: OTHER }], now: NOW }, { ledger: spy.ledger })).toEqual({ outcome: "rejected", reason: "input_malformed", field: "backlog" });
-    expect(replayBacklog({ backlog: [a], now: Number.NaN }, { ledger: spy.ledger })).toEqual({ outcome: "rejected", reason: "input_malformed", field: "now" });
+    expect(replayBacklog({ backlog: [], now: NOW, links: current }, { ledger: spy.ledger })).toEqual({ outcome: "backlog_settled", settled: [], backlog: [] });
+    expect(replayBacklog({ backlog: [a, { ...b, sender: OTHER }], now: NOW, links: current }, { ledger: spy.ledger })).toEqual({ outcome: "rejected", reason: "input_malformed", field: "backlog" });
+    expect(replayBacklog({ backlog: [a], now: Number.NaN, links: current }, { ledger: spy.ledger })).toEqual({ outcome: "rejected", reason: "input_malformed", field: "now" });
     expect(spy.calls).toHaveLength(2);
   });
 
@@ -354,7 +411,7 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
       { settled: "applied", answer: failed.backlog[0], moved: [], deferred: [], outsideLedger: [] },
       {
         settled: "applied",
-        answer: { sender: WORKER_EXECUTOR, coverage: "partial", runs: [status(runId, "not_known")], answeredAt: NOW + MAX },
+        answer: { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "not_known")], answeredAt: NOW + MAX },
         moved: [{ runId, runGeneration: 1, before: "preparing", after: "unknown_running" }],
         deferred: [],
         outsideLedger: [],
@@ -363,6 +420,75 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
     expect(later.backlog).toEqual([]);
     expect(ledger.hasRunSighting(runId)).toEqual({ known: true, value: true });
     expect(state(runId)).toBe("unknown_running");
+  });
+});
+
+// 연결 표 대신, 인정된 연결 번호의 집합을 그때그때 읽는 가짜 links를 쓴다. 실제 감독에서는 장부의 커밋 실패가 복원기의 세대를
+// 지워 그 실행기의 연결이 후보에서 빠진다. 여기서는 장부가 실패를 돌려준 뒤 집합을 비워 그 결과만 흉내 낸다.
+describe("밀린 답도 장부 호출마다 그 직전에 연결을 본다", () => {
+  const linksOf = (open: Set<number>): AnswerLinks => ({ current: (connection, executorId) => open.has(connection) && executorId === WORKER_EXECUTOR });
+
+  test("닫힌 연결의 밀린 답을 다시 넘기면 장부를 부르지 않고 사본을 그대로 남긴다(실제 장부)", async () => {
+    const { ledger, fault, generation, state, runId } = realLedger();
+    const order: string[] = [];
+    const recording = recordingLedger(ledger, order);
+    const open = new Set([7]);
+    const pending = query([runId]);
+    fault.failCommit = true;
+    const failed = matched(handleForward(input(await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "finalized")], NOW + MAX, generation), [pending], { links: linksOf(open) }), { ledger: recording, random }));
+    fault.failCommit = false;
+    expect(failed.settled.map((s) => s.settled)).toEqual(["unsaved"]);
+    expect(failed.backlog.map((b) => b.connection)).toEqual([7]);
+    open.delete(7);
+    const replayed = replayBacklog({ backlog: failed.backlog, now: NOW + 600_000, links: linksOf(open) }, { ledger: recording });
+    expect(replayed).toEqual({ outcome: "backlog_settled", settled: [{ settled: "not_current", answer: failed.backlog[0], link: "not_current" }], backlog: failed.backlog });
+    // 연결 포트가 던져도(모름) 같다.
+    const throwing: AnswerLinks = {
+      current: () => {
+        throw new Error("연결 표를 읽지 못함");
+      },
+    };
+    const unknown = replayBacklog({ backlog: failed.backlog, now: NOW + 600_000, links: throwing }, { ledger: recording });
+    expect(unknown.outcome === "backlog_settled" && [unknown.settled.map((s) => s.settled === "not_current" && s.link), unknown.backlog]).toEqual([["unknown"], failed.backlog]);
+    expect(order).toEqual(["finalized"]);
+    expect(state(runId)).toBe("preparing");
+  });
+
+  test("앞선 장부 쓰기의 실패로 연결의 인정이 끝나면 같은 루프의 뒤 답은 장부에 닿지 않고 사본이 남는다(실제 장부)", async () => {
+    const { ledger, fault, generation, state, runId } = realLedger();
+    const order: string[] = [];
+    const open = new Set([7]);
+    let calls = 0;
+    // 둘째 호출(밀린 not_known)의 커밋만 실패시킨다.
+    const recording = recordingLedger(
+      {
+        applyExecutorAnswer: (i: ExecutorAnswerInput, f: { sender: string }) => {
+          fault.failCommit = ++calls === 2;
+          try {
+            return ledger.applyExecutorAnswer(i, f);
+          } finally {
+            fault.failCommit = false;
+          }
+        },
+      } as unknown as Ledger,
+      order,
+      (answer) => {
+        if (!answer.ok) open.clear();
+      },
+    );
+    const backlog: ExecutorAnswerCopy[] = [
+      { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 },
+      { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "not_known")], answeredAt: NOW + MAX },
+    ];
+    const pending = query([runId]);
+    const ended = [status(runId, "finalized")];
+    const outcome = matched(handleForward(input(await report(WORKER_EXECUTOR, pending.requestId, ended, NOW + MAX + 10, generation), [pending], { backlog, links: linksOf(open) }), { ledger: recording, random }));
+    const last: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: ended, answeredAt: NOW + MAX + 10 };
+    expect(order).toEqual(["running", "not_known"]);
+    expect(outcome.settled.map((s) => s.settled)).toEqual(["applied", "unsaved", "not_current"]);
+    expect(outcome.backlog).toEqual([last]);
+    expect(state(runId)).toBe("preparing");
+    expect(ledger.hasRunSighting(runId)).toEqual({ known: true, value: true });
   });
 });
 

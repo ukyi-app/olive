@@ -713,7 +713,8 @@ describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도
     expect([forward.verified.header.sender, forward.verified.header.run_generation, forward.verified.header.stop_generation]).toEqual([R1, 0, 0]);
     expect(forward.verified.body).toEqual({ in_reply_to: query, runs: [running] });
 
-    const pending = [{ requestId: query, recipient: R1, runIds: [RUN] }];
+    // 조회는 이 연결에 실은 것이다.
+    const pending = [{ requestId: query, recipient: R1, runIds: [RUN], connection: id }];
     // 지금 인정된 연결은 이 연결 하나다. now는 봉투의 issued_at(T + 2)과 다르게 둔다(answeredAt이 받은 시각이 아님을 가른다).
     const links = { current: (connection: number, executor: string) => connection === id && executor === R1 };
     expect(handleForward({ forward, now: T + 3, stopGeneration: 0, pendingQueries: pending, links, backlog: [] }, ports)).toEqual({
@@ -721,7 +722,7 @@ describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도
       queryRequestId: query,
       executor: R1,
       connection: id,
-      settled: [{ settled: "applied", answer: { sender: R1, coverage: "partial", runs: [running], answeredAt: T + 2 }, moved: [], deferred: [], outsideLedger: [] }],
+      settled: [{ settled: "applied", answer: { sender: R1, connection: id, coverage: "partial", runs: [running], answeredAt: T + 2 }, moved: [], deferred: [], outsideLedger: [] }],
       backlog: [],
     });
     expect(answers).toEqual([{ input: { coverage: "partial", runs: [running], answeredAt: T + 2, now: T + 3 }, from: { sender: R1 } }]);
