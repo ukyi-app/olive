@@ -25,6 +25,8 @@ interface World {
   setIntake(open: boolean): void;
   setStopGeneration(value: number | null): void;
   setSend(next: () => Promise<SendOutcome>): void;
+  // 지정 실행기의 연결 판정(LinkGate.mayIssue의 답). 기본은 { ok: true }.
+  setLink(next: (executorId: string) => unknown): void;
   failSigner(on: boolean): void;
   wrap(over: Partial<LifeLoopLedger>): void;
 }
@@ -38,6 +40,7 @@ function world(): World {
   let intake = true;
   let stopGeneration: number | null = 0;
   let send: () => Promise<SendOutcome> = async () => "sent";
+  let link: (executorId: string) => unknown = () => ({ ok: true });
   let signerFails = false;
   let override: Partial<LifeLoopLedger> = {};
   const port = (name: keyof LifeLoopLedger) =>
@@ -63,6 +66,7 @@ function world(): World {
       recordStopInstruction: port("recordStopInstruction"),
     },
     intake: { intakeOpen: () => intake && ledger.intakeOpen(), stopGeneration: () => stopGeneration },
+    links: { mayIssue: (executorId) => link(executorId) as never },
     clock: { now: () => queued.shift() ?? clockAt },
     random,
     signer,
@@ -95,6 +99,9 @@ function world(): World {
     setSend: (next) => {
       send = next;
     },
+    setLink: (next) => {
+      link = next;
+    },
     failSigner: (on) => {
       signerFails = on;
     },
@@ -118,6 +125,7 @@ function started(w: World, overrides: Parameters<typeof worker>[0] = {}) {
   must(w.ledger.startRun({ runId: run.runId, requestId, stopGeneration: 0, now: NOW }));
   return { runId: run.runId, requestId, from: from(run) };
 }
+type Started = ReturnType<typeof started>;
 
 function accept(w: World, s: ReturnType<typeof started>, action: "receipt_accepted" | "receipt_started" = "receipt_accepted"): void {
   const base = { receiptId: id(), runId: s.runId, instructionRequestId: s.requestId, bodyDigest: digest(`${action}:${s.runId}`), now: NOW };
@@ -129,7 +137,7 @@ function ran(result: LifeTickResult): Extract<LifeTickResult, { kind: "ran" }> {
   return result;
 }
 
-const tick = (w: World, lastQueries: { runId: string; at: number }[] = []) => lifeTick(w.ports, POLICY, { lastQueries });
+const tick = (w: World, lastQueries: { runId: string; at: number }[] = [], unsentRenews: string[] = []) => lifeTick(w.ports, POLICY, { lastQueries, unsentRenews });
 
 function only(result: LifeTickResult, runId: string): RunOutcome {
   const outcome = ran(result).runs.find((r) => r.runId === runId);
@@ -248,9 +256,11 @@ describe("보장 1: 의도 하나, 장부에 적은 뒤에만 지시", () => {
     w.queueClock(Number.NaN);
     expect(await tick(w)).toEqual({ kind: "not_run", reason: "clock_unavailable" });
     w = make();
-    expect(await lifeTick(w.ports, POLICY, { lastQueries: [{ runId: "x", at: -1 }] })).toEqual({ kind: "not_run", reason: "input_malformed" });
+    expect(await lifeTick(w.ports, POLICY, { lastQueries: [{ runId: "x", at: -1 }], unsentRenews: [] })).toEqual({ kind: "not_run", reason: "input_malformed" });
     w = make();
-    expect(await lifeTick(w.ports, { renewEveryMs: 20_000, answerTimeoutMs: 1 }, { lastQueries: [] })).toEqual({ kind: "not_run", reason: "policy_rejected" });
+    expect(await lifeTick(w.ports, POLICY, { lastQueries: [], unsentRenews: [7] } as never)).toEqual({ kind: "not_run", reason: "input_malformed" });
+    w = make();
+    expect(await lifeTick(w.ports, { renewEveryMs: 20_000, answerTimeoutMs: 1 }, { lastQueries: [], unsentRenews: [] })).toEqual({ kind: "not_run", reason: "policy_rejected" });
     expect(w.log).toEqual([]);
   });
 
@@ -492,12 +502,20 @@ describe("보장 4: 취소와 기한은 전해진다, 쓰기 뒤의 실패는 �
     expect(only(result, c.second)).toEqual({ runId: c.second, outcome: "closed_not_started" });
     expect(state(c.w, c.first)).toBe("stopping");
 
-    // 둘째 실행의 장부 답을 읽다 던진다: 첫 실행의 결과는 그대로이고 멈춘 자리가 나온다.
-    c = make();
-    const second = c.second;
-    c.w.wrap({
+    // 둘째 실행의 장부 쓰기는 실제로 커밋되고 그 답을 읽다 던진다: 첫 실행의 결과와 둘째 실행의 항목이 남고, 셋째 실행은 쓰지 않는다.
+    // 작업자 자리는 하나라 시작한 실행은 가운데 하나이고 앞뒤는 대기 실행이다.
+    const w = world();
+    const owners = [input(w), input(w), input(w)];
+    const first = { runId: must(w.ledger.admitRun(worker({ inputRequestId: owners[0] }))).run.runId };
+    const second = started(w, { inputRequestId: owners[1] });
+    accept(w, second);
+    const third = { runId: must(w.ledger.admitRun(worker({ inputRequestId: owners[2] }))).run.runId };
+    for (const owner of owners) must(w.ledger.cancelInput(owner, NOW + 1));
+    w.setClock(NOW + 2_000);
+    w.wrap({
       recordStopInstruction: ((args: { runId: string }) => {
-        if (args.runId !== second) return c.w.ledger.recordStopInstruction(args as never);
+        const answer = w.ledger.recordStopInstruction(args as never);
+        if (args.runId !== second.runId) return answer;
         return {
           ok: true,
           get run(): never {
@@ -506,11 +524,73 @@ describe("보장 4: 취소와 기한은 전해진다, 쓰기 뒤의 실패는 �
         };
       }) as never,
     });
-    result = ran(await tick(c.w));
+    result = ran(await tick(w));
     expect(result.halted).toBe("threw");
-    expect(result.haltedAt).toBe(second);
-    expect(result.runs).toEqual([expect.objectContaining({ runId: c.first, outcome: "stop_sent" })]);
-    expect(c.w.sent.map((e) => e.header.action)).toEqual(["task_cancel"]);
+    expect(result.haltedAt).toBe(second.runId);
+    const stopLine = unanswered(w).find((i) => i.runId === second.runId && i.action === "task_cancel");
+    expect(result.runs).toEqual([
+      { runId: first.runId, outcome: "closed_not_started" },
+      expect.objectContaining({ runId: second.runId, outcome: "stop_recorded_not_sent", reason: "ledger_answer_malformed", requestId: stopLine?.requestId, issuedAt: NOW + 2_000, executorId: WORKER_EXECUTOR, cancelReason: "requested" }),
+    ]);
+    expect(writes(w)).toEqual(["recordStopInstruction", "recordStopInstruction"]);
+    expect(state(w, third.runId)).toBe("queued");
+    expect(w.sent).toEqual([]);
+  });
+
+  test("갱신의 답을 읽다 던지면 적힌 갱신이 결과에 남고, 쓰기 포트가 던지면 같은 식별값으로 기록 여부 모름을 낸다", async () => {
+    // 실제 장부에 적은 뒤 leaseUntil을 읽다 던진다. 뒤의 대기 실행 b는 취소됐지만 닫히지 않는다.
+    const w = world();
+    const a = started(w);
+    accept(w, a);
+    const owner = input(w);
+    const b = must(w.ledger.admitRun(worker({ inputRequestId: owner }))).run;
+    must(w.ledger.cancelInput(owner, NOW + 1));
+    w.setClock(NOW + 10_000);
+    w.wrap({
+      recordRenewInstruction: ((args: { runId: string }) => {
+        const answer = must(w.ledger.recordRenewInstruction(args as never));
+        if (args.runId !== a.runId) return answer;
+        return {
+          ok: true,
+          get leaseUntil(): never {
+            throw new Error("답 읽기 실패");
+          },
+        };
+      }) as never,
+    });
+    const result = ran(await tick(w));
+    expect(result).toMatchObject({ halted: "threw", haltedAt: a.runId });
+    expect(result.runs).toEqual([
+      expect.objectContaining({ runId: a.runId, outcome: "renew_recorded_not_sent", reason: "ledger_answer_malformed", leaseUntil: null, issuedAt: NOW + 10_000, delivery: "not_sent" }),
+    ]);
+    expect(times(w, a.runId).renewIssued).toEqual({ issuedAt: NOW + 10_000, leaseUntil: NOW + 40_000 });
+    expect(writes(w)).toEqual(["recordRenewInstruction"]);
+    expect(state(w, b.runId)).toBe("queued");
+
+    // 쓰기 포트가 커밋한 뒤 던진다: 적혔는지 모르는 항목으로 같은 요청 ID를 내고, 다음 실행은 계속 본다.
+    const w2 = world();
+    const c = started(w2);
+    accept(w2, c);
+    const owner2 = input(w2);
+    const d = must(w2.ledger.admitRun(worker({ inputRequestId: owner2 }))).run;
+    must(w2.ledger.cancelInput(owner2, NOW + 1));
+    w2.setClock(NOW + 10_000);
+    let passed: string | undefined;
+    w2.wrap({
+      recordRenewInstruction: ((args: { runId: string; requestId: string }) => {
+        const answer = w2.ledger.recordRenewInstruction(args as never);
+        if (args.runId !== c.runId) return answer;
+        passed = args.requestId;
+        throw new Error("커밋 뒤 끊김");
+      }) as never,
+    });
+    const second = ran(await tick(w2));
+    const unknown = only(second, c.runId) as Extract<RunOutcome, { outcome: "renew_record_unknown" }>;
+    expect(unknown).toMatchObject({ outcome: "renew_record_unknown", reason: "threw", issuedAt: NOW + 10_000, executorId: WORKER_EXECUTOR, stopGeneration: 0 });
+    expect(unknown.requestId).toBe(passed as string);
+    expect(times(w2, c.runId).renewIssued).toEqual({ issuedAt: NOW + 10_000, leaseUntil: NOW + 40_000 });
+    expect(only(second, d.runId)).toEqual({ runId: d.runId, outcome: "closed_not_started" });
+    expect(second.halted).toBeNull();
   });
 
   test("결과에는 자격 digest·서명·nonce·키 재료가 없다", async () => {
@@ -529,6 +609,273 @@ describe("보장 4: 취소와 기한은 전해진다, 쓰기 뒤의 실패는 �
       expect(text).not.toContain(envelope.header.nonce);
     }
     expect(text).not.toContain("PRIVATE");
+  });
+});
+
+describe("쓰기 직전의 확인: 연결, 최신 읽기, 칸의 꼴, 싣지 못한 갱신, 시각", () => {
+  const plain = (ports: LifeLoopPorts, policy: LifecyclePolicy = POLICY) => lifeTick(ports, policy, { lastQueries: [], unsentRenews: [] });
+
+  test("지정 실행기의 연결이 지시를 낼 수 없거나 모르면 갱신을 적지 않는다. 종료는 연결을 보지 않고 적는다", async () => {
+    const w = world();
+    const owner = input(w);
+    const s = started(w, { inputRequestId: owner });
+    accept(w, s);
+    w.setClock(NOW + 17_000);
+    const asked: string[] = [];
+    w.setLink((executorId) => {
+      asked.push(executorId);
+      return { ok: false, reason: "no_connection" };
+    });
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "renew_withheld", reason: "no_connection" });
+    expect(asked).toEqual([WORKER_EXECUTOR]);
+    for (const answer of [
+      () => {
+        throw new Error("연결 표를 읽지 못함");
+      },
+      () => ({ ok: "true" }),
+      () => undefined,
+    ]) {
+      w.setLink(answer);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "renew_withheld", reason: "link_unknown" });
+    }
+    expect(w.log).toEqual([]);
+    expect(times(w, s.runId)).toMatchObject({ lease: { issuedAt: NOW, expiresAt: NOW + 30_000 }, renewIssued: null });
+
+    w.setLink((executorId) => {
+      asked.push(executorId);
+      return { ok: false, reason: "no_connection" };
+    });
+    must(w.ledger.cancelInput(owner, NOW + 17_000));
+    w.setSend(async () => "no_connection");
+    expect(only(await tick(w), s.runId)).toMatchObject({ outcome: "stop_recorded_not_sent", reason: "no_connection", cancelReason: "requested" });
+    expect(asked).toEqual([WORKER_EXECUTOR]);
+    expect(writes(w)).toEqual(["recordStopInstruction"]);
+  });
+
+  test("겹쳐 부른 박자는 읽기·쓰기 없이 돌려보낸다: 갱신·종료는 한 줄이고 갱신 봉투의 끝은 장부의 값과 같다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    w.setClock(NOW + 10_000);
+    const [one, two] = await Promise.all([tick(w), tick(w)]);
+    expect(two).toEqual({ kind: "not_run", reason: "tick_in_progress" });
+    expect(only(one, s.runId)).toMatchObject({ outcome: "renew_sent", leaseUntil: NOW + 40_000 });
+    expect(writes(w)).toEqual(["recordRenewInstruction"]);
+    const stored = times(w, s.runId);
+    expect(w.sent.map((e) => e.body)).toEqual([{ run_id: s.runId, lease_until: stored.renewIssued?.leaseUntil }]);
+    expect(stored.lease).toEqual({ issuedAt: NOW + 10_000, expiresAt: NOW + 40_000 });
+    // 앞 박자가 돌아온 뒤에는 다시 돈다.
+    expect((await tick(w)).kind).toBe("ran");
+
+    const w2 = world();
+    const owner = input(w2);
+    const c = started(w2, { inputRequestId: owner });
+    accept(w2, c);
+    must(w2.ledger.cancelInput(owner, NOW + 1));
+    w2.setClock(NOW + 10_000);
+    const [three, four] = await Promise.all([tick(w2), tick(w2)]);
+    expect(only(three, c.runId)).toMatchObject({ outcome: "stop_sent" });
+    expect(four).toEqual({ kind: "not_run", reason: "tick_in_progress" });
+    expect(unanswered(w2).filter((i) => i.runId === c.runId && i.action === "task_cancel")).toHaveLength(1);
+    expect(w2.sent.map((e) => e.header.action)).toEqual(["task_cancel"]);
+  });
+
+  test("다른 포트 묶음으로 같은 장부를 겹쳐 불러도 쓰기 직전의 다시 읽기가 같은 실행의 두 번째 지시를 막는다", async () => {
+    // 대기 실행 Q, 접수된 실행 A 순. 두 박자가 모두 A의 의도를 고른 뒤 Q를 처리하는 사이에 서로 끼어든다.
+    for (const cancel of [false, true]) {
+      const w = world();
+      const q = must(w.ledger.admitRun(worker())).run;
+      const owner = input(w);
+      const a = started(w, { inputRequestId: owner });
+      accept(w, a);
+      if (cancel) must(w.ledger.cancelInput(owner, NOW + 1));
+      w.setClock(NOW + 10_000);
+      const other: LifeLoopPorts = { ...w.ports, ledger: { ...w.ports.ledger } };
+      const results = (await Promise.all([tick(w), plain(other)])).map(ran);
+      for (const r of results) expect(only(r, q.runId)).toEqual({ runId: q.runId, outcome: "wait" });
+      // 두 포트 묶음은 같은 쓰기 함수를 나눠 쓰므로 쓰기 호출이 한 기록에 모인다.
+      expect(writes(w)).toEqual([cancel ? "recordStopInstruction" : "recordRenewInstruction"]);
+      if (cancel) expect(unanswered(w).filter((i) => i.runId === a.runId && i.action === "task_cancel")).toHaveLength(1);
+      expect(results.map((r) => only(r, a.runId).outcome).sort()).toEqual([cancel ? "stop_sent" : "renew_sent", "superseded"]);
+      expect(w.sent).toHaveLength(1);
+      if (!cancel) expect((w.sent[0] as Envelope).body).toEqual({ run_id: a.runId, lease_until: times(w, a.runId).renewIssued?.leaseUntil });
+    }
+  });
+
+  test("앞 실행을 내보내는 사이에 들어온 취소·종료 쓰기를 보고 낡은 판단으로 쓰지 않는다", async () => {
+    // 대기 실행 Q(취소됨), 접수된 실행 A 순. Q를 닫는 장부 쓰기 뒤에 다른 쓰기가 A에 끼어든다.
+    const make = (between: (w: World, a: Started, ownerA: string) => void, cancelA: boolean) => {
+      const w = world();
+      const ownerQ = input(w);
+      const q = must(w.ledger.admitRun(worker({ inputRequestId: ownerQ }))).run;
+      const ownerA = input(w);
+      const a = started(w, { inputRequestId: ownerA });
+      accept(w, a);
+      must(w.ledger.cancelInput(ownerQ, NOW + 1));
+      if (cancelA) must(w.ledger.cancelInput(ownerA, NOW + 1));
+      w.setClock(NOW + 10_000);
+      w.wrap({
+        recordStopInstruction: ((args: { runId: string }) => {
+          const answer = w.ledger.recordStopInstruction(args as never);
+          if (args.runId === q.runId) between(w, a, ownerA);
+          return answer;
+        }) as never,
+      });
+      return { w, a, q };
+    };
+    // 갱신을 계획한 뒤 소유자 입력이 취소된다.
+    const one = make((w, _a, ownerA) => must(w.ledger.cancelInput(ownerA, NOW + 10_000)), false);
+    const result = ran(await tick(one.w));
+    expect(only(result, one.q.runId)).toEqual({ runId: one.q.runId, outcome: "closed_not_started" });
+    expect(only(result, one.a.runId)).toEqual({ runId: one.a.runId, outcome: "superseded", planned: "renew_lease" });
+    expect(times(one.w, one.a.runId).renewIssued).toBeNull();
+    expect(only(await tick(one.w), one.a.runId)).toMatchObject({ outcome: "stop_sent", cancelReason: "requested" });
+
+    // 종료를 계획한 뒤 다른 쓰기가 같은 실행의 종료를 적는다.
+    const two = make((w, a) => {
+      must(w.ledger.recordStopInstruction({ runId: a.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 10_000, reason: "requested" }));
+    }, true);
+    const r2 = ran(await tick(two.w));
+    expect(only(r2, two.a.runId)).toEqual({ runId: two.a.runId, outcome: "superseded", planned: "stop" });
+    expect(unanswered(two.w).filter((i) => i.runId === two.a.runId && i.action === "task_cancel")).toHaveLength(1);
+    expect(two.w.sent).toEqual([]);
+  });
+
+  test("시작 접수는 유효한 영수증 ID만 증거로 보고, 판단에 쓰는 칸이 빠지거나 틀리거나 줄이 겹치면 그 실행에 쓰지도 내보내지도 않는다", async () => {
+    type Change = (value: Record<string, unknown>) => Record<string, unknown>[];
+    const without =
+      (key: string): Change =>
+      (row) => {
+        const copy = { ...row };
+        delete copy[key];
+        return [copy];
+      };
+    const set =
+      (key: string, value: unknown): Change =>
+      (row) => [{ ...row, [key]: value }];
+    // fixture: accepted(접수됨, 갱신이 나갈 자리), fresh(접수 없음), cancelled(접수됨, 소유자 취소)
+    const make = (fixture: "accepted" | "fresh" | "cancelled") => {
+      const w = world();
+      const owner = input(w);
+      const s = started(w, { inputRequestId: owner });
+      if (fixture !== "fresh") accept(w, s);
+      if (fixture === "cancelled") must(w.ledger.cancelInput(owner, NOW + 1));
+      w.setClock(NOW + 10_000);
+      return { w, s };
+    };
+    const rows: [Parameters<typeof make>[0], Change][] = [
+      ["fresh", without("acceptedReceiptId")],
+      ["fresh", set("acceptedReceiptId", undefined)],
+      ["fresh", set("acceptedReceiptId", "")],
+      ["fresh", set("startedReceiptId", "receipt")],
+      ["accepted", set("deadlineAt", Number.NaN)],
+      ["accepted", set("state", "flying")],
+      ["accepted", set("executorId", 7)],
+      ["accepted", without("runGeneration")],
+      ["accepted", (row) => [row, { ...row }]],
+      ["cancelled", without("inputRequestId")],
+    ];
+    for (const [fixture, change] of rows) {
+      const { w, s } = make(fixture);
+      w.wrap({
+        listRuns: (() => {
+          const read = w.ledger.listRuns();
+          return read.known ? { known: true, value: read.value.flatMap((row): unknown[] => (row.runId === s.runId ? change(row as never) : [row])) } : read;
+        }) as never,
+      });
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "runs" });
+      expect(w.log).toEqual([]);
+      expect(w.sent).toEqual([]);
+    }
+    const histories: [Parameters<typeof make>[0], Change][] = [
+      ["accepted", (v) => [{ lease: v.lease }]],
+      ["accepted", (v) => [{ ...v, runId: id() }]],
+      ["accepted", (v) => [{ ...v, lease: { issuedAt: "x", expiresAt: NOW + 30_000 } }]],
+      ["cancelled", (v) => [{ ...v, lastStopAt: "x" }]],
+      ["cancelled", (v) => [{ ...v, lastStopAt: {} }]],
+    ];
+    for (const [fixture, change] of histories) {
+      const { w, s } = make(fixture);
+      w.wrap({
+        instructionTimes: ((runId: string) => {
+          const read = w.ledger.instructionTimes(runId);
+          return read.known && read.value !== null ? { known: true, value: change(read.value as never)[0] } : read;
+        }) as never,
+      });
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(w.log).toEqual([]);
+      expect(w.sent).toEqual([]);
+    }
+  });
+
+  test("싣지 못한 갱신을 넘긴 실행은 장부의 임대 끝으로 새 갱신을 적지 않고 조회로 간다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    // 판단 17000, 기록 17000, 싣기 직전 17001: 송신 규칙으로 싣지 않는다. 장부는 끝 47000을 믿는다.
+    w.queueClock(NOW + 17_000, NOW + 17_000, NOW + 17_001);
+    expect(only(await tick(w), s.runId)).toMatchObject({ outcome: "renew_recorded_not_sent", reason: "renew_margin_lost" });
+    const asked: { runId: string; at: number }[] = [];
+    const seen: string[] = [];
+    for (const at of [NOW + 18_000, NOW + 31_000, NOW + 41_000]) {
+      w.setClock(at);
+      const outcome = only(await tick(w, asked, [s.runId]), s.runId);
+      seen.push(outcome.outcome);
+      if (outcome.outcome === "query_sent") asked.push({ runId: s.runId, at: outcome.at });
+    }
+    expect(seen).toEqual(["query_sent", "query_held", "query_sent"]);
+    expect(writes(w)).toEqual(["recordRenewInstruction"]);
+    expect(w.sent.map((e) => e.header.action)).toEqual(["status_query", "status_query"]);
+  });
+
+  test("요청 ID를 먼저 만들고, 마지막 시계 읽기와 장부 호출 사이에 다른 포트를 부르지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    w.setClock(NOW + 17_000);
+    // 난수 포트가 도는 동안 1ms가 흐른다. 그 뒤에 읽은 시각(17001)으로는 여유가 모자란다.
+    const random: Random = {
+      bytes: (length) => {
+        w.setClock(NOW + 17_001);
+        return getRandomValues(new Uint8Array(length));
+      },
+    };
+    expect(only(await plain({ ...w.ports, random }), s.runId)).toEqual({ runId: s.runId, outcome: "renew_withheld", reason: "margin_lost" });
+    expect(writes(w)).toEqual([]);
+    expect(times(w, s.runId).renewIssued).toBeNull();
+  });
+
+  test("싣는 시각에 작업 기한까지 여유가 모자라면 갱신을 싣지 않는다", async () => {
+    const policy: LifecyclePolicy = { renewEveryMs: 1_000, answerTimeoutMs: 20_000 };
+    const w = world();
+    const s = started(w, { deadlineAt: NOW + 14_000 });
+    accept(w, s);
+    // 판단 1000, 기록 1000(기한까지 13000), 싣기 직전 14001(기한이 지났다).
+    w.queueClock(NOW + 1_000, NOW + 1_000, NOW + 14_001);
+    expect(only(await plain(w.ports, policy), s.runId)).toMatchObject({ outcome: "renew_recorded_not_sent", reason: "deadline_within_margin", issuedAt: NOW + 1_000, delivery: "not_sent" });
+    expect(w.sent).toEqual([]);
+    const w2 = world();
+    const s2 = started(w2, { deadlineAt: NOW + 14_000 });
+    accept(w2, s2);
+    w2.queueClock(NOW + 1_000, NOW + 1_000, NOW + 1_000);
+    expect(only(await plain(w2.ports, policy), s2.runId)).toMatchObject({ outcome: "renew_sent" });
+  });
+
+  test("조회의 간격은 내보내기가 돌아온 뒤에 읽은 시각부터 센다", async () => {
+    const w = world();
+    const s = started(w);
+    must(w.ledger.markLost(NOW + 1));
+    w.setClock(NOW + 10_000);
+    // 포트가 19000ms 뒤에 싣는다.
+    w.setSend(async () => {
+      w.setClock(NOW + 29_000);
+      return "sent";
+    });
+    const outcome = only(await tick(w), s.runId) as Extract<RunOutcome, { outcome: "query_sent" }>;
+    expect(outcome).toMatchObject({ outcome: "query_sent", at: NOW + 29_000 });
+    w.setSend(async () => "sent");
+    w.setClock(NOW + 30_000);
+    expect(only(await tick(w, [{ runId: s.runId, at: outcome.at }]), s.runId)).toMatchObject({ outcome: "query_held", lastQueryAt: NOW + 29_000 });
   });
 });
 
