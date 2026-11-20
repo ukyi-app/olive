@@ -18,9 +18,9 @@ import {
   EXECUTOR_ACTION_HANDLING,
   type ForwardInput,
   handleForward,
-  type PendingQuery,
   type ReceiptLedger,
   type ReceiptOutcome,
+  type SentQuery,
 } from "../../../src/supervisor/dispatch/receipts.ts";
 import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, startedWorker, tempPath, WORKER_EXECUTOR } from "../../ledger/helpers.ts";
 
@@ -72,8 +72,9 @@ async function verified<A extends Action>(
   return result;
 }
 
+// 연결 1은 지금도 인정된 연결이고 밀린 답은 없다. 연결·밀린 답의 경우는 receipts-answers.test.ts가 본다.
 function forward(v: Verified, extra: Partial<ForwardInput> = {}): ForwardInput {
-  return { forward: { verified: v }, now: NOW + 2, stopGeneration: 0, pendingQueries: [], ...extra };
+  return { forward: { verified: v, connection: 1 }, now: NOW + 2, stopGeneration: 0, pendingQueries: [], links: { current: () => true }, backlog: [], ...extra };
 }
 
 // 부르면 실패하는 장부. 장부를 부르지 않아야 하는 길에 쓴다.
@@ -83,6 +84,9 @@ const untouchable: ReceiptLedger = {
   },
   recordReport: () => {
     throw new Error("recordReport를 부르면 안 된다");
+  },
+  applyExecutorAnswer: () => {
+    throw new Error("applyExecutorAnswer를 부르면 안 된다");
   },
 };
 
@@ -99,6 +103,7 @@ function spyLedger(answer: (id: string) => unknown = (x) => ({ ok: true, deliver
       calls.push({ op: "recordReport", input, from });
       return answer(input.reportId) as ReturnType<Ledger["recordReport"]>;
     },
+    applyExecutorAnswer: untouchable.applyExecutorAnswer,
   };
   return ledger;
 }
@@ -304,19 +309,29 @@ describe("보장 3: status_report는 감독이 낸 조회의 답일 때만 받�
     const { ledger, runId, generation } = realLedger();
     const drafted = statusQueryDraft({ recipient: WORKER_EXECUTOR, stopGeneration: 0, runIds: [runId] }, fakeRandom(9));
     if (!drafted.ok) throw new Error(drafted.reason);
-    const pending: PendingQuery = { requestId: drafted.draft.requestId, recipient: drafted.draft.recipient, runIds: drafted.draft.body.run_ids };
+    // 조회를 실은 연결은 forward()의 연결(1)이다.
+    const pending: SentQuery = { requestId: drafted.draft.requestId, recipient: drafted.draft.recipient, runIds: drafted.draft.body.run_ids, connection: 1 };
     const runs: RunStatus[] = [{ run_id: runId, state: "running", run_generation: 1, last_receipt_id: null }];
     return { ledger, runId, generation, pending, runs };
   }
 
-  test("조회를 받은 실행기의 답은 대조되고 장부를 부르지 않는다(status_matched, 장부 반영 없음)", async () => {
+  test("조회를 받은 실행기의 답은 대조되고 장부의 applyExecutorAnswer에 partial로 넘어간다(status_matched, 실제 장부)", async () => {
     const { ledger, runId, generation, pending, runs } = await setup();
     const v = await verified("status_report", WORKER_EXECUTOR, { in_reply_to: pending.requestId, runs }, 0, generation);
-    const outcome = handleForward(forward(v, { pendingQueries: [pending] }), { ledger: untouchable, random: fakeRandom() });
-    expect(outcome).toEqual({ outcome: "status_matched", queryRequestId: pending.requestId, executor: WORKER_EXECUTOR, runs, ledger: "not_reflected" });
+    const outcome = handleForward(forward(v, { pendingQueries: [pending] }), { ledger, random: fakeRandom() });
+    const answer = { sender: WORKER_EXECUTOR, connection: 1, coverage: "partial" as const, runs, answeredAt: NOW };
+    expect(outcome).toEqual({
+      outcome: "status_matched",
+      queryRequestId: pending.requestId,
+      executor: WORKER_EXECUTOR,
+      connection: 1,
+      settled: [{ settled: "applied", answer, moved: [], deferred: [], outsideLedger: [] }],
+      backlog: [],
+    });
     expectNoAck(outcome);
     const run = ledger.getRun(runId);
     expect(run.known && run.value?.state).toBe("preparing");
+    expect(ledger.hasRunSighting(runId)).toEqual({ known: true, value: true });
   });
 
   test("다른 실행기가 같은 in_reply_to로 답하면 받지 않는다(other_executor)", async () => {
@@ -442,17 +457,17 @@ describe("동작별 처리 표와 구별된 거절", () => {
   test("입력 객체를 바꾸지 않는다", async () => {
     const { ledger, runId, requestId, generation } = realLedger();
     const v = await verified("receipt_started", WORKER_EXECUTOR, { receipt_id: id(), run_id: runId, instruction_request_id: requestId, started_at: NOW }, 1, generation);
-    const pending: PendingQuery = { requestId: id(), recipient: WORKER_EXECUTOR, runIds: [runId] };
+    const pending: SentQuery = { requestId: id(), recipient: WORKER_EXECUTOR, runIds: [runId], connection: 1 };
     const input = deepFreeze(forward(v, { pendingQueries: [pending] }));
     const before = JSON.stringify(input);
     expect(handleForward(input, { ledger, random: fakeRandom() }).outcome).toBe("ack");
     expect(JSON.stringify(input)).toBe(before);
     const status = deepFreeze(forward(await verified("status_report", WORKER_EXECUTOR, { in_reply_to: pending.requestId, runs: [{ run_id: runId, state: "running", run_generation: 1, last_receipt_id: null }] }, 0, generation), { pendingQueries: [pending] }));
     const statusBefore = JSON.stringify(status);
-    const matched = handleForward(status, { ledger: untouchable, random: fakeRandom() });
+    const matched = handleForward(status, { ledger, random: fakeRandom() });
     expect(matched.outcome).toBe("status_matched");
     expect(JSON.stringify(status)).toBe(statusBefore);
     // 돌려준 runs는 입력과 다른 객체다(부르는 쪽이 고쳐도 입력이 바뀌지 않는다).
-    if (matched.outcome === "status_matched") expect(matched.runs[0]).not.toBe((status.forward.verified.body as Bodies["status_report"]).runs[0]);
+    if (matched.outcome === "status_matched") expect(matched.settled[0]!.answer.runs[0]).not.toBe((status.forward.verified.body as Bodies["status_report"]).runs[0]);
   });
 });
