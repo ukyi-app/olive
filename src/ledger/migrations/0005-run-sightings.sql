@@ -6,7 +6,8 @@
 -- - reported_state: 실행기가 답한 상태. not_known은 "안다"는 답이 아니라 목록에 없다.
 -- - last_receipt_id: 답이 실은 그 실행의 마지막 영수증 ID. 적기만 한다(영수증의 반영은 applyReceipt의 몫이다).
 -- - answered_at: 답 봉투의 issued_at(실행기 시계). 재시작 복원 2단계의 관측은 포트가 답의 시각을 싣지 않아 NULL이다.
--- - received_at: 감독이 그 답을 장부에 적은 시각(장부 시계). coverage: full(hello의 전체 목록) 또는 partial(조회의 답).
+-- - received_at: 그 답을 받은 시각. 운영 중에는 감독이 받은 때의 장부 시계, 재시작 복원 2단계에서는 복원기가 처음 받은 때의
+--   복원기 시계이고, 적기를 다시 시도해도 처음 값이다. coverage: full(hello의 전체 목록) 또는 partial(조회의 답).
 -- CHECK는 정수의 범위, 상태·coverage의 목록, NULL 허용 여부만 본다. 값의 형식(UUID, 실행기 주체 이름)은 장부의 공개 쓰기가 검사한다.
 -- 함정: CHECK는 NULL을 통과로 읽는다. NULL을 받는 칸은 answered_at·last_receipt_id 둘이고, 그 밖은 NOT NULL이 막는다.
 -- answered_at의 범위 검사는 IS NULL을 따로 적어 NULL이 범위 비교를 통과한 것처럼 읽히지 않게 한다. 트리거의 대조는 NOT EXISTS라
