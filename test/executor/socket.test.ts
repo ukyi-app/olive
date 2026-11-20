@@ -6,17 +6,20 @@ import { randomUUID } from "node:crypto";
 import type * as tls from "node:tls";
 import { type Envelope, limits } from "../../src/contract/v1/index.ts";
 import type { Connection, Transport } from "../../src/executor/link.ts";
-import { createExecutorSocket, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
+import type { StoreIo } from "../../src/executor/store.ts";
+import { createExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
 import { startTlsServer, type TlsServer } from "../../src/supervisor/transport/tls-server.ts";
-import { createFrameDecoder, encodeFrame } from "../../src/transport/framing.ts";
+import { createFrameDecoder, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES } from "../../src/transport/framing.ts";
 import { createTlsClient, type TlsClient } from "../../src/transport/tls-client.ts";
 import type { RawTlsMaterial } from "../../src/transport/tls-policy.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
-import { fromSupervisor, gate, type Rig, rig, syncReply } from "./support.ts";
+import { barrier, fromSupervisor, gate, type Rig, rig, scriptedIo, syncReply } from "./support.ts";
 
 const HOST = "127.0.0.1";
 const pki = makePki();
 const POLICY: ReconnectPolicy = { initialDelayMs: 100, maxDelayMs: 400, multiplier: 2, jitterRatio: 0 };
+// 받을 수 있는 가장 작은 상한: 틀 하나의 최대 크기.
+const RECEIVE: ReceivePolicy = { maxQueuedBytes: FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES };
 const material = (leaf: Issued): RawTlsMaterial => ({ certificatePem: leaf.pem, privateKeyPem: leaf.keyPem, trustBundlePem: pki.ca.pem });
 
 const cleanup: (() => unknown)[] = [];
@@ -131,7 +134,10 @@ function made(result: ReturnType<typeof createExecutorSocket>) {
 }
 
 // port를 주지 않으면 감독 흉내를 새로 띄운다. 주면 그 포트로 붙는다(닫힌 포트 시험).
-async function setup(options: { port?: number; policy?: ReconnectPolicy; random?: () => number } = {}): Promise<Setup> {
+// wrap은 소켓이 부르는 connect를 감싼다(시험이 붙기의 결과를 늦게 돌려준다).
+async function setup(
+  options: { port?: number; policy?: ReconnectPolicy; random?: () => number; io?: Partial<StoreIo>; wrap?: (client: TlsClient) => Pick<TlsClient, "connect"> } = {},
+): Promise<Setup> {
   let peers: Peer[] = [];
   let port = options.port;
   if (port === undefined) {
@@ -139,13 +145,23 @@ async function setup(options: { port?: number; policy?: ReconnectPolicy; random?
     port = sup.server.port;
     peers = sup.peers;
   }
-  const r = await rig({ syncTo: null });
+  const r = await rig({ syncTo: null, io: options.io });
   const client = createTlsClient({ address: HOST, port, supervisorDnsName: SUPERVISOR_DNS, supervisorUri: SUPERVISOR_URI, material: material(pki.executor()), now: Date.now });
   cleanup.push(() => client.close());
   const timer = new FakeTimer();
   const events: SocketEvent[] = [];
   const rec = recordingLink(r);
-  const socket = made(createExecutorSocket({ client, link: rec.link, policy: options.policy ?? POLICY, timer, random: options.random ?? (() => 0), onEvent: (e) => events.push(e) }));
+  const socket = made(
+    createExecutorSocket({
+      client: options.wrap?.(client) ?? client,
+      link: rec.link,
+      policy: options.policy ?? POLICY,
+      receive: RECEIVE,
+      timer,
+      random: options.random ?? (() => 0),
+      onEvent: (e) => events.push(e),
+    }),
+  );
   cleanup.push(() => socket.stop());
   return { r, peers, client, timer, events, opened: rec.opened, socket };
 }
@@ -259,6 +275,79 @@ test("새 연결: 앞 연결이 끝나면 그 대기값과 남은 프레임을 �
   expect(actionsOf(a)).toEqual(["stop_sync_request"]);
 });
 
+test("새 연결: 앞 처리가 멈춘 채 감독이 닫아도 그 끝을 알아채 다시 붙고, 늦게 풀린 앞 처리는 새 연결에 아무것도 바꾸지 않는다", async () => {
+  const disk = scriptedIo();
+  const s = await setup({ io: disk.io });
+  s.socket.start();
+  const a = await syncPeer(s, 0);
+  // 맞춘 연결에서 정상 조회의 nonce 처리(검증 안)를 붙든다.
+  const consuming = barrier();
+  disk.markers.gate = consuming;
+  a.socket.write(frame(query(s, randomUUID())));
+  await consuming.entered;
+  // 두 번째 조회는 따로 쓴다. 같은 조각이면 앞 조회와 함께 이미 디코더를 지나 줄에 들어간다.
+  await new Promise<void>((done) => a.socket.write(frame(query(s, randomUUID())), () => done()));
+  a.socket.destroy();
+  await until(() => a.closed);
+
+  // 앞 처리를 풀지 않은 채로 끝을 알아채고 다시 붙기를 건다.
+  await until(() => s.timer.waits.length === 1);
+  expect(closedReasons(s)).toEqual(["peer_ended"]);
+  expect(s.socket.phase()).toBe("waiting");
+  expect(s.opened[0]!.inFlight).toBe(1);
+  expect(s.opened[0]!.connection.state).toBe("closed");
+  expect(s.r.link.live()).toBe(false);
+  s.timer.waits[0]!.fire();
+  await until(() => (s.peers[1]?.got.length ?? 0) >= 1);
+  const b = s.peers[1]!;
+  expect(actionsOf(b)).toEqual(["stop_sync_request"]);
+  const events = [...s.events];
+  const pendingB = s.opened[1]!.connection.pending();
+
+  // 이제 앞 처리를 푼다. 답을 새 연결에 쓰지 않고, 새 연결의 맞춤 상태와 다시 붙기의 간격을 바꾸지 않는다.
+  disk.markers.gate = undefined;
+  consuming.open();
+  await until(() => s.opened[0]!.inFlight === 0);
+  await until(() => s.client.openConnections() === 1);
+  expect(s.opened[0]!.seen).toHaveLength(2);
+  expect(s.events).toEqual(events);
+  expect(s.timer.waits).toHaveLength(1);
+  expect(s.opened[1]!.connection.state).toBe("syncing");
+  expect(s.opened[1]!.connection.pending()).toEqual(pendingB);
+  expect(actionsOf(b)).toEqual(["stop_sync_request"]);
+  // 새 연결은 자기 challenge의 답으로 맞추고, 앞 연결의 조회 답은 그 뒤에도 실리지 않는다.
+  b.socket.write(frame(syncReply(s.r, 0, challengeOf(b.got[0]!))));
+  await until(() => actionsOf(b).includes("hello"));
+  expect(actionsOf(b)).toEqual(["stop_sync_request", "hello"]);
+  expect(actionsOf(a)).toEqual(["stop_sync_request", "hello"]);
+  expect(s.opened).toHaveLength(2);
+});
+
+test("받기: 처리를 기다리는 받은 틀이 상한을 넘으면 그 연결만 닫고 넘친 틀은 판단에 닿지 않는다", async () => {
+  const s = await setup();
+  s.socket.start();
+  const a = await syncPeer(s, 0);
+  const held = gate();
+  s.opened[0]!.hold = held.wait;
+  a.socket.write(frame(query(s, randomUUID())));
+  await until(() => s.opened[0]!.seen.length === 2);
+  // 상한은 틀 하나의 최대 크기다. 이 틀 하나는 들고 둘이면 넘는다.
+  const pad = frame({ pad: "x".repeat(40_000) });
+  expect(pad.length).toBeLessThanOrEqual(RECEIVE.maxQueuedBytes);
+  expect(2 * pad.length).toBeGreaterThan(RECEIVE.maxQueuedBytes);
+  a.socket.write(pad);
+  a.socket.write(pad);
+  await until(() => closedReasons(s).length === 1);
+  expect(closedReasons(s)).toEqual(["receive_backlog"]);
+  await until(() => a.closed);
+  expect(s.timer.waits.map((w) => w.ms)).toEqual([100]);
+  expect(s.opened[0]!.connection.state).toBe("closed");
+  held.open();
+  await until(() => s.opened[0]!.inFlight === 0);
+  expect(s.opened[0]!.seen).toHaveLength(2);
+  expect(s.timer.waits).toHaveLength(1);
+});
+
 test("닫기: link가 그 연결을 닫으면(맞춤 기한) 소켓도 닫고, 받은 것의 처리가 던지면 그 연결을 닫는다. 둘 다 간격을 두고 다시 붙는다", async () => {
   const s = await setup();
   s.socket.start();
@@ -369,6 +458,92 @@ test("멈춤: 열린 소켓을 닫고 더 붙지 않는다. 기다리는 중이�
   await until(() => p.client.openConnections() === 0);
 });
 
+test("멈춤: 열린 연결에서 연달아 부른 둘째 stop()도 소켓의 close 뒤에 돌아온다", async () => {
+  const s = await setup();
+  s.socket.start();
+  await syncPeer(s, 0);
+  const first = s.socket.stop();
+  await s.socket.stop();
+  expect(s.client.openConnections()).toBe(0);
+  await first;
+  expect(closedReasons(s)).toEqual(["stopped"]);
+});
+
+test("멈춤: link가 먼저 닫아 기다림으로 바뀐 직후의 stop()도 그 소켓의 close 뒤에 돌아온다", async () => {
+  const s = await setup();
+  s.socket.start();
+  await until(() => (s.peers[0]?.got.length ?? 0) >= 1);
+  s.r.clock.advance(limits.STOP_SYNC_WAIT_MS);
+  s.r.link.tick();
+  expect(closedReasons(s)).toEqual(["link_closed"]);
+  expect(s.socket.phase()).toBe("waiting");
+  await s.socket.stop();
+  expect(s.client.openConnections()).toBe(0);
+  expect(s.timer.waits[0]!.cleared).toBe(true);
+});
+
+test("멈춤: 멈춘 뒤 늦게 돌아온 검증된 소켓도 link에 열지 않고, stop()은 그 소켓의 close 뒤에 돌아온다", async () => {
+  const late = gate();
+  const s = await setup({
+    wrap: (client) => ({
+      // 신호를 넘기지 않아 TLS는 끝까지 맺고, 그 결과만 시험이 열 때까지 늦춘다.
+      connect: async () => {
+        const verified = await client.connect();
+        await late.wait;
+        return verified;
+      },
+    }),
+  });
+  s.socket.start();
+  await until(() => s.client.openConnections() === 1);
+  const stopping = s.socket.stop();
+  late.open();
+  await stopping;
+  expect(s.client.openConnections()).toBe(0);
+  expect(s.opened).toHaveLength(0);
+  expect(s.timer.waits).toHaveLength(0);
+  expect(kinds(s)).toEqual(["connecting", "stopped"]);
+});
+
+// bun test는 처리되지 않은 거절을 그때 돌던 시험의 실패로 센다(unhandledRejection을 들어도 같다). 그래서 이 시험은
+// 거절이 처리되지 않으면 그 자체로 실패하고, 더해 돌려준 약속마다 거절 처리기가 붙었는지를 직접 센다.
+test("기록: 비동기 기록 콜백이 실패해도 처리되지 않은 거절로 나가지 않고 연결의 수명을 바꾸지 않는다", async () => {
+  const r = await rig({ syncTo: null });
+  const timer = new FakeTimer();
+  const returned: Promise<void>[] = [];
+  let handled = 0;
+  const socket = made(
+    createExecutorSocket({
+      client: { connect: () => Promise.reject(new Error("붙지 않는다")) },
+      link: r.link,
+      policy: POLICY,
+      receive: RECEIVE,
+      timer,
+      random: () => 0,
+      onEvent: () => {
+        const failing = Promise.reject(new Error("기록 실패"));
+        const then = failing.then.bind(failing);
+        failing.then = ((onFulfilled, onRejected) => {
+          if (typeof onRejected === "function") handled++;
+          return then(onFulfilled, onRejected);
+        }) as typeof failing.then;
+        returned.push(failing);
+        return failing;
+      },
+    }),
+  );
+  socket.start();
+  await until(() => timer.waits.length === 1);
+  // connecting, connect_failed, retry_scheduled
+  expect(returned).toHaveLength(3);
+  expect(handled).toBe(3);
+  expect(socket.phase()).toBe("waiting");
+  // 처리되지 않은 거절이 있었다면 실행기가 알아챌 차례(매크로태스크 한 바퀴)를 이 시험 안에서 지난다.
+  await new Promise((done) => setImmediate(done));
+  await socket.stop();
+  expect(handled).toBe(4);
+});
+
 test("정책: 간격의 숫자가 범위 밖이면 소켓을 만들지 않고 구별된 거절을 낸다", async () => {
   const r = await rig({ syncTo: null });
   const client = { connect: () => Promise.reject(new Error("붙지 않는다")) };
@@ -384,7 +559,17 @@ test("정책: 간격의 숫자가 범위 밖이면 소켓을 만들지 않고 �
     { ...POLICY, initialDelayMs: Number.NaN },
   ];
   for (const policy of bad) {
-    expect(createExecutorSocket({ client, link: r.link, policy, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(policy)).toEqual({ ok: false, reason: "policy_rejected" });
+    expect(createExecutorSocket({ client, link: r.link, policy, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(policy)).toEqual({ ok: false, reason: "policy_rejected" });
   }
-  expect(createExecutorSocket({ client, link: r.link, policy: POLICY, timer: new FakeTimer(), random: () => 0 }).ok).toBe(true);
+  // 받아 둘 양의 상한: 틀 하나의 최대 크기보다 작거나 정수가 아니면 거절한다.
+  const badReceive: ReceivePolicy[] = [
+    { maxQueuedBytes: RECEIVE.maxQueuedBytes - 1 },
+    { maxQueuedBytes: RECEIVE.maxQueuedBytes + 0.5 },
+    { maxQueuedBytes: Number.NaN },
+    { maxQueuedBytes: Number.POSITIVE_INFINITY },
+  ];
+  for (const receive of badReceive) {
+    expect(createExecutorSocket({ client, link: r.link, policy: POLICY, receive, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(receive)).toEqual({ ok: false, reason: "policy_rejected" });
+  }
+  expect(createExecutorSocket({ client, link: r.link, policy: POLICY, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }).ok).toBe(true);
 });
