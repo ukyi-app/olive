@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { LEDGER_RUN_STATES, type LedgerRunState, type RunKind, TRANSITIONS } from "../../../src/ledger/index.ts";
-import { type LifecyclePolicy, type LifecycleView, nextIntent } from "../../../src/supervisor/scheduler/lifecycle.ts";
+import { type LifecyclePolicy, type LifecycleView, nextIntent, RENEW_MARGIN_MS } from "../../../src/supervisor/scheduler/lifecycle.ts";
 import { type HoldReason, type Origin, planNext, type SchedulerInput, type SchedulerPolicy, type SchedulerRun, type SchedulerView } from "../../../src/supervisor/scheduler/queue.ts";
 import { id, must, NOW, open, ready, tempPath, worker } from "../../ledger/helpers.ts";
 
@@ -272,7 +272,9 @@ describe("모르거나 꼴이 틀린 입력", () => {
     for (const lease of leases) {
       expect(nextIntent({ ...base, run: running, lease }, LIFE)).toEqual({ intent: "query", runId: "r", toward: "unknown_running" });
     }
-    expect(nextIntent({ ...base, run: running, lease: { issuedAt: NOW - 20_000, expiresAt: NOW + 1 } }, LIFE).intent).toBe("renew_lease");
+    // 살아 있어도 끝까지 전달 여유(RENEW_MARGIN_MS)가 남지 않으면 같은 ID 조회다. 여유가 정확히 남으면 갱신한다.
+    expect(nextIntent({ ...base, run: running, lease: { issuedAt: NOW - 20_000, expiresAt: NOW + 1 } }, LIFE)).toEqual({ intent: "query", runId: "r", toward: "unknown_running" });
+    expect(nextIntent({ ...base, run: running, lease: { issuedAt: NOW - 20_000, expiresAt: NOW + RENEW_MARGIN_MS } }, LIFE).intent).toBe("renew_lease");
   });
 
   test("F8: 마지막 지시 시각을 읽지 못하면 확정 재시도와 stopping 조회를 내지 않는다", () => {
@@ -396,7 +398,14 @@ describe("수명 전이의 의도", () => {
   // 시험이 장부의 표를 직접 읽어 판정한다(구현의 도우미를 쓰지 않는다).
   const allowed = (kind: RunKind, from: LedgerRunState, to: LedgerRunState) => from === to || (TRANSITIONS[kind][from]?.includes(to) ?? false);
 
-  const leases = [null, { issuedAt: NOW - 1_000, expiresAt: NOW + 29_000 }, { issuedAt: NOW - 20_000, expiresAt: NOW + 10_000 }, { issuedAt: NOW - 40_000, expiresAt: NOW - 10_000 }];
+  // 넷째는 갱신 주기가 돌았고 끝까지 전달 여유가 남은 임대다. 셋째는 주기가 돌았지만 여유가 남지 않은 임대다.
+  const leases = [
+    null,
+    { issuedAt: NOW - 1_000, expiresAt: NOW + 29_000 },
+    { issuedAt: NOW - 20_000, expiresAt: NOW + 10_000 },
+    { issuedAt: NOW - 10_000, expiresAt: NOW + 20_000 },
+    { issuedAt: NOW - 40_000, expiresAt: NOW - 10_000 },
+  ];
   const lasts = [null, "unknown" as const, NOW - 1_000, NOW - 60_000];
 
   test("모든 상태와 입력 조합에서 표가 허락하지 않는 의도를 내지 않는다", () => {
