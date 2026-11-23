@@ -48,10 +48,36 @@ const POLICY: CredentialRefPolicy = {
   revisionOf: () => "rev-1",
 };
 
+// 바이트 그릇(Uint8Array 등 뷰, ArrayBuffer)은 숫자 배열로 펴서 본다. Buffer는 toJSON이 data 배열로 편다.
+const SAMPLE_NUMBERS = Array.from(new TextEncoder().encode(SAMPLE)).join(",");
 const leaks = (value: unknown): boolean => {
-  const text = JSON.stringify(value) ?? "";
-  return text.includes(SAMPLE) || text.includes(Buffer.from(SAMPLE).toString("hex")) || text.includes(Buffer.from(SAMPLE).toString("base64"));
+  const text =
+    JSON.stringify(value, (_key, v: unknown) =>
+      ArrayBuffer.isView(v) ? Array.from(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) : v instanceof ArrayBuffer ? Array.from(new Uint8Array(v)) : v,
+    ) ?? "";
+  return (
+    text.includes(SAMPLE) ||
+    text.includes(Buffer.from(SAMPLE).toString("hex")) ||
+    text.includes(Buffer.from(SAMPLE).toString("base64")) ||
+    text.includes(SAMPLE_NUMBERS)
+  );
 };
+// 결과를 허용된 칸과 원시형으로만 옮긴다. 결과 객체를 통째로 견주면 실패 진단에 들어 있던 값이 그대로 찍히므로,
+// 다른 칸은 칸 이름 없이 표식으로, 원시형이 아니거나 표본이 든 값은 표식으로 바꾼 사본을 견준다.
+const RESULT_FIELDS = new Set(["kind", "reason", "connection", "runId", "refusal"]);
+function safe(result: unknown): Record<string, unknown> | "not_an_object" {
+  if (typeof result !== "object" || result === null) return "not_an_object";
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(result)) {
+    if (!RESULT_FIELDS.has(key)) {
+      out["<unexpected_field>"] = true;
+      continue;
+    }
+    const v = (result as Record<string, unknown>)[key];
+    out[key] = v === null || typeof v === "number" || (typeof v === "string" && !leaks(v)) ? v : "<not_allowed_value>";
+  }
+  return out;
+}
 const allZero = (bytes: Uint8Array) => bytes.every((b) => b === 0);
 const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
 
@@ -167,7 +193,8 @@ function fakeServer() {
   const handed: Handed[] = [];
   const checks: (string | null)[] = [];
   let duringCheck: (() => void) | null = null;
-  let mode: "normal" | "unknown" | "throw" = "normal";
+  // throw: 받기 전에 던짐. throw_after: 틀을 받은 뒤 완료를 알리지 않고 던짐. null: 넘기지 않고 꼴이 아닌 답(둘 다 서버 계약 밖).
+  let mode: "normal" | "unknown" | "throw" | "throw_after" | "null" = "normal";
   const server = {
     writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult {
       if (mode === "throw") throw new Error("write path failed");
@@ -177,7 +204,9 @@ function fakeServer() {
       duringCheck?.();
       if (verdict !== null) return { kind: "not_written", reason: "refused", refusal: verdict };
       if (recognized.get(principal) !== connection) return { kind: "not_written", reason: "not_recognized" };
+      if (mode === "null") return null as unknown as WriteFrameResult;
       handed.push({ connection, frame, copy: frame.slice(), settled: options.settled });
+      if (mode === "throw_after") throw new Error(`write failed near ${SAMPLE}`);
       if (mode === "unknown") {
         options.settled("failed");
         return { kind: "unknown" };
@@ -193,7 +222,7 @@ function fakeServer() {
     set duringCheck(fn: (() => void) | null) {
       duringCheck = fn;
     },
-    set mode(value: "normal" | "unknown" | "throw") {
+    set mode(value: "normal" | "unknown" | "throw" | "throw_after" | "null") {
       mode = value;
     },
   };
@@ -238,7 +267,7 @@ describe("보장 1: 검증되고 장부가 받은 task_start 접수 영수증에
   test("정상: 그 연결로 값 틀 하나를 넘기고, 실행기 쪽 디코더가 같은 실행 ID·지문·값으로 받는다", async () => {
     const t = setup();
     const result = await t.sender.onReceipt(...receipt());
-    expect(result).toEqual({ kind: "written", connection: 1, runId: RUN });
+    expect(safe(result)).toEqual({ kind: "written", connection: 1, runId: RUN });
     expect(t.fake.handed.length).toBe(1);
     const got = decode(t.fake.handed[0]!.copy);
     expect(got.runId).toBe(RUN);
@@ -263,7 +292,7 @@ describe("보장 1: 검증되고 장부가 받은 task_start 접수 영수증에
       [{ action: "receipt_started" }, "not_accepted_receipt"],
     ];
     for (const [over, reason] of cases) {
-      expect(await t.sender.onReceipt(...receipt(over))).toEqual({ kind: "ignored", reason } as CredentialSendResult);
+      expect(safe(await t.sender.onReceipt(...receipt(over)))).toEqual({ kind: "ignored", reason } as CredentialSendResult);
     }
     expect(t.files.calls.length).toBe(0);
     expect(t.fake.handed.length).toBe(0);
@@ -273,7 +302,7 @@ describe("보장 1: 검증되고 장부가 받은 task_start 접수 영수증에
     const t = setup();
     const [forward] = receipt();
     const [, otherOutcome] = receipt();
-    expect(await t.sender.onReceipt(forward, otherOutcome)).toEqual({ kind: "ignored", reason: "outcome_mismatch" });
+    expect(safe(await t.sender.onReceipt(forward, otherOutcome))).toEqual({ kind: "ignored", reason: "outcome_mismatch" });
     expect(t.fake.handed.length).toBe(0);
   });
 
@@ -281,7 +310,7 @@ describe("보장 1: 검증되고 장부가 받은 task_start 접수 영수증에
     const t = setup();
     t.fake.recognized.set(EXEC, 2);
     const result = await t.sender.onReceipt(...receipt({ connection: 1 }));
-    expect(result).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "not_recognized", refusal: null });
+    expect(safe(result)).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "not_recognized", refusal: null });
     expect(t.fake.handed.length).toBe(0);
     expect(t.files.lent.every(allZero)).toBe(true);
   });
@@ -289,7 +318,7 @@ describe("보장 1: 검증되고 장부가 받은 task_start 접수 영수증에
   test("다른 실행(실행 줄의 지정 실행기가 이 주체가 아님): 계정 파일을 읽지 않고 보내지 않는다", async () => {
     const t = setup();
     const result = await t.sender.onReceipt(...receipt({ runId: RUN_B }));
-    expect(result).toEqual({ kind: "blocked", connection: 1, runId: RUN_B, reason: "not_assigned" });
+    expect(safe(result)).toEqual({ kind: "blocked", connection: 1, runId: RUN_B, reason: "not_assigned" });
     expect(t.files.calls.length).toBe(0);
     expect(t.fake.handed.length).toBe(0);
   });
@@ -298,7 +327,7 @@ describe("보장 1: 검증되고 장부가 받은 task_start 접수 영수증에
     const t = setup();
     const pair = receipt();
     expect((await t.sender.onReceipt(...pair)).kind).toBe("written");
-    expect(await t.sender.onReceipt(...pair)).toEqual({ kind: "already_sent", connection: 1, runId: RUN });
+    expect(safe(await t.sender.onReceipt(...pair))).toEqual({ kind: "already_sent", connection: 1, runId: RUN });
     // 장부가 duplicate로 다시 받은 같은 실행의 새 영수증도 같다.
     expect((await t.sender.onReceipt(...receipt({ outcome: "applied_without_ack" }))).kind).toBe("already_sent");
     expect(t.files.calls.length).toBe(1);
@@ -353,7 +382,7 @@ describe("보장 2: 읽기의 await 뒤에 바뀐 것을 lastCheck에서 다시 
       change(t);
       hold.release();
       const result = await pending;
-      expect(result).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "refused", refusal: reason });
+      expect(safe(result)).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "refused", refusal: reason });
       expect(t.fake.handed.length).toBe(0);
       expect(t.files.lent.length).toBe(1);
       expect(allZero(t.files.lent[0]!)).toBe(true);
@@ -368,7 +397,7 @@ describe("보장 2: 읽기의 await 뒤에 바뀐 것을 lastCheck에서 다시 
     await Bun.sleep(0);
     t.fake.recognized.set(EXEC, 9);
     hold.release();
-    expect(await pending).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "not_recognized", refusal: null });
+    expect(safe(await pending)).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "not_recognized", refusal: null });
     expect(t.fake.handed.length).toBe(0);
     expect(allZero(t.files.lent[0]!)).toBe(true);
   });
@@ -384,7 +413,7 @@ describe("보장 2: 읽기의 await 뒤에 바뀐 것을 lastCheck에서 다시 
   test("읽기 앞에서 이미 막히면 계정 파일을 읽지 않는다", async () => {
     const t = setup();
     t.state.open = false;
-    expect(await t.sender.onReceipt(...receipt())).toEqual({ kind: "blocked", connection: 1, runId: RUN, reason: "intake_closed" });
+    expect(safe(await t.sender.onReceipt(...receipt()))).toEqual({ kind: "blocked", connection: 1, runId: RUN, reason: "intake_closed" });
     expect(t.files.calls.length).toBe(0);
   });
 
@@ -398,7 +427,7 @@ describe("보장 2: 읽기의 await 뒤에 바뀐 것을 lastCheck에서 다시 
         },
       },
     });
-    expect(await t.sender.onReceipt(...receipt())).toEqual({ kind: "blocked", connection: 1, runId: RUN, reason: "clock_failed" });
+    expect(safe(await t.sender.onReceipt(...receipt()))).toEqual({ kind: "blocked", connection: 1, runId: RUN, reason: "clock_failed" });
     t.sender.forgetConnection(1);
     fail = false;
     const hold = t.files.hold();
@@ -406,7 +435,7 @@ describe("보장 2: 읽기의 await 뒤에 바뀐 것을 lastCheck에서 다시 
     await Bun.sleep(0);
     fail = true;
     hold.release();
-    expect(await pending).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "refused", refusal: "clock_failed" });
+    expect(safe(await pending)).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "refused", refusal: "clock_failed" });
     expect(t.fake.handed.length).toBe(0);
   });
 });
@@ -415,7 +444,7 @@ describe("보장 3: 계정 파일을 다시 읽고 실행 줄의 지문과 같�
   test("지문 불일치: 넘기지 않고 읽은 버퍼는 0", async () => {
     const t = setup();
     t.rows.set(RUN, runRow({ credential: { account: "main", method: "subscription", revision: "rev-1", digest: OTHER_DIGEST } }));
-    expect(await t.sender.onReceipt(...receipt())).toEqual({ kind: "unreadable", connection: 1, runId: RUN, reason: "digest_mismatch" });
+    expect(safe(await t.sender.onReceipt(...receipt()))).toEqual({ kind: "unreadable", connection: 1, runId: RUN, reason: "digest_mismatch" });
     expect(t.fake.handed.length).toBe(0);
     expect(t.files.lent.length).toBe(1);
     expect(allZero(t.files.lent[0]!)).toBe(true);
@@ -440,7 +469,7 @@ describe("보장 3: 계정 파일을 다시 읽고 실행 줄의 지문과 같�
       const t = setup();
       t.files.answer(answer);
       const result = await t.sender.onReceipt(...receipt());
-      expect(result).toEqual({ kind: "unreadable", connection: 1, runId: RUN, reason } as CredentialSendResult);
+      expect(safe(result)).toEqual({ kind: "unreadable", connection: 1, runId: RUN, reason } as CredentialSendResult);
       expect(t.fake.handed.length).toBe(0);
       expect(leaks(result)).toBe(false);
       expect(leaks(t.notes)).toBe(false);
@@ -450,7 +479,7 @@ describe("보장 3: 계정 파일을 다시 읽고 실행 줄의 지문과 같�
 
   test("정책의 maxBytes가 값 틀 상한보다 크면 읽지 않는다", async () => {
     const t = setup({ policy: { ...POLICY, maxBytes: 16_385 } });
-    expect(await t.sender.onReceipt(...receipt())).toEqual({ kind: "unreadable", connection: 1, runId: RUN, reason: "limit_above_frame" });
+    expect(safe(await t.sender.onReceipt(...receipt()))).toEqual({ kind: "unreadable", connection: 1, runId: RUN, reason: "limit_above_frame" });
     expect(t.files.calls.length).toBe(0);
   });
 });
@@ -473,40 +502,94 @@ describe("보장 4: 값과 틀은 결과·관측·예외에 없고, settled 뒤�
   test("unknown: 서버가 돌아오기 전에 부른 settled에서 한 번 정리하고 반환 뒤 다시 정리하지 않는다", async () => {
     const t = setup();
     t.fake.mode = "unknown";
-    expect(await t.sender.onReceipt(...receipt())).toEqual({ kind: "unknown", connection: 1, runId: RUN });
+    expect(safe(await t.sender.onReceipt(...receipt()))).toEqual({ kind: "unknown", connection: 1, runId: RUN, reason: "server_unknown" });
     expect(allZero(t.fake.handed[0]!.frame)).toBe(true);
     expect(allZero(t.files.lent[0]!)).toBe(true);
     expect(wipes(t.notes).map((n) => n.kind === "wiped" && n.at)).toEqual(["failed"]);
   });
 
-  test("서버가 계약 밖으로 던지면 그 자리에서 0으로 채우고 던지지 않는다", async () => {
+  // 서버 계약 밖의 답은 넘겼는지 알 수 없으므로 not_written(넘긴 바이트 0)이라고 하지 않는다. 버퍼는 그 자리에서 채운다.
+  for (const [mode, reason, handed] of [
+    ["throw", "write_threw", 0],
+    ["throw_after", "write_threw", 1],
+    ["null", "write_result_malformed", 0],
+  ] as const) {
+    test(`서버가 계약 밖의 답(${mode}): 송달 모름(unknown/${reason})이고 값과 틀은 0, 결과·거절에 표본이 없다`, async () => {
+      const t = setup();
+      t.fake.mode = mode;
+      const settled = await t.sender.onReceipt(...receipt()).then(
+        (result) => ({ resolved: true, result, text: "" }),
+        (error: unknown) => ({ resolved: false, result: null, text: String((error as Error)?.message ?? error) }),
+      );
+      expect(settled.resolved).toBe(true);
+      expect(leaks(settled.text)).toBe(false);
+      expect(leaks(settled.result)).toBe(false);
+      expect(safe(settled.result)).toEqual({ kind: "unknown", connection: 1, runId: RUN, reason });
+      expect(t.fake.handed.length).toBe(handed);
+      expect(t.files.lent.length).toBe(1);
+      expect(allZero(t.files.lent[0]!)).toBe(true);
+      if (handed === 1) expect(allZero(t.fake.handed[0]!.frame)).toBe(true);
+      expect(wipes(t.notes).map((n) => n.kind === "wiped" && n.at)).toEqual([reason]);
+      expect(leaks(t.notes)).toBe(false);
+    });
+  }
+
+  test("실행 줄의 credential 접근자가 표본을 담아 던져도 이름으로 끝나고 결과·거절에 표본이 없다", async () => {
     const t = setup();
-    t.fake.mode = "throw";
-    const result = await t.sender.onReceipt(...receipt());
-    expect(result).toEqual({ kind: "not_written", connection: 1, runId: RUN, reason: "write_threw", refusal: null });
-    expect(allZero(t.files.lent[0]!)).toBe(true);
-    expect(wipes(t.notes).length).toBe(1);
+    const row = runRow();
+    Object.defineProperty(row, "credential", {
+      get() {
+        throw new Error(`row broken near ${SAMPLE}`);
+      },
+    });
+    t.rows.set(RUN, row);
+    const settled = await t.sender.onReceipt(...receipt()).then(
+      (result) => ({ resolved: true, result, text: "" }),
+      (error: unknown) => ({ resolved: false, result: null, text: String((error as Error)?.message ?? error) }),
+    );
+    expect(settled.resolved).toBe(true);
+    expect(leaks(settled.text)).toBe(false);
+    expect(safe(settled.result)).toEqual({ kind: "blocked", connection: 1, runId: RUN, reason: "ledger_unavailable" });
+    expect(t.files.calls.length).toBe(0);
+    expect(leaks(t.notes)).toBe(false);
+  });
+
+  test("유출 판정은 문자열·hex·base64와 Uint8Array·숫자 배열·Buffer·ArrayBuffer 꼴을 모두 잡는다", () => {
+    const bytes = sampleBytes();
+    for (const carrier of [SAMPLE, Buffer.from(SAMPLE).toString("hex"), Buffer.from(SAMPLE).toString("base64"), bytes, Array.from(bytes), Buffer.from(bytes), bytes.buffer]) {
+      expect(leaks({ nested: [{ carrier }] })).toBe(true);
+    }
+    expect(leaks({ kind: "written", connection: 1, runId: RUN })).toBe(false);
   });
 
   test("결과·관측 어디에도 값의 표본이 없다(모든 길)", async () => {
     const results: CredentialSendResult[] = [];
     const notes: CredentialSendNote[] = [];
-    for (const mode of ["normal", "unknown", "throw"] as const) {
+    const run = async (prepare: (t: ReturnType<typeof setup>) => void, over: Parameters<typeof receipt>[0] = {}) => {
       const t = setup();
-      t.fake.mode = mode;
-      results.push(await t.sender.onReceipt(...receipt()));
-      results.push(await t.sender.onReceipt(...receipt()));
+      prepare(t);
+      results.push(await t.sender.onReceipt(...receipt(over)));
+      results.push(await t.sender.onReceipt(...receipt(over)));
       t.fake.handed[0]?.settled("flushed");
       notes.push(...t.notes);
-    }
-    const t = setup();
-    t.rows.set(RUN, runRow({ credential: { account: "main", method: "subscription", revision: "rev-1", digest: OTHER_DIGEST } }));
-    results.push(await t.sender.onReceipt(...receipt()));
-    notes.push(...t.notes);
-    expect(results.length).toBe(7);
+    };
+    for (const mode of ["normal", "unknown", "throw", "throw_after", "null"] as const) await run((t) => (t.fake.mode = mode));
+    await run(() => {}, { outcome: "ledger_refused" });
+    await run((t) => (t.state.open = false));
+    await run((t) => t.rows.set(RUN, runRow({ credential: { account: "main", method: "subscription", revision: "rev-1", digest: OTHER_DIGEST } })));
+    await run((t) =>
+      t.files.answer(() => {
+        throw new Error(`read failed near ${SAMPLE}`);
+      }),
+    );
+    // 실행 ID가 UUID 꼴이 아니면 인코더가 틀을 거절한다(frame_failed).
+    await run((t) => t.rows.set("run-not-a-uuid", runRow({ runId: "run-not-a-uuid" })), { runId: "run-not-a-uuid" });
+    await run((t) => t.fake.recognized.set(EXEC, 2));
+    expect(new Set(results.map((r) => r.kind))).toEqual(new Set(["ignored", "already_sent", "blocked", "unreadable", "frame_failed", "not_written", "written", "unknown"]));
     expect(leaks(results)).toBe(false);
     expect(leaks(notes)).toBe(false);
     expect(notes.some((n) => Object.values(n).some((v: unknown) => v instanceof Uint8Array))).toBe(false);
+    expect(results.every((r) => !/<(unexpected_field|not_allowed_value)>|not_an_object/.test(JSON.stringify(safe(r))))).toBe(true);
   });
 
   test("관측이 던져도 보내기와 정리는 그대로다", async () => {
@@ -528,16 +611,28 @@ describe("정적", () => {
       .map((line) => line.replace(/\/\/.*$/, ""))
       .join("\n");
 
+  // 선언은 첫 줄부터 다음 최상위 줄(들여쓰지 않은 줄) 앞까지다. 갈래 안의 ";"에서 끊지 않는다.
+  const declarationOf = (source: string, name: string): string | null => {
+    const lines = source.split("\n");
+    const start = lines.findIndex((line) => line.startsWith(`export type ${name} =`));
+    if (start === -1) return null;
+    let end = start + 1;
+    while (end < lines.length && (lines[end]!.trim() === "" || /^\s/.test(lines[end]!))) end++;
+    return lines.slice(start, end).join("\n").trimEnd();
+  };
+
   test("결과·관측 타입에 Uint8Array 칸이 없다", async () => {
     const source = strip(await readText("src/supervisor/dispatch/credential-send.ts"));
-    for (const name of ["CredentialSendResult", "CredentialSendNote"]) {
-      const start = source.indexOf(`export type ${name} =`);
-      expect(start).toBeGreaterThan(-1);
-      const end = source.indexOf(";\n", start);
-      const declaration = source.slice(start, end);
-      expect(declaration.includes("|")).toBe(true);
-      expect(/Uint8Array|ArrayBuffer|Buffer\b/.test(declaration)).toBe(false);
+    for (const name of ["CredentialSendResult", "CredentialSendNote", "CredentialSendUnknown"]) {
+      const declaration = declarationOf(source, name);
+      expect(declaration === null ? "missing" : "found").toBe("found");
+      // 끝까지 읽었는지: 선언은 ";"로 끝나고 중괄호가 맞는다.
+      expect(declaration!.endsWith(";")).toBe(true);
+      expect((declaration!.match(/\{/g) ?? []).length).toBe((declaration!.match(/\}/g) ?? []).length);
+      expect(/Uint8Array|ArrayBuffer|Buffer\b|DataView/.test(declaration!)).toBe(false);
     }
+    // 결과의 갈래는 여덟이다(갈래를 더하면 이 수와 위 검사를 함께 본다).
+    expect((declarationOf(source, "CredentialSendResult")!.match(/readonly kind: "/g) ?? []).length).toBe(8);
   });
 
   test("재전송 박자·장부·내보내기 포트는 이 모듈을 import하지 않는다", async () => {
@@ -692,7 +787,7 @@ test("루프백: 실제 서버로 보낸 값 틀 하나를 실행기 쪽 섞어 
     observe: (note) => sendNotes.push(note),
   });
   const result = await sender.onReceipt(...receipt({ connection }));
-  expect(result).toEqual({ kind: "written", connection, runId: RUN });
+  expect(safe(result)).toEqual({ kind: "written", connection, runId: RUN });
   await until(() => credentials.length === 1);
   await until(() => sendNotes.some((n) => n.kind === "wiped"));
   expect(rejected).toBeNull();

@@ -30,7 +30,7 @@ export interface CredentialSendPorts {
   readonly files: CredentialFiles;
   // 계정 폴더 정책. maxBytes가 CREDENTIAL_MAX_BYTES보다 크면 읽지 않고 보내지 않는다.
   readonly policy: CredentialRefPolicy;
-  // 기록용. 던져도 무시한다.
+  // 기록용. 동기 예외는 무시한다. 돌려준 약속은 보지 않으므로 비동기 기록기는 자기 거절을 스스로 처리한다.
   readonly observe?: (note: CredentialSendNote) => void;
 }
 
@@ -80,24 +80,33 @@ export type CredentialSendResult =
   | { readonly kind: "unreadable"; readonly connection: number; readonly runId: string; readonly reason: CredentialBorrowRefusal }
   // 틀을 만들지 못했다. 값은 0으로 채웠다.
   | { readonly kind: "frame_failed"; readonly connection: number; readonly runId: string; readonly reason: string }
-  // 서버가 넘기지 않았다(넘긴 바이트 0). refused면 refusal에 lastCheck의 이름이 있다. 값과 틀은 0으로 채웠다.
+  // 서버가 넘기지 않았다고 돌려줬다(넘긴 바이트 0). refused면 refusal에 lastCheck의 이름이 있다. 값과 틀은 0으로 채웠다.
   | {
       readonly kind: "not_written";
       readonly connection: number;
       readonly runId: string;
-      readonly reason: NotWrittenReason | "write_threw";
+      readonly reason: NotWrittenReason;
       readonly refusal: string | null;
     }
   // 틀 하나를 통째로 넘겼다. 상대가 받았다는 뜻이 아니다. settled에서 0으로 채운다.
   | { readonly kind: "written"; readonly connection: number; readonly runId: string }
-  // 서버의 write가 던졌다. 서버가 돌아오기 전에 settled를 불렀으므로 정리는 이미 끝났다.
-  | { readonly kind: "unknown"; readonly connection: number; readonly runId: string };
+  // 넘겼는지 모른다. 값과 틀은 이미 0이다.
+  // server_unknown: 서버가 unknown을 돌려줬다(write가 던졌고, 돌아오기 전에 settled를 불렀다).
+  // write_threw·write_result_malformed: 서버가 계약 밖으로 던졌거나 꼴이 아닌 답을 줬다. 그 자리에서 채웠다.
+  | { readonly kind: "unknown"; readonly connection: number; readonly runId: string; readonly reason: CredentialSendUnknown };
+
+export type CredentialSendUnknown = "server_unknown" | "write_threw" | "write_result_malformed";
 
 // 관측. 사유 이름·연결 번호·실행 ID만 싣는다.
 export type CredentialSendNote =
   | { readonly kind: "attempt"; readonly connection: number; readonly runId: string; readonly outcome: Exclude<CredentialSendResult["kind"], "ignored">; readonly reason: string | null }
   // 값과 틀을 0으로 채웠다. at은 그 자리: settled의 끝, 또는 넘기지 못한 길의 이름.
-  | { readonly kind: "wiped"; readonly connection: number; readonly runId: string; readonly at: SendEnd | "not_written" | "frame_failed" | "write_threw" };
+  | {
+      readonly kind: "wiped";
+      readonly connection: number;
+      readonly runId: string;
+      readonly at: SendEnd | "not_written" | "frame_failed" | "write_threw" | "write_result_malformed";
+    };
 
 export interface CredentialSender {
   // handleForward가 돌려준 결과와 그 forward를 그대로 받는다. 대상이 아니면 ignored. 던지지 않고 거절된 약속을 내지 않는다.
@@ -137,8 +146,15 @@ function acceptedStart(forward: ForwardInput["forward"], outcome: ReceiptOutcome
   }
 }
 
+// 실행 줄에서 뒤에 쓰는 칸만 옮긴 평범한 사본.
+interface RunView {
+  readonly credential: Pick<Run["credential"], "account" | "method" | "digest">;
+  readonly deadlineAt: number;
+}
+
 // 실행 줄이 지금 값을 받을 실행인가. 읽기 앞과 lastCheck가 같은 판정을 쓴다.
-function runBlock(ledger: CredentialSendLedger, target: Target): { readonly run: Run } | { readonly block: CredentialSendBlock } {
+// 장부가 준 객체의 칸은 여기서 한 번씩 꺼낸다: 부르는 check가 예외를 잡으므로 접근자가 던져도 이름으로 끝나고, 뒤에서 다시 읽지 않는다.
+function runBlock(ledger: CredentialSendLedger, target: Target): { readonly run: RunView } | { readonly block: CredentialSendBlock } {
   const read = ledger.getRun(target.runId);
   if (read.known !== true) return { block: "ledger_unavailable" };
   const run = read.value;
@@ -148,7 +164,27 @@ function runBlock(ledger: CredentialSendLedger, target: Target): { readonly run:
   if (run.state !== "preparing") return { block: "not_preparing" };
   if (run.acceptedReceiptId === null) return { block: "not_accepted" };
   if (run.stopReceiptId !== null || run.cleanedReceiptId !== null || run.resultDigest !== null) return { block: "run_ended" };
-  return { run };
+  const credential = run.credential;
+  return { run: { credential: { account: credential.account, method: credential.method, digest: credential.digest }, deadlineAt: run.deadlineAt } };
+}
+
+type WriteAnswer = { readonly kind: "written" } | { readonly kind: "unknown" } | { readonly kind: "not_written"; readonly reason: NotWrittenReason; readonly refusal: string | null };
+
+// 서버의 답에서 쓸 칸을 한 번씩 꺼낸다. 꼴이 아니거나 읽다 던지면 null이다(넘겼는지 모른다).
+function writeAnswer(result: unknown): WriteAnswer | null {
+  try {
+    const kind = (result as { kind?: unknown } | null)?.kind;
+    if (kind === "written" || kind === "unknown") return { kind };
+    if (kind !== "not_written") return null;
+    const reason = (result as { reason?: unknown }).reason;
+    if (typeof reason !== "string") return null;
+    if (reason !== "refused") return { kind, reason: reason as NotWrittenReason, refusal: null };
+    const refusal = (result as { refusal?: unknown }).refusal;
+    // refusal은 lastCheck가 낸 이름이다. 그 밖의 글자를 결과에 옮기지 않는다.
+    return typeof refusal === "string" && (CREDENTIAL_SEND_BLOCKS as readonly string[]).includes(refusal) ? { kind, reason, refusal } : null;
+  } catch {
+    return null;
+  }
 }
 
 export function createCredentialSender(ports: CredentialSendPorts): CredentialSender {
@@ -190,6 +226,7 @@ export function createCredentialSender(ports: CredentialSendPorts): CredentialSe
     }
     if ("block" in row) return row;
     if (expected !== null && row.run.credential.digest !== expected.digest) return { block: "credential_changed" as const };
+    // row.run은 runBlock이 옮긴 평범한 사본이라 아래 읽기는 던지지 않는다.
     let now: number;
     try {
       now = ports.clock.now();
@@ -240,12 +277,17 @@ export function createCredentialSender(ports: CredentialSendPorts): CredentialSe
       const wipe = (at: Extract<CredentialSendNote, { kind: "wiped" }>["at"]) => {
         if (wiped) return;
         wiped = true;
-        value.fill(0);
-        frame.fill(0);
+        // 한 배열의 fill이 던져도(소유를 어긴 포트가 버퍼를 떼어 간 때) 다른 배열은 채운다. settled 안이므로 던지지 않는다.
+        try {
+          value.fill(0);
+        } catch {}
+        try {
+          frame.fill(0);
+        } catch {}
         note({ kind: "wiped", connection: target.connection, runId: target.runId, at });
       };
 
-      let result: ReturnType<CredentialSendServer["writeFrame"]>;
+      let result: unknown;
       try {
         result = ports.server.writeFrame(target.connection, target.executorId, frame, {
           lastCheck: () => {
@@ -255,16 +297,22 @@ export function createCredentialSender(ports: CredentialSendPorts): CredentialSe
           settled: (end) => wipe(end),
         });
       } catch {
-        // 서버 계약 밖이다. settled가 올지 모르므로 여기서 채운다: 값이 남는 것보다, 넘겨졌다면 0이 나가 상대 디코더가 거절하는 쪽을 고른다.
+        // 서버 계약 밖이다. 틀을 받은 뒤 던졌을 수 있으므로 넘긴 바이트 0이라고 하지 않는다(unknown).
+        // settled가 올지 모르므로 여기서 채운다: 값이 남는 것보다, 넘겨졌다면 0이 나가 상대 디코더가 거절하는 쪽을 고른다.
         wipe("write_threw");
-        return finish(target, { kind: "not_written", connection: target.connection, runId: target.runId, reason: "write_threw", refusal: null });
+        return finish(target, { kind: "unknown", connection: target.connection, runId: target.runId, reason: "write_threw" });
       }
-      if (result.kind === "written") return finish(target, { kind: "written", connection: target.connection, runId: target.runId });
+      const answer = writeAnswer(result);
+      if (answer === null) {
+        // 꼴이 아닌 답도 넘겼는지 모른다. 위와 같이 그 자리에서 채운다.
+        wipe("write_result_malformed");
+        return finish(target, { kind: "unknown", connection: target.connection, runId: target.runId, reason: "write_result_malformed" });
+      }
+      if (answer.kind === "written") return finish(target, { kind: "written", connection: target.connection, runId: target.runId });
       // unknown이면 서버가 돌아오기 전에 settled를 불렀다. 다시 정리하지 않는다.
-      if (result.kind === "unknown") return finish(target, { kind: "unknown", connection: target.connection, runId: target.runId });
+      if (answer.kind === "unknown") return finish(target, { kind: "unknown", connection: target.connection, runId: target.runId, reason: "server_unknown" });
       wipe("not_written");
-      const refusal = result.reason === "refused" ? result.refusal : null;
-      return finish(target, { kind: "not_written", connection: target.connection, runId: target.runId, reason: result.reason, refusal });
+      return finish(target, { kind: "not_written", connection: target.connection, runId: target.runId, reason: answer.reason, refusal: answer.refusal });
     },
 
     forgetConnection(connection) {

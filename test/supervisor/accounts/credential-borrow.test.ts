@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   borrowCredentialValue,
   CREDENTIAL_BORROW_REFUSALS,
+  type CredentialBorrow,
   type CredentialFiles,
   type CredentialRead,
   type CredentialRefPolicy,
@@ -26,6 +27,9 @@ const policy = (dir: string, over: Partial<CredentialRefPolicy> = {}): Credentia
   ...over,
 });
 const allZero = (bytes: Uint8Array) => bytes.every((b) => b === 0);
+// 거절의 이름만 꺼낸다. 결과를 통째로 견주면 성공 결과의 값 버퍼가 실패 진단에 찍히므로, 성공이나 다른 칸이 있으면 표식을 낸다.
+const refusalOf = (result: CredentialBorrow): string =>
+  result.ok === false && Object.keys(result).sort().join(",") === "ok,reason" ? result.reason : "<not_a_bare_refusal>";
 
 const roots: string[] = [];
 afterAll(() => {
@@ -65,14 +69,15 @@ describe("borrowCredentialValue", () => {
     mkdirSync(join(dir, "other"));
     writeFileSync(join(dir, "other", KEY), sampleBytes());
     symlinkSync(join(dir, "other"), join(dir, "main"));
-    expect(await borrowCredentialValue(nodeCredentialFiles, policy(dir), REF)).toEqual({ ok: false, reason: "outside_account" });
+    expect(refusalOf(await borrowCredentialValue(nodeCredentialFiles, policy(dir), REF))).toBe("outside_account");
   });
 
   test("지문이 다르면 거절하고 읽은 버퍼를 0으로 채운다", async () => {
     const bytes = sampleBytes();
     const port = fake(() => ({ kind: "bytes", bytes }));
     const result = await borrowCredentialValue(port.files, policy("/accounts"), { ...REF, digest: "f".repeat(64) });
-    expect(result).toEqual({ ok: false, reason: "digest_mismatch" });
+    expect(result.ok === false).toBe(true);
+    expect(refusalOf(result)).toBe("digest_mismatch");
     expect(allZero(bytes)).toBe(true);
     expect(JSON.stringify(result).includes(SAMPLE)).toBe(false);
   });
@@ -80,14 +85,14 @@ describe("borrowCredentialValue", () => {
   test("상한: 정책의 maxBytes로 읽고, 포트가 상한을 어긴 바이트도 거절하며 0으로 채운다", async () => {
     const big = new Uint8Array(1025).fill(0x41);
     const port = fake(() => ({ kind: "bytes", bytes: big }));
-    expect(await borrowCredentialValue(port.files, policy("/accounts"), REF)).toEqual({ ok: false, reason: "too_large" });
+    expect(refusalOf(await borrowCredentialValue(port.files, policy("/accounts"), REF))).toBe("too_large");
     expect(port.calls.map((c) => c.maxBytes)).toEqual([1024]);
     expect(allZero(big)).toBe(true);
   });
 
   test("정책의 maxBytes가 값 틀 상한(16,384)보다 크면 읽지 않는다. 정각은 받는다", async () => {
     const over = fake(() => ({ kind: "bytes", bytes: sampleBytes() }));
-    expect(await borrowCredentialValue(over.files, policy("/accounts", { maxBytes: 16_385 }), REF)).toEqual({ ok: false, reason: "limit_above_frame" });
+    expect(refusalOf(await borrowCredentialValue(over.files, policy("/accounts", { maxBytes: 16_385 }), REF))).toBe("limit_above_frame");
     expect(over.calls.length).toBe(0);
     const exact = fake(() => ({ kind: "bytes", bytes: sampleBytes() }));
     expect((await borrowCredentialValue(exact.files, policy("/accounts", { maxBytes: 16_384 }), REF)).ok).toBe(true);
@@ -102,14 +107,33 @@ describe("borrowCredentialValue", () => {
       [{ ...REF, digest: DIGEST.toUpperCase() }, policy("/accounts"), "digest_malformed"],
       [REF, policy("relative"), "policy_invalid"],
     ];
-    for (const [ref, given, reason] of cases) expect(await borrowCredentialValue(port.files, given, ref)).toEqual({ ok: false, reason } as never);
+    for (const [ref, given, reason] of cases) expect(refusalOf(await borrowCredentialValue(port.files, given, ref))).toBe(reason);
     expect(port.calls.length).toBe(0);
     const throwing = fake(() => {
       throw new Error(`port failed ${SAMPLE}`);
     });
     const result = await borrowCredentialValue(throwing.files, policy("/accounts"), REF);
-    expect(result).toEqual({ ok: false, reason: "read_failed" });
+    expect(refusalOf(result)).toBe("read_failed");
     expect(JSON.stringify(result).includes(SAMPLE)).toBe(false);
+  });
+
+  test("포트 답의 kind·bytes 접근자가 표본을 담아 던져도 read_failed이고 결과·거절에 표본이 없다", async () => {
+    for (const field of ["kind", "bytes"] as const) {
+      const answer = { kind: "bytes", bytes: sampleBytes() } as Record<string, unknown>;
+      Object.defineProperty(answer, field, {
+        get() {
+          throw new Error(`answer broken near ${SAMPLE}`);
+        },
+      });
+      const port = fake(() => answer as unknown as CredentialRead);
+      const settled = await borrowCredentialValue(port.files, policy("/accounts"), REF).then(
+        (result) => ({ resolved: true, result, text: JSON.stringify(result) }),
+        (error: unknown) => ({ resolved: false, result: null, text: String((error as Error)?.message ?? error) }),
+      );
+      expect(settled.resolved).toBe(true);
+      expect(settled.text.includes(SAMPLE)).toBe(false);
+      expect(settled.result !== null && refusalOf(settled.result)).toBe("read_failed");
+    }
   });
 
   test("거절 이름은 목록 안이다", () => {

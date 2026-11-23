@@ -65,6 +65,14 @@ test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재�
     sendSites(credentialSend),
     [...credentialSend.matchAll(/\bmarkStartDispatch\b/g)].length,
   ]).toEqual([0, 0, [], 0]);
+  // task_start 글자는 받은 영수증의 instruction 칸을 견주는 한 줄에만 있다. 초안을 펼쳐 action·recipient를 손으로 꾸미는 함수는 이 글자를 더 써야 하므로 여기서 걸린다.
+  expect([
+    startLiterals(credentialSend),
+    credentialSend
+      .split("\n")
+      .filter((line) => /["'`]task_start["'`]/.test(line))
+      .map((line) => line.trim()),
+  ]).toEqual([1, ['if (body.instruction !== "task_start") return "not_task_start";']]);
   const drafting = files.filter((file) => startDraftCalls(src(file)) > 0);
   expect(drafting).toEqual(["src/supervisor/dispatch/assign-loop.ts", "src/supervisor/dispatch/resend.ts"]);
   for (const file of drafting) {

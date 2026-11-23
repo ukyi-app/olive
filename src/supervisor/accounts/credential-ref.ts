@@ -154,7 +154,7 @@ const DIGEST_HEX = /^[0-9a-f]{64}$/;
 // 실행 줄의 참조(account·method·digest)로 그 계정의 자격 파일을 다시 읽어, 바이트의 지문이 참조의 digest와 같을 때만 그 바이트를 빌려준다.
 // 소속은 resolveCredentialRef와 같은 포트·같은 경로 규칙(계정 폴더 안의 그 방식의 키)으로 본다: 지문만 보면 다른 계정의 같은 파일을 가르지 못한다.
 // revision은 대조하지 않는다. 실행기는 값을 지문으로만 대조하고(src/executor/profile.ts의 credentialMatches), 같은 바이트면 같은 값이다.
-// 던지지 않는다. 거절의 길에서는 포트가 준 버퍼를 여기서 0으로 채운다.
+// 포트가 던지거나 그 답을 읽다 던져도 read_failed로 끝낸다. 거절의 길에서는 포트가 준 버퍼를 여기서 0으로 채운다.
 export async function borrowCredentialValue(
   files: CredentialFiles,
   policy: CredentialRefPolicy,
@@ -173,19 +173,23 @@ export async function borrowCredentialValue(
   const digest = ref.digest;
   if (typeof digest !== "string" || !DIGEST_HEX.test(digest)) return refuse("digest_malformed");
 
-  let read: CredentialRead;
+  // 포트의 답에서 쓸 칸은 이 try 안에서 한 번씩 꺼낸다. 접근자가 던져도 read_failed이고 그 문구를 싣지 않는다.
+  let kind: unknown;
+  let answered: unknown;
   try {
-    read = await files.read({ dir: policy.dir, account, key }, policy.maxBytes);
+    const read: CredentialRead = await files.read({ dir: policy.dir, account, key }, policy.maxBytes);
+    kind = read?.kind;
+    if (kind === "bytes") answered = (read as { bytes?: unknown }).bytes;
   } catch {
     return refuse("read_failed");
   }
-  if (read?.kind === "missing") return refuse("missing");
-  if (read?.kind === "not_a_file") return refuse("not_a_file");
-  if (read?.kind === "outside_account") return refuse("outside_account");
-  if (read?.kind === "too_large") return refuse("too_large");
-  if (read?.kind !== "bytes" || !(read.bytes instanceof Uint8Array)) return refuse("read_failed");
+  if (kind === "missing") return refuse("missing");
+  if (kind === "not_a_file") return refuse("not_a_file");
+  if (kind === "outside_account") return refuse("outside_account");
+  if (kind === "too_large") return refuse("too_large");
+  if (kind !== "bytes" || !(answered instanceof Uint8Array)) return refuse("read_failed");
 
-  const bytes = read.bytes;
+  const bytes = answered;
   let lent = false;
   try {
     if (bytes.length === 0) return refuse("empty");
