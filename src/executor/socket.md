@@ -1,6 +1,6 @@
 # 실행기가 감독에 붙는 소켓 (`socket.ts`)
 
-실행기 쪽 연결의 조립이다. `tls-client.ts`로 감독에 붙고(실행기가 먼저 붙고 듣지 않는다, D-55), `framing.ts`의 틀로 바이트를 자르고 이어, `link.ts`의 `ExecutorLink`에 연결마다 `Transport` 하나로 넘긴다. 끊기면 정책의 간격을 두고 다시 붙는다. 연결의 판단(맞춤, challenge, 정지 세대, `hello`, 재전송)은 `link.ts`·`worker.ts`의 것을 부르고 여기서 다시 만들지 않는다.
+실행기 쪽 연결의 조립이다. `tls-client.ts`로 감독에 붙고(실행기가 먼저 붙고 듣지 않는다, D-55), `framing.ts`의 틀로 바이트를 자르고 이어, `link.ts`의 `ExecutorLink`에 연결마다 `Transport` 하나로 넘긴다. 같은 연결로 온 자격 값 틀은 봉투와 갈라 우편함(`credential-inbox.ts`)에 넘긴다. 끊기면 정책의 간격을 두고 다시 붙는다. 연결의 판단(맞춤, challenge, 정지 세대, `hello`, 재전송)은 `link.ts`·`worker.ts`의 것을 부르고 여기서 다시 만들지 않는다.
 
 소켓과 TLS는 `tls-client.ts`가 연 것만 쓴다. 이 파일은 `node:tls`·`node:net`을 import하지 않는다(`test/executor/static.test.ts`). 타이머와 난수는 주입받는다. 밖으로 던지지 않고 결과는 구별된 사건으로만 알린다. 기록 콜백(`onEvent`)은 기다리지 않고, 그 실패(던짐, 돌려준 약속의 거절)는 무시된다.
 
@@ -11,7 +11,8 @@ createExecutorSocket(options: ExecutorSocketOptions): CreateSocketResult
 
 ExecutorSocketOptions = {
   client: Pick<TlsClient, "connect">                  // tls-client.ts. 재료·주소는 부르는 쪽이 만들 때 넣는다
-  link: Pick<ExecutorLink, "open" | "isCurrent">      // 이 소켓 하나만 이 link에 연결을 연다
+  link: Pick<ExecutorLink, "open" | "isCurrent" | "epoch">  // 이 소켓 하나만 이 link에 연결을 연다
+  inbox: Pick<CredentialInbox, "offer" | "dropEpoch">  // 작업자의 credentials와 같은 우편함(credential-inbox.md)
   policy: ReconnectPolicy
   receive: ReceivePolicy
   timer: { set(callback, ms): unknown; clear(handle): void }
@@ -36,7 +37,7 @@ ExecutorSocket = {
 }
 ```
 
-`maxQueuedBytes`의 하한 65,540은 틀 하나의 최대 크기(접두 4바이트 + 계약 v1의 `MAX_MESSAGE_BYTES` 65,536)다. 그보다 작으면 처리 중에 온 정상 틀 하나만으로 연결이 닫힌다. 하한 밖의 값과 JavaScript 안전 정수가 아닌 값(`Number.isSafeInteger`가 거짓: 소수, `NaN`, 무한, 9,007,199,254,740,991 초과)은 `policy_rejected`다. 기본값은 없다.
+`maxQueuedBytes`는 봉투 틀만 센다. 자격 값 틀은 줄에 들지 않으므로 세지 않는다(아래 보장 4). `maxQueuedBytes`의 하한 65,540은 틀 하나의 최대 크기(접두 4바이트 + 계약 v1의 `MAX_MESSAGE_BYTES` 65,536)다. 그보다 작으면 처리 중에 온 정상 틀 하나만으로 연결이 닫힌다. 하한 밖의 값과 JavaScript 안전 정수가 아닌 값(`Number.isSafeInteger`가 거짓: 소수, `NaN`, 무한, 9,007,199,254,740,991 초과)은 `policy_rejected`다. 기본값은 없다.
 
 | 사건 (`SocketEvent`) | 뜻 |
 |---|---|
@@ -58,8 +59,9 @@ ExecutorSocket = {
 | `encode_failed` | 보낼 봉투를 정규 직렬화(`canonicalJson`)나 틀로 만들지 못했다 |
 | `receive_failed` | 받은 프레임의 처리(`Connection.receive`)가 던졌다. 그 지시의 결과를 모르므로 새 연결에서 다시 맞춘다 |
 | `receive_backlog` | 처리를 기다리는 받은 틀의 바이트가 `maxQueuedBytes`를 넘었다 |
+| `credential_not_synced` | 맞춘 지금 연결이 아닌 때(맞추기 전, `link`의 지금 연결이 아님, 연결 번호가 `link.epoch()`와 다름) 자격 값 틀이 왔다. 그 값은 0으로 채웠다 |
 | `stopped` | `stop`이 닫았다 |
-| `framing.ts`의 거절 이름 | 틀이 거절했다(`frame_empty`·`frame_too_large`·`frame_truncated`·`frame_bad_utf8`·`frame_not_json`·`frame_duplicate_key`·`frame_too_deep`·`frame_after_end`) |
+| `framing.ts`의 거절 이름 | 틀이 거절했다(`frame_empty`·`frame_too_large`·`frame_truncated`·`frame_bad_utf8`·`frame_not_json`·`frame_duplicate_key`·`frame_too_deep`·`frame_after_end`, 섞어 받는 디코더의 `frame_unknown_kind`·`frame_credential_empty`·`frame_credential_too_large`·`frame_credential_bad_run_id`·`frame_credential_bad_digest`) |
 
 ## 보장
 
@@ -69,9 +71,10 @@ ExecutorSocket = {
 - **받은 바이트는 연결마다 디코더 하나를 거쳐 프레임 단위로, 받은 순서대로 하나씩 넘긴다.** 앞 프레임의 `receive`가 끝난 뒤에 다음 것을 넘긴다. `receive`는 검증(nonce I/O)과 저장을 기다리므로 겹쳐 부르면 뒤 프레임이 먼저 처리될 수 있다.
 - **처리를 기다리는 동안에도 소켓 읽기를 멈추지 않는다.** 멈추면 읽지 않은 바이트 뒤에 있는 상대의 끝 알림이 앞 처리가 풀릴 때까지 오지 않는다. 대신 줄에서 처리를 기다리는 **완성된** 틀의 전송 길이(접두 포함)의 합을 세어 `maxQueuedBytes`를 넘으면 그 연결만 닫는다(`receive_backlog`, 그 줄의 틀은 판단에 닿지 않는다). 상한이 세는 것은 이 합뿐이다. 연결 하나가 그 밖에 따로 쥐는 것:
   - **처리 중인 프레임 하나.** 줄에서 꺼내 `receive`에 넘길 때 합에서 빼므로 상한에 세지 않는다(전송 길이로 65,540바이트 이하). 처리가 멈춰 있는 동안 상한만큼의 줄과 함께 남는다.
-  - **디코더가 쥔 덜 온 틀의 조각**(접두 4바이트와 선언된 길이의 본문 버퍼, 65,540바이트 이하, `framing.ts`)과 **마지막으로 받은 조각 하나**.
+  - **디코더가 쥔 덜 온 틀의 조각**(접두 4바이트와 선언된 길이의 본문 버퍼, 또는 값 틀의 실행 ID·지문 칸과 값 버퍼. 65,540바이트 이하, `framing.ts`)과 **마지막으로 받은 조각 하나**.
+  - **우편함의 한 칸.** 연결마다가 아니라 실행기 전체에 값 하나(16,384바이트 이하)와 실행 ID·지문이다(보장 4).
   - **해석된 객체의 비용.** 줄과 처리 중인 프레임은 바이트가 아니라 해석된 값(JSON 객체)으로 쥐므로 실제 힙 사용은 전송 길이와 다르다. 운영자가 계산할 수 있는 값은 전송 길이의 합이고, 힙·RSS의 실측 상한은 **미확인**이다.
-- **틀이 거절한 바이트는 판단에 닿지 않고 그 연결을 닫는다.** 거절이 나온 `push`의 앞쪽 온전한 틀도 넘기지 않는다. 그 연결이 닫히면 `link`도 그 연결의 것을 받지 않으므로 넘겨도 쓰이지 않는다. 거절한 디코더는 다시 동기화하지 않는다(`framing.ts`).
+- **틀이 거절한 바이트는 판단에 닿지 않고 그 연결을 닫는다.** 거절이 나온 `push`의 앞쪽 온전한 틀도 넘기지 않는다. 그 연결이 닫히면 `link`도 그 연결의 것을 받지 않으므로 넘겨도 쓰이지 않는다. 그 앞쪽에 온전한 자격 값 틀이 있으면 우편함에 넘기지 않고 0으로 채운다. 거절한 디코더는 다시 동기화하지 않는다(`framing.ts`).
 - 시험: `socket.test.ts`의 "싣고 받기" 둘(틀의 경계와 무관하게 셋으로 잘라 쓴 세 프레임이 그 차례로 닿고 답도 그 차례, 동시 처리 1개, 중복 키 틀이 닿지 않고 `frame_duplicate_key`로 닫힘), "받기"(처리를 붙든 채 상한을 넘기면 `receive_backlog`로 그 연결만 닫히고 넘친 틀은 닿지 않음).
 
 ### 2. 새 연결이면 앞 연결의 것을 버린다
@@ -93,6 +96,16 @@ ExecutorSocket = {
 - **간격과 받아 둘 양의 숫자는 기본값이 없다.** 실측 전이라 부르는 쪽이 정책으로 넘긴다. 범위 밖이면 `policy_rejected`이고 소켓을 만들지 않는다.
 - 시험: "다시 붙기" 둘(100·200·400·400, 덜기 750, 범위 밖 난수는 덜지 않음, 맞춘 연결 뒤에만 처음으로: 100·200·100), "닫기"(link가 닫은 뒤와 처리가 던진 뒤에도 간격을 둠), "멈춤" 다섯(열린 중·기다리는 중·붙는 중, 연달아 부른 둘째 `stop`, `link`가 먼저 닫은 직후의 `stop`, 멈춘 뒤 늦게 돌아온 소켓, 검증은 끝났고 반환만 늦은 소켓을 감독이 끝내는 중에 넘겨받음: 뒤의 넷 다 `stop`이 돌아올 때 `openConnections()`가 0이고 마지막은 그 소켓의 close 리스너도 이미 불렸다), "정책". `tls.test.ts`의 "연결"(돌려준 `closed` 약속은 close 사건 전에는 풀리지 않고, 풀렸을 때 `openConnections()`가 0).
 
+### 4. 자격 값 틀은 맞춘 지금 연결에서만 받고, 봉투의 길에 넣지 않는다
+
+- **연결마다 섞어 받는 디코더(`createMixedFrameDecoder`) 하나가 봉투 틀과 자격 값 틀을 받은 순서대로 가른다.** 봉투 틀은 봉투만 받는 디코더와 같은 검사·같은 결과라(`framing.md`) 위 보장 1~3은 그대로다.
+- **값 틀은 줄에 넣지 않고 `link.receive`·봉투 검증·`onEvent`에 넘기지 않는다.** 그 틀을 가른 그 자리에서, 그 연결이 맞춤을 끝냈고(`synced` 사건을 낸 연결) `link`의 지금 연결이며 그 연결 번호가 `link.epoch()`와 같을 때만 우편함의 `offer(연결 번호, 값)`에 넘긴다. 아니면(맞추기 전, 지금 연결이 아님, 번호가 다름) 그 값과 같은 조각에서 그 뒤에 온 값을 0으로 채우고 그 연결을 닫는다(`credential_not_synced`). 그 앞에 줄에 넣은 봉투는 연결이 닫히며 버려진다.
+- **값은 같은 조각에서 그보다 앞에 받은 봉투의 처리를 기다리지 않는다.** 줄에 넣으면 연결이 닫힐 때 줄 안의 값을 찾아 0으로 채우는 길이 하나 더 생긴다. 감독은 접수 영수증을 받은 뒤에만 값을 보내므로, 그 실행의 `task_start` 처리는 값이 오기 전에 끝났다.
+- **연결이 끝나면(상대의 끝, 오류, `link`의 닫기·교체, `stop`) 우편함의 `dropEpoch(그 연결 번호)`를 부른다.** 그 연결에서 받아 아직 쓰지 않은 값은 0으로 채워지고, 그 연결에서 기다리던 `take`는 `null`로 끝난다(`credential-inbox.md`).
+- **값 틀은 `maxQueuedBytes`에 세지 않는다.** 줄에 들지 않고, 우편함이 한 칸이라 받은 값은 실행기 전체에 하나(16,384바이트 이하)로 묶인다. 소켓은 값 틀을 받은 자리에서 넘기거나 0으로 채우고 쥐지 않는다.
+- **값의 바이트는 사건·닫힘 이유·오류에 실리지 않는다.** 소켓은 디코더의 step과 값 틀을 기록하지 않는다.
+- 시험: `socket.test.ts`의 "자격 값" 넷(감독 쪽 `encodeCredentialFrame`의 틀이 맞춘 뒤 `take`로 나오고 같은 조각의 두 봉투는 처리를 붙든 동안에도 값이 먼저 우편함에 닿은 뒤 받은 차례로 판단에 닿음, 값은 판단에 닿지 않음, `take`가 먼저 기다리면 늦게 온 값을 받음 / 맞추기 전의 값 틀은 우편함에 닿지 않고 0으로 채워지며 `credential_not_synced`로 닫힘 / 거절과 함께 온 앞선 정상 값은 우편함에 닿지 않고 0으로 채워지며 `frame_unknown_kind`로 닫힘 / 연결이 끝나면 칸의 값이 0이고 그 뒤 `take`는 `null`).
+
 ## 계약 v1 "구현이 지킬 것"에서 이 소켓의 몫
 
 - **연결마다 새 128비트 이상 challenge:** `link.ts`의 몫이다(`open`마다 `challenge()`, 기본 `randomBytes(16)`). 이 소켓의 몫은 인증된 연결마다 `link.open`을 정확히 한 번 부르는 것이다.
@@ -111,11 +124,13 @@ ExecutorSocket = {
 
 ## 이 PR에 없는 것
 
-실행기 진입점과 기동 순서(저장소 열기 → 프로필·키 → 기동 대조 → `recover` → 연결), 자격의 값을 받는 일, 인증서 재료가 바뀐 뒤의 재인증과 `peerNotAfter` 전 재연결, 감독 쪽 서버 조립, `link.tick`·`worker.tick`을 주기로 부르는 일, 반쯤 열린 연결의 감지, 쓰기 버퍼의 상한, 간격과 받아 둘 양의 운영 값.
+실행기 진입점과 기동 순서(저장소 열기 → 프로필·키 → 기동 대조 → `recover` → 연결), 감독이 자격 값을 보내는 일, 인증서 재료가 바뀐 뒤의 재인증과 `peerNotAfter` 전 재연결, 감독 쪽 서버 조립, `link.tick`·`worker.tick`을 주기로 부르는 일, 반쯤 열린 연결의 감지, 쓰기 버퍼의 상한, 간격과 받아 둘 양의 운영 값.
 
 ## 뒤 조각이 지켜야 할 것
 
 - **진입점이 저장소·프로필·키·기동 대조·복구(`recover`)를 마친 뒤 한 `ExecutorLink`에 소켓 하나만 붙인다.** 둘이 같은 `link`에 열면 서로의 연결을 닫는다.
+- **진입점은 우편함 하나를 만들어 이 소켓(`inbox`)과 작업자(`credentials`)에 함께 넘긴다.** 다른 우편함이면 소켓이 넣은 값을 작업자가 꺼내지 못한다. 우편함의 `epoch`에는 같은 `link`의 `epoch()`를 준다(`credential-inbox.md`).
+- **감독은 맞춘 뒤 그 실행의 접수 영수증을 받은 연결에서만 값 틀을 보낸다.** 맞추기 전에 보내면 이 소켓이 그 연결을 닫는다(`credential_not_synced`).
 - **진입점이 `link.tick()`과 `worker.tick()`을 주기로 부른다.** 25초 맞춤 기한과 세대 저장 대기는 `link`가 처리한다. `link.tick`을 부르지 않으면 감독이 맞춤에 답하지 않는 연결이 기한 뒤에도 닫히지 않아(받는 프레임이 없으면 `expireIfDue`가 돌지 않는다) 다시 붙지 않는다. 맞춘 뒤 일반 조회의 처리가 멈추는 것에는 이 tick이 기한을 주지 않는다.
 - **진입점이 `TlsClient`를 만들고 그 재료 오류를 처리하고, 끝낼 때 `stop()`을 기다린 뒤 클라이언트를 닫는다.** `createTlsClient`는 재료가 틀리면 던진다(`TlsMaterialError`). 이 소켓은 `connect`만 부르고 클라이언트를 닫지 않는다. `stop()`이 돌아오면 이 소켓이 받은 소켓의 `close`는 모두 끝났다.
 - **감독은 연결에 쓰는 데 성공한 것을 접수로 보지 않는다.** 감독이 지시를 쓰고 곧바로 닫으면 실행기는 그 지시를 받지 못했을 수 있다: 줄에서 버려진 `task_start`·`task_cancel`은 실행 기록도 영수증도 남기지 않는다. 감독은 **장부의 미응답 판정**(`ledger.ts`의 `unansweredInstructions`: 시작은 그 실행의 영수증·보고의 유무, 종료는 그 요청의 접수 영수증이나 실행의 종료 확인의 유무)과 **재전송의 기한**(`resend.ts`)을 따라 같은 요청을 새 nonce로 다시 보낸다. 이미 실행 기록의 쓰기에 들어간 시작은 연결이 끝나도 되감기지 않으므로, 다시 맞춘 뒤 저장된 outbox의 사건(`receipt_stopped` 등)이 올 수 있다. **버려진 지시가 모두 다시 실행된다고 보장하지 않는다**: 재전송의 기한이 지나면(시작은 발행 시각에 고정된 한도) 다시 보내지 않는다. 같은 실행에 종료가 적히면 감독은 시작만 다시 보내지 않고, 답을 받지 못한 취소는 따로 다시 보낸다(`resend.ts`).

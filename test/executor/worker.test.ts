@@ -248,6 +248,35 @@ test("시작: 자격 digest가 값과 다르면 띄우지 않는다(정확한 �
   expect(JSON.stringify(r.transport.sent)).not.toContain(text);
 });
 
+test("자격: 받은 값의 배열은 대조·변환 뒤 띄우든 띄우지 않든 0으로 채우고, 실행이 끝나면 자격의 출처에 그 실행을 잊게 한다", async () => {
+  const zeroed = (value: Uint8Array) => value.every((byte) => byte === 0);
+  // 띄운 실행.
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  expect(r.launcher.spawned).toBe(1);
+  expect(r.credentials.handed.map(zeroed)).toEqual([true]);
+  expect(r.credentials.forgotten).toEqual([runId]);
+
+  // 지문이 달라 띄우지 않은 실행.
+  const mismatch = await make();
+  const value = credentialValue();
+  const bad = await start(mismatch, { value, digest: sha256("다른 값") });
+  await mismatch.worker.idle();
+  expect(mismatch.launcher.spawned).toBe(0);
+  expect(mismatch.credentials.handed.map(zeroed)).toEqual([true]);
+  expect(mismatch.credentials.forgotten).toEqual([bad.runId]);
+
+  // 받은 직후 연결이 끊겨 대조 전에 멈춘 실행.
+  const lost = await make();
+  lost.credentials.before = () => lost.connection.close();
+  const dropped = await start(lost);
+  await lost.worker.idle();
+  expect(lost.launcher.spawned).toBe(0);
+  expect(lost.credentials.handed.map(zeroed)).toEqual([true]);
+  expect(lost.credentials.forgotten).toEqual([dropped.runId]);
+});
+
 test("시작: 연결이 없거나 맞춤 전이면 새 실행 0·새 자격 0", async () => {
   // 맞춤 전: 시작 지시를 검증하지도 처리하지도 않는다.
   const unsynced = await make({ syncTo: null });

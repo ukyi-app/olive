@@ -2,18 +2,19 @@
 // 루프백(127.0.0.1, 빈 포트)의 실제 상호 TLS로 돈다. 인증서와 키는 시험 안에서 메모리로 만든다(../transport/certs.ts).
 // 다시 붙기의 기다림은 가짜 타이머가 쥐고 시험이 직접 부른다(실제 시간으로 기다리지 않는다).
 import { afterEach, expect, test } from "bun:test";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type * as tls from "node:tls";
 import { type Envelope, limits } from "../../src/contract/v1/index.ts";
+import { type CredentialInbox, createCredentialInbox } from "../../src/executor/credential-inbox.ts";
 import type { Connection, Transport } from "../../src/executor/link.ts";
 import type { StoreIo } from "../../src/executor/store.ts";
 import { createExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
 import { startTlsServer, type TlsServer } from "../../src/supervisor/transport/tls-server.ts";
-import { createFrameDecoder, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES } from "../../src/transport/framing.ts";
+import { createFrameDecoder, encodeCredentialFrame, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES } from "../../src/transport/framing.ts";
 import { createTlsClient, type TlsClient } from "../../src/transport/tls-client.ts";
 import type { RawTlsMaterial } from "../../src/transport/tls-policy.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
-import { barrier, fromSupervisor, gate, type Rig, rig, scriptedIo, syncReply } from "./support.ts";
+import { barrier, fromSupervisor, gate, type Rig, rig, scriptedIo, sha256, syncReply } from "./support.ts";
 
 const HOST = "127.0.0.1";
 const pki = makePki();
@@ -21,6 +22,7 @@ const POLICY: ReconnectPolicy = { initialDelayMs: 100, maxDelayMs: 400, multipli
 // 받을 수 있는 가장 작은 상한: 틀 하나의 최대 크기.
 const RECEIVE: ReceivePolicy = { maxQueuedBytes: FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES };
 const material = (leaf: Issued): RawTlsMaterial => ({ certificatePem: leaf.pem, privateKeyPem: leaf.keyPem, trustBundlePem: pki.ca.pem });
+const inboxFor = (r: Rig) => createCredentialInbox({ epoch: () => r.link.epoch() });
 
 const cleanup: (() => unknown)[] = [];
 afterEach(async () => {
@@ -115,6 +117,7 @@ function recordingLink(r: Rig) {
         return connection;
       },
       isCurrent: (connection: Connection) => r.link.isCurrent(connection),
+      epoch: () => r.link.epoch(),
     },
   };
 }
@@ -127,6 +130,8 @@ interface Setup {
   events: SocketEvent[];
   opened: Opened[];
   socket: ReturnType<typeof made>;
+  inbox: CredentialInbox;
+  offered: Uint8Array[];
 }
 function made(result: ReturnType<typeof createExecutorSocket>) {
   if (!result.ok) throw new Error(result.reason);
@@ -151,10 +156,20 @@ async function setup(
   const timer = new FakeTimer();
   const events: SocketEvent[] = [];
   const rec = recordingLink(r);
+  const inbox = inboxFor(r);
+  // 소켓이 우편함에 넘긴 값의 배열. 연결이 끝난 뒤 0으로 채워졌는지 시험이 본다.
+  const offered: Uint8Array[] = [];
   const socket = made(
     createExecutorSocket({
       client: options.wrap?.(client) ?? client,
       link: rec.link,
+      inbox: {
+        offer: (epoch, credential) => {
+          offered.push(credential.value);
+          return inbox.offer(epoch, credential);
+        },
+        dropEpoch: (epoch) => inbox.dropEpoch(epoch),
+      },
       policy: options.policy ?? POLICY,
       receive: RECEIVE,
       timer,
@@ -163,7 +178,7 @@ async function setup(
     }),
   );
   cleanup.push(() => socket.stop());
-  return { r, peers, client, timer, events, opened: rec.opened, socket };
+  return { r, peers, client, timer, events, opened: rec.opened, socket, inbox, offered };
 }
 
 const kinds = (s: Setup) => s.events.map((e) => e.kind);
@@ -229,6 +244,111 @@ test("싣고 받기: 틀이 거절한 바이트는 판단에 닿지 않고 그 �
   expect(actionsOf(peer)).toEqual(["stop_sync_request", "hello"]);
   expect(s.r.link.live()).toBe(false);
   expect(s.opened[0]!.connection.state).toBe("closed");
+});
+
+// 자격 값 틀. 값의 비교는 digest로만 단언한다(실패한 단언이 값을 싣지 않게).
+const credentialFrame = (runId: string, value: Uint8Array, digest = sha256(value)): Uint8Array => {
+  const made = encodeCredentialFrame(runId, digest, value);
+  if (!made.ok) throw new Error(made.reason);
+  return made.frame;
+};
+const zeroed = (value: Uint8Array) => value.every((byte) => byte === 0);
+// 소켓 안에서만 쥐다 버리는 값(우편함에 넘기지 않은 값)이 0으로 채워졌는지 본다. 그 길이의 배열에 0을 채우는 호출마다
+// 채우기 직전의 digest와 배열을 모은다. 길이를 다른 배열과 겹치지 않는 값으로 고른다.
+const WIPE_PROBE_BYTES = 777;
+function watchWipes(): { wiped: { sum: string; array: Uint8Array }[]; restore: () => void } {
+  const wiped: { sum: string; array: Uint8Array }[] = [];
+  const original = Uint8Array.prototype.fill;
+  Uint8Array.prototype.fill = function (this: Uint8Array, ...args: Parameters<typeof original>) {
+    if (this.length === WIPE_PROBE_BYTES && args[0] === 0 && args.length === 1) wiped.push({ sum: sha256(this), array: this });
+    return original.apply(this, args);
+  } as typeof original;
+  const restore = () => {
+    Uint8Array.prototype.fill = original;
+  };
+  cleanup.push(restore);
+  return { wiped, restore };
+}
+const wipedValue = (wiped: { sum: string; array: Uint8Array }[], sum: string) => wiped.some((w) => w.sum === sum && zeroed(w.array));
+
+test("자격 값: 감독이 encodeCredentialFrame으로 만든 틀이 맞춘 뒤 take로 나오고, 같은 조각의 봉투는 줄로 차례대로 가며 값은 link.receive에 닿지 않는다", async () => {
+  const s = await setup();
+  s.socket.start();
+  const peer = await syncPeer(s, 0);
+  // 봉투의 처리를 붙든다. 값은 줄을 지나지 않으므로 붙든 동안에도 우편함에 닿는다.
+  const held = gate();
+  s.opened[0]!.hold = held.wait;
+  const runId = randomUUID();
+  const value = randomBytes(300);
+  const ids = [randomUUID(), randomUUID()];
+  peer.socket.write(concat(frame(query(s, ids[0]!)), credentialFrame(runId, value), frame(query(s, ids[1]!))));
+  await until(() => s.offered.length === 1);
+  const got = await s.inbox.take(runId, sha256(value), new AbortController().signal);
+  expect(got === null ? null : sha256(got)).toBe(sha256(value));
+  expect(s.opened[0]!.inFlight).toBe(1);
+  held.open();
+  await until(() => actionsOf(peer).filter((a) => a === "status_report").length === 2);
+  // 판단에 닿은 것은 맞춤 답과 두 봉투뿐이고 받은 차례 그대로다.
+  expect(s.opened[0]!.seen).toHaveLength(3);
+  expect(s.opened[0]!.seen.slice(1).map((raw) => (raw as Envelope).header.request_id)).toEqual(ids);
+
+  // take가 먼저 기다리면 늦게 온 값을 내준다.
+  const later = randomUUID();
+  const lateValue = randomBytes(200);
+  const waiting = s.inbox.take(later, sha256(lateValue), new AbortController().signal);
+  peer.socket.write(credentialFrame(later, lateValue));
+  const late = await waiting;
+  expect(late === null ? null : sha256(late)).toBe(sha256(lateValue));
+  expect(s.opened[0]!.seen).toHaveLength(3);
+  expect(closedReasons(s)).toEqual([]);
+  expect(s.r.link.live()).toBe(true);
+});
+
+test("자격 값: 맞추기 전의 값 틀은 우편함에 넘기지 않고 0으로 채운 뒤 credential_not_synced로 그 연결을 닫는다", async () => {
+  const s = await setup();
+  const probe = watchWipes();
+  s.socket.start();
+  await until(() => (s.peers[0]?.got.length ?? 0) >= 1);
+  const value = randomBytes(WIPE_PROBE_BYTES);
+  s.peers[0]!.socket.write(credentialFrame(randomUUID(), value));
+  await until(() => closedReasons(s).length === 1);
+  probe.restore();
+  expect(closedReasons(s)).toEqual(["credential_not_synced"]);
+  expect(s.offered).toHaveLength(0);
+  expect(wipedValue(probe.wiped, sha256(value))).toBe(true);
+  expect(s.opened[0]!.seen).toHaveLength(0);
+  expect(s.opened[0]!.connection.state).toBe("closed");
+});
+
+test("자격 값: 거절과 함께 온 앞선 정상 값은 넘기지 않고 0으로 채운다", async () => {
+  const s = await setup();
+  s.socket.start();
+  const peer = await syncPeer(s, 0);
+  const probe = watchWipes();
+  const value = randomBytes(WIPE_PROBE_BYTES);
+  // 정상 값 틀 바로 뒤에 모르는 종류의 바이트.
+  peer.socket.write(concat(credentialFrame(randomUUID(), value), Uint8Array.of(0x07)));
+  await until(() => closedReasons(s).length === 1);
+  probe.restore();
+  expect(closedReasons(s)).toEqual(["frame_unknown_kind"]);
+  expect(s.offered).toHaveLength(0);
+  expect(wipedValue(probe.wiped, sha256(value))).toBe(true);
+  expect(s.opened[0]!.seen).toHaveLength(1);
+});
+
+test("자격 값: 연결이 끝나면 우편함의 칸이 비고 그 값은 0으로 채워지며, 그 뒤의 take는 내받지 못한다", async () => {
+  const s = await setup();
+  s.socket.start();
+  const peer = await syncPeer(s, 0);
+  const runId = randomUUID();
+  const value = randomBytes(64);
+  peer.socket.write(credentialFrame(runId, value));
+  await until(() => s.offered.length === 1);
+  expect(zeroed(s.offered[0]!)).toBe(false);
+  peer.socket.destroy();
+  await until(() => closedReasons(s).length === 1);
+  expect(zeroed(s.offered[0]!)).toBe(true);
+  expect(await s.inbox.take(runId, sha256(value), new AbortController().signal)).toBeNull();
 });
 
 test("새 연결: 앞 연결이 끝나면 그 대기값과 남은 프레임을 버리고, 늦게 끝난 처리는 새 연결의 맞춤이 되지 않는다", async () => {
@@ -601,6 +721,7 @@ test("기록: 비동기 기록 콜백이 실패해도 처리되지 않은 거절
     createExecutorSocket({
       client: { connect: () => Promise.reject(new Error("붙지 않는다")) },
       link: r.link,
+      inbox: inboxFor(r),
       policy: POLICY,
       receive: RECEIVE,
       timer,
@@ -644,7 +765,7 @@ test("정책: 간격의 숫자가 범위 밖이면 소켓을 만들지 않고 �
     { ...POLICY, initialDelayMs: Number.NaN },
   ];
   for (const policy of bad) {
-    expect(createExecutorSocket({ client, link: r.link, policy, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(policy)).toEqual({ ok: false, reason: "policy_rejected" });
+    expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(policy)).toEqual({ ok: false, reason: "policy_rejected" });
   }
   // 받아 둘 양의 상한: 틀 하나의 최대 크기보다 작거나 정수가 아니면 거절한다.
   const badReceive: ReceivePolicy[] = [
@@ -654,7 +775,7 @@ test("정책: 간격의 숫자가 범위 밖이면 소켓을 만들지 않고 �
     { maxQueuedBytes: Number.POSITIVE_INFINITY },
   ];
   for (const receive of badReceive) {
-    expect(createExecutorSocket({ client, link: r.link, policy: POLICY, receive, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(receive)).toEqual({ ok: false, reason: "policy_rejected" });
+    expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy: POLICY, receive, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(receive)).toEqual({ ok: false, reason: "policy_rejected" });
   }
-  expect(createExecutorSocket({ client, link: r.link, policy: POLICY, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }).ok).toBe(true);
+  expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy: POLICY, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }).ok).toBe(true);
 });
