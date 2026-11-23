@@ -10,7 +10,7 @@
 import type { Ledger, Restorer, Run } from "../../ledger/index.ts";
 import { encodeCredentialFrame } from "../../transport/framing.ts";
 import { borrowCredentialValue, type CredentialBorrowRefusal, type CredentialFiles, type CredentialRefPolicy } from "../accounts/credential-ref.ts";
-import type { ConnectionServer, NotWrittenReason, SendEnd } from "../transport/server.ts";
+import { type ConnectionServer, NOT_WRITTEN_REASONS, type NotWrittenReason, type SendEnd } from "../transport/server.ts";
 import type { Clock } from "./ports.ts";
 import type { ForwardInput, ReceiptOutcome } from "./receipts.ts";
 
@@ -177,7 +177,8 @@ function writeAnswer(result: unknown): WriteAnswer | null {
     if (kind === "written" || kind === "unknown") return { kind };
     if (kind !== "not_written") return null;
     const reason = (result as { reason?: unknown }).reason;
-    if (typeof reason !== "string") return null;
+    // 서버의 사유 목록 밖 글자는 결과·관측에 옮기지 않는다. 넘긴 바이트 0이라는 답도 믿을 수 없어 꼴이 아닌 답으로 본다.
+    if (typeof reason !== "string" || !(NOT_WRITTEN_REASONS as readonly string[]).includes(reason)) return null;
     if (reason !== "refused") return { kind, reason: reason as NotWrittenReason, refusal: null };
     const refusal = (result as { refusal?: unknown }).refusal;
     // refusal은 lastCheck가 낸 이름이다. 그 밖의 글자를 결과에 옮기지 않는다.

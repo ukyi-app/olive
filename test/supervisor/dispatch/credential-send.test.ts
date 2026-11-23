@@ -68,6 +68,8 @@ const RESULT_FIELDS = new Set(["kind", "reason", "connection", "runId", "refusal
 function safe(result: unknown): Record<string, unknown> | "not_an_object" {
   if (typeof result !== "object" || result === null) return "not_an_object";
   const out: Record<string, unknown> = {};
+  // Object.keys와 JSON은 심볼 키를 건너뛴다. 결과에 허용된 심볼 칸은 없으므로 있기만 해도 표식이다.
+  if (Object.getOwnPropertySymbols(result).length > 0) out["<unexpected_symbol>"] = true;
   for (const key of Object.keys(result)) {
     if (!RESULT_FIELDS.has(key)) {
       out["<unexpected_field>"] = true;
@@ -187,16 +189,22 @@ interface Handed {
   readonly settled: (end: SendEnd) => void;
 }
 
+type Mode = "normal" | "unknown" | "throw" | "throw_after" | "null" | "bad_reason";
+
 // 서버의 쓰기 면을 흉내 낸다: 인정 → lastCheck → 인정 재확인 → 넘김. 인정은 주체마다 연결 하나.
 function fakeServer() {
   const recognized = new Map<string, number>([[EXEC, 1]]);
   const handed: Handed[] = [];
+  // 입구에서 받은 틀. handed는 넘긴 틀만 남기므로, 넘기지 않은 길의 틀 소거는 이것으로 본다.
+  const entered: Uint8Array[] = [];
   const checks: (string | null)[] = [];
   let duringCheck: (() => void) | null = null;
-  // throw: 받기 전에 던짐. throw_after: 틀을 받은 뒤 완료를 알리지 않고 던짐. null: 넘기지 않고 꼴이 아닌 답(둘 다 서버 계약 밖).
-  let mode: "normal" | "unknown" | "throw" | "throw_after" | "null" = "normal";
+  // throw: 받기 전에 던짐. throw_after: 틀을 받은 뒤 완료를 알리지 않고 던짐. null: 넘기지 않고 꼴이 아닌 답.
+  // bad_reason: 넘기지 않았다며 사유 목록 밖의 글자(표본)를 줌. 모두 서버 계약 밖이다.
+  let mode: Mode = "normal";
   const server = {
     writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult {
+      entered.push(frame);
       if (mode === "throw") throw new Error("write path failed");
       if (recognized.get(principal) !== connection) return { kind: "not_written", reason: "not_recognized" };
       const verdict = options.lastCheck();
@@ -205,6 +213,7 @@ function fakeServer() {
       if (verdict !== null) return { kind: "not_written", reason: "refused", refusal: verdict };
       if (recognized.get(principal) !== connection) return { kind: "not_written", reason: "not_recognized" };
       if (mode === "null") return null as unknown as WriteFrameResult;
+      if (mode === "bad_reason") return { kind: "not_written", reason: SAMPLE } as unknown as WriteFrameResult;
       handed.push({ connection, frame, copy: frame.slice(), settled: options.settled });
       if (mode === "throw_after") throw new Error(`write failed near ${SAMPLE}`);
       if (mode === "unknown") {
@@ -218,11 +227,12 @@ function fakeServer() {
     server,
     recognized,
     handed,
+    entered,
     checks,
     set duringCheck(fn: (() => void) | null) {
       duringCheck = fn;
     },
-    set mode(value: "normal" | "unknown" | "throw" | "throw_after" | "null") {
+    set mode(value: Mode) {
       mode = value;
     },
   };
@@ -513,6 +523,7 @@ describe("보장 4: 값과 틀은 결과·관측·예외에 없고, settled 뒤�
     ["throw", "write_threw", 0],
     ["throw_after", "write_threw", 1],
     ["null", "write_result_malformed", 0],
+    ["bad_reason", "write_result_malformed", 0],
   ] as const) {
     test(`서버가 계약 밖의 답(${mode}): 송달 모름(unknown/${reason})이고 값과 틀은 0, 결과·거절에 표본이 없다`, async () => {
       const t = setup();
@@ -528,6 +539,8 @@ describe("보장 4: 값과 틀은 결과·관측·예외에 없고, settled 뒤�
       expect(t.fake.handed.length).toBe(handed);
       expect(t.files.lent.length).toBe(1);
       expect(allZero(t.files.lent[0]!)).toBe(true);
+      expect(t.fake.entered.length).toBe(1);
+      expect(allZero(t.fake.entered[0]!)).toBe(true);
       if (handed === 1) expect(allZero(t.fake.handed[0]!.frame)).toBe(true);
       expect(wipes(t.notes).map((n) => n.kind === "wiped" && n.at)).toEqual([reason]);
       expect(leaks(t.notes)).toBe(false);
@@ -562,6 +575,14 @@ describe("보장 4: 값과 틀은 결과·관측·예외에 없고, settled 뒤�
     expect(leaks({ kind: "written", connection: 1, runId: RUN })).toBe(false);
   });
 
+  test("사본 비교는 자체 심볼 칸을 키와 값 없이 표식으로 바꾼다", () => {
+    const wanted = { kind: "written", connection: 1, runId: RUN };
+    const copy = safe({ ...wanted, [Symbol("extra")]: sampleBytes() });
+    expect(copy !== "not_an_object" && copy["<unexpected_symbol>"] === true).toBe(true);
+    expect(leaks(copy)).toBe(false);
+    expect(safe(wanted)).toEqual(wanted);
+  });
+
   test("결과·관측 어디에도 값의 표본이 없다(모든 길)", async () => {
     const results: CredentialSendResult[] = [];
     const notes: CredentialSendNote[] = [];
@@ -585,11 +606,15 @@ describe("보장 4: 값과 틀은 결과·관측·예외에 없고, settled 뒤�
     // 실행 ID가 UUID 꼴이 아니면 인코더가 틀을 거절한다(frame_failed).
     await run((t) => t.rows.set("run-not-a-uuid", runRow({ runId: "run-not-a-uuid" })), { runId: "run-not-a-uuid" });
     await run((t) => t.fake.recognized.set(EXEC, 2));
-    expect(new Set(results.map((r) => r.kind))).toEqual(new Set(["ignored", "already_sent", "blocked", "unreadable", "frame_failed", "not_written", "written", "unknown"]));
+    // 종류 이름을 그대로 견주면 실패 진단에 칸의 글자가 찍힌다. 있음과 수만 본다.
+    const kinds = new Set<string>(results.map((r) => r.kind));
+    const wantedKinds = ["ignored", "already_sent", "blocked", "unreadable", "frame_failed", "not_written", "written", "unknown"];
+    for (const kind of wantedKinds) expect(kinds.has(kind)).toBe(true);
+    expect(kinds.size).toBe(wantedKinds.length);
     expect(leaks(results)).toBe(false);
     expect(leaks(notes)).toBe(false);
     expect(notes.some((n) => Object.values(n).some((v: unknown) => v instanceof Uint8Array))).toBe(false);
-    expect(results.every((r) => !/<(unexpected_field|not_allowed_value)>|not_an_object/.test(JSON.stringify(safe(r))))).toBe(true);
+    expect(results.every((r) => !/<(unexpected_field|unexpected_symbol|not_allowed_value)>|not_an_object/.test(JSON.stringify(safe(r))))).toBe(true);
   });
 
   test("관측이 던져도 보내기와 정리는 그대로다", async () => {

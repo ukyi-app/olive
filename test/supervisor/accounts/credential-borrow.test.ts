@@ -28,8 +28,14 @@ const policy = (dir: string, over: Partial<CredentialRefPolicy> = {}): Credentia
 });
 const allZero = (bytes: Uint8Array) => bytes.every((b) => b === 0);
 // 거절의 이름만 꺼낸다. 결과를 통째로 견주면 성공 결과의 값 버퍼가 실패 진단에 찍히므로, 성공이나 다른 칸이 있으면 표식을 낸다.
-const refusalOf = (result: CredentialBorrow): string =>
-  result.ok === false && Object.keys(result).sort().join(",") === "ok,reason" ? result.reason : "<not_a_bare_refusal>";
+// reason도 허용 목록에 드는지 먼저 본다: 목록 밖의 글자·바이트를 그대로 돌려주면 실패 진단에 찍힌다.
+// Object.keys는 심볼 키를 건너뛰므로 자체 심볼 칸은 따로 본다(허용된 심볼 칸은 없다).
+const refusalOf = (result: CredentialBorrow): string => {
+  if (result.ok !== false || Object.keys(result).sort().join(",") !== "ok,reason") return "<not_a_bare_refusal>";
+  if (Object.getOwnPropertySymbols(result).length > 0) return "<not_a_bare_refusal>";
+  const reason: unknown = result.reason;
+  return typeof reason === "string" && (CREDENTIAL_BORROW_REFUSALS as readonly string[]).includes(reason) ? reason : "<not_allowed_reason>";
+};
 
 const roots: string[] = [];
 afterAll(() => {
