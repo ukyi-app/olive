@@ -38,6 +38,11 @@ export interface VerifiedSupervisorConnection {
   readonly supervisor: TlsDeploymentIdentity;
   // 감독 인증서의 만료 시각. 그 전에 다시 붙는 것은 부르는 쪽의 일이다.
   readonly peerNotAfter: number;
+  // 이 소켓의 실제 close 사건에서 풀리며, 그때는 이미 openConnections()의 집계에서 빠져 있다. 거절되지 않는다.
+  // 클라이언트 전체를 close()하면 집계는 실제 close 사건보다 먼저 0이 된다(live.clear()).
+  // 함정: socket.closed·destroyed는 close 사건보다 먼저 참이 될 수 있어, 늦게 받은 쪽이 그 속성으로는
+  // 이미 닫힌 소켓과 닫히는 중인 소켓을 가르지 못한다. 이 약속은 검증 직후 걸어 두므로 사건을 놓치지 않는다.
+  readonly closed: Promise<void>;
 }
 
 export type ConnectFailure =
@@ -110,8 +115,13 @@ class Client implements TlsClient {
         settled = true;
         signal?.removeEventListener("abort", onAbort);
         this.live.add(socket);
-        socket.once("close", () => this.live.delete(socket));
-        resolve({ socket, supervisor: verdict.identity, peerNotAfter: peer.facts!.notAfter });
+        const closed = new Promise<void>((done) =>
+          socket.once("close", () => {
+            this.live.delete(socket);
+            done();
+          }),
+        );
+        resolve({ socket, supervisor: verdict.identity, peerNotAfter: peer.facts!.notAfter, closed });
       });
     });
   }

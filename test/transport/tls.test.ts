@@ -244,6 +244,21 @@ describe("재료: 이 재료로 시작해도 되는가", () => {
 
 // 실행기는 듣지 않는다: 실행기 진입점이 장차 import할 모듈(tls-client·tls-policy)에서 닿는 코드에 듣는 API와 감독 서버 모듈이 없다.
 // 진입점 기준의 같은 확인은 test/entrypoints.test.ts가 한다. 이것은 아직 진입점에 잇지 않은 지금도 같은 규칙이 성립함을 본다.
+test("연결: 돌려준 closed 약속은 그 소켓의 close 사건이 와야 풀리고, 풀렸을 때 openConnections()에서 빠져 있다", async () => {
+  const { handle } = await server();
+  const c = client(handle.port);
+  const conn = await c.connect();
+  let closeHeard = false;
+  conn.socket.once("close", () => (closeHeard = true));
+  // 두 쪽 모두 한 차례 뒤에 정해지므로, 이미 풀린 약속이면 앞쪽이 이긴다.
+  expect(await Promise.race([conn.closed.then(() => "closed"), Promise.resolve().then(() => "open")])).toBe("open");
+  expect(c.openConnections()).toBe(1);
+  conn.socket.destroy();
+  await conn.closed;
+  expect(closeHeard).toBe(true);
+  expect(c.openConnections()).toBe(0);
+});
+
 test("정적: 실행기 쪽 TLS 모듈에서 닿는 코드에 듣는 API와 감독 서버 모듈이 없다", async () => {
   const listening = /\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\.listen\(/;
   const transpiler = new Bun.Transpiler({ loader: "ts" });
