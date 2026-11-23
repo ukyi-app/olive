@@ -473,7 +473,7 @@ test("시작 전에 닫힌 줄은 상한이 아님", () => {
     expect(into, kind).toEqual(["queued", ...closure]);
     const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
     expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
-    // 닫기 두 줄을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
+    // 닫기 간선 셋(preparing·stopping·unknown_running → not_started)을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
     const requeue = { ...withoutClosure, running: [...(withoutClosure.running ?? []), "queued" as const] };
     expect(startedReachesNotStarted(requeue), kind).toBe(true);
   }
@@ -516,7 +516,7 @@ test("관리자가 닫은 줄의 잔액은 같은 입력의 다음 실행의 상
     if (c.reduced !== null) must(ledger.recordBudget({ runId: first.runId, budgetLeft: c.reduced, now: NOW }));
     if (c.by === "operator") {
       must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
-      must(ledger.closeRunByOperator({ runId: first.runId, checkedBy: "pod_replaced", podName: "worker-a-0", now: NOW + 2 }));
+      must(ledger.closeRunByOperator({ runId: first.runId, checkedBy: "pod_replaced", podName: "worker-a-0", now: NOW + 31_000 }));
     } else {
       must(ledger.closeUnreceivedRun({ runId: first.runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_001, now: NOW + 30_002 }, { sender: WORKER_EXECUTOR }));
     }

@@ -177,7 +177,7 @@ describe("모르거나 꼴이 틀린 입력", () => {
       expect(Object.entries(TRANSITIONS[kind]).filter(([, to]) => to?.includes("not_started")).map(([from]) => from), kind).toEqual(["queued", ...closure]);
       const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
       expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
-      // 닫기 두 줄을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
+      // 닫기 간선 셋(preparing·stopping·unknown_running → not_started)을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
       const requeue = { ...withoutClosure, running: [...(withoutClosure.running ?? []), "queued" as const] };
       expect(startedReachesNotStarted(requeue), kind).toBe(true);
     }

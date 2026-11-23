@@ -2,8 +2,10 @@
 // 실제 장부 파일에 적고, 공개 읽기와 원 SQL로 본다. 파드 이름·ID·digest·시각은 이 시험이 지어낸 값이다. 운영값이 아니다.
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { limits } from "../../src/contract/v1/index.ts";
 import { type Ledger, LedgerInputError, loadMigrations, openLedger } from "../../src/ledger/index.ts";
 import { type OperatorClosureInput, RESTORE_KEY } from "../../src/ledger/ledger.ts";
+import { planNext, type SchedulerView } from "../../src/supervisor/scheduler/queue.ts";
 import { clock, digest, id, must, NOW, open, ready, session, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
 
 const FILE = "0007-operator-closure.sql";
@@ -60,7 +62,18 @@ function lostAfterStart(ledger: Ledger) {
   return live;
 }
 
-const RAW_OPERATOR = "INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at) VALUES (?, ?, ?, ?, ?, 1)";
+// 원 SQL의 근거 줄. 마지막 값은 closed_at이다(시작 발행 NOW부터 띄울 수 있는 마지막 시각이 지난 LATER를 기본으로 넘긴다).
+const RAW_OPERATOR = "INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at) VALUES (?, ?, ?, ?, ?, ?)";
+// 시작 지시를 NOW에 낸 실행을 관리자가 닫을 수 있게 되는 첫 시각(감독의 시계). 그 1ms 전이 실행기가 새로 띄울 수 있는 마지막 시각이다.
+const CLOSABLE_AT = NOW + Math.max(limits.RUN_LEASE_MAX_MS, limits.MESSAGE_TTL_MAX_MS) + limits.CLOCK_SKEW_MS;
+
+function stoppingAfterAccepted(ledger: Ledger, receipt: boolean) {
+  const live = startedWorker(ledger);
+  must(ledger.markStartDispatch({ runId: live.runId, requestId: live.requestId, now: NOW }));
+  if (receipt) must(ledger.applyReceipt(accepted(live), live.from));
+  must(ledger.recordStopInstruction({ runId: live.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1, reason: "requested" }));
+  return live;
+}
 
 // ---- 보장 1: 닫을 수 있는 실행 ----
 
@@ -153,6 +166,8 @@ test("보장 2: 확인 칸이 하나라도 틀리면 아무것도 쓰지 않는�
     { podName: "worker_a" },
     { podName: "a".repeat(254) },
     { podName: 7 as never },
+    { podName: "a\u0000b" },
+    { podName: "ab\u0000" },
   ];
   for (const extra of bad) expect(() => closeOp(ledger, lost.runId, extra as Partial<OperatorClosureInput>), JSON.stringify(extra).slice(0, 40)).toThrow(LedgerInputError);
   expect(() => ledger.closeRunByOperator({ runId: lost.runId, checkedBy: "pod_replaced", podName: POD, now: LATER, note: "x" } as never)).toThrow(LedgerInputError);
@@ -199,33 +214,79 @@ test("보장 2: 트리거는 코드 없이도 근거 없는 not_started, 꼴 밖
   // 근거 없는 갱신.
   for (const c of [lost, stopping, preparing]) expect(() => rawWrite(c.path, "UPDATE runs SET state = 'not_started' WHERE run_id = ?", c.runId)).toThrow("run_closure_unproven");
   const path = lost.path;
-  // 꼴 밖의 근거: 방법, 파드 이름, 앞 상태, 정지 세대, NULL.
-  const refused: [string, string, string | null, string | null, number | null][] = [
-    [lost.runId, "unknown_running", "looked", POD, 0],
-    [lost.runId, "unknown_running", "", POD, 0],
-    [lost.runId, "unknown_running", "pod_replaced", "", 0],
-    [lost.runId, "unknown_running", "pod_replaced", "Pod", 0],
-    [lost.runId, "unknown_running", "pod_replaced", "a..b", 0],
-    [lost.runId, "unknown_running", "pod_replaced", "a-", 0],
-    [lost.runId, "unknown_running", "pod_replaced", "a/b", 0],
-    [lost.runId, "unknown_running", "pod_replaced", "a".repeat(254), 0],
-    [lost.runId, "unknown_running", "pod_replaced", POD, 1],
-    [lost.runId, "stopping", "pod_replaced", POD, 0],
-    [lost.runId, "unknown_running", null, POD, 0],
-    [lost.runId, "unknown_running", "pod_replaced", null, 0],
-    [lost.runId, "unknown_running", "pod_replaced", POD, null],
+  // 꼴 밖의 근거: 방법, 파드 이름(가운데·끝의 U+0000 포함), 앞 상태, 정지 세대, 띄울 수 있는 마지막 시각 전, NULL.
+  const refused: [string, string, string | null, string | null, number | null, number | null][] = [
+    [lost.runId, "unknown_running", "looked", POD, 0, LATER],
+    [lost.runId, "unknown_running", "", POD, 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "Pod", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "a..b", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "a-", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "a/b", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "a".repeat(254), 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "a\u0000b", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", "ab\u0000", 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", POD, 1, LATER],
+    [lost.runId, "stopping", "pod_replaced", POD, 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", POD, 0, CLOSABLE_AT - 1],
+    [lost.runId, "unknown_running", "pod_replaced", POD, 0, 1],
+    [lost.runId, "unknown_running", null, POD, 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", null, 0, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", POD, null, LATER],
+    [lost.runId, "unknown_running", "pod_replaced", POD, 0, null],
   ];
   for (const values of refused) expect(() => rawWrite(path, RAW_OPERATOR, ...values), JSON.stringify(values).slice(40, 120)).toThrow();
-  expect(() => rawWrite(preparing.path, RAW_OPERATOR, preparing.runId, "preparing", "pod_replaced", POD, 0)).toThrow("operator_closure_unproven");
+  // NUL과 시각은 NOT NULL·CHECK가 아니라 트리거가 막는다.
+  for (const values of refused.slice(8, 10)) expect(() => rawWrite(path, RAW_OPERATOR, ...values)).toThrow("operator_closure_unproven");
+  for (const values of refused.slice(12, 14)) expect(() => rawWrite(path, RAW_OPERATOR, ...values)).toThrow("operator_closure_unproven");
+  expect(() => rawWrite(preparing.path, RAW_OPERATOR, preparing.runId, "preparing", "pod_replaced", POD, 0, LATER)).toThrow("operator_closure_unproven");
   expect(rows(path, "SELECT count(*) AS n FROM operator_closures")).toEqual([{ n: 0 }]);
+  expect(rows(path, "SELECT state FROM runs WHERE run_id = ?", lost.runId)).toEqual([{ state: "unknown_running" }]);
   expect(rows(preparing.path, "SELECT count(*) AS n FROM operator_closures")).toEqual([{ n: 0 }]);
-  // 맞는 근거 뒤에는 된다. 근거는 고치거나 지우거나 바꿔 넣지 못한다.
-  rawWrite(stopping.path, RAW_OPERATOR, stopping.runId, "stopping", "process_absent", POD, 0);
-  rawWrite(stopping.path, "UPDATE runs SET state = 'not_started' WHERE run_id = ?", stopping.runId);
+  // 맞는 근거 줄 하나를 넣는 문장이 실행 줄도 닫는다(따로 여는 연결에서 읽어도 근거만 있는 상태는 없다). 정각(CLOSABLE_AT)은 받는다.
+  rawWrite(stopping.path, RAW_OPERATOR, stopping.runId, "stopping", "process_absent", POD, 0, CLOSABLE_AT);
+  expect(rows(stopping.path, "SELECT r.state, r.updated_at, o.from_state FROM runs r JOIN operator_closures o ON o.run_id = r.run_id")).toEqual([
+    { state: "not_started", updated_at: CLOSABLE_AT, from_state: "stopping" },
+  ]);
+  // 근거는 고치거나 지우거나 바꿔 넣지 못한다.
   expect(() => rawWrite(stopping.path, "UPDATE operator_closures SET pod_name = 'other'")).toThrow("operator_closure_unproven");
   expect(() => rawWrite(stopping.path, "DELETE FROM operator_closures")).toThrow("operator_closure_unproven");
-  expect(() => rawWrite(stopping.path, RAW_OPERATOR.replace("INSERT", "INSERT OR REPLACE"), stopping.runId, "stopping", "pod_replaced", POD, 0)).toThrow("operator_closure_unproven");
+  expect(() => rawWrite(stopping.path, RAW_OPERATOR.replace("INSERT", "INSERT OR REPLACE"), stopping.runId, "stopping", "pod_replaced", POD, 0, LATER)).toThrow("operator_closure_unproven");
   expect(rows(stopping.path, "SELECT run_id, checked_by FROM operator_closures")).toEqual([{ run_id: stopping.runId, checked_by: "process_absent" }]);
+});
+
+test("보장 2: 원 SQL에서도 근거와 닫기는 한 문장이다(전이가 막히면 근거도 없고, 종료 영수증이 연결된 실행에는 근거가 들어가지 않는다)", () => {
+  const make = () => {
+    const p = tempPath();
+    const l = ready(open(p));
+    const s = startedWorker(l);
+    must(l.recordStopInstruction({ runId: s.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW, reason: "requested" }));
+    l.close();
+    return { path: p, runId: s.runId };
+  };
+  // 닫는 갱신을 이 연결에서만 막으면 근거 줄을 넣은 문장째 되돌아간다.
+  const blocked = make();
+  const raw = new Database(blocked.path);
+  try {
+    raw.run("PRAGMA foreign_keys = ON");
+    raw.run("CREATE TEMP TRIGGER block_close BEFORE UPDATE OF state ON main.runs BEGIN SELECT RAISE(ABORT, 'test_block_close'); END");
+    expect(() => raw.query(RAW_OPERATOR).run(blocked.runId, "stopping", "process_absent", POD, 0, LATER)).toThrow("test_block_close");
+  } finally {
+    raw.close();
+  }
+  expect(rows(blocked.path, "SELECT count(*) AS n FROM operator_closures")).toEqual([{ n: 0 }]);
+  expect(rows(blocked.path, "SELECT state FROM runs WHERE run_id = ?", blocked.runId)).toEqual([{ state: "stopping" }]);
+  // 종료 영수증을 먼저 연결한 stopping(원 SQL)에는 근거가 들어가지 않고 상태도 그대로다.
+  const confirmed = make();
+  const receiptId = id();
+  rawWrite(confirmed.path, "INSERT INTO deliveries (id, action, run_id, body_digest, received_at) VALUES (?, 'receipt_stopped', ?, ?, ?)", receiptId, confirmed.runId, digest("stopped"), NOW + 1);
+  rawWrite(confirmed.path, "UPDATE runs SET stop_receipt_id = ? WHERE run_id = ?", receiptId, confirmed.runId);
+  expect(() => rawWrite(confirmed.path, RAW_OPERATOR, confirmed.runId, "stopping", "process_absent", POD, 0, LATER)).toThrow("operator_closure_unproven");
+  expect(rows(confirmed.path, "SELECT state, stop_receipt_id FROM runs WHERE run_id = ?", confirmed.runId)).toEqual([{ state: "stopping", stop_receipt_id: receiptId }]);
+  expect(rows(confirmed.path, "SELECT count(*) AS n FROM operator_closures")).toEqual([{ n: 0 }]);
+  // 이관의 시각 숫자는 계약의 두 시한의 큰 쪽 + 시계 오차와 같다(장부의 코드는 같은 식을 쓴다).
+  const sql = (rows(confirmed.path, "SELECT sql FROM sqlite_master WHERE name = 'operator_closures_proven'") as { sql: string }[])[0]?.sql ?? "";
+  expect([...sql.matchAll(/\+ (\d+)\)/g)].map((m) => Number(m[1]))).toEqual([CLOSABLE_AT - NOW]);
 });
 
 test("보장 2: 한 실행에 두 근거(D-90과 관리자)는 함께 생기지 않는다(코드와 트리거, 두 방향)", () => {
@@ -236,16 +297,30 @@ test("보장 2: 한 실행에 두 근거(D-90과 관리자)는 함께 생기지 
   must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
   ledger.close();
   rawWrite(path, "INSERT INTO unreceived_closures (run_id, from_state, answer_executor_id, answer_issued_at, answer_received_at, open_id, closed_at) VALUES (?, 'unknown_running', ?, ?, 1, 'o', 1)", bare.runId, WORKER_EXECUTOR, NOW + 30_000);
-  expect(() => rawWrite(path, RAW_OPERATOR, bare.runId, "unknown_running", "pod_replaced", POD, 0)).toThrow("operator_closure_unproven");
+  expect(() => rawWrite(path, RAW_OPERATOR, bare.runId, "unknown_running", "pod_replaced", POD, 0, LATER)).toThrow("operator_closure_unproven");
 
-  // 관리자 근거만 원 SQL로 넣은 unknown_running(받은 기록 0줄, D-90의 다른 조건은 맞음): D-90 근거는 들어가지 않는다.
-  const second = tempPath();
-  const ledger2 = ready(open(second));
-  const other = startedWorker(ledger2);
-  must(ledger2.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
-  ledger2.close();
-  rawWrite(second, RAW_OPERATOR, other.runId, "unknown_running", "pod_replaced", POD, 0);
-  expect(() => rawWrite(second, "INSERT INTO unreceived_closures (run_id, from_state, answer_executor_id, answer_issued_at, answer_received_at, open_id, closed_at) VALUES (?, 'unknown_running', ?, ?, 1, 'o', 1)", other.runId, WORKER_EXECUTOR, NOW + 30_000)).toThrow("unreceived_closure_unproven");
+  // 관리자 근거를 원 SQL로 넣은 unknown_running(받은 기록 0줄, D-90의 다른 조건은 맞음): D-90 근거는 들어가지 않는다.
+  const d90 = "INSERT INTO unreceived_closures (run_id, from_state, answer_executor_id, answer_issued_at, answer_received_at, open_id, closed_at) VALUES (?, 'unknown_running', ?, ?, 1, 'o', 1)";
+  const lostBare = () => {
+    const p = tempPath();
+    const l = ready(open(p));
+    const s = startedWorker(l);
+    must(l.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
+    l.close();
+    return { path: p, runId: s.runId };
+  };
+  const second = lostBare();
+  rawWrite(second.path, RAW_OPERATOR, second.runId, "unknown_running", "pod_replaced", POD, 0, LATER);
+  expect(() => rawWrite(second.path, d90, second.runId, WORKER_EXECUTOR, NOW + 30_000)).toThrow("unreceived_closure_unproven");
+  // 관리자 근거는 같은 문장에서 실행을 not_started로 닫아 판 6의 트리거(앞 상태)도 막는다. unreceived_closures_exclusive만으로 막는지
+  // 보려고 이 장부에서 닫는 트리거를 지워 "관리자 근거가 있고 상태는 unknown_running"을 만든다.
+  const isolated = lostBare();
+  rawWrite(isolated.path, "DROP TRIGGER operator_closures_close_run");
+  rawWrite(isolated.path, RAW_OPERATOR, isolated.runId, "unknown_running", "pod_replaced", POD, 0, LATER);
+  expect(rows(isolated.path, "SELECT state FROM runs WHERE run_id = ?", isolated.runId)).toEqual([{ state: "unknown_running" }]);
+  expect(() => rawWrite(isolated.path, d90, isolated.runId, WORKER_EXECUTOR, NOW + 30_000)).toThrow("unreceived_closure_unproven");
+  rawWrite(isolated.path, "DROP TRIGGER unreceived_closures_exclusive");
+  rawWrite(isolated.path, d90, isolated.runId, WORKER_EXECUTOR, NOW + 30_000);
 
   // 코드: D-90으로 닫은 실행은 관리자가 닫지 못하고(run_ended), 관리자가 닫은 실행은 D-90이 닫지 못한다.
   const ledger3 = ready(open(tempPath()));
@@ -364,7 +439,15 @@ test("이관: 판 1~6의 장부가 판 7로 올라가고 기존 줄은 그대로
   open(path).close();
   const seven = objects();
   expect([...six].filter(([name, sql]) => seven.get(name) !== sql).map(([name]) => name)).toEqual(["runs_not_started_needs_closure"]);
-  expect([...seven.keys()].filter((name) => !six.has(name)).sort()).toEqual(["operator_closures", "operator_closures_fixed", "operator_closures_permanent", "operator_closures_proven", "sqlite_autoindex_operator_closures_1", "unreceived_closures_exclusive"].filter((n) => seven.has(n)).sort());
+  // 정의(sql)가 있는 새 객체 전부. WITHOUT ROWID 표의 기본 키는 따로 인덱스가 없어 여기 없다.
+  expect([...seven.keys()].filter((name) => !six.has(name)).sort()).toEqual([
+    "operator_closures",
+    "operator_closures_close_run",
+    "operator_closures_fixed",
+    "operator_closures_permanent",
+    "operator_closures_proven",
+    "unreceived_closures_exclusive",
+  ]);
   expect(rows(path, "SELECT kind, from_state, to_state FROM run_transitions WHERE to_state = 'not_started' ORDER BY kind, from_state")).toEqual([
     { kind: "session", from_state: "queued", to_state: "not_started" },
     { kind: "worker", from_state: "preparing", to_state: "not_started" },
@@ -382,4 +465,137 @@ test("복원의 점유가 있는 실행도 관리자 닫기는 받고, 점유는
   must(closeOp(ledger, lost.runId));
   expect(run(ledger, lost.runId).state).toBe("not_started");
   expect(slotFree(ledger)).toBe(false);
+});
+
+// ---- 받은 시작이 아직 뜰 수 있는 동안은 닫지 않는다 ----
+
+test("마지막 시각: 받은 시작이 아직 뜰 수 있는 stopping은 두 방법 모두 거절이고 아무것도 쓰지 않으며 다음 실행은 시작하지 못한다(접수 영수증 있음·없음)", () => {
+  for (const receipt of [true, false]) {
+    for (const checkedBy of ["process_absent", "pod_replaced"] as const) {
+      const path = tempPath();
+      const ledger = ready(open(path));
+      const live = stoppingAfterAccepted(ledger, receipt);
+      const before = run(ledger, live.runId);
+      expect(before.state, `${receipt} ${checkedBy}`).toBe("stopping");
+      expect(closeOp(ledger, live.runId, { checkedBy, now: NOW + 2 })).toEqual({ ok: false, reason: "start_may_launch" });
+      expect(run(ledger, live.runId)).toEqual(before);
+      expect(slotFree(ledger)).toBe(false);
+      expect(ledger.operatorClosure(live.runId)).toEqual({ known: true, value: null });
+      const next = must(ledger.admitRun(worker())).run.runId;
+      expect(ledger.startRun({ runId: next, requestId: id(), stopGeneration: 0, now: NOW + 3 })).toEqual({ ok: false, reason: "slot_busy" });
+      ledger.close();
+      expect(rows(path, "SELECT count(*) AS n FROM operator_closures")).toEqual([{ n: 0 }]);
+    }
+  }
+});
+
+test("마지막 시각: 정각(띄울 수 있는 마지막 시각)은 거절, 1ms 뒤는 닫히고 그 실행의 시작은 다시 나가지 않는다(stopping·unknown_running)", () => {
+  const cases: ["stopping" | "unknown_running", (ledger: Ledger) => { runId: string }][] = [
+    ["stopping", (ledger) => stoppingAfterAccepted(ledger, true)],
+    ["unknown_running", lostAfterStart],
+  ];
+  for (const [state, make] of cases) {
+    for (const checkedBy of ["process_absent", "pod_replaced"] as const) {
+      const ledger = ready(open(tempPath()));
+      const live = make(ledger);
+      expect(run(ledger, live.runId).state).toBe(state);
+      expect(closeOp(ledger, live.runId, { checkedBy, now: CLOSABLE_AT - 1 }), `${state} ${checkedBy}`).toEqual({ ok: false, reason: "start_may_launch" });
+      expect(run(ledger, live.runId).state).toBe(state);
+      expect(must(closeOp(ledger, live.runId, { checkedBy, now: CLOSABLE_AT })).run).toMatchObject({ state: "not_started", updatedAt: CLOSABLE_AT });
+      expect(slotFree(ledger)).toBe(true);
+      const unanswered = ledger.unansweredInstructions();
+      expect(unanswered.known && unanswered.value.instructions.map((i) => i.runId)).toEqual([]);
+    }
+  }
+});
+
+test("마지막 시각: 띄우기 전에 낸 갱신은 그 갱신의 발행 + 시한까지 닫기를 미룬다", () => {
+  const ledger = ready(open(tempPath()));
+  const live = startedWorker(ledger);
+  const renewAt = NOW + 10_000;
+  must(ledger.recordRenewInstruction({ runId: live.runId, requestId: id(), stopGeneration: 0, now: renewAt }));
+  must(ledger.recordStopInstruction({ runId: live.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: renewAt + 1, reason: "requested" }));
+  expect(closeOp(ledger, live.runId, { now: CLOSABLE_AT })).toEqual({ ok: false, reason: "start_may_launch" });
+  expect(closeOp(ledger, live.runId, { now: CLOSABLE_AT + 10_000 - 1 })).toEqual({ ok: false, reason: "start_may_launch" });
+  expect(run(ledger, live.runId).state).toBe("stopping");
+  expect(must(closeOp(ledger, live.runId, { now: CLOSABLE_AT + 10_000 })).run.state).toBe("not_started");
+});
+
+// ---- D-94: 받은 적 없는 실행도 관리자가 닫을 수 있고, 그 기록은 늘 실패다 ----
+
+test("D-94: 자동 닫기 조건이 맞는 실행을 자동 닫기와 관리자 닫기로 닫으면 단계·관리자 표시·같은 입력의 더 큰 예산이 갈리고, 두 닫기는 서로를 막는다", () => {
+  // 리뷰의 입력: 영수증·송신 표식·감액·사본이 없는 작업 부탁을 시작하고 끊김으로 unknown_running, 지정 실행기의 빈 전체 답.
+  const make = () => {
+    const ledger = ready(open(tempPath()));
+    const owner = id();
+    must(ledger.enqueueInput({ requestId: owner, source: "admin-dm", sourceRef: { ref: `inbox/${owner}`, expiresAt: NOW + 3_600_000 }, receivedAt: NOW }));
+    const ref = id();
+    must(ledger.recordToolRequest({ ref, owner, dedupeKey: `start_worker:${owner}:${ref}`, role: "diagnosis", purpose: "diagnose", sourceRef: `inbox/${owner}`, inputDigest: digest("in"), sessionId: "session-1", callId: id(), now: NOW }));
+    const w = worker();
+    const runId = id();
+    must(ledger.assignToolRequest({ ref, runId, snapshotDigest: w.snapshotDigest as string, profileRevision: w.profileRevision, policyRevision: w.policyRevision, executorId: w.executorId, credential: w.credential, deadlineAt: w.deadlineAt, budgetLeft: 10, now: NOW }));
+    must(ledger.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+    must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
+    return { ledger, owner, ref, runId };
+  };
+  const unreceivedInput = { runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_001, now: NOW + 30_002 };
+  const auto = make();
+  const byOperator = make();
+  must(auto.ledger.closeUnreceivedRun({ runId: auto.runId, ...unreceivedInput }, { sender: WORKER_EXECUTOR }));
+  must(closeOp(byOperator.ledger, byOperator.runId, { now: CLOSABLE_AT }));
+  // 반대 순서의 닫기는 거절이다.
+  expect(closeOp(auto.ledger, auto.runId)).toEqual({ ok: false, reason: "run_ended" });
+  expect(byOperator.ledger.closeUnreceivedRun({ runId: byOperator.runId, ...unreceivedInput }, { sender: WORKER_EXECUTOR })).toEqual({ ok: false, reason: "transition_denied" });
+  for (const [c, phase, closedByOperator, startsNext] of [
+    [auto, "not_started", false, true],
+    [byOperator, "failed_stopped", true, false],
+  ] as const) {
+    const label = phase;
+    const read = c.ledger.readToolRequest({ owner: c.owner, ref: c.ref });
+    expect(read.known && read.value?.phase, label).toBe(phase);
+    const next = must(c.ledger.admitRun(worker({ inputRequestId: c.owner, budgetLeft: 12 }))).run.runId;
+    const queue = c.ledger.queueView();
+    const all = c.ledger.listRuns();
+    const holds = c.ledger.slotHolds();
+    if (!queue.known || !all.known || !holds.known) throw new Error("장부를 읽지 못함");
+    expect(all.value.map((r) => [r.runId, r.state, r.closedByOperator]), label).toEqual([
+      [c.runId, "not_started", closedByOperator],
+      [next, "queued", undefined],
+    ]);
+    const bars = new Map(queue.value.runs.map((r) => [r.runId, r.startBar]));
+    const view: SchedulerView = {
+      runs: all.value.map((r) => ({ ...r, startBar: bars.get(r.runId) ?? null })),
+      inputs: [{ requestId: c.owner, origin: "admin", receivedAt: NOW, expiresAt: NOW + 3_600_000, cancelled: false }],
+      slotHolds: holds.value,
+      now: NOW + 40_000,
+    };
+    const decision = planNext(view, { alertMaxWaitMs: 60_000 });
+    if (startsNext) {
+      expect(decision.candidates.map((x) => x.runId), label).toEqual([next]);
+      expect(c.ledger.startRun({ runId: next, requestId: id(), stopGeneration: 0, now: NOW + 40_000 }), label).toMatchObject({ ok: true, run: { state: "preparing", budgetLeft: 12 } });
+    } else {
+      expect(decision, label).toEqual({ candidates: [], held: [{ runId: next, kind: "worker", reason: "budget_replenished" }] });
+    }
+  }
+});
+
+// ---- 닫기 전에 받은 미반영 보고 ----
+
+test("닫기 전에 받은 결과 보고는 닫는 트랜잭션에서 반영하지 않고 마치고, 다시 연 장부에서 같은 보고의 재전송은 duplicate다", () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const live = startedWorker(ledger);
+  must(ledger.applyReceipt(accepted(live), live.from));
+  must(ledger.applyReceipt(startedReceipt(live), live.from));
+  const report = resultReport(live.runId);
+  expect(ledger.recordReport(report, live.from)).toEqual({ ok: true, delivery: "new", ack: report.reportId });
+  expect(ledger.pendingReports()).toMatchObject({ known: true, value: [{ reportId: report.reportId }] });
+  must(ledger.recordStopInstruction({ runId: live.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1, reason: "requested" }));
+  must(closeOp(ledger, live.runId, { now: LATER + 2 }));
+  expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
+  ledger.close();
+  expect(rows(path, "SELECT applied_at FROM deliveries WHERE id = ?", report.reportId)).toEqual([{ applied_at: LATER + 2 }]);
+  const reopened = ready(open(path));
+  expect(reopened.recordReport(report, live.from)).toEqual({ ok: true, delivery: "duplicate", ack: report.reportId });
+  expect(reopened.pendingReports()).toEqual({ known: true, value: [] });
 });
