@@ -120,7 +120,7 @@ LifeTickResult =
 
 내지 않는다. 판단이 그래도 확정을 내는 상태(`failed_stopped`·`cleanup_pending`)는 `finalize_withheld`로 남는다. 장부 포트에 확정 기록이 없다. 그 실행들은 자리를 쥔 채 남는다.
 
-- **`resultSettled`는 늘 `false`다.** 판단(`lifecycle.ts`)이 이 값을 보는 곳은 작업자의 `ready_result` 하나이고, `true`면 확정(`finalized`로 가는 의도)을 낸다. 확정 지시는 결과 digest와 보관 시각을 싣고 실행기에 정리를 청한다. 실행기가 결과 보고를 다시 보내지 않게 되는 것은 확정이 아니라 그 보고의 ack다(`src/executor/worker.ts`의 정리 길은 결과 사건의 받음 표시를 세우지 않고, 받음 표시가 없는 사건은 다시 보내며, 그 표시는 ack만 세운다). 확정은 되돌릴 수 없는 정리를 부르므로, `true`의 뜻은 "그 실행의 결과 보고가 저장 자리(`storedRef`)와 함께 장부에 반영됐고 그 digest가 실행 줄의 `resultDigest`와 같다"여야 한다. 장부에 그것을 읽는 공개 읽기가 없다: `pendingReports()`는 반영 전 보고만 내고, `markResult`는 보고 없이도 `ready_result`로 판정할 수 있어 상태만으로는 본문이 보관됐는지 모른다. 그래서 읽지 못함과 같이 `false`(확정을 내지 않는 쪽)로 넘긴다.
+- **`resultSettled`는 늘 `false`다.** 판단(`lifecycle.ts`)이 이 값을 보는 곳은 작업자의 `ready_result` 하나이고, `true`이면서 앞선 확정 지시가 없거나 그 답을 기다리는 시간(`answerTimeoutMs`)이 지났을 때 확정(`finalized`로 가는 의도)을 낸다. 그 시간 안이면 `true`여도 `wait`다. 확정 지시는 결과 digest와 보관 시각을 싣고 실행기에 정리를 청한다. 실행기가 결과 보고를 다시 보내지 않게 되는 것은 확정이 아니라 그 보고의 ack다(`src/executor/worker.ts`의 정리 길은 결과 사건의 받음 표시를 세우지 않고, 받음 표시가 없는 사건은 다시 보내며, 그 표시는 ack만 세운다). 확정은 되돌릴 수 없는 정리를 부르므로, `true`의 뜻은 "그 실행의 결과 보고가 저장 자리(`storedRef`)와 함께 장부에 반영됐고 그 digest가 실행 줄의 `resultDigest`와 같다"여야 한다. 장부에 그것을 읽는 공개 읽기가 없다: `pendingReports()`는 반영 전 보고만 내고, `markResult`는 보고 없이도 `ready_result`로 판정할 수 있어 상태만으로는 본문이 보관됐는지 모른다. 그래서 읽지 못함과 같이 `false`(확정을 내지 않는 쪽)로 넘긴다.
 - **결과 보고가 받아들여진 것은 종료 증명이나 게시 허가가 아니다(계약 v1).** 결과 보고가 반영되고 `ready_result`로 판정돼도 이 박자는 `wait`이고 자리를 풀지 않는다(시험이 지킨다).
 
 ## 겹쳐 부르기

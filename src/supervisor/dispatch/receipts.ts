@@ -12,7 +12,7 @@
 //    장부를 부를 때마다 그 직전에 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 보고, 맞을 때만 applyExecutorAnswer에
 //    partial로 넘긴다. sender·runs·answeredAt은 검증된 봉투의 값이다.
 //    그 실행기의 밀린 답(저장되지 않은 앞 답)이 있으면 받은 순서대로 먼저 넘기고, 앞 답이 저장되지 않으면 뒤 답은 넘기지 않는다.
-// 4. 결과 보고(report_result)는 보관 → 장부 → ack 순서이고 세 걸음이 한 동기 흐름이다(await·콜백이 없다).
+// 4. 결과 보고(report_result)는 보관 → 장부 → ack 순서이고 세 걸음이 한 동기 흐름이다(await·이벤트 루프의 양보·지연 콜백의 예약이 없다. 넘긴 콜백은 그 자리에서 동기로 부른다).
 //    보관소가 참조를 낸 뒤에만 장부에 적고, 장부가 받은 뒤에만 ack한다. 장부의 읽기로 먼저 걸러 보관소에 닿지 않는 것은 정해진
 //    목록뿐이다(resultGate): 장부가 모르는 실행, 지정 실행기·세대가 다른 보고, 세션·queued·시작 지시가 없던 not_started 실행,
 //    소유자가 없는 실행, 장부 읽기가 약속 밖의 값을 준 경우. 그 밖에 장부가 끝내 받지 않는 보고(판정이 끝난 실행의 맞지 않는 결과 등)는
@@ -378,6 +378,8 @@ const isRunState = (value: unknown): value is LedgerRunState => (LEDGER_RUN_STAT
 const isRunKind = (value: unknown): value is RunKind => typeof value === "string" && Object.hasOwn(TRANSITIONS, value);
 
 // 그 실행에 시작 지시가 한 번이라도 적혔는가. 읽지 못하거나 꼴이 틀리면 모름이다.
+// 임대 묶음은 장부의 꼴(null, 또는 발행 시각과 시각이나 "unknown"인 끝)일 때만 시작 이력으로 친다. 배열·빈 객체·틀린 시각을
+// 시작으로 치면 장부가 거절할 본문이 보관소에 남는다. 칸은 한 번씩만 읽는다(던지면 부르는 쪽이 모름으로 닫는다).
 function readEverStarted(ledger: Pick<Ledger, "instructionTimes">, runId: string): boolean | "unknown" {
   const answer: unknown = ledger.instructionTimes(runId);
   if (!isRecord(answer) || answer.known !== true) return "unknown";
@@ -385,7 +387,10 @@ function readEverStarted(ledger: Pick<Ledger, "instructionTimes">, runId: string
   if (!isRecord(times) || times.runId !== runId) return "unknown";
   const lease = times.lease;
   if (lease === null) return false;
-  return isRecord(lease) ? true : "unknown";
+  if (!isRecord(lease) || Array.isArray(lease)) return "unknown";
+  const issuedAt = lease.issuedAt;
+  const expiresAt = lease.expiresAt;
+  return isTime(issuedAt) && (isTime(expiresAt) || expiresAt === "unknown") ? true : "unknown";
 }
 
 // 읽지 못함·꼴이 틀린 답·다른 실행의 줄·장부가 아는 목록과 꼴 밖의 값은 모름이다(보관소에 닿지 않는다).
@@ -434,7 +439,8 @@ function resultGate(run: ResultRunView | null | "unknown", from: EnvelopeFrom): 
   return { owner: run.inputRequestId };
 }
 
-// 결과 보고: 거르기 → 보관 → 장부 → ack. 셋 사이에 await·콜백이 없다(이 함수와 storeResult·settle은 동기다).
+// 결과 보고: 거르기 → 보관 → 장부 → ack. 셋 사이에 await·이벤트 루프의 양보·지연 콜백의 예약이 없다(이 함수와 storeResult·settle은
+// 동기이고, settle은 넘겨받은 콜백을 그 자리에서 부른다).
 // 장부가 보관 뒤에 거절하거나 모르면 ack가 없고 본문은 보관소에 남는다: 같은 보고가 다시 오면 storeResult가 같은 참조(created: false)를
 // 내고 장부가 다시 가른다. 이 처리기는 지우지 않는다. 본문은 그 저장 참조를 가리키는 커밋된 보고가 장부에 하나도 없을 때만 고아다:
 // 거절된 보고가 가리키는 자리도 앞서 받은 다른 보고가 이미 참조하고 있을 수 있다(같은 실행의 자리는 하나다).

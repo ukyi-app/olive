@@ -418,6 +418,47 @@ describe("장부 읽기와 장부 답의 경계", () => {
     expect(resultRows(ledger)).toHaveLength(0);
   });
 
+  test("not_started의 임대 묶음이 장부의 꼴(null 또는 시각과 끝)이 아니면 보관하지 않고 result_unknown(ledger_read)이다", async () => {
+    const { ledger, runId: closed } = ownedRun();
+    must(ledger.closeUnreceivedRun({ runId: closed, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_005, now: NOW + 30_010 }, { sender: WORKER_EXECUTOR }));
+    const owner = id();
+    must(ledger.enqueueInput({ requestId: owner, source: "test", sourceRef: { ref: `inputs/${id()}`, expiresAt: NOW + 600_000 }, receivedAt: NOW }));
+    const cancelled = must(ledger.admitRun(worker({ inputRequestId: owner }))).run.runId;
+    must(ledger.recordStopInstruction({ runId: cancelled, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1 }));
+    expect(runState(ledger, closed)).toBe("not_started");
+    expect(runState(ledger, cancelled)).toBe("not_started");
+    const throwing = {
+      get issuedAt(): never {
+        throw new Error(`임대 ${RESULT.summary}`);
+      },
+      expiresAt: "unknown",
+    };
+    const bent: unknown[] = [{}, [], { issuedAt: "later", expiresAt: NOW + 60_000 }, { issuedAt: NOW, expiresAt: 0 }, throwing];
+    const backend = fileBackend();
+    for (const runId of [cancelled, closed]) {
+      for (const lease of bent) {
+        const calls: string[] = [];
+        const view: ResultPorts["ledger"] = {
+          getRun: (r) => ledger.getRun(r),
+          instructionTimes: (r) => {
+            const real = ledger.instructionTimes(r);
+            if (!real.known) throw new Error("지시 이력을 읽지 못함");
+            return { known: true, value: { ...real.value, lease } } as ReturnType<Ledger["instructionTimes"]>;
+          },
+          recordReport: (i, f) => (calls.push("recordReport"), ledger.recordReport(i, f)),
+        };
+        const random = countingRandom();
+        const outcome = handleForward(forward(await resultReport(id(), runId, RESULT, WORKER_EXECUTOR, ledger.runGeneration(runId))), { ledger, random, results: { backend, ledger: view } });
+        expect(outcome).toMatchObject({ outcome: "result_unknown", at: "ledger_read" });
+        expectNoBody(outcome);
+        expect(calls).toEqual([]);
+        expect(random.calls).toBe(0);
+      }
+    }
+    expect(keyCount(backend)).toBe(0);
+    expect(resultRows(ledger)).toHaveLength(0);
+  });
+
   test("장부 답의 칸을 읽다 던져도 처리기는 던지지 않고, 돌아온 값에 그 문구(본문 조각)가 없다", async () => {
     const { ledger, runId } = ownedRun();
     const backend = fileBackend();
