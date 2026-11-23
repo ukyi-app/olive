@@ -13,8 +13,10 @@
 //    partial로 넘긴다. sender·runs·answeredAt은 검증된 봉투의 값이다.
 //    그 실행기의 밀린 답(저장되지 않은 앞 답)이 있으면 받은 순서대로 먼저 넘기고, 앞 답이 저장되지 않으면 뒤 답은 넘기지 않는다.
 // 4. 결과 보고(report_result)는 보관 → 장부 → ack 순서이고 세 걸음이 한 동기 흐름이다(await·콜백이 없다).
-//    보관소가 참조를 낸 뒤에만 장부에 적고, 장부가 받은 뒤에만 ack한다. 장부가 모르는 실행, 지정 실행기·세대가 다른 보고,
-//    결과를 받을 수 없는 실행의 보고는 장부의 읽기로 먼저 걸러 보관소에 닿지 않는다.
+//    보관소가 참조를 낸 뒤에만 장부에 적고, 장부가 받은 뒤에만 ack한다. 장부의 읽기로 먼저 걸러 보관소에 닿지 않는 것은 정해진
+//    목록뿐이다(resultGate): 장부가 모르는 실행, 지정 실행기·세대가 다른 보고, 세션·queued·시작 지시가 없던 not_started 실행,
+//    소유자가 없는 실행, 장부 읽기가 약속 밖의 값을 준 경우. 그 밖에 장부가 끝내 받지 않는 보고(판정이 끝난 실행의 맞지 않는 결과 등)는
+//    본문부터 보관된다.
 import {
   type DeferredLoss,
   type Delivery,
@@ -22,12 +24,15 @@ import {
   LEDGER_RUN_STATES,
   REFUSALS as LEDGER_REFUSALS,
   type Ledger,
+  type LedgerRunState,
   type LostRun,
   type ReceiptInput,
   type Refusal as LedgerRefusal,
   type ReportInput,
+  type RunKind,
+  TRANSITIONS,
 } from "../../ledger/index.ts";
-import { ACTION_SPECS, isAction, type Result, resultDigest, type RunStatus, type Verified } from "../../contract/v1/index.ts";
+import { ACTION_SPECS, isAction, parsePrincipal, type Result, resultDigest, type RunStatus, type Verified } from "../../contract/v1/index.ts";
 import { type ResultBackend, resultBody, storeResult } from "../scheduler/result-store.ts";
 import type { Output } from "../transport/connections.ts";
 import { ackDraft, type Draft, type RefusalReason as DraftRefusalReason } from "./envelopes.ts";
@@ -93,11 +98,12 @@ export interface ReceiptPorts {
   readonly results?: ResultPorts;
 }
 
-// 결과 보고의 포트. 읽기(getRun)와 쓰기(recordReport)를 같은 객체에서 부른다: 거른 그 장부에 적어야 거른 판단이 그 기록에 맞는다.
-// 백엔드는 동기다(result-store.ts 머리 주석): 보관과 장부 기록 사이에 같은 프로세스의 고아 정리가 끼지 못한다.
+// 결과 보고의 포트. 읽기(getRun, not_started일 때만 instructionTimes)와 쓰기(recordReport)를 같은 객체에서 부른다: 거른 그 장부에
+// 적어야 거른 판단이 그 기록에 맞는다.
+// 백엔드는 동기다(result-store.ts 머리 주석): 보관과 장부 기록 사이에 지연 실행과 이벤트 루프의 양보가 없다.
 export interface ResultPorts {
   readonly backend: ResultBackend;
-  readonly ledger: Pick<Ledger, "getRun" | "recordReport">;
+  readonly ledger: Pick<Ledger, "getRun" | "instructionTimes" | "recordReport">;
 }
 
 // 지금 답을 기다리는 상태 조회 하나. 부르는 쪽이 statusQueryDraft의 초안에서 보존한 값이다.
@@ -355,16 +361,36 @@ function reportInput(action: "report_session_broken" | "report_hook_event", read
 }
 
 // 결과 보고의 실행 줄에서 쓰는 칸. getRun의 답에서 칸마다 한 번만 읽어 옮긴다(getter가 두 번 다른 값을 내도 판단이 하나다).
+// neverStarted는 not_started일 때만 instructionTimes로 읽는다(그 밖은 false).
 interface ResultRunView {
   readonly executorId: string;
   readonly runGeneration: number;
-  readonly kind: string;
-  readonly state: string;
+  readonly kind: RunKind;
+  readonly state: LedgerRunState;
   readonly inputRequestId: string | null;
+  readonly neverStarted: boolean;
 }
 
-// 읽지 못함·꼴이 틀린 답·다른 실행의 줄은 모름이다(보관소에 닿지 않는다).
-function readResultRun(ledger: Pick<Ledger, "getRun">, runId: string): ResultRunView | null | "unknown" {
+// 장부의 소유자(입력 요청 ID) 꼴. 장부·보관소와 같은 UUID 꼴이다.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const isRunState = (value: unknown): value is LedgerRunState => (LEDGER_RUN_STATES as readonly unknown[]).includes(value);
+// 실행 종류의 목록은 장부의 전이 표의 열쇠다.
+const isRunKind = (value: unknown): value is RunKind => typeof value === "string" && Object.hasOwn(TRANSITIONS, value);
+
+// 그 실행에 시작 지시가 한 번이라도 적혔는가. 읽지 못하거나 꼴이 틀리면 모름이다.
+function readEverStarted(ledger: Pick<Ledger, "instructionTimes">, runId: string): boolean | "unknown" {
+  const answer: unknown = ledger.instructionTimes(runId);
+  if (!isRecord(answer) || answer.known !== true) return "unknown";
+  const times: unknown = answer.value;
+  if (!isRecord(times) || times.runId !== runId) return "unknown";
+  const lease = times.lease;
+  if (lease === null) return false;
+  return isRecord(lease) ? true : "unknown";
+}
+
+// 읽지 못함·꼴이 틀린 답·다른 실행의 줄·장부가 아는 목록과 꼴 밖의 값은 모름이다(보관소에 닿지 않는다).
+// 판단에 쓰는 칸은 모두 여기서 도메인을 본다: 약속 밖의 값을 어느 갈래로도 읽지 않는다.
+function readResultRun(ledger: Pick<Ledger, "getRun" | "instructionTimes">, runId: string): ResultRunView | null | "unknown" {
   try {
     const answer: unknown = ledger.getRun(runId);
     if (!isRecord(answer) || answer.known !== true) return "unknown";
@@ -372,32 +398,46 @@ function readResultRun(ledger: Pick<Ledger, "getRun">, runId: string): ResultRun
     if (run === null) return null;
     if (!isRecord(run)) return "unknown";
     const view = { runId: run.runId, executorId: run.executorId, runGeneration: run.runGeneration, kind: run.kind, state: run.state, inputRequestId: run.inputRequestId };
-    if (view.runId !== runId || !isText(view.executorId) || !Number.isSafeInteger(view.runGeneration) || !isText(view.kind) || !isText(view.state)) return "unknown";
-    if (view.inputRequestId !== null && !isText(view.inputRequestId)) return "unknown";
-    return { executorId: view.executorId, runGeneration: view.runGeneration as number, kind: view.kind, state: view.state, inputRequestId: view.inputRequestId };
+    const owner = parsePrincipal(view.executorId)?.kind;
+    if (view.runId !== runId || !isText(view.executorId) || (owner !== "worker_executor" && owner !== "session_executor")) return "unknown";
+    if (!Number.isSafeInteger(view.runGeneration) || (view.runGeneration as number) < 0) return "unknown";
+    if (!isRunKind(view.kind) || !isRunState(view.state)) return "unknown";
+    if (view.inputRequestId !== null && !(typeof view.inputRequestId === "string" && UUID.test(view.inputRequestId))) return "unknown";
+    let neverStarted = false;
+    if (view.state === "not_started") {
+      const started = readEverStarted(ledger, runId);
+      if (started === "unknown") return "unknown";
+      neverStarted = !started;
+    }
+    return { executorId: view.executorId, runGeneration: view.runGeneration as number, kind: view.kind, state: view.state, inputRequestId: view.inputRequestId, neverStarted };
   } catch {
     return "unknown";
   }
 }
 
-// 보관 전에 거른다. 장부가 이 보고를 받을 수 없음이 이 읽기만으로 확정되는 경우만 거절한다.
+// 보관 전에 거른다. 장부가 이 보고를 받을 수 없고 앞서 받은 보고의 재전송일 수도 없음이 이 읽기만으로 확정되는 경우만 거절한다.
 // - 실행·낸 쪽·세대: 장부의 recordReport가 이미 받은 id인지 보기 전에 보는 것과 같다(같은 보고의 재전송도 같은 답이다).
 // - 세션 실행·queued: 장부는 그 실행의 결과 보고를 적은 적이 없으므로(재전송의 duplicate ack가 있을 수 없다) 새 보고도 적지 않는다.
-// 판정이 끝난 상태(ready_result·failed_stopped·cleanup_pending·finalized)와 not_started는 여기서 거르지 않는다: 이미 적힌 같은 보고의
-// 재전송은 장부가 duplicate로 ack해야 하고(그 id가 적혔는지 읽는 공개 읽기가 없다), not_started의 닫기 근거도 장부만 읽는다.
+// - 시작 지시가 한 번도 없던 not_started: queued에서 취소된 실행이다. queued 밖에서 not_started로 가려면 닫기 근거가 있어야 하고
+//   닫기는 시작 지시가 정확히 하나인 실행만 닫는다(ledger.ts closeUnreceivedRun). 그래서 닫기 근거가 없고, queued와 근거 없는
+//   not_started의 결과 보고는 장부가 늘 거절하므로 적힌 보고도 없다.
+// 판정이 끝난 상태(ready_result·failed_stopped·cleanup_pending·finalized)와 시작 지시가 있던 not_started는 거르지 않는다: 그 실행에
+// 앞서 적힌 보고가 있을 수 있어 같은 보고의 재전송은 장부가 duplicate로 ack해야 하고(그 id가 적혔는지 읽는 공개 읽기가 없다),
+// not_started의 닫기 근거(늦은 첫 보고를 받는 조건)도 장부만 읽는다.
 function resultGate(run: ResultRunView | null | "unknown", from: EnvelopeFrom): ResultRefusal | "unknown" | { readonly owner: string } {
   if (run === "unknown") return "unknown";
   if (run === null) return "unknown_run";
   if (run.executorId !== from.sender) return "sender_mismatch";
   if (run.runGeneration !== from.runGeneration) return "run_generation_mismatch";
-  if (run.kind !== "worker" || run.state === "queued") return "not_receivable";
+  if (run.kind !== "worker" || run.state === "queued" || run.neverStarted) return "not_receivable";
   if (run.inputRequestId === null) return "no_owner";
   return { owner: run.inputRequestId };
 }
 
 // 결과 보고: 거르기 → 보관 → 장부 → ack. 셋 사이에 await·콜백이 없다(이 함수와 storeResult·settle은 동기다).
 // 장부가 보관 뒤에 거절하거나 모르면 ack가 없고 본문은 보관소에 남는다: 같은 보고가 다시 오면 storeResult가 같은 참조(created: false)를
-// 내고 장부가 다시 가른다. 장부가 끝내 받지 않으면 장부에 참조가 없는 고아이고, 머리가 온전해 sweepStored가 기한 뒤 지울 수 있다.
+// 내고 장부가 다시 가른다. 이 처리기는 지우지 않는다. 본문은 그 저장 참조를 가리키는 커밋된 보고가 장부에 하나도 없을 때만 고아다:
+// 거절된 보고가 가리키는 자리도 앞서 받은 다른 보고가 이미 참조하고 있을 수 있다(같은 실행의 자리는 하나다).
 function handleResult(action: string, header: Record<string, unknown>, read: Reader, body: Record<string, unknown>, input: ForwardInput, ports: ReceiptPorts): ReceiptOutcome {
   const reportId = read.text("report_id");
   const runId = read.text("run_id");
@@ -437,14 +477,23 @@ function handleResult(action: string, header: Record<string, unknown>, read: Rea
 type LedgerAnswer = { ok: true; delivery: Delivery; ack: string } | { ok: false; reason: LedgerRefusal };
 
 // 장부의 답이 약속한 꼴인가. ok면 delivery가 둘 중 하나이고 ack id가 넘긴 id와 같아야 한다(다른 id의 ack는 다른 영수증의 재전송을 멈춘다).
+// 칸마다 한 번만 읽어 지역 값으로만 판단한다. 칸을 읽다 던지면 꼴이 틀린 답이고 그 예외의 문구는 버린다(본문이 실려 있을 수 있다).
 function readAnswer(answer: unknown, id: string): LedgerAnswer | null {
-  if (!isRecord(answer)) return null;
-  if (answer.ok === true) {
-    if ((answer.delivery !== "new" && answer.delivery !== "duplicate") || answer.ack !== id) return null;
-    return { ok: true, delivery: answer.delivery, ack: answer.ack };
+  try {
+    if (!isRecord(answer)) return null;
+    const ok = answer.ok;
+    if (ok === true) {
+      const delivery = answer.delivery;
+      const ack = answer.ack;
+      if ((delivery !== "new" && delivery !== "duplicate") || ack !== id) return null;
+      return { ok: true, delivery, ack };
+    }
+    if (ok !== false) return null;
+    const reason = answer.reason;
+    return (LEDGER_REFUSALS as readonly unknown[]).includes(reason) ? { ok: false, reason: reason as LedgerRefusal } : null;
+  } catch {
+    return null;
   }
-  if (answer.ok === false && (LEDGER_REFUSALS as readonly unknown[]).includes(answer.reason)) return { ok: false, reason: answer.reason as LedgerRefusal };
-  return null;
 }
 
 // 장부 반영 → ack 초안. 장부가 ok를 돌려준 뒤에만 ackDraft를 부른다(그 전에 초안이 만들어지는 길이 없다).

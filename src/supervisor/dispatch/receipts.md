@@ -7,7 +7,7 @@
 이 모듈이 주장하는 것은 아래 넷뿐이다.
 
 1. **낸 쪽과 세대는 검증 결과에서만 온다.** 장부에 넘기는 `from`은 검증된 봉투 머리의 `sender`와 `run_generation`이다. 본문의 값(본문이 주장하는 실행기 이름이나 세대)으로 대신하지 않는다. 낸 쪽이 받아들여지는지, 세대가 맞는지는 장부가 본다(`sender_mismatch`, `run_generation_mismatch`). 장부의 규칙은 이렇다: 일반 영수증·보고는 그 실행의 지정 실행기만 낼 수 있다. 세션 인수 영수증(`receipt_session_takeover`)은 앞 세션의 지정 실행기이거나 대기 중인 세션 실행의 지정 실행기가 낼 수 있고, 같은 인수의 재전송은 처음 낸 쪽만 ack를 받는다(`src/ledger/ledger.md` "세션 증거"). 인수의 ack는 인수 증거를 저장했다는 확인일 뿐이고, 앞 세션의 종료나 다음 세션의 시작을 허가하지 않는다. 영수증과 다른 보고에서 이 모듈은 그 검사를 복사하지 않는다. 결과 보고만 보관 전에 장부의 읽기로 같은 것을 먼저 보고(본문을 맡지 않으려고), 장부가 기록할 때 다시 본다. ack의 받는 쪽도 같은 머리의 `sender`다.
-2. **장부가 받은 것에만 ack.** 장부가 `ok`를 돌려준 영수증·보고에만, 장부가 돌려준 그 id로 ack 초안을 만든다. 장부가 거절했거나, 던졌거나, 답이 꼴에 맞지 않으면(`ok`인데 `delivery`가 `new`·`duplicate`가 아니거나 `ack`가 넘긴 id와 다름, 거절 사유가 장부의 `REFUSALS` 밖) ack가 없어 실행기가 다시 보낸다. 재전송은 장부가 `delivery: "duplicate"`(이미 반영함)로 받고, 그때 부르는 쪽이 감독의 정지 세대를 알고(`null`이 아님) `ackDraft`가 초안을 만들면 ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다. 정지 세대가 계속 `null`이면 재전송에도 계속 ack가 없다. 한 `forward` 안에서 장부 호출이 먼저이고, `ackDraft`(난수 포트를 쓰는 유일한 자리)는 장부가 `ok`를 돌려준 뒤에만 불린다.
+2. **장부가 받은 것에만 ack.** 장부가 `ok`를 돌려준 영수증·보고에만, 장부가 돌려준 그 id로 ack 초안을 만든다. 장부가 거절했거나, 던졌거나, 답이 꼴에 맞지 않으면(`ok`인데 `delivery`가 `new`·`duplicate`가 아니거나 `ack`가 넘긴 id와 다름, 거절 사유가 장부의 `REFUSALS` 밖, 답의 칸을 읽다 던짐) ack가 없어 실행기가 다시 보낸다. 답의 칸(`ok`·`delivery`·`ack`·`reason`)은 예외 경계 안에서 한 번씩만 읽어 그 지역 값으로만 판단하고, 읽다 던진 예외의 문구는 결과에 싣지 않는다(고정 사유 `malformed_answer`). 이 경계는 영수증·보고·결과 보고가 함께 지나는 `settle`에 있다. 재전송은 장부가 `delivery: "duplicate"`(이미 반영함)로 받고, 그때 부르는 쪽이 감독의 정지 세대를 알고(`null`이 아님) `ackDraft`가 초안을 만들면 ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다. 정지 세대가 계속 `null`이면 재전송에도 계속 ack가 없다. 한 `forward` 안에서 장부 호출이 먼저이고, `ackDraft`(난수 포트를 쓰는 유일한 자리)는 장부가 `ok`를 돌려준 뒤에만 불린다.
 3. **`status_report`는 감독이 그 연결에 낸 조회의 답이고 지금 인정된 연결에서 왔을 때만 장부에 넘긴다.** 부르는 쪽이 넘긴 "답을 기다리는 조회" 목록에서 `in_reply_to`가 그 요청 ID인 것을 찾고, 그 조회를 받은 실행기(초안의 `recipient`)가 서명한 보고만 받는다. 답의 실행 ID 집합이 물은 실행 ID 집합과 같아야 하고, 답이 온 연결(`forward.connection`)이 그 조회를 실제로 실은 연결(항목의 `connection`)과 같아야 한다. 아니면 `status_unmatched`이고 장부를 부르지 않는다. 대조된 답은 **장부를 부를 때마다 그 직전에** 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 포트(`links`)에 묻고, 맞을 때만 장부의 `applyExecutorAnswer`에 `partial`로 넘긴다. 그 실행기의 밀린 답이 있으면 받은 순서대로 먼저 넘기고, 밀린 답마다 그 답이 온 연결을 같은 방식으로 본다(아래 "운영 중 상태 보고의 장부 반영").
 4. **결과 보고는 보관 → 장부 → ack이고 그 사이에 `await`가 없다.** `report_result`는 장부의 읽기로 먼저 거르고, 결과 보관소의 판단(`src/supervisor/scheduler/result-store.ts`의 `storeResult`)이 참조를 낸 뒤에만 그 참조와 결과 digest로 `recordReport`를 부르고, 장부가 받은 뒤에만 ack 초안을 만든다. 처리기 전체가 동기 함수다(아래 "결과 보고"). 보관이 모름이거나 거절이거나 장부가 받지 않으면 ack가 없다.
 
@@ -49,7 +49,7 @@
 | `AnswerSettlement` | 답 하나를 넘긴 결과: `applied`(`moved`, `deferred`, `outsideLedger`), `unsaved`(`reason`, `unsavedSightings`), `ledger_failed`(`threw`·`malformed_answer`), `not_current`(`link`: `not_current`·`unknown`. 넘기기 직전에 본 그 답의 연결이 인정된 연결이 아니거나 모름, 장부를 부르지 않음), `held`(앞의 밀린 답 때문에 넘기지 않음). 모두 `answer`(그 사본)를 싣는다 |
 | `ReceiptPorts` | `ledger: ReceiptLedger`, `random: Random`(`ports.ts`), `results?: ResultPorts`(결과 보고에만 쓴다. 없으면 결과 보고는 `result_unknown`·`ports`) |
 | `ReceiptLedger` | `Pick<Ledger, "applyReceipt" \| "recordReport" \| "applyExecutorAnswer">`. 실제 장부가 그대로 맞는다 |
-| `ResultPorts` | `backend: ResultBackend`(`result-store.ts`의 포트, 동기), `ledger: Pick<Ledger, "getRun" \| "recordReport">`. 결과 보고의 거르기와 기록을 같은 장부 객체로 한다 |
+| `ResultPorts` | `backend: ResultBackend`(`result-store.ts`의 포트, 동기), `ledger: Pick<Ledger, "getRun" \| "instructionTimes" \| "recordReport">`(`instructionTimes`는 실행이 `not_started`일 때만 부른다). 결과 보고의 거르기와 기록을 같은 장부 객체로 한다 |
 | `EXECUTOR_ACTION_HANDLING` | 위 표의 동작 → 처리 |
 | `REJECT_REASONS`, `STATUS_UNMATCHED_REASONS`, `RESULT_REFUSALS` | 구별된 거절의 이름 |
 
@@ -60,27 +60,29 @@
 | `ack` | 장부가 받았다(`delivery`: `new` 이번에 반영, `duplicate` 이미 반영) | 있음(`ack`) |
 | `applied_without_ack` | 장부는 받았지만 ack 초안을 만들지 못했다(`stop_generation_unknown`, `ackDraft`의 거절 사유, `draft_threw`). 실행기가 다시 보내면 장부가 `duplicate`로 받고, 그때 정지 세대를 알고 초안 생성에 성공하면 ack한다 | 없음 |
 | `ledger_refused` | 장부의 거절 사유 그대로 | 없음 |
-| `ledger_failed` | 장부가 던졌다(`threw`) 또는 답이 꼴에 맞지 않는다(`malformed_answer`) | 없음 |
+| `ledger_failed` | 장부가 던졌다(`threw`) 또는 답이 꼴에 맞지 않는다(`malformed_answer`, 답의 칸을 읽다 던진 것 포함) | 없음 |
 | `status_matched` | 기다리는 조회의 답이고 지금 인정된 연결에서 왔다. `queryRequestId`, `executor`, `connection`, `settled`(밀린 답 → 이번 답, 받은 순서. 마지막이 이번 답. 넘기는 동안 연결의 인정이 끝난 답은 `not_current`), `backlog`(다음에 그 실행기의 어떤 답보다 먼저 넘길 답) | 없음 |
 | `status_not_current` | 기다리는 조회의 답이지만 그 연결이 지금 인정된 연결이 아니거나(`link: "not_current"`) 그것을 모른다(`unknown`: 포트가 던지거나 `true`·`false` 밖의 답). 장부에 넘기지 않았다. `answer`에 그 답의 사본을 싣는다 | 없음 |
 | `status_unmatched` | `unknown_query`, `other_executor`, `runs_mismatch`, `other_connection`(그 조회를 실은 연결이 아닌 연결에서 옴. 항목의 연결 번호가 없거나 꼴이 틀려도 이것). 장부를 부르지 않았다 | 없음 |
 | `result_refused` | 결과 보고를 장부에 넘기지 않았다. 확정된 이유(`reason`): 장부의 읽기로 본 `unknown_run`·`sender_mismatch`·`run_generation_mismatch`·`not_receivable`·`no_owner`, 보관소의 판단이 거절한 `conflict`·`too_large`·`digest_mismatch`·`invalid_input` | 없음 |
-| `result_unknown` | 결과 보고를 장부에 넘기지 않았다. 모름(`at`): `ports`(결과 포트가 없음), `ledger_read`(장부를 읽지 못함·꼴이 틀린 답), `store`(보관이 `unknown`이거나 던짐) | 없음 |
+| `result_unknown` | 결과 보고를 장부에 넘기지 않았다. 모름(`at`): `ports`(결과 포트가 없음), `ledger_read`(장부를 읽지 못함·꼴이 틀린 답·장부가 아는 목록과 꼴 밖의 값), `store`(보관이 `unknown`이거나 던짐) | 없음 |
 | `rejected` | 위 표의 거절과 꼴 거절 | 없음 |
 
 ## 결과 보고
 
-한 동기 함수 안에서 순서대로 한다. 어느 걸음도 `await`·콜백·비동기 포트를 거치지 않는다(시험이 소스에서 `await`·`async`·`Promise`·`then`·타이머가 없음을 본다). 그래서 같은 프로세스의 고아 정리(`sweepStored`)가 보관과 장부 기록 사이에 끼어 방금 맡긴 본문을 지울 수 없고, 거르기에서 읽은 실행 줄이 장부 기록 전에 바뀌지 않는다(장부는 한 프로세스만 연다).
+한 동기 함수 안에서 순서대로 한다. 보장하는 것은 거르기·보관·장부 기록·ack 사이에 **지연 실행과 이벤트 루프의 양보가 없다**는 것이다: 처리기는 `await`·콜백 예약을 두지 않고, `settle`은 넘겨받은 콜백을 그 자리에서 부르며, 비동기로 답하는 백엔드는 모름이다. 그래서 다른 작업(같은 프로세스의 다른 타이머에서 부르는 고아 정리 `sweepStored` 등)이 그 사이에 돌 수 없다. 전제는 **넘겨받은 포트(백엔드·장부)가 동기이고, 그 안에서 장부 변경이나 정리로 다시 들어오지 않는 것**이다. 기본 파일 포트와 실제 장부는 그렇다. 포트 자신이 동기 호출 안에서 장부를 바꾸거나 정리를 부르면 이 처리기는 막지 못한다(거르기에서 읽은 실행 줄이 기록 전에 바뀌면 장부가 기록 때 다시 가른다).
 
-1. **거르기(장부의 읽기).** `results.ledger.getRun(run_id)`. 읽지 못하거나 답의 꼴이 틀리면 `result_unknown`(`ledger_read`), 없는 실행은 `unknown_run`, 지정 실행기가 머리의 낸 쪽이 아니면 `sender_mismatch`, 실행 세대가 머리와 다르면 `run_generation_mismatch`, 세션 실행이거나 `queued`면 `not_receivable`, 소유자(`inputRequestId`)가 없으면 `no_owner`. 모두 보관소에 닿지 않는다(본문을 맡지 않는다).
+시험은 두 가지를 본다. 실제 장부·파일 백엔드에서 부르는 순서(`getRun` → `putNew` → `read` → `recordReport` → ack 난수)를 정확히 대조하고, `receipts.ts`의 줄마다 첫 `//` 뒤를 지운 소스에서 `await`·`async`·`Promise`·`.then(`·`queueMicrotask`·`setTimeout`·`setImmediate`·`nextTick` 여덟 토큰을 찾는다. 이 토큰 검사는 그 파일의 글자만 본다: 목록 밖의 예약(`setInterval` 등. 예약 직후 해제하는 사본은 두 시험을 모두 통과한다), 다른 모듈이 하는 비동기 동작, 포트 안의 재진입은 찾지 못한다.
+
+1. **거르기(장부의 읽기).** `results.ledger.getRun(run_id)`, 실행이 `not_started`면 `results.ledger.instructionTimes(run_id)`도. 판단에 쓰는 칸(실행 ID, 지정 실행기, 세대, 종류, 상태, 소유자)은 칸마다 한 번 읽어 도메인을 본다: 상태는 장부의 `LEDGER_RUN_STATES`, 종류는 장부의 전이 표(`TRANSITIONS`)의 열쇠, 지정 실행기는 계약의 실행기 이름, 세대는 0 이상의 안전 정수, 소유자는 `null`이거나 UUID. 읽지 못하거나 답의 꼴이 틀리거나 이 목록·꼴 밖이면 `result_unknown`(`ledger_read`). 없는 실행은 `unknown_run`, 지정 실행기가 머리의 낸 쪽이 아니면 `sender_mismatch`, 실행 세대가 머리와 다르면 `run_generation_mismatch`, 세션 실행이거나 `queued`이거나 시작 지시가 한 번도 없던 `not_started`(`instructionTimes`의 `lease`가 `null`)면 `not_receivable`, 소유자(`inputRequestId`)가 없으면 `no_owner`. 모두 보관소에 닿지 않는다(본문을 맡지 않는다). 시작 지시가 없던 `not_started`는 `queued`에서 취소된 실행이다: `queued` 밖에서 `not_started`로 가려면 닫기 근거가 있어야 하고(`src/ledger/states.ts`의 전이 주석), 닫기(`closeUnreceivedRun`)는 시작 지시가 정확히 하나인 실행만 닫으며, 장부는 `queued`와 닫기 근거 없는 `not_started`의 결과 보고를 늘 거절한다(`recordReport`의 결과 판정). 그래서 그 실행에는 적힌 보고가 없고 받을 수도 없다.
 2. **보관.** `storeResult(backend, { runId, owner: inputRequestId, digest, body, now })`. 본문 바이트는 결과의 정규 직렬화(`resultBody`), digest는 계약의 `resultDigest`다. `stored`일 때만 다음으로 간다. `unknown`(백엔드 장애, 폴더를 내리지 못함, 비동기로 답한 백엔드 등)은 `result_unknown`(`store`), `conflict`·`rejected`는 `result_refused`.
 3. **장부 → ack.** 그 참조와 digest로 `recordReport`를 부르고 나머지는 다른 보고와 같다(`settle`: 장부가 `ok`일 때만 ack 초안).
 
 - **같은 보고의 재전송:** 거르기를 다시 지나고, 보관소는 같은 자리에 같은 본문이 있으므로 같은 참조(`created: false`)를 낸다. 장부는 `duplicate`로 받고 ack를 다시 만든다. 두 번 보관하거나 두 번 반영하지 않는다.
-- **보관은 됐는데 장부가 거절하거나 모를 때(`ledger_refused`·`ledger_failed`):** ack가 없고 **본문은 보관소에 남는다.** 처리기는 지우지 않는다: `ledger_failed`는 적혔는지 모르고, 적혔으면 지운 본문은 되살릴 수 없다. 같은 보고가 다시 오면 같은 참조로 이어지고 장부가 다시 가른다(일시 장애였으면 그때 적힌다). 장부가 끝내 받지 않으면(아래 "남는 한계") 그 본문은 장부에 참조가 없는 고아다. 머리가 온전한 기록이라 `listStored`가 `stored`와 보관 시각으로 보이고, `sweepStored`가 장부의 참조 목록(`keep`) 밖이면서 기한 전의 것으로 지울 수 있다. 이 처리기는 고아 정리를 부르지 않는다.
+- **보관은 됐는데 장부가 거절하거나 모를 때(`ledger_refused`·`ledger_failed`):** ack가 없고 **본문은 보관소에 남는다.** 처리기는 지우지 않는다: `ledger_failed`는 적혔는지 모르고, 적혔으면 지운 본문은 되살릴 수 없다. 같은 보고가 다시 오면 같은 참조로 이어지고 장부가 다시 가른다(일시 장애였으면 그때 적힌다). 본문은 **그 저장 참조를 가리키는 커밋된 보고가 장부에 하나도 없을 때만** 고아다. 이번 호출의 거절이나 `created: false`만으로는 고아가 아니다: 같은 실행의 자리는 하나라, 끝내 거절된 보고가 가리키는 자리를 앞서 받은 다른 보고가 이미 참조하고 있을 수 있다(먼저 받은 결과로 판정된 실행에 다른 id로 같은 결과가 오면 보관소는 `exists`, 장부는 `transition_denied`다). 고아는 머리가 온전한 기록이라 `listStored`가 `stored`와 보관 시각으로 보이고, `sweepStored`가 장부의 참조 목록(`keep`) 밖이면서 기한 전의 것으로 지울 수 있다. 이 처리기는 고아 정리를 부르지 않는다.
 - **정지 세대를 모를 때(`applied_without_ack`):** 장부는 받았고 참조가 적혔다. 다시 오면 같은 참조·`duplicate`로 ack한다.
 - **같은 실행에 다른 결과(같은 id든 다른 id든):** 보관소의 자리는 실행마다 하나라 `conflict`로 장부 전에 거절된다. 새 본문을 남기지 않고 앞의 본문과 장부 줄은 그대로다. ack가 없어 실행기는 계속 다시 보낸다.
-- **거르기가 거르지 않는 상태:** 판정이 끝난 상태(`ready_result`·`failed_stopped`·`cleanup_pending`·`finalized`)와 `not_started`는 장부에 맡긴다. 이미 적힌 같은 보고의 재전송이면 장부가 `duplicate`로 ack해야 하는데 그 id가 적혔는지 읽는 공개 읽기가 없고, `not_started`의 닫기 근거도 장부만 읽는다.
+- **거르기가 거르지 않는 상태:** 판정이 끝난 상태(`ready_result`·`failed_stopped`·`cleanup_pending`·`finalized`)와 시작 지시가 있던 `not_started`는 장부에 맡긴다(본문부터 보관한다). 그 실행에는 앞서 적힌 보고가 있을 수 있어, 그 재전송이면 장부가 `duplicate`로 ack해야 하는데 그 id가 적혔는지 읽는 공개 읽기가 없다. 시작 지시가 있던 `not_started`는 닫기 근거가 있으면 늦은 첫 보고도 받는데(`new` ack), 닫기 근거는 장부만 읽는다. 판정과 다른 결과가 먼저 온 `ready_result`처럼 장부가 끝내 받지 않는 보고도 이 읽기만으로는 재전송과 가를 수 없어 보관된다(아래 "남는 한계").
 - **본문을 싣지 않는다.** 거절·모름·ack·결과에는 보고 id·실행 ID·이유만 있다. 본문은 보관소에만 간다.
 
 ## 운영 중 상태 보고의 장부 반영
@@ -146,7 +148,7 @@
 - **밀린 답은 그 프로세스의 메모리에만 있다.** 재시작하면 사라지고 장부에 흔적이 없다(`ledger.md`의 "0행의 뜻(함정)").
 - **막힘에 상한이 없다.** 앞 답이 계속 저장되지 않거나 인정이 끝난 연결의 "안다"는 사본이 남아 있으면 그 실행기의 뒤 답은 무기한 `held`다. 상한과 경보는 정하지 않았다.
 - **`not_known`만 실은 답을 저장하지 못하면 그 임대 거두기는 다시 조회의 새 답에 달린다.** 위 "다시 조회로 얻는 것".
-- **장부가 끝내 받지 않는 결과 보고는 보관소에 고아를 남긴다.** 거르기가 거르지 않는 경우다: 닫기 근거가 없는 `not_started`(장부가 `transition_denied`), 결과 없음으로 판정된 실행의 새 보고(`transition_denied`), 보고 없이 다른 digest로 판정된 실행의 새 보고(`receipt_conflict`), 이미 다른 실행에 쓴 보고 id를 다른 `run_id`로 다시 쓴 보고(그 실행의 자리에 보관된 뒤 장부가 `receipt_conflict`). 그 본문은 그 실행의 자리를 차지하므로 고아 정리가 지우기 전까지 그 실행의 다른 결과는 `conflict`다. 고아 정리의 `keep`(장부에 적힌 결과 참조 전부)을 만들 장부의 읽기는 아직 없다(`pendingReports()`는 반영 전 보고만 낸다).
+- **장부가 끝내 받지 않는 결과 보고는 본문부터 보관된다.** 거르기가 거르지 않는 경우다: 결과 없음으로 판정된 실행의 새 보고(`transition_denied`), 판정과 다른 결과(보고 없이 다른 digest로 판정된 `ready_result` 등, `receipt_conflict`), 이미 다른 실행에 쓴 보고 id를 다른 `run_id`로 다시 쓴 보고(그 실행의 자리에 보관된 뒤 장부가 `receipt_conflict`). 그 자리를 가리키는 커밋된 보고가 없으면 그 본문은 고아이고, 그 실행의 자리를 차지하므로 고아 정리가 지우기 전까지 판정에 맞는 뒤의 결과도 보관소의 `conflict`로 막힌다(ack가 없어 실행기는 계속 다시 보낸다). 고아 정리의 `keep`(장부에 커밋된 결과 참조 전부)을 만들 장부의 읽기는 아직 없다(`pendingReports()`는 반영 전 보고만 낸다).
 - **같은 실행의 다른 결과는 장부의 충돌 기록에 남지 않는다.** 보관소가 `conflict`로 먼저 거절하므로 장부의 `receipt_conflicts`에 줄이 생기지 않는다(장부의 충돌 규칙은 장부에 닿은 보고에만 적용된다). ack가 없는 것은 같다.
 - **소유자 없는 실행의 결과는 받지 못한다.** 보관소는 소유자(입력 요청 ID)로 읽기를 막으므로 `inputRequestId`가 없는 작업자 실행의 결과는 `no_owner`이고 실행기는 계속 다시 보낸다.
 - **빈 자리가 있는 보류 배열은 성공으로 읽힌다.** 장부 포트가 길이만 있고 항목이 빈 `deferred`를 돌려주면 처리기는 `applied`로 센다. 실제 장부는 빈 자리 없는 배열을 돌려주므로 포트가 약속을 어긴 경우다.
@@ -167,6 +169,7 @@
 - **ack는 장부가 받은 것만 싣는다.** `ack` 결과의 초안만 봉해서 보낸다. `applied_without_ack`·`ledger_refused`·`ledger_failed`에 대해 ack를 따로 만들지 않는다. ack는 재전송을 멈추라는 뜻일 뿐이고 종료·정리·실행 허가가 아니다.
 - **`now`와 정지 세대는 장부와 같은 시계·같은 복원기에서 읽는다.** 정지 세대는 이 처리기를 부르는 순간의 값이다. 연결 판단이 봉투를 받아들인 때의 값을 다시 쓰지 않는다.
 - **결과 포트를 늘 넘긴다.** `results`가 없으면 결과 보고는 ack 없이 끝나 실행기가 무기한 다시 보낸다. `results.backend`는 동기 백엔드(파일 백엔드의 조건은 `src/supervisor/scheduler/result-store-file.md` "뒤 조각이 지켜야 할 것": 실제 폴더, 링크 없는 경로, 바뀌지 않는 상위 폴더, 감독 하나, 기록 상한), `results.ledger`는 `ledger`와 같은 장부다. 이 처리기를 부르는 흐름에도 `await`를 두지 않는다(같은 프로세스의 고아 정리를 같은 흐름 안에서 부르지 않는다).
-- **고아 정리는 장부의 결과 참조 전부를 `keep`으로 넘긴다.** 보관은 됐지만 장부에 적히지 않은 본문만 지우게 한다. 기한은 실행기의 재전송이 같은 참조로 이어질 시간보다 길어야 한다(지운 뒤 같은 보고가 오면 새로 보관된다).
+- **고아 정리는 장부의 결과 참조 전부를 `keep`으로 넘긴다.** 보관은 됐지만 그 참조를 가리키는 커밋된 보고가 없는 본문만 지우게 한다. 기한은 실행기의 재전송이 같은 참조로 이어질 시간보다 길어야 한다(지운 뒤 같은 보고가 오면 새로 보관된다).
+- **고아 정리는 참조를 읽은 그 동기 구간 안에서 지운다.** `keep`은 장부의 모든 커밋된 결과 참조(미반영과 반영 완료 모두)를 읽어 만들고, 그 읽기와 삭제 사이에 다른 보고를 받지 않는다. 완전한 읽기를 얻지 못하면 그 회차의 삭제를 보류한다. 유예 시간만으로는 이 틈을 닫을 수 없다: 재전송은 옛 파일을 다시 쓰고(`created: false`) 그 `storedAt`은 처음 값이라, 읽은 뒤에 장부가 받은 보고의 본문도 기한이 지난 것으로 보인다.
 - **결과 보고의 ack는 종료 증명이나 게시 허가가 아니다(계약 v1).** 장부에 적힌 참조로 자리를 풀거나 게시를 열지 않는다. 확정은 결과 검사(`markResult`)와 수명 박자의 일이다.
 - **장부 반영의 결과로 생기는 일(갱신 발급, 결과 검사, 세션 교체, 훅 사건의 처리)은 이 처리기가 하지 않는다.** 시작의 접수 영수증을 장부가 받은 뒤에만 갱신을 발급하는 조건(`ledger.md` "스케줄러")은 순환이 장부를 다시 읽어 지킨다. D-89에 따라 감독은 갱신한 임대를 반대 증거가 없으면 믿으므로, 종료 영수증이 이 처리기를 거쳐 장부에 닿아야 그 믿음이 끝난다.

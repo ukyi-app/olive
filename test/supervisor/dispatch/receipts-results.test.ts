@@ -99,14 +99,25 @@ function storedKeys(backend: ResultBackend): readonly string[] {
 }
 const keyCount = (backend: ResultBackend) => storedKeys(backend).length;
 
+// 보관된 바이트를 메모리에서 비교한다. toEqual로 바이트를 비교하면 실패 문구에 본문 바이트가 나온다.
+type Read = ReturnType<ResultBackend["read"]>;
+const sameRead = (a: Read, b: Read) => a.status === "ok" && b.status === "ok" && Buffer.compare(a.bytes, b.bytes) === 0;
+
+function runState(ledger: Ledger, runId: string): string {
+  const read = ledger.getRun(runId);
+  if (!read.known || read.value === null) throw new Error("실행을 읽지 못함");
+  return read.value.state;
+}
+
 const resultRows = (ledger: Ledger) => {
   const pending = ledger.pendingReports();
   if (!pending.known) throw new Error("보고를 읽지 못함");
   return pending.value.filter((report) => report.action === "report_result");
 };
 
+// 실패 문구에는 기대한 종류와 실제 종류만 적는다. 결과 객체를 직렬화하면 거기 잘못 실린 본문이 시험 출력에 나온다.
 function expectAck(outcome: ReceiptOutcome, reportId: string, delivery: "new" | "duplicate") {
-  if (outcome.outcome !== "ack") throw new Error(`ack가 아니다: ${JSON.stringify(outcome)}`);
+  if (outcome.outcome !== "ack") throw new Error(`기대: ack(${delivery}), 실제: ${outcome.outcome}`);
   expect(outcome.id).toBe(reportId);
   expect(outcome.delivery).toBe(delivery);
   expect(outcome.ack.recipient).toBe(WORKER_EXECUTOR);
@@ -159,6 +170,7 @@ describe("보장 1: 보관 → 장부 → ack, 사이에 await가 없다", () =>
       backend,
       ledger: {
         getRun: (r) => (log.push("getRun"), ledger.getRun(r)),
+        instructionTimes: (r) => (log.push("instructionTimes"), ledger.instructionTimes(r)),
         recordReport: (i, f) => (log.push("recordReport"), ledger.recordReport(i, f)),
       },
     };
@@ -218,7 +230,7 @@ describe("보장 2: 모름과 거절에는 ack가 없다", () => {
     const { ledger, runId } = ownedRun();
     const backend = fileBackend();
     const reportId = id();
-    const refuse = { getRun: (r: string) => ledger.getRun(r), recordReport: () => ({ ok: false as const, reason: "ledger_unwritable" as const }) };
+    const refuse = { getRun: (r: string) => ledger.getRun(r), instructionTimes: (r: string) => ledger.instructionTimes(r), recordReport:() => ({ ok: false as const, reason: "ledger_unwritable" as const }) };
     const random = countingRandom();
     const refused = handleForward(forward(await resultReport(reportId, runId)), { ledger, random, results: { backend, ledger: refuse } });
     expect(refused).toEqual({ outcome: "ledger_refused", action: "report_result", id: reportId, reason: "ledger_unwritable" });
@@ -249,7 +261,7 @@ describe("보장 2: 모름과 거절에는 ack가 없다", () => {
       const outcome = handleForward(forward(await resultReport(id(), runId)), {
         ledger,
         random,
-        results: { backend: fileBackend(), ledger: { getRun: (r) => ledger.getRun(r), recordReport: recordReport as Ledger["recordReport"] } },
+        results: { backend: fileBackend(), ledger: { getRun: (r) => ledger.getRun(r), instructionTimes: (r) => ledger.instructionTimes(r), recordReport: recordReport as Ledger["recordReport"] } },
       });
       expect(outcome.outcome).toBe("ledger_failed");
       expect(random.calls).toBe(0);
@@ -274,7 +286,7 @@ describe("보장 2: 모름과 거절에는 ack가 없다", () => {
       const outcome = handleForward(forward(await resultReport(id(), runId)), {
         ledger,
         random: countingRandom(),
-        results: { backend, ledger: { getRun: getRun as Ledger["getRun"], recordReport: (i, f) => ledger.recordReport(i, f) } },
+        results: { backend, ledger: { getRun: getRun as Ledger["getRun"], instructionTimes: (r) => ledger.instructionTimes(r), recordReport:(i, f) => ledger.recordReport(i, f) } },
       });
       expect(outcome).toMatchObject({ outcome: "result_unknown", at: "ledger_read" });
     }
@@ -311,7 +323,7 @@ describe("보장 3: 장부가 아는 실행의 결과만, 한 번만", () => {
     const sessionRow = ledger.getRun(sessionRun);
     if (!sessionRow.known || sessionRow.value === null) throw new Error("세션 실행을 읽지 못함");
     const sessionLike = { ...sessionRow.value, executorId: WORKER_EXECUTOR, runGeneration: 1 };
-    const sessionView: ResultPorts["ledger"] = { getRun: () => ({ known: true, value: sessionLike }), recordReport: (i, f) => ledger.recordReport(i, f) };
+    const sessionView: ResultPorts["ledger"] = { getRun: () => ({ known: true, value: sessionLike }), instructionTimes: (r) => ledger.instructionTimes(r), recordReport:(i, f) => ledger.recordReport(i, f) };
     expect(handleForward(forward(await resultReport(id(), sessionRun)), { ledger, random: countingRandom(), results: { backend, ledger: sessionView } })).toMatchObject({
       outcome: "result_refused",
       reason: "not_receivable",
@@ -344,7 +356,98 @@ describe("보장 3: 장부가 아는 실행의 결과만, 한 번만", () => {
     expectNoBody(outcome);
     expect(random.calls).toBe(0);
     expect(keyCount(backend)).toBe(1);
-    expect(backend.read(storedKeys(backend)[0]!)).toEqual(stored);
+    expect(sameRead(backend.read(storedKeys(backend)[0]!), stored)).toBe(true);
     expect(resultRows(ledger)).toEqual(before);
+  });
+
+  test("대기에서 취소돼 시작 지시가 한 번도 없던 not_started는 보관소에 닿기 전에 거절한다", async () => {
+    const { ledger } = ownedRun();
+    const backend = fileBackend();
+    const owner = id();
+    must(ledger.enqueueInput({ requestId: owner, source: "test", sourceRef: { ref: `inputs/${id()}`, expiresAt: NOW + 600_000 }, receivedAt: NOW }));
+    const cancelled = must(ledger.admitRun(worker({ inputRequestId: owner }))).run.runId;
+    must(ledger.recordStopInstruction({ runId: cancelled, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1 }));
+    expect(runState(ledger, cancelled)).toBe("not_started");
+    const random = countingRandom();
+    const outcome = handleForward(forward(await resultReport(id(), cancelled, RESULT, WORKER_EXECUTOR, ledger.runGeneration(cancelled))), {
+      ledger,
+      random,
+      results: { backend, ledger },
+    });
+    expect(outcome).toMatchObject({ outcome: "result_refused", reason: "not_receivable" });
+    expectNoBody(outcome);
+    expect(random.calls).toBe(0);
+    expect(keyCount(backend)).toBe(0);
+  });
+
+  test("닫기 근거가 있는 not_started는 거르지 않는다: 늦은 첫 보고는 new, 재전송은 duplicate로 ack한다", async () => {
+    const { ledger, runId } = ownedRun();
+    const backend = fileBackend();
+    must(ledger.closeUnreceivedRun({ runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_005, now: NOW + 30_010 }, { sender: WORKER_EXECUTOR }));
+    expect(runState(ledger, runId)).toBe("not_started");
+    const reportId = id();
+    expectAck(handleForward(forward(await resultReport(reportId, runId)), { ledger, random: countingRandom(), results: { backend, ledger } }), reportId, "new");
+    expectAck(handleForward(forward(await resultReport(reportId, runId)), { ledger, random: countingRandom(), results: { backend, ledger } }), reportId, "duplicate");
+    expect(keyCount(backend)).toBe(1);
+  });
+});
+
+describe("장부 읽기와 장부 답의 경계", () => {
+  test("장부 읽기가 아는 목록·꼴 밖의 값을 주면 보관하지 않고 result_unknown(ledger_read)이다", async () => {
+    const { ledger, runId } = ownedRun();
+    const backend = fileBackend();
+    const bent: Record<string, unknown>[] = [{ state: "mystery_state" }, { kind: "robot" }, { inputRequestId: "not-a-uuid" }, { runGeneration: -1 }, { executorId: "not a principal" }];
+    for (const change of bent) {
+      const calls: string[] = [];
+      const view: ResultPorts["ledger"] = {
+        getRun: (r) => {
+          const real = ledger.getRun(r);
+          if (!real.known || real.value === null) throw new Error("실행을 읽지 못함");
+          return { known: true, value: { ...real.value, ...change } } as ReturnType<Ledger["getRun"]>;
+        },
+        instructionTimes: (r) => ledger.instructionTimes(r),
+        recordReport: (i, f) => (calls.push("recordReport"), ledger.recordReport(i, f)),
+      };
+      const random = countingRandom();
+      const outcome = handleForward(forward(await resultReport(id(), runId)), { ledger, random, results: { backend, ledger: view } });
+      expect(outcome).toMatchObject({ outcome: "result_unknown", at: "ledger_read" });
+      expect(calls).toEqual([]);
+      expect(random.calls).toBe(0);
+    }
+    expect(keyCount(backend)).toBe(0);
+    expect(resultRows(ledger)).toHaveLength(0);
+  });
+
+  test("장부 답의 칸을 읽다 던져도 처리기는 던지지 않고, 돌아온 값에 그 문구(본문 조각)가 없다", async () => {
+    const { ledger, runId } = ownedRun();
+    const backend = fileBackend();
+    const view: ResultPorts["ledger"] = {
+      getRun: (r) => ledger.getRun(r),
+      instructionTimes: (r) => ledger.instructionTimes(r),
+      recordReport: (i, f) => {
+        const real = ledger.recordReport(i, f);
+        return {
+          ok: real.ok,
+          get delivery(): never {
+            throw new Error(`장부 답 ${RESULT.summary} ${RESULT.items[0]!.text}`);
+          },
+          ack: i.reportId,
+        } as unknown as ReturnType<Ledger["recordReport"]>;
+      },
+    };
+    const random = countingRandom();
+    // 던지면 그 문구가 시험 출력에 실리므로 던졌는지만 센다.
+    let outcome: ReceiptOutcome | undefined;
+    let threw = false;
+    try {
+      outcome = handleForward(forward(await resultReport(id(), runId)), { ledger, random, results: { backend, ledger: view } });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(false);
+    expect(outcome?.outcome).toBe("ledger_failed");
+    expect(outcome !== undefined && outcome.outcome === "ledger_failed" ? outcome.failure : null).toBe("malformed_answer");
+    expectNoBody(outcome as ReceiptOutcome);
+    expect(random.calls).toBe(0);
   });
 });
