@@ -1538,6 +1538,180 @@ describe("(5) 인정된 연결에 틀 하나를 쓴다(recognized, writeFrame)",
     expect(order).not.toContain("write");
   });
 
+  test("서버의 확인 → lastCheck → 인정의 재확인 → finalCheck → write: finalCheck는 재확인 뒤에 한 번 불리고, 그 뒤 write까지 외부 읽기가 없다", async () => {
+    const shared = { t: Date.now() };
+    const order: string[] = [];
+    const injected = () => {
+      order.push("clock");
+      return shared.t;
+    };
+    const h = await start({ clock: injected });
+    h.onRestorer = () => order.push("restorer");
+    const generation = h.restorer.stopGeneration;
+    h.restorer.stopGeneration = () => {
+      order.push("stopGeneration");
+      return generation();
+    };
+    const a = await greet(h, K1, R1);
+    const sa = serverSocket(h, a);
+    const watched = ["destroyed", "writable", "writableLength", "writableNeedDrain", "writableCorked", "writableEnded", "writableFinished"].filter((name) => {
+      try {
+        onAccess(sa, name, () => order.push(name));
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    expect(watched).toEqual(expect.arrayContaining(["writableLength", "writableCorked"]));
+    const write = sa.write;
+    sa.write = function (this: ServerSocket, ...args: unknown[]) {
+      order.push("write");
+      return (write as (...a: unknown[]) => boolean).apply(this, args);
+    } as typeof sa.write;
+    const deadline = shared.t + 1;
+    const timed = () => ({
+      lastCheck: () => {
+        order.push("lastCheck");
+        return null;
+      },
+      finalCheck: () => {
+        order.push("finalCheck");
+        const now = injected();
+        order.push("finalCheck:end");
+        return now < deadline ? null : "too_late";
+      },
+      settled: () => {},
+    });
+    order.length = 0;
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 1 }), timed())).toEqual(WRITTEN);
+    const l = order.indexOf("lastCheck");
+    // lastCheck 뒤에 재확인의 두 읽기, 그다음 finalCheck(그 안의 시계 한 번), 그 뒤 곧바로 write다.
+    expect(order.slice(l)).toEqual(["lastCheck", "stopGeneration", "restorer", "finalCheck", "clock", "finalCheck:end", "write"]);
+    expect(order.slice(0, l)).not.toContain("clock");
+    await until(() => a.frames.length === 2);
+
+    // finalCheck가 읽은 시각이 기한 정각이면 넘기지 않는다. 연결은 열린 채다.
+    shared.t = deadline;
+    order.length = 0;
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 2 }), timed())).toEqual({ kind: "not_written", reason: "refused", refusal: "too_late" });
+    expect(order).not.toContain("write");
+    expect(h.closedNotes(a.id)).toEqual([]);
+  });
+
+  test("finalCheck가 이름을 답하거나 던지면 넘긴 바이트 0이고 연결은 열린 채다. lastCheck가 거절했거나 재확인에서 인정을 잃었으면 부르지 않는다. 없으면 재확인 뒤 곧바로 쓴다", async () => {
+    const original: { stopGeneration(): number | null } = { stopGeneration: () => GENERATION };
+    const box: { source: StopGenerationSource } = { source: original };
+    const h = await start({ restorer: () => box.source });
+    const a = await greet(h, K1, R1);
+    const raw = rawOf(a);
+    const handedA = handedTo(serverSocket(h, a));
+    // caller()에 finalCheck를 붙인다. 부른 수를 센다.
+    const timed = (final: () => unknown, verdict: () => string | null = () => null) => {
+      const c = caller(verdict);
+      let finals = 0;
+      const options: WriteFrameOptions = {
+        ...c.options,
+        finalCheck: () => {
+          finals++;
+          return final() as string | null;
+        },
+      };
+      return { ...c, options, finals: () => finals };
+    };
+
+    const named = timed(() => "too_late");
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 1 }), named.options)).toEqual({ kind: "not_written", reason: "refused", refusal: "too_late" });
+    const threw = timed(() => {
+      throw new Error("시험: finalCheck 실패");
+    });
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 2 }), threw.options)).toEqual({ kind: "not_written", reason: "check_failed" });
+    const odd = timed(() => undefined);
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 3 }), odd.options)).toEqual({ kind: "not_written", reason: "check_failed" });
+    let inner = null as WriteFrameResult | null;
+    const nested = timed(() => {
+      inner = h.server.writeFrame(a.id, R1, frame({ n: "inner" }), caller().options);
+      return "stop";
+    });
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 4 }), nested.options)).toEqual({ kind: "not_written", reason: "refused", refusal: "stop" });
+    expect(inner).toEqual({ kind: "not_written", reason: "reentered" });
+    // lastCheck가 거절하면 finalCheck를 부르지 않는다.
+    const refusedFirst = timed(() => null, () => "intake_closed");
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 5 }), refusedFirst.options)).toEqual({ kind: "not_written", reason: "refused", refusal: "intake_closed" });
+    // 재확인에서 인정을 잃으면(같은 세대의 새 복원기) finalCheck를 부르지 않는다.
+    const swapped = timed(
+      () => null,
+      () => {
+        box.source = { stopGeneration: () => GENERATION };
+        return null;
+      },
+    );
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 6 }), swapped.options)).toEqual(NOT_RECOGNIZED);
+    box.source = original;
+    await Bun.sleep(20);
+    expect({ handed: handedA.length, received: raw().byteLength }).toEqual({ handed: 0, received: 0 });
+    expect([named, threw, odd, nested, refusedFirst, swapped].map((c) => [c.checks(), c.finals(), c.ends])).toEqual([
+      [1, 1, []],
+      [1, 1, []],
+      [1, 1, []],
+      [1, 1, []],
+      [1, 0, []],
+      [1, 0, []],
+    ]);
+    expect(h.closedNotes(a.id)).toEqual([]);
+    expect(phaseOf(h, a)).toBe("greeted");
+
+    // 같은 연결에 이어서 쓴다: finalCheck가 null이면 쓰고, finalCheck가 없으면 지금과 같이 쓴다.
+    const passed = timed(() => null);
+    const one = frame({ n: 7 });
+    expect(h.server.writeFrame(a.id, R1, one, passed.options)).toEqual(WRITTEN);
+    const plain = caller();
+    const two = frame({ n: 8 });
+    expect(h.server.writeFrame(a.id, R1, two, plain.options)).toEqual(WRITTEN);
+    await until(() => a.frames.length === 3 && passed.ends.length + plain.ends.length === 2);
+    expect(raw()).toEqual(concat(one, two));
+    expect([passed.finals(), passed.ends, plain.ends]).toEqual([1, ["flushed"], ["flushed"]]);
+
+    // finalCheck가 등록표를 적용해 그 연결이 닫혔으면 null을 답해도 넘기지 않는다(서버 자기 기록으로 본다).
+    const b = await greet(h, K2, R2);
+    const handedB = handedTo(serverSocket(h, b));
+    const dropping = timed(() => {
+      h.server.applyRegistry({ kind: "content", content: doc(2, [row(K1, "r1", "s1")]) });
+      return null;
+    });
+    expect(h.server.writeFrame(b.id, R2, frame({ n: 9 }), dropping.options)).toEqual({ kind: "not_written", reason: "closed" });
+    expect([handedB, dropping.finals(), dropping.ends]).toEqual([[], 1, []]);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment" }]);
+  });
+
+  test("재확인의 마지막 게시 조회가 서버를 닫고 같은 복원기를 돌려주면 finalCheck와 그 시계를 부르지 않고 closed다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const handedA = handedTo(serverSocket(h, a));
+    let reads = 0;
+    let closing: Promise<void> | null = null;
+    // 처음 읽기는 writeFrame의 인정, 두 번째가 재확인의 마지막 게시 조회다. 그 안에서 닫고 같은 객체를 돌려준다.
+    h.onRestorer = () => {
+      reads++;
+      if (reads === 2) closing = h.server.close();
+    };
+    let finals = 0;
+    let clocks = 0;
+    const ends: string[] = [];
+    const result = h.server.writeFrame(a.id, R1, frame({ n: 1 }), {
+      lastCheck: () => null,
+      finalCheck: () => {
+        finals++;
+        clocks++;
+        return null;
+      },
+      settled: (end) => void ends.push(end),
+    });
+    h.onRestorer = () => {};
+    await closing;
+    const closed = result.kind === "not_written" && result.reason === "closed";
+    expect(reads === 2 && closing !== null && finals === 0 && clocks === 0 && closed && handedA.length === 0 && ends.length === 0).toBe(true);
+  });
+
   test("넘긴 틀의 끝은 정확히 한 번이다: 완료 오류, 완료 전의 닫힘(상대, 등록표, 서버 종료), 닫힌 뒤 늦게 온 완료", async () => {
     const h = await start();
 
