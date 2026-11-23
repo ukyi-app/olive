@@ -11,6 +11,7 @@
 //    시작은 연결 확인 뒤와 내보내기 직전에 시계를 다시 읽어 발행 + START_LAST_SEAL_MS 한도를 다시 본다. 마지막 읽기가 보는 것은 이 한도뿐이다.
 //    작업 기한의 여유는 봉할 때(sealDraft)와 실제로 싣는 순간의 내보내기 포트가 보고, 싣는 순간의 시작 한도도 그 포트가 지킨다.
 //    항목의 정지 세대가 장부의 지금 세대와 다르거나, 연결이 지시를 낼 수 없거나, 읽기가 모름이면 봉하지 않는다.
+//    장부가 모른다고 옮긴(unknown_running) 실행의 시작은 봉하지 않는다(조회만 한다, D-92).
 // 3. 두드리지 않는다. 같은 요청 ID는 max(항목의 발행 시각, 부르는 쪽이 넘긴 마지막 송신 시각)부터 정책의 간격이 지나야 다시 낸다.
 //    마지막 송신 시각은 결과의 at(내보내기 포트가 돌아온 뒤 읽은 시각)이다. 전달이 모름(포트가 던지거나 정의 밖의 값을 돌려줌)일 때
 //    이 값이 실은 시각의 상한인 것은 내보내기 포트가 전달을 확정할 수 없는 모든 끝(예외, 정의 밖의 반환값)에서 맡은 쓰기를
@@ -77,9 +78,10 @@ type Head = { readonly requestId: string; readonly runId: string; readonly actio
 
 // 다시 내지 않은 이유. 모두 내보내기 포트를 부르지 않았다는 뜻이다. 대부분 봉하기 전의 것이고, clock_unavailable은
 // 시작의 마지막 시계 읽기(서명 뒤)에서도 나며 그때는 이미 서명한 봉투를 버린다.
-// session_run: 세션 실행의 지시. stop_recorded: 같은 실행에 종료가 적힌 시작(열자마자 닫힐 실행을 열지 않는다).
+// session_run: 세션 실행의 지시. run_unknown: 장부가 모른다고 옮긴(unknown_running) 실행의 시작(조회만 한다, D-92).
+// stop_recorded: 같은 실행에 종료가 적힌 시작(열자마자 닫힐 실행을 열지 않는다).
 // read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸(머리 칸과 본문을 다시 만들 칸)이 처음 읽은 것과 다르다.
-export type Withheld = "session_run" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown";
+export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown";
 
 export type ResendOutcome =
   // 같은 요청을 새 봉투에 담아 실었다(sent는 받았다는 뜻이 아니다). sealedAt은 봉할 때 읽은 시각이다.
@@ -452,6 +454,11 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
     return { ...head, outcome: "stop_generation_mismatch", stopGeneration: item.stopGeneration, currentStopGeneration: fresh.stopGeneration };
   }
   if (action === "task_start") {
+    // 끊김(markLostFor)이나 복원 3단계(markLost)가 모른다고 옮긴 실행은 되살리지 않고 같은 실행 ID로 조회만 한다(D-92).
+    // 처음 봉투를 받지 못한 실행기가 새 연결로 받으면 쓸모없는 실행을 연다. 조회는 수명 박자의 일이다.
+    // 함정: 이 판정은 시한 판정(start_expired) 뒤에 둔다. 발행 + START_LAST_SEAL_MS가 지난 시작은 상태와 무관하게 start_expired로
+    // 끝나야 부르는 쪽이 그 결과를 D-90의 "더 보내지 않음" 재료로 쓴다.
+    if (item.runState === "unknown_running") return withheld("run_unknown");
     // 같은 실행에 종료가 적혔으면 시작을 다시 내지 않는다. 실행기가 시작을 받은 적이 없다면 열자마자 닫힐 일을 여는 것이고,
     // 받았다면 시작의 재전송은 영수증을 다시 받는 것밖에 없다. 종료는 따로 다시 낸다.
     const stopRecorded =
