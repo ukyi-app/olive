@@ -275,7 +275,7 @@ test("새 연결: 앞 연결이 끝나면 그 대기값과 남은 프레임을 �
   expect(actionsOf(a)).toEqual(["stop_sync_request"]);
 });
 
-test("새 연결: 앞 처리가 멈춘 채 감독이 닫아도 그 끝을 알아채 다시 붙고, 늦게 풀린 앞 처리는 새 연결에 아무것도 바꾸지 않는다", async () => {
+test("새 연결: 앞 처리가 멈춘 채 감독이 닫아도 그 끝을 알아채 다시 붙고, 늦게 풀린 앞 처리의 nonce 쓰기가 오류 없이 끝나면 새 연결에 아무것도 바꾸지 않는다", async () => {
   const disk = scriptedIo();
   const s = await setup({ io: disk.io });
   s.socket.start();
