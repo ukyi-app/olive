@@ -299,7 +299,8 @@ export function createCredentialSender(ports: CredentialSendPorts): CredentialSe
         });
       } catch {
         // 서버 계약 밖이다. 틀을 받은 뒤 던졌을 수 있으므로 넘긴 바이트 0이라고 하지 않는다(unknown).
-        // settled가 올지 모르므로 여기서 채운다: 값이 남는 것보다, 넘겨졌다면 0이 나가 상대 디코더가 거절하는 쪽을 고른다.
+        // settled가 올지 모르므로 여기서 채운다: 값이 남는 것보다 넘겨졌다면 0이 나가는 쪽을 고른다.
+        // 머리가 이미 넘어갔다면 디코더는 0인 값으로 틀을 완성할 수 있고, 값을 걸러내는 것은 실행기 쪽 받기의 지문 대조다.
         wipe("write_threw");
         return finish(target, { kind: "unknown", connection: target.connection, runId: target.runId, reason: "write_threw" });
       }
