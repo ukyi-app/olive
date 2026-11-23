@@ -1,5 +1,6 @@
 // 답을 받지 못한 지시를 같은 요청으로 다시 내보내는 한 박자. 장부의 unansweredInstructions()가 낸 지시마다, 그 항목의 값만으로
-// 초안을 다시 만들어 봉하고 지정 실행기의 연결에 싣는다. 장부에 쓰지 않는다(포트에 쓰기 연산이 없다).
+// 초안을 다시 만들어 봉하고 지정 실행기의 연결에 싣는다. 장부에 쓰는 것은 시작의 송신 표식(markStartDispatch) 하나뿐이고,
+// 그것도 이 모듈이 아니라 공유 함수(send-gate.ts의 sendInstruction)가 싣기 직전에 적는다. 지시 줄·실행 줄은 쓰지 않는다.
 // 장부·접수·연결·시계·난수·서명·내보내기는 포트로, 정책과 앞 박자들의 기억(지시마다 마지막으로 내보낸 시각)은 인자로 받는다.
 // 소켓·타이머·시계·난수를 직접 부르지 않는다. 쥐는 것은 같은 장부 포트로 박자가 진행 중이라는 표시 하나다(돌아오면 지운다).
 //
@@ -24,9 +25,10 @@ import { ACTION_SPECS, type Envelope, limits } from "../../contract/v1/index.ts"
 import { LEDGER_RUN_STATES, type Ledger, type Restorer, type UnansweredInstruction } from "../../ledger/index.ts";
 import { type Drafted, type DraftAction, finalizeDraft, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, stopDraft } from "./envelopes.ts";
 import type { Clock, InstructionSink, Random, Signer } from "./ports.ts";
+import { type MarkFailure, sendInstruction } from "./send-gate.ts";
 
-// 장부 포트. 읽기 하나뿐이다: 이 박자는 장부에 아무것도 쓰지 않는다.
-export type ResendLedger = Pick<Ledger, "unansweredInstructions">;
+// 장부 포트. 읽기 하나와 시작의 송신 표식이다. 표식은 그 항목을 다시 읽은 이 장부 객체로 적는다(표식은 장부 열기마다 따로 센다).
+export type ResendLedger = Pick<Ledger, "unansweredInstructions" | "markStartDispatch">;
 
 // 접수. 시작을 다시 낼 때만 본다(새 일을 여는 지시다). 종료·확정은 정지 중에도 접수가 닫혀도 다시 낸다.
 export type ResendIntake = Pick<Restorer, "intakeOpen">;
@@ -104,6 +106,15 @@ export type ResendOutcome =
       readonly delivery: "not_sent";
       readonly executorId: string;
       readonly sealedAt: number;
+    })
+  // 시작의 송신 표식이 ok가 아니어서 포트를 부르지 않았다(markReason에 그 이유). 장부의 지시는 그대로이고 다음 박자가 다시 시도한다.
+  | (Head & {
+      readonly outcome: "not_sent";
+      readonly reason: "start_unmarked";
+      readonly delivery: "not_sent";
+      readonly executorId: string;
+      readonly sealedAt: number;
+      readonly markReason: MarkFailure;
     })
   // 실렸을 수 있다. at은 resent의 at과 같은 규칙의 시각이고 부르는 쪽은 이 값을 lastResends에 넣는다.
   | (Head & {
@@ -401,7 +412,7 @@ async function tickOnce(ports: ResendPorts, ledger: ResendLedger, policy: Resend
       outcomes.push(await resendOne(ctx, entry.item, trace));
     } catch {
       // 항목 안에서 포트 묶음의 속성(ledger·intake·links)을 읽다 던지면 여기로 온다.
-      // 장부에 쓰지 않으므로 멈춰도 잃는 기록은 없다. 실렸을 수 있는 항목만 그 사실로 남긴다.
+      // 실행 줄과 미응답 지시 줄을 바꾸지 않으므로(시작의 재전송은 송신 표식을 쓴다) 멈춰도 잃는 기록은 없다. 실렸을 수 있는 항목만 그 사실로 남긴다.
       if (trace.fallback !== null) outcomes.push(trace.fallback());
       return { kind: "ran", instructions: outcomes, halted: "threw", haltedAt: entry.item.requestId };
     }
@@ -415,7 +426,9 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
 
   // 싣기 직전에 다시 읽는다. 처음 읽은 뒤 앞 항목의 송신을 기다리는 동안 영수증이 왔거나, 정지 세대가 바뀌었거나, 같은 실행에
   // 종료가 적혔을 수 있다. 판단은 모두 이 읽기의 값으로 한다.
-  const fresh = readUnanswered(ctx.ports.ledger);
+  // 시작의 송신 표식도 이 읽기와 같은 장부 객체로 적는다.
+  const ledger = ctx.ports.ledger;
+  const fresh = readUnanswered(ledger);
   if (fresh === null) return withheld("read_unknown");
   const found = fresh.entries.filter((e) => ("item" in e ? e.item.requestId : e.requestId) === planned.requestId);
   if (found.length === 0) return { ...head, outcome: "answered" };
@@ -497,21 +510,11 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   // 받는 쪽과 봉투 시한은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과는 바뀌지 않는다.
   const executorId = item.executorId;
   const expiresAt = envelope.header.expires_at;
-  // 내보내기 포트의 수신 객체와 함수는 시작의 마지막 시계 읽기 전에 얻는다. 그 읽기 뒤에 포트의 접근자(get send() 등)가 돌면
-  // 그 안에서 흐른 시간만큼 한도가 지난 시작이 포트에 닿는다. 얻다 던지거나 함수가 아니면 포트를 부르지 않은 그 항목의 실패다.
-  let target: unknown;
-  let send: unknown;
-  try {
-    target = ctx.ports.sink;
-    send = (target as InstructionSink).send;
-  } catch {
-    send = undefined;
-  }
-  if (action === "task_start") {
-    const checked = startStillSealable();
-    if (typeof checked !== "number") return checked;
-  }
-  if (typeof send !== "function") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };
+  // 송신 표식 → 마지막 시계 읽기 → 내보내기는 공유 함수 하나로만 한다(배정·시작 박자와 같은 자리, send-gate.md). 그 함수는
+  // 내보내기 포트의 수신 객체와 함수를 표식과 시작의 마지막 시계 읽기보다 먼저 얻는다. 그 읽기 뒤에 포트의 접근자(get send() 등)가
+  // 돌면 그 안에서 흐른 시간만큼 한도가 지난 시작이 포트에 닿는다. 얻다 던지거나 함수가 아니면 포트를 부르지 않은 그 항목의 실패이고
+  // 표식도 적지 않는다(시작이면 마지막 시계 읽기가 먼저다). 표식의 커밋은 마지막 시계 읽기보다 앞이다: 커밋에 걸린 시간은 그 읽기가 잰다.
+  // 표식은 마지막으로 읽은 시각으로 적는다. 취소·확정은 표식·마지막 읽기 없이 싣는다.
   const mayBeLoaded = (reason: "send_threw" | "send_answer_malformed", loadedBy: number): ResendOutcome => ({
     ...head,
     outcome: "not_sent",
@@ -522,14 +525,17 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
     at: loadedBy,
   });
   trace.fallback = () => mayBeLoaded("send_threw", expiresAt);
-  let sent: unknown;
-  let threw = false;
-  try {
-    // 마지막 시계 읽기 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
-    sent = await Reflect.apply(send, target, [envelope]);
-  } catch {
-    threw = true;
-  }
+  // sendInstruction은 포트 호출 전까지 기다리지 않는다(표식·마지막 시계 읽기는 동기). 그래서 마지막 읽기와 포트 호출 사이에 await가 없다.
+  const lastCheck = (): ResendOutcome | null => {
+    const checked = startStillSealable();
+    return typeof checked === "number" ? null : checked;
+  };
+  const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck } : null);
+  if (gate.kind === "stopped") return gate.value;
+  if (gate.kind === "sink_unavailable") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };
+  if (gate.kind === "unmarked") return { ...head, outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId, sealedAt: sealAt, markReason: gate.markReason };
+  const threw = gate.kind === "threw";
+  const sent = gate.kind === "answered" ? gate.answer : undefined;
   if (!threw && (sent === "no_connection" || sent === "too_late_to_send")) {
     return { ...head, outcome: "not_sent", reason: sent, delivery: "not_sent", executorId, sealedAt: sealAt };
   }
