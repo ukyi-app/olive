@@ -1,12 +1,14 @@
-// D-91·D-93·D-96: 관리자가 작업자 파드를 바꾼 뒤 종료가 확인되지 않은 작업자 실행을 "실패로 끝남"으로 닫는다(판 0007-operator-closure).
+// D-91·D-93·D-96·D-97: 새 작업자 파드가 닫을 수 있게 되는 시각 뒤에 떴고 그 시각을 근거에 남긴 뒤에만, 종료가 확인되지 않은 작업자
+// 실행을 "실패로 끝남"으로 닫는다(판 0007-operator-closure).
 // 실제 장부 파일에 적고, 공개 읽기와 원 SQL로 본다. 파드 이름·ID·digest·시각은 이 시험이 지어낸 값이다. 운영값이 아니다.
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { getRandomValues } from "node:crypto";
-import { limits } from "../../src/contract/v1/index.ts";
+import { generateKeyPairSync, getRandomValues } from "node:crypto";
+import { type Envelope, limits, sealEnvelope } from "../../src/contract/v1/index.ts";
 import { type Ledger, LedgerInputError, loadMigrations, openLedger } from "../../src/ledger/index.ts";
 import { type OperatorClosureInput, RESTORE_KEY } from "../../src/ledger/ledger.ts";
 import { type AssignLoopPolicy, type AssignLoopPorts, assignAndStartTick } from "../../src/supervisor/dispatch/assign-loop.ts";
+import { type ResendPorts, resendTick } from "../../src/supervisor/dispatch/resend.ts";
 import { planNext, type SchedulerView } from "../../src/supervisor/scheduler/queue.ts";
 import { clock, digest, id, must, NOW, open, ready, session, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
 
@@ -15,8 +17,11 @@ const VERSION = loadMigrations().findIndex((m) => m.name === FILE) + 1;
 const POD = "worker-diagnosis-7f9c-x2kq";
 const LATER = NOW + 60_000;
 
+// 새 파드가 뜬 시각(podStartedAt)은 따로 주지 않으면 닫는 시각과 같다(닫는 그 시각에 뜬 파드: 두 시각 조건을 함께 지난다).
+// 파드의 시각만 따로 보는 시험은 그 값을 준다.
 function closeOp(ledger: Ledger, runId: string, extra: Partial<OperatorClosureInput> = {}) {
-  return ledger.closeRunByOperator({ runId, checkedBy: "pod_replaced", podName: POD, now: LATER, ...extra });
+  const now = extra.now ?? LATER;
+  return ledger.closeRunByOperator({ runId, checkedBy: "pod_replaced", podName: POD, podStartedAt: now, now, ...extra });
 }
 
 function run(ledger: Ledger, runId: string) {
@@ -65,7 +70,10 @@ function lostAfterStart(ledger: Ledger) {
 }
 
 // 원 SQL의 근거 줄. 마지막 값은 closed_at이다(시작 발행 NOW부터 닫을 수 있게 되는 시각이 지난 LATER를 기본으로 넘긴다).
-const RAW_OPERATOR = "INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at) VALUES (?, ?, ?, ?, ?, ?)";
+// pod_started_at에는 closed_at과 같은 값이 들어간다(?6). 파드의 시각을 따로 주는 시험은 RAW_OPERATOR_POD를 쓴다.
+const RAW_OPERATOR = "INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at, pod_started_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)";
+// 마지막 값이 pod_started_at이다.
+const RAW_OPERATOR_POD = "INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at, pod_started_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
 // 원 SQL의 세 INSERT 방식. OR IGNORE는 NOT NULL·CHECK 위반을 예외 없이 0줄로 끝내므로, 트리거가 스스로 거절하는지는 셋 모두로 본다.
 const INSERT_MODES = ["INSERT", "INSERT OR REPLACE", "INSERT OR IGNORE"] as const;
 // 시작 지시를 NOW에 낸 실행을 관리자가 닫을 수 있게 되는 첫 시각(감독의 시계): 발행 + 두 시한의 큰 쪽 + 시계 오차.
@@ -88,14 +96,14 @@ test("보장 1: 영수증을 받은 unknown_running과 종료 확인 없는 stop
   expect(slotFree(ledger)).toBe(false);
   const closed = must(closeOp(ledger, lost.runId));
   expect(closed.run).toMatchObject({ state: "not_started", stopReceiptId: null });
-  expect(closed.closure).toEqual({ runId: lost.runId, fromState: "unknown_running", checkedBy: "pod_replaced", podName: POD, stopGeneration: 0, closedAt: LATER });
+  expect(closed.closure).toEqual({ runId: lost.runId, fromState: "unknown_running", checkedBy: "pod_replaced", podName: POD, podStartedAt: LATER, stopGeneration: 0, closedAt: LATER });
   expect(slotFree(ledger)).toBe(true);
 
   const stopping = startedWorker(ledger);
   must(ledger.recordStopInstruction({ runId: stopping.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW, reason: "requested" }));
   expect(run(ledger, stopping.runId).state).toBe("stopping");
   expect(must(closeOp(ledger, stopping.runId)).closure).toMatchObject({ fromState: "stopping", checkedBy: "pod_replaced" });
-  expect(ledger.operatorClosure(stopping.runId)).toEqual({ known: true, value: { runId: stopping.runId, fromState: "stopping", checkedBy: "pod_replaced", podName: POD, stopGeneration: 0, closedAt: LATER } });
+  expect(ledger.operatorClosure(stopping.runId)).toEqual({ known: true, value: { runId: stopping.runId, fromState: "stopping", checkedBy: "pod_replaced", podName: POD, podStartedAt: LATER, stopGeneration: 0, closedAt: LATER } });
   expect(slotFree(ledger)).toBe(true);
 });
 
@@ -175,7 +183,7 @@ test("보장 2: 확인 칸이 하나라도 틀리면 아무것도 쓰지 않는�
     { podName: "ab\u0000" },
   ];
   for (const extra of bad) expect(() => closeOp(ledger, lost.runId, extra as Partial<OperatorClosureInput>), JSON.stringify(extra).slice(0, 40)).toThrow(LedgerInputError);
-  expect(() => ledger.closeRunByOperator({ runId: lost.runId, checkedBy: "pod_replaced", podName: POD, now: LATER, note: "x" } as never)).toThrow(LedgerInputError);
+  expect(() => ledger.closeRunByOperator({ runId: lost.runId, checkedBy: "pod_replaced", podName: POD, podStartedAt: LATER, now: LATER, note: "x" } as never)).toThrow(LedgerInputError);
   expect(run(ledger, lost.runId).state).toBe("unknown_running");
   expect(ledger.operatorClosure(lost.runId)).toEqual({ known: true, value: null });
   // 경계 값: 253자와 한 글자, 점으로 이은 이름은 받는다.
@@ -291,7 +299,7 @@ test("보장 2: 원 SQL에서도 근거와 닫기는 한 문장이다(전이가 
   expect(rows(confirmed.path, "SELECT count(*) AS n FROM operator_closures")).toEqual([{ n: 0 }]);
   // 이관의 시각 숫자는 계약의 두 시한의 큰 쪽 + 시계 오차와 같다(장부의 코드는 같은 식을 쓴다).
   const sql = (rows(confirmed.path, "SELECT sql FROM sqlite_master WHERE name = 'operator_closures_proven'") as { sql: string }[])[0]?.sql ?? "";
-  expect([...sql.matchAll(/\+ (\d+)\)/g)].map((m) => Number(m[1]))).toEqual([CLOSABLE_AT - NOW]);
+  expect([...sql.matchAll(/\+ (\d+)\)/g)].map((m) => Number(m[1]))).toEqual([CLOSABLE_AT - NOW, CLOSABLE_AT - NOW]);
 });
 
 test("보장 2: 한 실행에 두 근거(D-90과 관리자)는 함께 생기지 않는다(코드와 트리거, 두 방향)", () => {
@@ -753,4 +761,241 @@ test("닫기 전에 받은 결과 보고는 닫는 트랜잭션에서 반영하�
   const reopened = ready(open(path));
   expect(reopened.recordReport(report, live.from)).toEqual({ ok: true, delivery: "duplicate", ack: report.reportId });
   expect(reopened.pendingReports()).toEqual({ known: true, value: [] });
+});
+
+// ---- D-97: 새 작업자 파드가 한도 뒤에 떴고 그 시각을 근거에 남긴 뒤에만 닫는다 ----
+
+const keys = generateKeyPairSync("ed25519");
+
+// 실제 재전송 박자 한 번(감독의 시각 at). 미응답 시작은 장부의 원래 발행 시각으로 봉해 내보낸다.
+async function resendOnce(ledger: Ledger, at: number): Promise<Envelope[]> {
+  const sent: Envelope[] = [];
+  const ports: ResendPorts = {
+    ledger,
+    intake: { intakeOpen: () => true },
+    links: { mayIssue: () => ({ ok: true }) },
+    clock: { now: () => at },
+    random: { bytes: (n) => getRandomValues(new Uint8Array(n)) },
+    signer: { seal: (input) => sealEnvelope(input, keys.privateKey) },
+    sink: {
+      send: async (envelope) => {
+        sent.push(envelope);
+        return "sent";
+      },
+    },
+  };
+  await resendTick(ports, { resendEveryMs: 5_000 }, { lastResends: [] });
+  return sent;
+}
+
+function rawChanges(path: string, sql: string, ...params: (string | number | bigint | null)[]): number {
+  const raw = new Database(path);
+  try {
+    raw.run("PRAGMA foreign_keys = ON");
+    return raw.query(sql).run(...params).changes;
+  } finally {
+    raw.close();
+  }
+}
+
+const stateAndClosures = (path: string, runId: string) => rows(path, "SELECT state, (SELECT count(*) FROM operator_closures) AS n FROM runs WHERE run_id = ?", runId);
+
+test("D-97: 닫기 전에 새 파드로 시작을 다시 실어 접수·시작 영수증을 받은 이력은 그 파드가 한도 전에 떴으면 닫지 않고(연산과 원 SQL 세 INSERT 방식), 한도 정각 이후에 뜬 파드면 닫힌다", async () => {
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const live = startedWorker(ledger);
+  must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
+  // +5000에 뜬 새 파드의 실행기에 +6000의 재전송이 원래 발행 시각(NOW)을 실은 시작을 내고, 접수·시작 영수증이 온다.
+  const sent = await resendOnce(ledger, NOW + 6_000);
+  expect(sent.map((e) => [e.header.action, e.header.request_id, e.header.issued_at])).toEqual([["task_start", live.requestId, NOW]]);
+  must(ledger.applyReceipt({ ...accepted(live), now: NOW + 6_001 }, live.from));
+  const started = { ...startedReceipt(live), now: NOW + 7_000 };
+  must(ledger.applyReceipt(started, live.from));
+  const before = run(ledger, live.runId);
+  expect(before).toMatchObject({ state: "unknown_running", startedReceiptId: started.receiptId });
+  const at = CLOSABLE_AT + 1;
+  const earlyPod = NOW + 5_000;
+  for (const pod of [earlyPod, CLOSABLE_AT - 1]) expect(closeOp(ledger, live.runId, { podStartedAt: pod, now: at }), `${pod - NOW}`).toEqual({ ok: false, reason: "pod_started_too_early" });
+  // 닫는 시각보다 늦은 파드의 시각, 시각이 아닌 값은 입력 오류다.
+  for (const pod of [at + 1, 0, -1, 1.5, null, "1800000031000"]) expect(() => closeOp(ledger, live.runId, { podStartedAt: pod as never, now: at }), `${pod}`).toThrow(LedgerInputError);
+  expect(() => ledger.closeRunByOperator({ runId: live.runId, checkedBy: "pod_replaced", podName: POD, now: at } as never)).toThrow(LedgerInputError);
+  expect(run(ledger, live.runId)).toEqual(before);
+  expect(ledger.operatorClosure(live.runId)).toEqual({ known: true, value: null });
+  expect(slotFree(ledger)).toBe(false);
+  ledger.close();
+  for (const mode of INSERT_MODES) {
+    for (const pod of [earlyPod, CLOSABLE_AT - 1, at + 1]) {
+      expect(() => rawWrite(path, RAW_OPERATOR_POD.replace("INSERT", mode), live.runId, "unknown_running", "pod_replaced", POD, 0, at, pod), `${mode} ${pod - NOW}`).toThrow("operator_closure_unproven");
+    }
+  }
+  expect(stateAndClosures(path, live.runId)).toEqual([{ state: "unknown_running", n: 0 }]);
+  // 관리자가 파드를 한 번 더 바꿔 한도 정각에 뜬 파드면 닫힌다.
+  const reopened = ready(open(path));
+  const closed = must(closeOp(reopened, live.runId, { podStartedAt: CLOSABLE_AT, now: at }));
+  expect(closed.closure).toEqual({ runId: live.runId, fromState: "unknown_running", checkedBy: "pod_replaced", podName: POD, podStartedAt: CLOSABLE_AT, stopGeneration: 0, closedAt: at });
+  expect(reopened.operatorClosure(live.runId)).toEqual({ known: true, value: closed.closure });
+  expect(slotFree(reopened)).toBe(true);
+});
+
+test("D-97: 사본에서 되살린 장부도 새 파드가 한도 전에 떴으면 닫지 않고, 한도 뒤에 뜬 파드면 원본이 낸 갱신을 몰라도 닫힌다(그 파드는 그 시작을 받을 수 없다)", async () => {
+  let now = NOW;
+  const source = tempPath();
+  const ledger = ready(open(source, { clock: () => now }));
+  const live = startedWorker(ledger);
+  now = NOW + 1_000;
+  const copy = tempPath();
+  must(ledger.createSnapshot({ path: copy, maxBytes: 10_000_000 }));
+  // 사본 뒤 원본에서: +6000에 새 파드(+5000에 뜸)로 시작을 다시 싣고 접수, +10000에 갱신.
+  now = NOW + 6_000;
+  expect((await resendOnce(ledger, now)).map((e) => e.header.issued_at)).toEqual([NOW]);
+  must(ledger.applyReceipt({ ...accepted(live), now: now + 1 }, live.from));
+  now = NOW + 10_000;
+  must(ledger.recordRenewInstruction({ runId: live.runId, requestId: id(), stopGeneration: 0, now }));
+  now = CLOSABLE_AT + 1;
+  must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now }));
+  expect(closeOp(ledger, live.runId, { podStartedAt: NOW + 5_000, now })).toEqual({ ok: false, reason: "start_may_launch" });
+  ledger.close();
+  const restored = open(copy, { clock: () => now });
+  must(restored.markLostFor({ executorId: WORKER_EXECUTOR, now }));
+  expect(run(restored, live.runId).state).toBe("unknown_running");
+  expect(closeOp(restored, live.runId, { podStartedAt: NOW + 5_000, now })).toEqual({ ok: false, reason: "pod_started_too_early" });
+  expect(run(restored, live.runId).state).toBe("unknown_running");
+  expect(restored.operatorClosure(live.runId)).toEqual({ known: true, value: null });
+  expect(slotFree(restored)).toBe(false);
+  expect(must(closeOp(restored, live.runId, { podStartedAt: CLOSABLE_AT, now })).closure).toMatchObject({ podStartedAt: CLOSABLE_AT, closedAt: now });
+});
+
+test("D-97 원 SQL: 파드가 뜬 시각의 NULL·빈 값·소수·범위·한도 경계·닫은 시각과의 순서를 세 INSERT 방식으로 넣으면 한도 정각부터 닫은 시각까지만 한 줄로 닫힌다", () => {
+  const fresh = () => {
+    const p = tempPath();
+    const l = ready(open(p));
+    const s = lostAfterStart(l);
+    l.close();
+    return { path: p, runId: s.runId };
+  };
+  const MAX = 9007199254740991;
+  // [이름, closed_at, pod_started_at]: 트리거가 거절한다.
+  const refused: [string, number | null, number | string | null][] = [
+    ["파드 NULL", LATER, null],
+    ["파드 0", LATER, 0],
+    ["파드 -1", LATER, -1],
+    ["파드 한도 1ms 전", LATER, CLOSABLE_AT - 1],
+    ["파드가 닫은 시각 1ms 뒤", LATER, LATER + 1],
+    ["파드가 범위 끝, 닫은 시각보다 뒤", LATER, MAX],
+    ["닫은 시각 NULL", null, LATER],
+    ["닫은 시각 한도 1ms 전, 파드 한도 1ms 전", CLOSABLE_AT - 1, CLOSABLE_AT - 1],
+  ];
+  for (const mode of INSERT_MODES) {
+    const made = fresh();
+    for (const [label, closedAt, pod] of refused) {
+      expect(() => rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, closedAt, pod), `${mode} ${label}`).toThrow("operator_closure_unproven");
+    }
+    // 정수로 바꿀 수 없는 값(빈 문자열, 소수)은 STRICT 표의 형 검사가 트리거보다 먼저, OR IGNORE에서도 예외로 막는다.
+    for (const [pod, kind] of [
+      ["", "TEXT"],
+      [CLOSABLE_AT + 0.5, "REAL"],
+    ] as const) {
+      expect(() => rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, LATER, pod), `${mode} ${kind}`).toThrow(`cannot store ${kind} value in INTEGER column operator_closures.pod_started_at`);
+    }
+    // 범위 위(안전 정수 + 1): 트리거를 지나 칸의 CHECK가 막고, OR IGNORE는 예외 없이 0줄이다(닫힌 것은 없다).
+    for (const pod of [LATER, MAX + 1]) {
+      const write = () => rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, BigInt(MAX) + 1n, BigInt(pod));
+      if (mode === "INSERT OR IGNORE") expect(write(), `${mode} ${pod}`).toBe(0);
+      else expect(write, `${mode} ${pod}`).toThrow("CHECK constraint failed");
+    }
+    expect(stateAndClosures(made.path, made.runId), mode).toEqual([{ state: "unknown_running", n: 0 }]);
+  }
+  // [closed_at, pod_started_at]: 한도 정각의 파드, 닫은 시각과 같은 파드는 한 줄로 닫힌다.
+  for (const [closedAt, pod] of [
+    [CLOSABLE_AT, CLOSABLE_AT],
+    [LATER, CLOSABLE_AT],
+    [LATER, LATER],
+  ]) {
+    for (const mode of INSERT_MODES) {
+      const made = fresh();
+      expect(rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, closedAt, pod), `${mode} ${closedAt - NOW} ${pod - NOW}`).toBe(1);
+      expect(rows(made.path, "SELECT r.state, o.pod_started_at, o.closed_at FROM runs r JOIN operator_closures o ON o.run_id = r.run_id")).toEqual([{ state: "not_started", pod_started_at: pod, closed_at: closedAt }]);
+    }
+  }
+});
+
+test("작업자 실행에 session_start 지시가 섞인 이력은 시각과 상관없이 닫지 않는다(원 SQL 세 INSERT 방식과 연산)", () => {
+  // 리뷰의 입력: startRun으로 NOW에 task_start, 취소로 stopping, 같은 실행의 session_start를 NOW + 10000에 원 SQL로 한 줄.
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const live = startedWorker(ledger);
+  must(ledger.recordStopInstruction({ runId: live.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW, reason: "requested" }));
+  ledger.close();
+  rawWrite(path, "INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at) VALUES (?, ?, 'session_start', 0, ?)", id(), live.runId, NOW + 10_000);
+  const times = [CLOSABLE_AT, CLOSABLE_AT + 10_000, LATER + 60_000];
+  for (const at of times) {
+    for (const mode of INSERT_MODES) {
+      expect(() => rawWrite(path, RAW_OPERATOR.replace("INSERT", mode), live.runId, "stopping", "pod_replaced", POD, 0, at), `${at - NOW} ${mode}`).toThrow("operator_closure_unproven");
+    }
+  }
+  expect(stateAndClosures(path, live.runId)).toEqual([{ state: "stopping", n: 0 }]);
+  const reopened = ready(open(path));
+  for (const at of times) expect(closeOp(reopened, live.runId, { now: at }), `${at - NOW}`).toEqual({ ok: false, reason: "start_may_launch" });
+  expect(run(reopened, live.runId).state).toBe("stopping");
+  expect(slotFree(reopened)).toBe(false);
+  reopened.close();
+  expect(stateAndClosures(path, live.runId)).toEqual([{ state: "stopping", n: 0 }]);
+});
+
+// 정지 세대 7의 장부에서 시작 뒤 취소를 적은 작업자 stopping(영수증 없음). record가 false면 같은 실행 줄(queued로)과 지시를 정지 기록이
+// 없는 새 장부로 옮겨 전이표의 간선으로 stopping까지 간다.
+function stoppingAtGeneration7(record: boolean) {
+  const source = tempPath();
+  const ledger = open(source);
+  must(ledger.applyStop({ generation: 7, stopped: false, now: NOW }));
+  ready(ledger);
+  const runId = must(ledger.admitRun(worker())).run.runId;
+  must(ledger.startRun({ runId, requestId: id(), stopGeneration: 7, now: NOW }));
+  must(ledger.recordStopInstruction({ runId, requestId: id(), action: "task_cancel", stopGeneration: 7, now: NOW + 1, reason: "requested" }));
+  ledger.close();
+  if (record) return { path: source, runId };
+  const bare = tempPath();
+  open(bare).close();
+  const raw = new Database(bare);
+  try {
+    raw.run("PRAGMA foreign_keys = ON");
+    raw.query("ATTACH DATABASE ? AS fixture").run(source);
+    const row = raw.query("SELECT * FROM fixture.runs WHERE run_id = ?").get(runId) as Record<string, string | number | null>;
+    row.state = "queued";
+    const names = Object.keys(row);
+    raw.query(`INSERT INTO main.runs (${names.join(", ")}) VALUES (${names.map(() => "?").join(", ")})`).run(...Object.values(row));
+    raw.query("INSERT INTO main.instructions SELECT * FROM fixture.instructions WHERE run_id = ?").run(runId);
+    raw.query("UPDATE main.runs SET state = 'preparing' WHERE run_id = ?").run(runId);
+    raw.query("UPDATE main.runs SET state = 'stopping' WHERE run_id = ?").run(runId);
+    raw.run("DETACH DATABASE fixture");
+  } finally {
+    raw.close();
+  }
+  return { path: bare, runId };
+}
+
+test("원 SQL: 정지 세대 7의 장부에서 정지 기록 없음·있음 × 입력 세대 NULL·7·0의 여섯 조합을 세 INSERT 방식으로 넣으면 기록 있음·7만 한 줄로 닫히고 나머지는 트리거가 거절한다", () => {
+  const cases: [boolean, number | null][] = [
+    [false, null],
+    [false, 7],
+    [false, 0],
+    [true, null],
+    [true, 7],
+    [true, 0],
+  ];
+  for (const [record, generation] of cases) {
+    for (const mode of INSERT_MODES) {
+      const made = stoppingAtGeneration7(record);
+      const label = `${record ? "정지 기록 7" : "정지 기록 없음"} / ${generation} / ${mode}`;
+      expect(rows(made.path, "SELECT generation FROM stop_state"), label).toEqual(record ? [{ generation: 7 }] : []);
+      const write = () => rawChanges(made.path, RAW_OPERATOR.replace("INSERT", mode), made.runId, "stopping", "pod_replaced", POD, generation, LATER);
+      if (record && generation === 7) {
+        expect(write(), label).toBe(1);
+        expect(rows(made.path, "SELECT r.state, o.stop_generation FROM runs r JOIN operator_closures o ON o.run_id = r.run_id"), label).toEqual([{ state: "not_started", stop_generation: 7 }]);
+      } else {
+        expect(write, label).toThrow("operator_closure_unproven");
+        expect(stateAndClosures(made.path, made.runId), label).toEqual([{ state: "stopping", n: 0 }]);
+      }
+    }
+  }
 });

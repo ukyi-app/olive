@@ -1,12 +1,14 @@
--- 종료가 확인되지 않은 작업자 실행(unknown_running·stopping)을 관리자가 작업자 파드를 바꾼 뒤 "실패로 끝남"으로 닫아 그 실행이 쥔
--- 작업자 자리를 놓는 판(D-91·D-93·D-94·D-96). 상태는 not_started이고, 이 판의 근거 줄이 "관리자가 실패로 닫음"을 말한다.
+-- 종료가 확인되지 않은 작업자 실행(unknown_running·stopping)을, 새 작업자 파드가 닫을 수 있게 되는 시각 뒤에 떴고 그 사실을 근거에
+-- 남긴 뒤에만 관리자가 "실패로 끝남"으로 닫아 그 실행이 쥔 작업자 자리를 놓는 판(D-91·D-93·D-94·D-96·D-97). 상태는 not_started이고,
+-- 이 판의 근거 줄이 "관리자가 실패로 닫음"을 말한다.
 -- 닫는 대상은 실행기가 받았다고 알린 실행(D-91의 글자)보다 넓다: 접수 영수증이 없는 실행, D-90이 자동으로 닫을 수 있는 실행도
 -- 받는다(D-94). 관리자가 닫은 실행은 늘 실패로 읽히고 예산은 시작한 줄로 세므로, 같은 실행이라도 D-90과 이 닫기 가운데 먼저 된 쪽에
 -- 따라 본체가 보는 단계와 같은 입력의 다음 배정이 다르다. 두 닫기는 서로를 막는다(아래 트리거).
 -- 자리를 놓아도 같은 종류의 점유 관측(slot_holds의 holds_slot = 1)이 따로 있으면 작업자 자리는 그대로 막혀 있다. 그 관측은 이 판이
 -- 풀지 않는다. 다섯 가지를 더한다.
 -- 1. 전이 한 줄: 작업자의 stopping → not_started(unknown_running → not_started는 판 6의 줄을 함께 쓴다).
--- 2. operator_closures(관리자 닫기 근거): 닫은 실행마다 한 줄. 확인 방법, 확인한 파드의 이름, 그때의 정지 세대, 닫은 시각.
+-- 2. operator_closures(관리자 닫기 근거): 닫은 실행마다 한 줄. 확인 방법, 확인한 파드의 이름과 그 파드가 뜬 시각, 그때의 정지 세대,
+--    닫은 시각.
 -- 3. operator_closures_close_run: 근거 줄을 넣는 그 SQL 문장 안에서 실행 줄을 not_started로 닫고 그 실행의 미반영 보고를 마친다.
 --    근거만 있고 상태는 그대로인 장부는 원 SQL로도 만들 수 없고, 닫는 전이가 거절되면 근거 줄도 함께 들어가지 않는다.
 -- 4. unreceived_closures_exclusive: 관리자 근거가 있는 실행에는 D-90 근거가 들어가지 않는다(한 실행에 근거 하나).
@@ -19,8 +21,11 @@
 -- "(조건) IS NOT 1"·"(조건) IS NOT 0"으로 쓴다: 조건에 NULL이 섞이면 결과가 NULL이고 NULL IS NOT 1·NULL IS NOT 0은 참이라 막는 쪽으로
 -- 간다("NOT IN"·"NOT BETWEEN"은 NULL에서 막지 않는다). 다른 표와의 대조는 "NOT EXISTS(= 로 맞는 줄)"로 쓴다: 어느 쪽이 NULL이거나
 -- 줄이 없으면 맞는 줄이 없어 막는다("A IS NOT B"는 두 쪽이 모두 NULL이면 거짓이라 통과하므로 대조에 쓰지 않는다).
--- 트리거가 보지 않는 칸의 범위: closed_at이 9007199254740991 위이면 트리거를 지나 칸의 CHECK가 막고, INSERT OR IGNORE면 예외 없이
--- 0줄이다(닫힌 것은 없다). 원 SQL 호출자는 예외만이 아니라 변경 수를 본다.
+-- 정수로 바꿀 수 없는 값(빈 문자열 같은 TEXT, 소수 REAL)은 STRICT 표의 형 검사가 트리거보다 먼저 세 INSERT 방식 모두 예외로 막는다
+-- (이 저장소의 Bun 1.4.4가 묶은 SQLite 3.53.4에서 돌려 본 것).
+-- 트리거가 보지 않는 칸의 범위: closed_at이 9007199254740991 위이면(pod_started_at은 closed_at 이하여야 트리거를 지나므로 그때만
+-- pod_started_at도 그 위일 수 있다) 트리거를 지나 칸의 CHECK가 막고, INSERT OR IGNORE면 예외 없이 0줄이다(닫힌 것은 없다). 원 SQL
+-- 호출자는 예외만이 아니라 변경 수를 본다.
 -- 늘어날 수 있는 집합(닫을 수 있는 앞 상태, 확인 방법의 목록)은 칸의 CHECK가 아니라 트리거에 둔다: 이름 없는 CHECK는 다음 판이
 -- 빼거나 넓히지 못하고, 트리거는 DROP·CREATE로 다시 만든다(이관 0006 머리의 주석).
 
@@ -33,6 +38,8 @@ INSERT INTO run_transitions (kind, from_state, to_state) VALUES
 -- - pod_name: 관리자가 확인한 파드(바꾼 뒤의 작업자 파드)의 이름. Kubernetes 이름 규칙(DNS 서브도메인: 소문자·숫자·'-'·'.', 253자
 --   이하, 라벨마다 영숫자로 시작하고 끝남)만 받는다. 장부는 원문을 넣지 않으므로 자유 메모 칸은 없다. "누가" 칸도 없다: 관리 진입점이
 --   넘기는 이름은 검증되지 않는다.
+-- - pod_started_at: 그 새 작업자 파드가 뜬 시각(Unix epoch 밀리초, D-97). 닫는 명령이 쿠버네티스에서 읽어 넘기는 클러스터의 시각이다.
+--   장부는 그 값을 스스로 확인하지 못한다(사람·명령이 넘긴 값의 기록, D-93과 같다).
 -- - stop_generation: 닫은 때의 정지 세대(stop_state.generation).
 -- - closed_at: 닫은 시각. 부르는 쪽이 넘긴 시각(감독의 시계)이고, 실행 줄의 updated_at과 마친 보고의 applied_at에도 이 값이 들어간다.
 -- 확인은 사람이 했다는 기록이지 장부가 확인한 사실이 아니다. 줄은 지우거나 고치지 않는다.
@@ -41,6 +48,7 @@ CREATE TABLE operator_closures (
   from_state TEXT NOT NULL,
   checked_by TEXT NOT NULL,
   pod_name TEXT NOT NULL,
+  pod_started_at INTEGER NOT NULL CHECK (pod_started_at BETWEEN 1 AND 9007199254740991),
   stop_generation INTEGER NOT NULL CHECK (stop_generation BETWEEN 0 AND 9007199254740991),
   closed_at INTEGER NOT NULL CHECK (closed_at BETWEEN 1 AND 9007199254740991)
 ) STRICT, WITHOUT ROWID;
@@ -48,27 +56,41 @@ CREATE TABLE operator_closures (
 -- 행으로 다시 보는 확인: 코드의 검사가 빠져도 아래 중 하나라도 맞으면 근거 줄은 들어가지 않는다.
 -- 이미 관리자 근거가 있음(INSERT OR REPLACE 포함), D-90 근거가 있음, 앞 상태가 unknown_running·stopping이 아님, 확인 방법이
 -- pod_replaced가 아님, 파드 이름이 이름 규칙 밖, 작업자가 아니거나 지금 상태가 from_state가 아니거나 종료 확인(stop_receipt_id)이 있음,
--- 정지 기록이 없거나 정지 세대가 그 기록과 같지 않음(입력이 NULL이면 같지 않다), 그 실행의 task_start 지시가 없음, 닫은 시각이 닫을
--- 수 있게 되는 시각 전.
+-- 정지 기록이 없거나 정지 세대가 그 기록과 같지 않음(입력이 NULL이면 같지 않다), 그 실행의 task_start 지시가 없음, 그 실행의
+-- session_start 지시가 있음, 닫은 시각이나 파드가 뜬 시각이 닫을 수 있게 되는 시각 전, 파드가 뜬 시각이 닫은 시각 뒤.
 -- 파드 이름의 검사: 길이 1–253, 첫·끝 글자가 영숫자, 영숫자·'-'·'.' 밖의 글자가 없음, '..'·'.-'·'-.'가 없음(라벨이 비거나 '-'로
 -- 시작·끝남), U+0000이 없음. length와 GLOB은 TEXT 안의 U+0000에서 읽기를 멈춰 그 뒤를 보지 않는다(이 저장소의 Bun 1.4.4가 묶은
 -- SQLite 3.53.4에서 돌려 본 것). instr(이름, char(0))은 그 뒤까지 보고 U+0000의 자리(1부터)를 낸다.
 -- 확인 방법이 pod_replaced 하나인 까닭(D-96): 관리자는 닫기 전에 작업자 파드를 지워 새로 띄운다. 옛 실행기 프로세스가 끝나므로, 그
 -- 실행기가 쥐고 있던 시작 권한(임대)은 장부가 그 갱신을 알든 모르든(사본에서 되살린 장부) 함께 사라지고, 마지막 임대 검사를 이미
 -- 통과한 옛 실행기가 뒤늦게 띄우는 일도 없다. 장부는 파드가 바뀌었는지 확인하지 못한다: 근거 줄은 사람이 했다는 기록이다.
--- 닫을 수 있게 되는 시각: 그 실행의 task_start·run_renew 지시의 발행 시각 최댓값 + 31000ms(감독의 시계, 정각은 받는다). 이 조건이
--- 막는 것은 새로 뜬 파드의 실행기가 감독이 다시 보낸 시작을 받아 띄우는 길이다. 감독은 시작을 다시 보내도 장부의 발행 시각을 그대로
--- 싣고(src/supervisor/dispatch/resend.ts), 실행기는 발행 + MESSAGE_TTL_MAX_MS 뒤로는 시작을 받지 않으며, 발행 + RUN_LEASE_MAX_MS부터는
--- (정각 포함) 준비·자격·띄우기 직전의 검사에서 멈춘다(src/executor/worker.ts의 launchBlocked). 띄우기 전(preparing)에 받은 갱신은
--- 임대 끝을 그 갱신의 발행 + RUN_LEASE_MAX_MS까지 늘릴 수 있다(계약 v1이 갱신의 끝을 그 값 이하로 막는다). 그래서 발행 최댓값 +
--- 30000(두 시한의 큰 쪽)부터 실행기 시계로 그 검사가 막히고, closed_at은 감독의 시계라 실행기 시계가 뒤처질 수 있는 만큼(계약의
--- CLOCK_SKEW_MS 1000ms)을 더한다. task_start가 없는 실행은 시간의 근거가 없어 막는다. session_start는 세지 않는다: 이 닫기는 작업자
--- 실행만 받고 작업자의 시작 지시는 task_start다.
--- 이 판이 막지 못하는 것: (ㄱ) 사람의 확인이 틀리면(파드를 바꾸지 않고 닫으면) 장부가 모르는 갱신(사본에서 되살린 장부)의 임대가
--- 남았거나 마지막 검사를 지난 옛 실행기가 띄우는 중이어도 닫힌다. (ㄴ) 새 파드의 실행기가 다시 보낸 시작을 받았을 때도 그 실행기의
--- 마지막 임대 검사와 프로세스 생성 사이의 지연에 이 판은 상한을 주지 못한다(1000ms는 계약의 시계 오차 상수이지 그 지연의 상한이
--- 아니다). 두 경우 모두 닫힌 실행의 시작 영수증이 오면 장부가 답에 경보를 싣고 그 종류의 자리를 다시 막는다(판 6과 같은 처리,
--- ledger.ts의 applyReceipt). 장부는 사람이 언제 확인했는지 모른다: 이 시각 뒤의 닫기라는 것만 본다.
+-- 닫을 수 있게 되는 시각: 그 실행의 task_start·run_renew 지시의 발행 시각 최댓값 + 31000ms(정각은 받는다). closed_at과
+-- pod_started_at이 모두 이 시각 이후여야 하고, pod_started_at ≤ closed_at이어야 한다(D-97). 감독은 시작을 다시 보내도 장부의 발행
+-- 시각을 그대로 싣고 발행 + 19000ms까지만 봉한다(src/supervisor/dispatch/resend.ts). 실행기는 발행 + MESSAGE_TTL_MAX_MS 뒤로는 시작을
+-- 받지 않고(봉투의 시한), 발행 + RUN_LEASE_MAX_MS부터는(정각 포함) 준비·자격·띄우기 직전의 검사에서 멈춘다(src/executor/worker.ts의
+-- launchBlocked). 띄우기 전(preparing)에 받은 갱신은 임대 끝을 그 갱신의 발행 + RUN_LEASE_MAX_MS까지 늘릴 수 있다(계약 v1이 갱신의
+-- 끝을 그 값 이하로 막는다). 그래서 발행 최댓값 + 30000(두 시한의 큰 쪽)부터 실행기 시계로 받기와 그 검사가 막히고, 시계 오차
+-- (계약의 CLOCK_SKEW_MS 1000ms)를 더한다.
+-- pod_started_at의 조건이 막는 것: 새 파드의 실행기가 감독이 다시 보낸 시작을 받아 띄우는 길. 그 실행기는 파드가 뜬 뒤에 시작하므로
+-- 무엇이든 파드가 뜬 시각 뒤에 받고, 그 시각이 한도 뒤면 그 실행의 시작은 이미 시한이 지났다. 갱신은 그 실행을 이미 받은
+-- 실행기에만 늘릴 임대가 있어, 새 파드에는 task_start의 발행만으로 족하다. 같은 식(갱신 포함)을 쓰면 더 기다릴 뿐이라 닫는 쪽으로만
+-- 틀린다. 그래서 장부가 모르는 갱신(사본에서 되살린 장부)도 새 파드에는 늘릴 임대가 없다. 파드를 한도 전에 바꿨으면 거절되고,
+-- 관리자는 파드를 한 번 더 바꾼다. closed_at의 조건은 그대로 둔다(파드가 뜬 시각 ≤ 닫은 시각이라 함께 맞는다).
+-- 두 시계: pod_started_at은 클러스터(쿠버네티스)의 시계, 발행 시각과 closed_at은 감독의 시계, 시작을 받는 것은 실행기의 시계다.
+-- 그 차이를 계약의 시계 오차 1000ms가 덮는다는 전제다(홈랩은 한 머신이라 시계가 하나다). 쿠버네티스의 시각은 초 단위라 부르는 쪽이
+-- 내림해 넘기면 실제보다 이르게 적혀 거절 쪽으로 간다.
+-- session_start 지시가 있는 실행은 닫지 않는다: 작업자 실행의 정상 이력에는 없고(ledger.ts의 startRun은 task_start만 적고
+-- startSession은 지시를 적지 않는다), 섞이면 그 시작이 무엇을 언제까지 띄울 수 있는지 이 식이 세지 않는다. task_start가 없는 실행도
+-- 시간의 근거가 없어 막는다.
+-- 새 파드의 실행기가 저장소에서 그 실행을 되살려 띄우는 길은 없다: 다시 뜬 실행기의 복원(src/executor/worker.ts의 recover·reconcile)은
+-- 사건·상태를 맞추고 남은 프로세스를 정리할 뿐 띄우지 않고, 기록이 이미 있는 실행의 시작 지시는 사건만 다시 보낸다(onStart).
+-- 이 판이 막지 못하는 것: (ㄱ) 사람·명령이 넘긴 값이 틀리면 닫힌다: 파드를 바꾸지 않았거나(장부가 모르는 갱신의 임대가 남았거나
+-- 마지막 검사를 지난 옛 실행기가 띄우는 중일 수 있다), 넘긴 파드의 시각이 그 파드의 실행기가 뜬 시각보다 늦은 경우. (ㄴ) 시계
+-- 전제가 깨져 클러스터·실행기의 시계가 감독의 시계보다 1000ms 넘게 뒤처지면, 한도 뒤로 적힌 새 파드의 실행기가 다시 보낸 시작을
+-- 받아 띄울 수 있다. 이때 장부가 남기는 신호는 닫은 뒤 처음 받는 유효한 새 시작 영수증 하나다: 그 영수증에서만 답의 경보와 그 종류의
+-- 자리 다시 막기가 함께 생긴다(판 6과 같은 처리, ledger.ts의 applyReceipt). 닫기 전에 받아 실행 줄에 연결된 첫 시작 영수증의
+-- 재전송은 경보·점유가 없고, 닫기 전에 받은 다른 시작 영수증의 재전송은 경보만 있고 점유는 없다. 장부는 사람이 언제 확인했는지
+-- 모른다: 두 시각이 한도 뒤라는 것만 본다.
 -- 이 트리거가 보지 않는 것: 장부가 건강한지, 접수 닫힘·사본 보류·정지 중인지(닫기는 이것들과 상관없이 받는다. ledger.ts의
 -- closeRunByOperator가 쓰기 모드로 장부 실패만 거절한다).
 CREATE TRIGGER operator_closures_proven BEFORE INSERT ON operator_closures
@@ -84,8 +106,12 @@ WHEN EXISTS (SELECT 1 FROM operator_closures o WHERE o.run_id = NEW.run_id)
     AND r.stop_receipt_id IS NULL)
   OR NOT EXISTS (SELECT 1 FROM stop_state s WHERE s.id = 1 AND s.generation = NEW.stop_generation)
   OR NOT EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'task_start')
+  OR EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'session_start')
   OR (NEW.closed_at >= (SELECT MAX(i.issued_at) FROM instructions i WHERE i.run_id = NEW.run_id
     AND i.action IN ('task_start', 'run_renew')) + 31000) IS NOT 1
+  OR (NEW.pod_started_at >= (SELECT MAX(i.issued_at) FROM instructions i WHERE i.run_id = NEW.run_id
+    AND i.action IN ('task_start', 'run_renew')) + 31000) IS NOT 1
+  OR (NEW.pod_started_at <= NEW.closed_at) IS NOT 1
 BEGIN
   SELECT RAISE(ABORT, 'operator_closure_unproven');
 END;

@@ -114,6 +114,7 @@ export const REFUSALS = [
   "run_ended",
   "stop_confirmed",
   "start_may_launch",
+  "pod_started_too_early",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
 export type Refused = { ok: false; reason: Refusal };
@@ -325,15 +326,17 @@ export interface UnreceivedClosureInput {
   now: number;
 }
 
-// D-91 관리자 닫기(closeRunByOperator)의 입력(D-93·D-96). checkedBy는 관리자가 확인한 방법(고정 목록 OPERATOR_CHECKS: 작업자 파드를
-// 바꿨다 하나), podName은 확인한 파드(바꾼 뒤의 작업자 파드)의 이름(Kubernetes 이름 규칙, POD_NAME), now는 닫는 시각이다.
-// 장부는 확인을 다시 하지 않는다: 사람이 확인했다는 기록이다. 목록을 늘리려면 이관 0007의 트리거도 다음 판에서 함께 다시 만든다.
+// D-91 관리자 닫기(closeRunByOperator)의 입력(D-93·D-96·D-97). checkedBy는 관리자가 확인한 방법(고정 목록 OPERATOR_CHECKS: 작업자
+// 파드를 바꿨다 하나), podName은 확인한 파드(바꾼 뒤의 작업자 파드)의 이름(Kubernetes 이름 규칙, POD_NAME), podStartedAt은 그 파드가
+// 뜬 시각(Unix epoch 밀리초, 클러스터의 시계), now는 닫는 시각(감독의 시계)이다. 장부는 확인과 파드의 시각을 다시 보지 못한다:
+// 사람·명령이 넘긴 값의 기록이다. 목록을 늘리려면 이관 0007의 트리거도 다음 판에서 함께 다시 만든다.
 export const OPERATOR_CHECKS = ["pod_replaced"] as const;
 export type OperatorCheck = (typeof OPERATOR_CHECKS)[number];
 export interface OperatorClosureInput {
   runId: string;
   checkedBy: OperatorCheck;
   podName: string;
+  podStartedAt: number;
   now: number;
 }
 
@@ -343,6 +346,7 @@ export interface OperatorClosure {
   fromState: LedgerRunState;
   checkedBy: OperatorCheck;
   podName: string;
+  podStartedAt: number;
   stopGeneration: number;
   closedAt: number;
 }
@@ -1406,15 +1410,18 @@ const UNRECEIVED_CLOSURE_FILE = "0006-unreceived-closure.sql";
 // 관리자 닫기(D-91)가 받는 앞 상태(작업자, 종료 확인 없음). 전이표의 두 줄(unknown_running·stopping → not_started)과 같다.
 // preparing·running은 믿는 임대가 있을 수 있어 받지 않는다: 끊김·답으로 unknown_running이 된 뒤 닫는다.
 const OPERATOR_CLOSABLE: readonly LedgerRunState[] = ["unknown_running", "stopping"];
-// 관리자 닫기를 받기 시작하는 때(그 실행의 task_start·run_renew 지시의 발행 시각 최댓값부터, 감독의 시계). 막는 것은 새로 뜬 파드의
-// 실행기가 감독이 다시 보낸 시작을 받아 띄우는 길이다: 시작을 다시 보내도 장부의 발행 시각을 그대로 싣고(resend.ts), 실행기는 띄우기
-// 직전에 자기 시계로 "지금 < 임대 끝"을 다시 본다(worker.ts의 launchBlocked). 임대 끝은 시작 지시의 발행 + RUN_LEASE_MAX_MS이고 띄우기
-// 전(preparing)에 받은 갱신이 그 갱신의 발행 + RUN_LEASE_MAX_MS까지 늘릴 수 있다(worker.ts의 onRenew, 계약의 parseRunRenew). 그래서
-// 실행기 시계로 발행 최댓값 + START_UNREACHABLE_MS부터 그 검사가 막힌다. 검사를 이미 지난 실행기가 프로세스를 만들기까지의 지연에는
-// 상한이 없다: 옛 실행기의 그 길은 관리자의 파드 교체(D-96)가 끊고, 이 값은 그 지연의 상한이 아니다(ledger.md "관리자가 실패로 닫기").
-// D-90(answer_too_early)은 같은 길이를 실행기 시계인 답의 시각과 바로 비교하지만, 여기서 아는 시각은 부르는 쪽이 넘긴 감독의 시각뿐이라
-// 실행기 시계가 뒤처질 수 있는 CLOCK_SKEW_MS를 더한다. D-90이 갱신을 보지 않는 것은 그 실행을 받은 적 없는 실행기에는 갱신이 닿아도
-// 늘릴 임대가 없어서다. 이관 0007의 트리거에 같은 값(31000)이 숫자로 있다(시험이 대조한다).
+// 관리자 닫기를 받기 시작하는 때(그 실행의 task_start·run_renew 지시의 발행 시각 최댓값부터). 닫는 시각(감독의 시계)과 새 작업자
+// 파드가 뜬 시각(클러스터의 시계, D-97)이 모두 이 값 뒤여야 한다. 막는 것은 새 파드의 실행기가 감독이 다시 보낸 시작을 받아 띄우는
+// 길이다: 시작을 다시 보내도 장부의 발행 시각을 그대로 싣고(resend.ts), 실행기는 봉투의 시한(발행 + MESSAGE_TTL_MAX_MS) 뒤로는 받지
+// 않으며 띄우기 직전에 자기 시계로 "지금 < 임대 끝"을 다시 본다(worker.ts의 launchBlocked). 임대 끝은 시작 지시의 발행 +
+// RUN_LEASE_MAX_MS이고 띄우기 전(preparing)에 받은 갱신이 그 갱신의 발행 + RUN_LEASE_MAX_MS까지 늘릴 수 있다(worker.ts의 onRenew,
+// 계약의 parseRunRenew). 그래서 실행기 시계로 발행 최댓값 + START_UNREACHABLE_MS부터 받기와 그 검사가 막힌다. 새 파드의 실행기는 파드가
+// 뜬 뒤에 시작하므로 그 시각이 이 값 뒤면 그 시작을 받지 못한다. 갱신은 그 실행을 이미 받은 실행기에만 뜻이 있어 새 파드에는
+// task_start만으로 족하지만, 같은 식을 써서 닫는 쪽으로만 틀린다. 검사를 이미 지난 옛 실행기가 프로세스를 만들기까지의 지연에는 상한이
+// 없다: 그 길은 관리자의 파드 교체(D-96)가 끊고, 이 값은 그 지연의 상한이 아니다(ledger.md "관리자가 실패로 닫기").
+// D-90(answer_too_early)은 같은 길이를 실행기 시계인 답의 시각과 바로 비교하지만, 여기서 아는 시각은 감독과 클러스터의 시각뿐이라
+// 실행기 시계가 뒤처질 수 있는 CLOCK_SKEW_MS를 더한다(홈랩은 한 머신이라 세 시계가 같다는 전제). D-90이 갱신을 보지 않는 것은 그 실행을
+// 받은 적 없는 실행기에는 갱신이 닿아도 늘릴 임대가 없어서다. 이관 0007의 트리거에 같은 값(31000)이 숫자로 두 번 있다(시험이 대조한다).
 const OPERATOR_CLOSE_AFTER_MS = START_UNREACHABLE_MS + limits.CLOCK_SKEW_MS;
 // 종료 확인 영수증이 적힌 뒤의 상태. 확정·정리의 정상 길이 있어 관리자 닫기를 받지 않는다(stop_confirmed).
 const STOP_CONFIRMED: readonly LedgerRunState[] = ["checking", "ready_result", "failed_stopped", "cleanup_pending"];
@@ -2684,32 +2691,37 @@ export class Ledger {
     });
   }
 
-  // D-91: 관리자가 작업자 파드를 바꾼 뒤(D-96의 확인 방법 하나와 확인한 파드의 이름) 종료가 확인되지 않은 작업자 실행을 "실패로 끝남"으로
-  // 닫아 그 실행이 쥔 자리를 놓는다. 상태는 not_started이고 근거 줄(operator_closures)이 관리자 닫기를 말한다. 본체가 보는 단계는 실패다(toToolRequest).
+  // D-91: 새 작업자 파드가 닫을 수 있게 되는 시각 뒤에 떴고 그 사실을 근거에 남긴 뒤에만(D-96의 확인 방법 하나, 확인한 파드의 이름과
+  // 뜬 시각, D-97) 종료가 확인되지 않은 작업자 실행을 "실패로 끝남"으로 닫아 그 실행이 쥔 자리를 놓는다. 상태는 not_started이고 근거 줄(operator_closures)이 관리자 닫기를 말한다. 본체가 보는 단계는 실패다(toToolRequest).
   // 작업자 자리를 실제로 쓸 수 있는지는 따로다: 같은 종류의 점유 관측(slot_holds)이 있으면 닫아도 자리는 막혀 있다(slotFree로 읽는다).
   // 장부는 파드가 바뀌었는지 확인하지 못한다. 받는 것은 작업자의 unknown_running·stopping(종료 확인 없음)뿐이고, D-90이 좁혀 닫지 않는
   // 실행(다른 열기의 표식, 사본 안·경계 모름, 판 이전의 시작, 예산 감액)도 이 상태면 받는다: 영수증·관측·표식·사본은 보지 않는다.
   // 접수 영수증이 없는 실행, D-90이 닫을 수 있는 실행도 받는다(D-94). 관리자가 닫으면 늘 실패이고 예산은 시작한 줄로 세므로, 두 닫기
   // 가운데 먼저 된 쪽에 따라 본체가 보는 단계와 같은 입력의 다음 배정이 다르다.
-  // 그 실행의 task_start 지시가 없거나, 그 실행의 task_start·run_renew 지시의 발행 최댓값 + OPERATOR_CLOSE_AFTER_MS 전이면 닫지 않는다.
-  // 장부는 사람이 언제 확인했는지 모르고 now만 본다: 이 시각 전에 한 확인을 이 시각 뒤에 넘겨도 장부는 가르지 못한다(부르는 쪽이 지킬 조건).
+  // 그 실행의 task_start 지시가 없거나 session_start 지시가 있거나(작업자의 정상 이력에는 없다: startRun은 task_start만 적고 startSession은
+  // 지시를 적지 않는다), now가 그 실행의 task_start·run_renew 지시의 발행 최댓값 + OPERATOR_CLOSE_AFTER_MS 전이면 닫지 않는다
+  // (start_may_launch: 기다린다). podStartedAt이 같은 한도 전이면 pod_started_too_early다(새 파드가 그 시작을 받을 수 있었다: 파드를
+  // 한 번 더 바꾼다). 장부는 사람이 언제 확인했는지, 넘긴 파드의 시각이 맞는지 모른다(부르는 쪽이 지킬 조건).
   // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 작업자(run_not_worker) → 끝 상태 아님(run_ended) →
   // 종료 확인 없음(stop_confirmed) → unknown_running·stopping(transition_denied) → 정지 기록 있음(stop_unknown) →
-  // task_start 지시가 있고 닫을 수 있게 되는 시각이 지남(start_may_launch).
-  // 확인 방법·파드 이름이 꼴 밖이면 트랜잭션을 열기 전에 LedgerInputError다(아무것도 쓰지 않는다).
+  // task_start 지시가 있고 session_start 지시가 없으며 닫을 수 있게 되는 시각이 지남(start_may_launch) → 파드가 그 시각 뒤에 뜸
+  // (pod_started_too_early).
+  // 확인 방법·파드 이름·파드의 시각이 꼴 밖이거나 파드의 시각이 now보다 늦으면 트랜잭션을 열기 전에 LedgerInputError다(아무것도 쓰지 않는다).
   // 쓰기 모드 new(풀기 releaseStop과 같은 묶음): 장부가 한 번이라도 실패했으면 거절하고, 사본 보류·정지·접수 닫힘은 막지 않는다.
   // 관리자는 사본을 대조하는 주체이고, 닫기는 새 일을 열지 않고 자리만 푼다(시작은 여전히 시작의 전제를 지난다).
   // 근거 줄을 넣는 문장 하나가 실행 줄을 not_started로 닫고 그 실행의 미반영 보고를 반영하지 않고 마친다(이관 0007의
   // operator_closures_close_run, applied_at = 닫은 시각: 닫힌 뒤에 처음 온 보고를 받은 자리에서 마치는 것(recordReport)과 같은 끝이다).
-  // 그 INSERT 트리거가 행으로 볼 수 있는 조건(앞 상태, 종료 확인 없음, 이름, 정지 세대, 시작 지시, 닫을 수 있게 되는 시각)을 다시 본다.
+  // 그 INSERT 트리거가 행으로 볼 수 있는 조건(앞 상태, 종료 확인 없음, 이름, 정지 세대, 시작 지시, 두 시각과 그 순서)을 다시 본다.
   closeRunByOperator(input: OperatorClosureInput): { ok: true; run: Run; closure: OperatorClosure } | Refused {
-    const v = exact(input, ["runId", "checkedBy", "podName", "now"], "closeRunByOperator");
+    const v = exact(input, ["runId", "checkedBy", "podName", "podStartedAt", "now"], "closeRunByOperator");
     const runId = str(v.runId, UUID, "runId");
     if (!(OPERATOR_CHECKS as readonly unknown[]).includes(v.checkedBy)) throw new LedgerInputError("checkedBy: 확인 방법의 목록 밖이다");
     const checkedBy = v.checkedBy as OperatorCheck;
     if (typeof v.podName !== "string" || v.podName.length > POD_NAME_MAX || !POD_NAME.test(v.podName)) throw new LedgerInputError("podName: Kubernetes 이름 규칙 밖이다");
     const podName = v.podName;
+    const podStartedAt = time(v.podStartedAt, "podStartedAt");
     const now = time(v.now, "now");
+    if (podStartedAt > now) throw new LedgerInputError("podStartedAt: 닫는 시각보다 늦다");
     return this.#write("operator_closure", "new", () => {
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
@@ -2721,17 +2733,23 @@ export class Ledger {
       if (!this.#operatorClosures) throw new Refuse("transition_denied");
       const stop = this.#stopRow();
       if (stop === null) throw new Refuse("stop_unknown");
-      // task_start가 없는 실행은 시간의 근거가 없다: 갱신·세션 시작 한 줄만으로 한도를 정하지 않는다.
-      const started = this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'task_start' LIMIT 1").get(runId);
-      if (started === null) throw new Refuse("start_may_launch");
+      // task_start가 없는 실행은 시간의 근거가 없다: 갱신·세션 시작 한 줄만으로 한도를 정하지 않는다. session_start가 섞인 실행은
+      // 그 시작이 언제까지 띄울 수 있는지 아래 식이 세지 않아 닫지 않는다.
+      const starts = this.#db
+        .query("SELECT count(*) FILTER (WHERE action = 'task_start') AS task, count(*) FILTER (WHERE action = 'session_start') AS session FROM instructions WHERE run_id = ?")
+        .get(runId) as { task: number; session: number };
+      if (starts.task === 0 || starts.session !== 0) throw new Refuse("start_may_launch");
       const issued = this.#db.query("SELECT MAX(issued_at) AS at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'run_renew')").get(runId) as {
         at: number | null;
       };
-      if (issued.at === null || now < safe(issued.at, "instructions.issued_at") + OPERATOR_CLOSE_AFTER_MS) throw new Refuse("start_may_launch");
+      if (issued.at === null) throw new Refuse("start_may_launch");
+      const closableAt = safe(issued.at, "instructions.issued_at") + OPERATOR_CLOSE_AFTER_MS;
+      if (now < closableAt) throw new Refuse("start_may_launch");
+      if (podStartedAt < closableAt) throw new Refuse("pod_started_too_early");
       this.#db
-        .query("INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, stop_generation, closed_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(runId, row.state, checkedBy, podName, stop.generation, now);
-      const closure: OperatorClosure = { runId, fromState: row.state, checkedBy, podName, stopGeneration: stop.generation, closedAt: now };
+        .query("INSERT INTO operator_closures (run_id, from_state, checked_by, pod_name, pod_started_at, stop_generation, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(runId, row.state, checkedBy, podName, podStartedAt, stop.generation, now);
+      const closure: OperatorClosure = { runId, fromState: row.state, checkedBy, podName, podStartedAt, stopGeneration: stop.generation, closedAt: now };
       return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow), closure };
     });
   }
@@ -2740,11 +2758,14 @@ export class Ledger {
   operatorClosure(runId: string): Read<OperatorClosure | null> {
     return this.#read(() => {
       if (!this.#operatorClosures) return null;
-      const row = this.#db.query("SELECT run_id, from_state, checked_by, pod_name, stop_generation, closed_at FROM operator_closures WHERE run_id = ?").get(runId) as {
+      const row = this.#db
+        .query("SELECT run_id, from_state, checked_by, pod_name, pod_started_at, stop_generation, closed_at FROM operator_closures WHERE run_id = ?")
+        .get(runId) as {
         run_id: string;
         from_state: string;
         checked_by: string;
         pod_name: string;
+        pod_started_at: number;
         stop_generation: number;
         closed_at: number;
       } | null;
@@ -2757,6 +2778,7 @@ export class Ledger {
         fromState: row.from_state as LedgerRunState,
         checkedBy: row.checked_by as OperatorCheck,
         podName: row.pod_name,
+        podStartedAt: safe(row.pod_started_at, "operator_closures.pod_started_at"),
         stopGeneration: safe(row.stop_generation, "operator_closures.stop_generation"),
         closedAt: safe(row.closed_at, "operator_closures.closed_at"),
       };

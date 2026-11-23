@@ -516,7 +516,7 @@ test("관리자가 닫은 줄의 잔액은 같은 입력의 다음 실행의 상
     if (c.reduced !== null) must(ledger.recordBudget({ runId: first.runId, budgetLeft: c.reduced, now: NOW }));
     if (c.by === "operator") {
       must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
-      must(ledger.closeRunByOperator({ runId: first.runId, checkedBy: "pod_replaced", podName: "worker-a-0", now: NOW + 31_000 }));
+      must(ledger.closeRunByOperator({ runId: first.runId, checkedBy: "pod_replaced", podName: "worker-a-0", podStartedAt: NOW + 31_000, now: NOW + 31_000 }));
     } else {
       must(ledger.closeUnreceivedRun({ runId: first.runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_001, now: NOW + 30_002 }, { sender: WORKER_EXECUTOR }));
     }
