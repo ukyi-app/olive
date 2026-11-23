@@ -412,7 +412,7 @@ async function tickOnce(ports: ResendPorts, ledger: ResendLedger, policy: Resend
       outcomes.push(await resendOne(ctx, entry.item, trace));
     } catch {
       // 항목 안에서 포트 묶음의 속성(ledger·intake·links)을 읽다 던지면 여기로 온다.
-      // 장부에 쓰지 않으므로 멈춰도 잃는 기록은 없다. 실렸을 수 있는 항목만 그 사실로 남긴다.
+      // 실행 줄과 미응답 지시 줄을 바꾸지 않으므로(시작의 재전송은 송신 표식을 쓴다) 멈춰도 잃는 기록은 없다. 실렸을 수 있는 항목만 그 사실로 남긴다.
       if (trace.fallback !== null) outcomes.push(trace.fallback());
       return { kind: "ran", instructions: outcomes, halted: "threw", haltedAt: entry.item.requestId };
     }

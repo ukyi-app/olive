@@ -126,7 +126,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 | `no_connection`, `too_late_to_send` | `not_sent` |
 | `send_threw`, `send_answer_malformed` | `unknown`: 포트가 연결에 실었는지 모른다 |
 
-`start_unmarked`·`sink_unavailable`·봉투를 만들지 못한 실패는 포트를 부르지 않았으므로 실리지 않은 것이 확실하다. 실제 장부를 표식 포트로 쓰면 이 결과에 표식이 없고, 주입한 표식 포트가 커밋한 뒤 던지면 표식 한 줄이 남은 `start_unmarked`(`threw`)다(닫기를 덜 하는 쪽). 장부에 적힌 시작은 그대로 답을 기다리는 지시로 남고, 재전송 박자가 같은 요청으로 다시 표식을 적고 싣는다. 표식 뒤에 싣지 못한 길(`no_connection`·`too_late_to_send`·`delivery: "unknown"`, 포트 호출 전의 프로세스 죽음)은 `send-gate.md` "표식 뒤에 싣지 않고 돌아가는 길"이다. 이 박자에는 시계 포트가 없어 표식과 송신 사이에 시계를 다시 읽지 않는다.
+`start_unmarked`·`sink_unavailable`·봉투를 만들지 못한 실패는 포트를 부르지 않았으므로 실리지 않은 것이 확실하다. 실제 장부를 표식 포트로 쓰면 이번 배정 시도가 새 표식을 쓰지 않았고(앞선 시도나 재전송이 같은 시작의 표식을 이미 썼을 수 있다), 주입한 표식 포트가 커밋한 뒤 던지면 표식 한 줄이 남은 `start_unmarked`(`threw`)다(닫기를 덜 하는 쪽). 장부에 적힌 시작은 그대로 답을 기다리는 지시로 남고, 재전송 박자가 같은 요청으로 다시 표식을 적고 싣는다. 표식 뒤에 싣지 못한 길(`no_connection`·`too_late_to_send`·`delivery: "unknown"`, 포트 호출 전의 프로세스 죽음)은 `send-gate.md` "표식 뒤에 싣지 않고 돌아가는 길"이다. 이 박자에는 시계 포트가 없어 표식과 송신 사이에 시계를 다시 읽지 않는다.
 
 `requestId`, `runId`, `stopGeneration`, `issuedAt`(장부의 답에서 읽지 못했으면 `null`), `executorId`를 싣는다. 이 값은 처음 지시를 가리키는 식별값이고, 본문을 다시 만들 재료는 아니다. 본문(예산 등)은 장부의 실행 줄에서 오므로 그 뒤 장부가 바뀌면 같은 식별값으로 다시 만든 본문이 처음과 다를 수 있다. 결과에는 본문이나 자격 참조를 싣지 않는다.
 

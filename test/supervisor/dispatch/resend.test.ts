@@ -820,6 +820,26 @@ describe("송신 표식: 재전송의 시작도 표식이 ok인 뒤에만 내보
       expect([label, w.log, w.sent.length]).toEqual([label, ["seal"], 0]);
       expect([label, Object.values(reads).every((n) => n <= 1)]).toEqual([label, true]);
       expect([label, marks(w)]).toEqual([label, []]);
+      // 같은 답을 내는 세계에서 시작 뒤에 구별되는 다음 항목(꼴이 틀린 실행 세대)을 붙인다. 작업자 자리를 더 쓰지 않고
+      // 박자가 첫 항목 뒤에도 이어 가는지를 결과 둘과 그 순서로 본다.
+      const v = world();
+      const t = started(v);
+      const tail = id();
+      v.wrapRead((real) => {
+        const value = (real() as { value: UnansweredInstructions }).value;
+        return { known: true, value: { ...value, instructions: [...value.instructions, { ...value.instructions[0], requestId: tail, runGeneration: 0 }] } };
+      });
+      v.wrapMark(() => answerOf(fields, {}));
+      v.setClock(NOW + 6_000);
+      const next = ran(await tick(v));
+      expect([label, next.instructions]).toEqual([
+        label,
+        [
+          { requestId: t.requestId, runId: t.runId, action: "task_start", outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId: t.run.executorId, sealedAt: NOW + 6_000, markReason },
+          { requestId: tail, outcome: "malformed", field: "runGeneration" },
+        ],
+      ]);
+      expect([label, next.halted, next.haltedAt, v.sent.length]).toEqual([label, null, null, 0]);
     }
   });
 
