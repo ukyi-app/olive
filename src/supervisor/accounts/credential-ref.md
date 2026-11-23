@@ -80,6 +80,24 @@ homelab 차트(`platform/olive/templates/supervisor-deployment.yaml`, `superviso
 - `maxBytes`: 계약·설계에 자격 값의 상한이 없다. 부르는 쪽이 정한다. 기본값을 두지 않는다.
 - `keys`: 방식마다 차트의 키 이름. 차트 값이 바뀔 수 있어 박지 않는다.
 
+## 값 빌려주기 (`borrowCredentialValue`)
+
+```ts
+borrowCredentialValue(files, policy, ref: { account, method, digest }): Promise<CredentialBorrow>
+CredentialBorrow = { ok: true, value: Uint8Array } | { ok: false, reason: CredentialBorrowRefusal }
+CREDENTIAL_BORROW_REFUSALS  // 거절 사유 열셋
+```
+
+값을 보내는 쪽(`dispatch/credential-send.ts`)이 실행 줄의 참조로 그 계정의 자격 파일을 다시 읽는 함수다. 아래 "뒤 조각이 지켜야 할 것"의 "다시 읽을 때는 파일의 소속과 지문을 모두 확인한다"를 이 함수가 맡는다.
+
+- **소속은 참조를 만들 때와 같은 규칙으로 본다.** 같은 `CredentialFiles` 포트에 `{ dir: policy.dir, account, key: policy.keys[method] }`를 넘긴다. 실제 포트(`nodeCredentialFiles`)의 계정 폴더 규칙과 그 한계(위 "계정 폴더의 배치")가 그대로 걸린다.
+- **지문이 같을 때만 빌려준다.** 읽은 바이트 그대로의 SHA-256(소문자 16진)이 `ref.digest`와 같아야 `ok`다. 다르면 `digest_mismatch`다. revision은 대조하지 않는다(실행기는 지문으로만 대조한다).
+- **상한은 정책의 `maxBytes`이고, 그 값이 `CREDENTIAL_MAX_BYTES`(16,384, `src/transport/framing.ts`)보다 크면 읽지 않는다**(`limit_above_frame`). 틀로 만들 수 없는 크기까지 메모리에 올리지 않는다. 포트가 상한을 어긴 바이트도 `too_large`다.
+- **빌려준 바이트의 소유는 부른 쪽이다.** `ok`의 `value`는 포트가 준 버퍼 그대로이고(사본이 없다) 부른 쪽이 다 쓴 뒤 0으로 채운다. 포트는 넘긴 버퍼를 부른 쪽이 다 쓰기 전에 옮기거나(transfer) 다시 쓰지 않는다. 빌려주지 않은 모든 길(빈 값, 상한 초과, 지문 불일치)에서는 이 함수가 돌아오기 전에 그 버퍼를 0으로 채운다.
+- **포트 때문에 던지지 않는다.** 포트의 `read`가 던지거나 그 답의 `kind`·`bytes`를 읽다 던지면 `read_failed`이고 예외의 문구를 싣지 않는다. 답의 칸은 한 번씩 꺼낸다. 결과에는 이름만 있다. `ref`와 `policy`는 부른 쪽이 만든 평범한 값이어야 한다.
+
+거절 사유는 `resolveCredentialRef`와 같은 이름(`policy_invalid`, `account_malformed`, `method_unknown`, `method_not_configured`, `missing`, `not_a_file`, `outside_account`, `read_failed`, `empty`, `too_large`)에 셋을 더한다: `limit_above_frame`, `digest_malformed`(참조의 지문이 소문자 16진 64자가 아님, 읽지 않는다), `digest_mismatch`. `revision_unknown`은 없다(`revisionOf`를 부르지 않는다).
+
 ## 이 PR에 없는 것
 
 - 값을 실행기에 나르는 일(계약 v1에 값을 나르는 메시지가 없다, `v1.md` "credential"). 실행기의 `CredentialSource` 구현.
