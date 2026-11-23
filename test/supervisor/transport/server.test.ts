@@ -1683,6 +1683,35 @@ describe("(5) 인정된 연결에 틀 하나를 쓴다(recognized, writeFrame)",
     expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment" }]);
   });
 
+  test("재확인의 마지막 게시 조회가 서버를 닫고 같은 복원기를 돌려주면 finalCheck와 그 시계를 부르지 않고 closed다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const handedA = handedTo(serverSocket(h, a));
+    let reads = 0;
+    let closing: Promise<void> | null = null;
+    // 처음 읽기는 writeFrame의 인정, 두 번째가 재확인의 마지막 게시 조회다. 그 안에서 닫고 같은 객체를 돌려준다.
+    h.onRestorer = () => {
+      reads++;
+      if (reads === 2) closing = h.server.close();
+    };
+    let finals = 0;
+    let clocks = 0;
+    const ends: string[] = [];
+    const result = h.server.writeFrame(a.id, R1, frame({ n: 1 }), {
+      lastCheck: () => null,
+      finalCheck: () => {
+        finals++;
+        clocks++;
+        return null;
+      },
+      settled: (end) => void ends.push(end),
+    });
+    h.onRestorer = () => {};
+    await closing;
+    const closed = result.kind === "not_written" && result.reason === "closed";
+    expect(reads === 2 && closing !== null && finals === 0 && clocks === 0 && closed && handedA.length === 0 && ends.length === 0).toBe(true);
+  });
+
   test("넘긴 틀의 끝은 정확히 한 번이다: 완료 오류, 완료 전의 닫힘(상대, 등록표, 서버 종료), 닫힌 뒤 늦게 온 완료", async () => {
     const h = await start();
 

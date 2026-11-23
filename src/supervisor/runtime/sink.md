@@ -69,9 +69,9 @@
 | `not_written`: `refused` + 그 밖의 이름 | `"no_connection"` | `no_connection` | `SINK_REFUSALS`의 그 이름 |
 | `unknown` | 약속 거절. 배정·재전송·수명 박자는 `reason: "send_threw"`, `delivery: "unknown"`으로 적는다. 취소 박자는 `outcome: "delivery_unknown"`, `reason: "send_threw"`를 관측하고 `delivery` 칸이 없다(`dispatch/cancel.ts`). 어느 쪽도 미송신으로 적지 않는다 | `unknown` | `write_unknown` |
 | `recognized`·등록부·`writeFrame`이 던짐, 꼴이 아닌 결과 | 약속 거절(위 칸과 같이 적힌다) | `unknown` | `port_threw`·`result_malformed` |
-
-꼴이 아닌 결과는 서버의 결과 타입(`transport/server.ts`의 `WriteFrameResult`)에 없는 답이다: 모르는 `kind`, `not_written`인데 사유가 없거나 `NOT_WRITTEN_REASONS`에 없는 사유, `refusal` 문자열이 없는 `refused`. "넘긴 바이트 0"은 서버가 그 꼴로 답했을 때만 믿는다. 꼴이 아닌 답을 `no_connection`으로 옮기면 박자가 확정 미송신으로 적고 다음 박자에 같은 요청 ID로 다시 낸다.
 | 서버까지 가지 않음(`UNSENDABLE`) | 약속 거절 | `unsendable` | 그 이름 |
+
+꼴이 아닌 결과는 서버의 결과 타입(`transport/server.ts`의 `WriteFrameResult`)에 없는 답이다: 객체가 아닌 값(`null`·`undefined` 포함), 모르는 `kind`, `not_written`인데 사유가 없거나 `NOT_WRITTEN_REASONS`에 없는 사유, `refusal` 문자열이 없는 `refused`. "넘긴 바이트 0"은 서버가 그 꼴로 답했을 때만 믿는다. 꼴이 아닌 답을 `no_connection`으로 옮기면 박자가 확정 미송신으로 적는다. 다음 박자는 그 항목을 다시 판단해 여전히 발급할 수 있을 때만 같은 요청 ID로 다시 봉한다(아래 "정한 것" 1).
 
 ## 정한 것
 
@@ -107,7 +107,7 @@
 ## 남는 한계
 
 - **끊긴 줄 모르는 연결에도 지시가 나갈 수 있다.** 상대가 FIN·RST 없이 사라진 연결은 서버가 닫을 때까지 인정되므로 연결 문은 `connected`, 포트는 `sent`다. 그 지시는 실행기에 닿지 않는다. 지시마다 다루는 길이 다르다.
-  - **받은 적 없는 작업자 시작**만 "받은 적 없음" 규칙(D-90)의 대상이다. 감독은 재전송 한도까지 같은 요청 ID로 다시 보내고, 한도가 지나면 재전송 박자는 `start_expired`를 낸다. 그것만으로 자리를 풀지 않는다: 접수 영수증이 한 번도 없었고 그 뒤 전체 점유 답에도 그 실행이 없어야 D-90이 닫는다(`dispatch/resend.md` "뒤 조각이 지킬 것", `ledger/ledger.md` "D-90").
+  - **받은 적 없는 작업자 시작**만 "받은 적 없음" 규칙(D-90)의 대상이다. 감독은 재전송 한도까지 같은 요청 ID로 다시 보내고, 한도가 지나면 재전송 박자는 `start_expired`를 낸다. 그것만으로 자리를 풀지 않는다: 접수 영수증이 한 번도 없었고, 실행기가 시작 봉투의 만료 시각(시작 발행 + 30,000ms) 이후에 만든 전체 점유 답에도 그 실행이 없어야 D-90이 닫는다(재전송 한도인 발행 + 19,000ms와 만료 사이에 만든 답은 장부가 `answer_too_early`로 거절한다)(`dispatch/resend.md` "뒤 조각이 지킬 것", `ledger/ledger.md` "D-90").
   - **그 밖의 지시(갱신·조회·취소·확정)**는 D-90으로 다루지 않는다. 재전송 박자가 다시 내는 취소·확정은 발급할 수 있는 동안 같은 요청 ID로 다시 낸다. 진행 중인 실행의 갱신이 유실되면 수명 박자가 임대의 끝과 여유를 보고 상태 조회로 옮긴다(`scheduler/lifecycle.ts`의 판정).
   - 반쯤 열린 연결의 감지는 뒤 조각이다(`server.md` "이 모듈에 없는 것"). FIN·RST가 없는 실제 유실을 재현한 시험은 없다.
 - **막힌 이유가 박자 결과에는 "연결 없음"으로 보인다.** 정지·접수 닫힘·맡기지 않을 실행기·시계 모름도 박자에는 `no_connection`이고 실제 이름은 기록에만 있다.

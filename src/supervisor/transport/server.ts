@@ -576,7 +576,8 @@ class Server implements ConnectionServer {
       // 가드 안에서 본다(recognizedBy·restorer는 던지지 않는다).
       if (verdict === null && !link.dead) kept = this.recognizedBy(principal, source) === connection && this.restorer() === source;
       // 쓰기로 정한 뒤의 마지막 외부 코드다. lastCheck와 재확인에 걸린 시간이 이 안에서 읽는 시각에 든다. 그 뒤 write까지는 서버 자기 기록만 본다.
-      if (kept && finalCheck !== undefined) timing = finalCheck();
+      // 게시 조회가 서버를 다시 불러 이 연결을 닫고 같은 객체를 돌려줄 수 있어 kept만으로는 열린 연결인지 모른다.
+      if (kept && !link.dead && finalCheck !== undefined) timing = finalCheck();
     } catch {
       return { kind: "not_written", reason: "check_failed" };
     } finally {

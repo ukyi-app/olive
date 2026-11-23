@@ -193,7 +193,8 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
       }
       // 넘긴 바이트 0이라는 답은 서버의 결과 타입이 허락한 꼴일 때만 믿는다. 사유가 없거나 모르는 사유, refusal이 없는 refused는
       // 서버가 무엇을 했는지 모르는 답이라 송달 모름으로 둔다(no_connection으로 옮기면 박자가 확정 미송신으로 적는다).
-      const reason = (result as { reason?: unknown }).reason;
+      // 객체가 아닌 답(null 등)에서 .reason을 읽으면 던져 port_threw로 잘못 적히므로 not_written 객체에서만 읽는다.
+      const reason = kind === "not_written" ? (result as { reason?: unknown }).reason : undefined;
       const wellFormed = kind === "not_written" && SERVER_REASONS.includes(reason) && (reason !== "refused" || typeof (result as { refusal?: unknown }).refusal === "string");
       if (!wellFormed) {
         note({ kind: "delivery_unknown", ...named, reason: "result_malformed" });

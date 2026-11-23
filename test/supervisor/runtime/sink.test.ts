@@ -718,6 +718,32 @@ describe("옮김 표: writeFrame의 결과 → SendOutcome(그리고 기록의 �
     }
   });
 
+  test("writeFrame이 던지지 않고 객체 아닌 값(null, undefined, 숫자)을 돌려주면 꼴 아닌 결과(result_malformed)이고 송달 모름이다", async () => {
+    for (const answer of [null, undefined, 3]) {
+      const notes: SinkNote[] = [];
+      const book: unknown[] = [];
+      const wire = createWireSink({
+        server: { recognized: () => CONNECTION, writeFrame: () => answer as never },
+        restorer: () => ({ stopGeneration: () => GEN, intakeOpen: () => true }),
+        withheld: { executors: () => ({ known: true, value: [] }) },
+        clock: { now: () => T0 },
+        queries: {
+          add: (q) => void book.push(q),
+          remove: (q) => {
+            const at = book.indexOf(q);
+            if (at >= 0) book.splice(at, 1);
+          },
+        },
+        observe: (note) => notes.push(note),
+      });
+      const started = await wire.sink.send(start(T0 + 600_000, { request_id: FIXED_ID })).then(() => false, () => true);
+      const asked = await wire.sink.send(query()).then(() => false, () => true);
+      const acked = wire.writeAck(CONNECTION, ack());
+      const malformed = notes.length === 3 && notes.every((n) => n.kind === "delivery_unknown" && n.reason === "result_malformed");
+      expect(started && asked && acked === "unknown" && book.length === 0 && malformed).toBe(true);
+    }
+  });
+
   test("recognized가 던지면 writeFrame을 부르지 않고 약속을 거절한다(port_threw)", async () => {
     const h = harness();
     const wire = createWireSink({
