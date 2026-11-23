@@ -890,12 +890,12 @@ test("D-97 원 SQL: 파드가 뜬 시각의 NULL·빈 값·소수·범위·한�
     for (const [label, closedAt, pod] of refused) {
       expect(() => rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, closedAt, pod), `${mode} ${label}`).toThrow("operator_closure_unproven");
     }
-    // 정수로 바꿀 수 없는 값(빈 문자열, 소수)은 STRICT 표의 형 검사가 트리거보다 먼저, OR IGNORE에서도 예외로 막는다.
+    // 정수가 아닌 값(빈 문자열, 소수)은 ANY 칸이 형을 그대로 넘겨 트리거가 OR IGNORE에서도 예외로 막는다.
     for (const [pod, kind] of [
       ["", "TEXT"],
       [CLOSABLE_AT + 0.5, "REAL"],
     ] as const) {
-      expect(() => rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, LATER, pod), `${mode} ${kind}`).toThrow(`cannot store ${kind} value in INTEGER column operator_closures.pod_started_at`);
+      expect(() => rawChanges(made.path, RAW_OPERATOR_POD.replace("INSERT", mode), made.runId, "unknown_running", "pod_replaced", POD, 0, LATER, pod), `${mode} ${kind}`).toThrow("operator_closure_unproven");
     }
     // 범위 위(안전 정수 + 1): 트리거를 지나 칸의 CHECK가 막고, OR IGNORE는 예외 없이 0줄이다(닫힌 것은 없다).
     for (const pod of [LATER, MAX + 1]) {
@@ -917,6 +917,77 @@ test("D-97 원 SQL: 파드가 뜬 시각의 NULL·빈 값·소수·범위·한�
       expect(rows(made.path, "SELECT r.state, o.pod_started_at, o.closed_at FROM runs r JOIN operator_closures o ON o.run_id = r.run_id")).toEqual([{ state: "not_started", pod_started_at: pod, closed_at: closedAt }]);
     }
   }
+});
+
+test("원 SQL: 근거의 정수 칸 셋(pod_started_at·stop_generation·closed_at)은 들어온 형을 바꾸지 않아, 소수·정수 꼴·지수·공백의 TEXT와 REAL은 세 INSERT 방식 모두 트리거가 거절하고 정수만 정수로 남는다", () => {
+  const MAX = 9007199254740991;
+  const valid = { pod_started_at: CLOSABLE_AT, stop_generation: 0, closed_at: LATER };
+  type Column = keyof typeof valid;
+  type Value = number | string | { real: number };
+  // 정수가 아닌 형의 값. INTEGER 칸이면 SQLite가 정수로 바꾼(반올림한) 뒤의 값을 트리거가 봤을 것들이다.
+  // { real }은 정수와 같은 값의 REAL이다(JS 숫자로 넘기면 정수로 묶이므로 SQL에서 CAST로 만든다).
+  const shapes = (v: number): [string, Value][] => [
+    ["소수점 TEXT", `${v}.0`],
+    ["정수 꼴 TEXT", String(v)],
+    ["지수 TEXT", v.toExponential()],
+    ["앞뒤 공백 TEXT", ` ${v} `],
+    ["소수 REAL", v + 0.5],
+    ["정수 값 REAL", { real: v }],
+  ];
+  const cases: [string, Partial<Record<Column, Value>>][] = [
+    // 한도보다 0.0001ms 이른 파드: INTEGER 칸이면 한도 정각으로 반올림되어 닫힌다.
+    ["파드 한도 0.0001ms 전 TEXT", { pod_started_at: `${CLOSABLE_AT - 1}.9999` }],
+    // 범위 끝과 닫은 시각을 넘는 파드: INTEGER 칸이면 범위 끝 정수로 바뀌어 닫힌다.
+    ["파드 범위 위 TEXT, 닫은 시각 범위 끝", { pod_started_at: "9007199254740991.1", closed_at: MAX }],
+    ...(Object.keys(valid) as Column[]).flatMap((column) => shapes(valid[column]).map(([label, value]): [string, Partial<Record<Column, Value>>] => [`${column} ${label}`, { [column]: value }])),
+  ];
+  const fresh = () => {
+    const p = tempPath();
+    const l = ready(open(p));
+    const s = lostAfterStart(l);
+    l.close();
+    return { path: p, runId: s.runId };
+  };
+  const insert = (mode: string, path: string, runId: string, values: Partial<Record<Column, Value>>) => {
+    const row = { ...valid, ...values };
+    const columns = Object.keys(valid) as Column[];
+    const slots = columns.map((column) => (typeof row[column] === "object" ? "CAST(? AS REAL)" : "?"));
+    const params = columns.map((column) => {
+      const value = row[column];
+      return typeof value === "object" ? value.real : value;
+    });
+    return rawChanges(path, `${mode} INTO operator_closures (run_id, from_state, checked_by, pod_name, ${columns.join(", ")}) VALUES (?, 'unknown_running', 'pod_replaced', ?, ${slots.join(", ")})`, runId, POD, ...params);
+  };
+  for (const mode of INSERT_MODES) {
+    const made = fresh();
+    for (const [label, values] of cases) {
+      expect(() => insert(mode, made.path, made.runId, values), `${mode} ${label}`).toThrow("operator_closure_unproven");
+      expect(stateAndClosures(made.path, made.runId), `${mode} ${label}`).toEqual([{ state: "unknown_running", n: 0 }]);
+    }
+    const reopened = ready(open(made.path));
+    expect(run(reopened, made.runId).state, mode).toBe("unknown_running");
+    expect(reopened.operatorClosure(made.runId), mode).toEqual({ known: true, value: null });
+    expect(slotFree(reopened), mode).toBe(false);
+    reopened.close();
+  }
+  // 정수는 그대로 받아 정수로 남는다.
+  for (const mode of INSERT_MODES) {
+    const made = fresh();
+    expect(insert(mode, made.path, made.runId, {}), mode).toBe(1);
+    expect(rows(made.path, "SELECT r.state, typeof(o.pod_started_at) AS p, typeof(o.stop_generation) AS g, typeof(o.closed_at) AS c, o.pod_started_at, o.stop_generation, o.closed_at FROM runs r JOIN operator_closures o ON o.run_id = r.run_id"), mode).toEqual([
+      { state: "not_started", p: "integer", g: "integer", c: "integer", ...valid },
+    ]);
+  }
+  // 칸의 선언만으로도 정수만 받는다: 이 장부 사본에서 BEFORE 트리거를 지우면 정수 꼴 TEXT와 정수 값 REAL은 칸의 CHECK가 막는다
+  // (정수 값 REAL은 범위 비교만으로는 지난다).
+  const bare = fresh();
+  rawWrite(bare.path, "DROP TRIGGER operator_closures_proven");
+  for (const column of Object.keys(valid) as Column[]) {
+    for (const value of [{ real: valid[column] }, String(valid[column])]) {
+      expect(() => insert("INSERT", bare.path, bare.runId, { [column]: value }), `${column} ${JSON.stringify(value)}`).toThrow(`CHECK constraint failed: typeof(${column}) = 'integer'`);
+    }
+  }
+  expect(stateAndClosures(bare.path, bare.runId)).toEqual([{ state: "unknown_running", n: 0 }]);
 });
 
 test("작업자 실행에 session_start 지시가 섞인 이력은 시각과 상관없이 닫지 않는다(원 SQL 세 INSERT 방식과 연산)", () => {

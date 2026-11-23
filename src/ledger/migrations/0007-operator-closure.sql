@@ -21,11 +21,17 @@
 -- "(조건) IS NOT 1"·"(조건) IS NOT 0"으로 쓴다: 조건에 NULL이 섞이면 결과가 NULL이고 NULL IS NOT 1·NULL IS NOT 0은 참이라 막는 쪽으로
 -- 간다("NOT IN"·"NOT BETWEEN"은 NULL에서 막지 않는다). 다른 표와의 대조는 "NOT EXISTS(= 로 맞는 줄)"로 쓴다: 어느 쪽이 NULL이거나
 -- 줄이 없으면 맞는 줄이 없어 막는다("A IS NOT B"는 두 쪽이 모두 NULL이면 거짓이라 통과하므로 대조에 쓰지 않는다).
--- 정수로 바꿀 수 없는 값(빈 문자열 같은 TEXT, 소수 REAL)은 STRICT 표의 형 검사가 트리거보다 먼저 세 INSERT 방식 모두 예외로 막는다
--- (이 저장소의 Bun 1.4.4가 묶은 SQLite 3.53.4에서 돌려 본 것).
--- 트리거가 보지 않는 칸의 범위: closed_at이 9007199254740991 위이면(pod_started_at은 closed_at 이하여야 트리거를 지나므로 그때만
--- pod_started_at도 그 위일 수 있다) 트리거를 지나 칸의 CHECK가 막고, INSERT OR IGNORE면 예외 없이 0줄이다(닫힌 것은 없다). 원 SQL
--- 호출자는 예외만이 아니라 변경 수를 본다.
+-- 정수 칸의 형: 트리거가 비교·대조에 쓰는 세 칸(pod_started_at, stop_generation, closed_at)은 ANY로 받아 들어온 값의 형을 바꾸지
+-- 않고, 트리거가 셋 모두 typeof가 'integer'인지 먼저 본다. INTEGER 칸이면 SQLite가 트리거보다 먼저 정수로 바꿀 수 있는 값을 바꿔
+-- 넘긴다: '1800000030999.9999'(한도보다 0.0001ms 이름)는 한도 정각의 정수, '9007199254740991.1'은 범위 끝의 정수, '1800000031000'·
+-- '1.800000031e12'·앞뒤 공백의 TEXT와 1800000031000.0 같은 REAL도 정수가 되어, 트리거가 바뀐 값을 보고 닫는다. ANY 칸은 TEXT·REAL·
+-- BLOB을 그대로 트리거에 넘기므로 거절된다(이 저장소의 Bun 1.4.4가 묶은 SQLite 3.53.4에서 돌려 본 것). 정수인 값만 받는 것은 공개
+-- 연산의 입력 검사(안전 정수)와 같다. 트리거의 typeof 검사가 없으면 정수가 아닌 값이 트리거의 비교를 지나(TEXT는 정수와의 비교에서
+-- 늘 크다) 칸의 CHECK에만 걸리고, 그 CHECK는 INSERT OR IGNORE에서 예외 없이 0줄로 끝난다.
+-- 칸의 CHECK(typeof와 범위)와 NOT NULL은 BEFORE 트리거 뒤에 돈다(같은 SQLite에서 본 순서): 트리거를 지난 정수의 범위만 그 CHECK가
+-- 마지막으로 본다. closed_at이 9007199254740991 위이면(pod_started_at은 closed_at 이하여야 트리거를 지나므로 그때만 pod_started_at도
+-- 그 위일 수 있다) 트리거를 지나 칸의 CHECK가 막고, INSERT OR IGNORE면 예외 없이 0줄이다(닫힌 것은 없다). 원 SQL 호출자는 예외만이
+-- 아니라 변경 수를 본다.
 -- 늘어날 수 있는 집합(닫을 수 있는 앞 상태, 확인 방법의 목록)은 칸의 CHECK가 아니라 트리거에 둔다: 이름 없는 CHECK는 다음 판이
 -- 빼거나 넓히지 못하고, 트리거는 DROP·CREATE로 다시 만든다(이관 0006 머리의 주석).
 
@@ -42,22 +48,24 @@ INSERT INTO run_transitions (kind, from_state, to_state) VALUES
 --   장부는 그 값을 스스로 확인하지 못한다(사람·명령이 넘긴 값의 기록, D-93과 같다).
 -- - stop_generation: 닫은 때의 정지 세대(stop_state.generation).
 -- - closed_at: 닫은 시각. 부르는 쪽이 넘긴 시각(감독의 시계)이고, 실행 줄의 updated_at과 마친 보고의 applied_at에도 이 값이 들어간다.
+-- 세 정수 칸은 ANY로 선언하고 CHECK에 typeof = 'integer'를 둔다(까닭은 머리의 "정수 칸의 형").
 -- 확인은 사람이 했다는 기록이지 장부가 확인한 사실이 아니다. 줄은 지우거나 고치지 않는다.
 CREATE TABLE operator_closures (
   run_id TEXT NOT NULL PRIMARY KEY REFERENCES runs (run_id),
   from_state TEXT NOT NULL,
   checked_by TEXT NOT NULL,
   pod_name TEXT NOT NULL,
-  pod_started_at INTEGER NOT NULL CHECK (pod_started_at BETWEEN 1 AND 9007199254740991),
-  stop_generation INTEGER NOT NULL CHECK (stop_generation BETWEEN 0 AND 9007199254740991),
-  closed_at INTEGER NOT NULL CHECK (closed_at BETWEEN 1 AND 9007199254740991)
+  pod_started_at ANY NOT NULL CHECK (typeof(pod_started_at) = 'integer' AND pod_started_at BETWEEN 1 AND 9007199254740991),
+  stop_generation ANY NOT NULL CHECK (typeof(stop_generation) = 'integer' AND stop_generation BETWEEN 0 AND 9007199254740991),
+  closed_at ANY NOT NULL CHECK (typeof(closed_at) = 'integer' AND closed_at BETWEEN 1 AND 9007199254740991)
 ) STRICT, WITHOUT ROWID;
 
 -- 행으로 다시 보는 확인: 코드의 검사가 빠져도 아래 중 하나라도 맞으면 근거 줄은 들어가지 않는다.
--- 이미 관리자 근거가 있음(INSERT OR REPLACE 포함), D-90 근거가 있음, 앞 상태가 unknown_running·stopping이 아님, 확인 방법이
--- pod_replaced가 아님, 파드 이름이 이름 규칙 밖, 작업자가 아니거나 지금 상태가 from_state가 아니거나 종료 확인(stop_receipt_id)이 있음,
--- 정지 기록이 없거나 정지 세대가 그 기록과 같지 않음(입력이 NULL이면 같지 않다), 그 실행의 task_start 지시가 없음, 그 실행의
--- session_start 지시가 있음, 닫은 시각이나 파드가 뜬 시각이 닫을 수 있게 되는 시각 전, 파드가 뜬 시각이 닫은 시각 뒤.
+-- 세 정수 칸 가운데 정수가 아닌 것이 있음(NULL 포함, 첫 줄: 참이면 뒤의 줄과 상관없이 막는다), 이미 관리자 근거가 있음(INSERT OR
+-- REPLACE 포함), D-90 근거가 있음, 앞 상태가 unknown_running·stopping이 아님, 확인 방법이 pod_replaced가 아님, 파드 이름이 이름
+-- 규칙 밖, 작업자가 아니거나 지금 상태가 from_state가 아니거나 종료 확인(stop_receipt_id)이 있음, 정지 기록이 없거나 정지 세대가
+-- 그 기록과 같지 않음(입력이 NULL이면 같지 않다), 그 실행의 task_start 지시가 없음, 그 실행의 session_start 지시가 있음, 닫은
+-- 시각이나 파드가 뜬 시각이 닫을 수 있게 되는 시각 전, 파드가 뜬 시각이 닫은 시각 뒤.
 -- 파드 이름의 검사: 길이 1–253, 첫·끝 글자가 영숫자, 영숫자·'-'·'.' 밖의 글자가 없음, '..'·'.-'·'-.'가 없음(라벨이 비거나 '-'로
 -- 시작·끝남), U+0000이 없음. length와 GLOB은 TEXT 안의 U+0000에서 읽기를 멈춰 그 뒤를 보지 않는다(이 저장소의 Bun 1.4.4가 묶은
 -- SQLite 3.53.4에서 돌려 본 것). instr(이름, char(0))은 그 뒤까지 보고 U+0000의 자리(1부터)를 낸다.
@@ -76,25 +84,33 @@ CREATE TABLE operator_closures (
 -- 실행기에만 늘릴 임대가 있어, 새 파드에는 task_start의 발행만으로 족하다. 같은 식(갱신 포함)을 쓰면 더 기다릴 뿐이라 닫는 쪽으로만
 -- 틀린다. 그래서 장부가 모르는 갱신(사본에서 되살린 장부)도 새 파드에는 늘릴 임대가 없다. 파드를 한도 전에 바꿨으면 거절되고,
 -- 관리자는 파드를 한 번 더 바꾼다. closed_at의 조건은 그대로 둔다(파드가 뜬 시각 ≤ 닫은 시각이라 함께 맞는다).
--- 두 시계: pod_started_at은 클러스터(쿠버네티스)의 시계, 발행 시각과 closed_at은 감독의 시계, 시작을 받는 것은 실행기의 시계다.
--- 그 차이를 계약의 시계 오차 1000ms가 덮는다는 전제다(홈랩은 한 머신이라 시계가 하나다). 쿠버네티스의 시각은 초 단위라 부르는 쪽이
--- 내림해 넘기면 실제보다 이르게 적혀 거절 쪽으로 간다.
+-- 시계: pod_started_at은 파드가 뜬 시각을 적은 클러스터(쿠버네티스)의 시계, 발행 시각과 closed_at은 감독의 시계, 시작을 받아 검사하는
+-- 것은 새 파드의 실행기의 시계다. 이 조건이 기대는 비교는 파드의 기록 시각과 그 뒤에 실행기가 시작을 검사하는 시각의 차이다: 실행기가
+-- 시작을 검사하는 시각(실행기 시계)이 파드의 기록 시각 − 1000ms(계약의 CLOCK_SKEW_MS) 이상이면, pod_started_at ≥ 발행 + 31000에서
+-- 그 검사 시각 ≥ 발행 + 30000(봉투의 시한, 임대 상한)이 따라와 그 실행기는 시작을 받지도 띄우지도 못한다. 실행기는 봉투의 발행 시각
+-- 값과 자기 시계를 바로 비교하므로 감독의 시계는 이 비교에 들지 않는다. 전제: 실행기의 시계가 클러스터의 시계보다 1000ms 넘게
+-- 뒤처지지 않고, 공통 시계가 파드가 뜬 뒤 1000ms 넘게 뒤로 가지 않는다(홈랩은 한 머신이라 시계가 하나다). 감독이 다시 보낼지(발행
+-- + 19000ms까지만 봉하는 재전송 한도)는 감독의 시계로 따로 정해지고, 이 조건은 그것에 기대지 않는다. 쿠버네티스의 시각은 초 단위라
+-- 부르는 쪽이 내림해 넘기면 실제보다 이르게 적혀 거절 쪽으로 간다.
 -- session_start 지시가 있는 실행은 닫지 않는다: 작업자 실행의 정상 이력에는 없고(ledger.ts의 startRun은 task_start만 적고
 -- startSession은 지시를 적지 않는다), 섞이면 그 시작이 무엇을 언제까지 띄울 수 있는지 이 식이 세지 않는다. task_start가 없는 실행도
 -- 시간의 근거가 없어 막는다.
 -- 새 파드의 실행기가 저장소에서 그 실행을 되살려 띄우는 길은 없다: 다시 뜬 실행기의 복원(src/executor/worker.ts의 recover·reconcile)은
 -- 사건·상태를 맞추고 남은 프로세스를 정리할 뿐 띄우지 않고, 기록이 이미 있는 실행의 시작 지시는 사건만 다시 보낸다(onStart).
 -- 이 판이 막지 못하는 것: (ㄱ) 사람·명령이 넘긴 값이 틀리면 닫힌다: 파드를 바꾸지 않았거나(장부가 모르는 갱신의 임대가 남았거나
--- 마지막 검사를 지난 옛 실행기가 띄우는 중일 수 있다), 넘긴 파드의 시각이 그 파드의 실행기가 뜬 시각보다 늦은 경우. (ㄴ) 시계
--- 전제가 깨져 클러스터·실행기의 시계가 감독의 시계보다 1000ms 넘게 뒤처지면, 한도 뒤로 적힌 새 파드의 실행기가 다시 보낸 시작을
--- 받아 띄울 수 있다. 이때 장부가 남기는 신호는 닫은 뒤 처음 받는 유효한 새 시작 영수증 하나다: 그 영수증에서만 답의 경보와 그 종류의
--- 자리 다시 막기가 함께 생긴다(판 6과 같은 처리, ledger.ts의 applyReceipt). 닫기 전에 받아 실행 줄에 연결된 첫 시작 영수증의
--- 재전송은 경보·점유가 없고, 닫기 전에 받은 다른 시작 영수증의 재전송은 경보만 있고 점유는 없다. 장부는 사람이 언제 확인했는지
--- 모른다: 두 시각이 한도 뒤라는 것만 본다.
+-- 마지막 검사를 지난 옛 실행기가 띄우는 중일 수 있다), 넘긴 파드의 시각이 그 파드의 실행기가 뜬 시각보다 늦은 경우. (ㄴ) 위의
+-- 시계 전제가 깨져 새 파드의 실행기가 시작을 검사하는 시각이 파드의 기록 시각 − 1000ms보다 이르면(실행기의 시계가 클러스터의 시계보다
+-- 1000ms 넘게 뒤처지거나, 공통 시계가 파드가 뜬 뒤 그만큼 뒤로 가면), 한도 뒤로 적힌 새 파드의 실행기도 감독이 그때 다시 보낸
+-- 시작을 받아 띄울 수 있다. 이때 장부가 남기는 신호는 닫은 뒤 새 시작 영수증 ID를 처음 받을 때마다 생기는 답의 경보와 그 종류의
+-- 자리 다시 막기다(같은 실행에 서로 다른 새 ID가 둘 오면 둘 다 낸다. 점유는 같은 실행기·실행·세대의 줄을 새 관측 번호로 바꿔
+-- 적는다. 판 6과 같은 처리, ledger.ts의 applyReceipt). 그 새 ID의 재전송은 경보만 다시 싣고 점유를 새로 적지 않는다. 닫기 전에 받아
+-- 실행 줄에 연결된 첫 시작 영수증의 재전송은 경보·점유가 없고, 닫기 전에 받은 다른 시작 영수증의 재전송은 경보만 있고 점유는 없다.
+-- 장부는 사람이 언제 확인했는지 모른다: 두 시각이 한도 뒤라는 것만 본다.
 -- 이 트리거가 보지 않는 것: 장부가 건강한지, 접수 닫힘·사본 보류·정지 중인지(닫기는 이것들과 상관없이 받는다. ledger.ts의
 -- closeRunByOperator가 쓰기 모드로 장부 실패만 거절한다).
 CREATE TRIGGER operator_closures_proven BEFORE INSERT ON operator_closures
-WHEN EXISTS (SELECT 1 FROM operator_closures o WHERE o.run_id = NEW.run_id)
+WHEN (typeof(NEW.pod_started_at) = 'integer' AND typeof(NEW.stop_generation) = 'integer' AND typeof(NEW.closed_at) = 'integer') IS NOT 1
+  OR EXISTS (SELECT 1 FROM operator_closures o WHERE o.run_id = NEW.run_id)
   OR EXISTS (SELECT 1 FROM unreceived_closures c WHERE c.run_id = NEW.run_id)
   OR (NEW.from_state IN ('unknown_running', 'stopping')) IS NOT 1
   OR (NEW.checked_by IN ('pod_replaced')) IS NOT 1
