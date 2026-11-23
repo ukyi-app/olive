@@ -672,6 +672,24 @@ describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => 
     await until(() => a.closed());
     expect(replies(a)).toBe(0);
 
+    // 묶지 않고 임계값도 그대로 둔 채 앞선 바이트 하나가 하위 쓰기에서 완료를 기다린다. 남은 것은 버퍼의 길이뿐이다
+    // (비우기 대기·묶음이 아니다). 다른 입력들은 묶음만으로도 닫히므로 길이의 관측은 이 입력만 가른다.
+    const c = await connect(h);
+    const sc = serverSocket(h, c);
+    const lowerC = holdLowerWrite(sc);
+    sc.write(frame({ prior: c.id }));
+    await until(lowerC.entered);
+    expect(sc.writableLength).toBeGreaterThan(0);
+    expect(sc.writableNeedDrain).toBe(false);
+    expect(sc.writableCorked).toBe(0);
+    const handedC = handedTo(sc);
+    c.send(syncRequest(K1, R1, h.clock.t));
+    await settled(c);
+    expect(handedC).toEqual([]);
+    unsent(c);
+    await until(() => c.closed());
+    expect(replies(c)).toBe(0);
+
     // 빈 스트림을 묶기만 했다. 세대를 모르는 복원기로 바꾼 뒤 기한 전의 박자를 줘도 옛 답의 쓰기를 시도하지 않는다.
     const b = await connect(h);
     const sb = serverSocket(h, b);
@@ -776,11 +794,23 @@ describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => 
     const lowerB = holdLowerWrite(serverSocket(h, b));
     b.send(syncRequest(K2, R2, T));
     await until(lowerB.entered);
+    // 박자에 완료 대기가 둘 열려 있어야 만료를 하나만 보고 멈추는 회귀가 드러난다(A는 박자 전에 이미 닫힌다).
+    const c = await connect(h);
+    const lowerC = holdLowerWrite(serverSocket(h, c));
+    c.send(syncRequest(K1, R1, T));
+    await until(lowerC.entered);
+    expect(phaseOf(h, b)).toBe("requested");
+    expect(phaseOf(h, c)).toBe("requested");
+    expect(h.closedNotes(b.id)).toEqual([]);
+    expect(h.closedNotes(c.id)).toEqual([]);
     h.clock.t = T + ANSWER;
     h.server.tick();
     expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "write_late" }]);
     expect(repliesSent(steps, b.id)).toBe(0);
     expect(h.server.table().get(b.id)).toBeUndefined();
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "write_late" }]);
+    expect(repliesSent(steps, c.id)).toBe(0);
+    expect(h.server.table().get(c.id)).toBeUndefined();
     expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "write_busy" }]);
   });
 
