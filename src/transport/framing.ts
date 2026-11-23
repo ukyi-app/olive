@@ -17,7 +17,9 @@
 // 한 번의 push가 완성해 돌려주는 틀들의 바이트(봉투 바이트, 값 틀의 실행 ID·지문·값)는 이 상한에 들지 않고 넣은 조각의 크기에 비례한다
 // (조각 + 직전에 쥐고 있던 미완성 틀 이하). 한 번의 반환량은 부르는 쪽이 조각의 크기로 묶는다.
 // 거절하면 그 디코더는 끝난다. 다시 동기화하지 않는다: 틀이 어긋난 뒤의 바이트는 어디가 경계인지 믿을 근거가 없다.
-// 거절 사유는 이름뿐이다. 값이나 틀의 바이트를 사유·반환값·오류에 싣지 않는다.
+// 거절 사유는 이름뿐이다. 거절 사유와 던진 오류, 그리고 거절된 틀 자체의 바이트는 반환값에 실리지 않는다.
+// 거절과 함께 돌아온 step에는 그 앞에 완성된 정상 값 틀이 들어 있을 수 있다. 진단에는 rejected의 이름만 쓰고 step·완성된 값 틀·만든 틀을
+// 통째로 기록하지 않는다. 앞선 정상 값의 소유는 받은 쪽에 있다(쓰거나 버릴 때 0으로 채운다).
 import { limits } from "../contract/v1/index.ts";
 
 export const FRAME_PREFIX_BYTES = 4;
@@ -93,7 +95,7 @@ export function createFrameDecoder(): FrameDecoder {
   return new Decoder();
 }
 
-// 봉투와 값을 함께 받는 디코더만 내는 사유.
+// 봉투만 받는 디코더는 내지 않는 사유. frame_unknown_kind만 섞어 받는 디코더 전용이고, 나머지 넷은 encodeCredentialFrame도 낸다.
 export const CREDENTIAL_FRAME_REJECT_REASONS = [
   // 머리의 첫 바이트가 봉투(0x00)도 값(0x01)도 아니다. 그 한 바이트를 받은 때 거절한다.
   "frame_unknown_kind",
@@ -122,7 +124,8 @@ export type DecodedFrame =
   | { readonly kind: "credential"; readonly credential: DecodedCredential };
 
 // 한 번의 push·end가 낸 틀들. 받은 순서 그대로다. 거절이 있으면 그 앞의 온전한 틀(값 틀 포함)은 frames에 들어 있고,
-// 그 뒤의 바이트는 보지 않았다. 부르는 쪽이 거절과 함께 온 값을 쓰지 않으면 그 값도 0으로 채워 버린다.
+// 그 뒤의 바이트는 보지 않았다. 그래서 거절된 step을 통째로 기록하면 앞선 정상 값이 따라간다(진단에는 rejected만 쓴다).
+// 부르는 쪽이 거절과 함께 온 값을 쓰지 않으면 그 값도 0으로 채워 버린다.
 export interface MixedDecodeStep {
   readonly frames: readonly DecodedFrame[];
   readonly rejected: MixedFrameRejectReason | null;
@@ -243,70 +246,72 @@ class Decoder implements FrameDecoder {
 }
 
 // 봉투 틀은 Decoder와 같은 순서·검사로 다룬다(시험이 두 디코더의 결과를 대조한다).
+// 상태는 모두 # 필드에 둔다. TypeScript의 private은 런타임에서 보통 속성이라, 조립 중인 값과 실행 ID·지문이 디코더 객체의
+// JSON.stringify·Object.keys에 그대로 나온다. # 필드는 런타임에서도 클래스 밖에서 읽거나 열거할 수 없다.
 class MixedDecoder implements MixedFrameDecoder {
-  private readonly prefix = new Uint8Array(FRAME_PREFIX_BYTES);
-  private prefixFilled = 0;
+  readonly #prefix = new Uint8Array(FRAME_PREFIX_BYTES);
+  #prefixFilled = 0;
   // 지금 채우는 칸은 셋 중 하나다: 봉투 본문, 값 틀의 실행 ID·지문 칸, 값. 값 틀은 실행 ID·지문 칸을 다 채워 꼴을 본 뒤에 값 버퍼를 잡고,
   // 값을 채우는 동안 실행 ID·지문 칸을 쥔다.
-  private body: Uint8Array | null = null;
-  private head: Uint8Array | null = null;
-  private value: Uint8Array | null = null;
-  private valueLength = 0;
-  private filled = 0;
-  private rejected: MixedFrameRejectReason | null = null;
-  private ended = false;
+  #body: Uint8Array | null = null;
+  #head: Uint8Array | null = null;
+  #value: Uint8Array | null = null;
+  #valueLength = 0;
+  #filled = 0;
+  #rejected: MixedFrameRejectReason | null = null;
+  #ended = false;
 
   push(chunk: Uint8Array): MixedDecodeStep {
-    if (this.rejected) return { frames: [], rejected: this.rejected };
-    if (this.ended) return this.fail([], "frame_after_end");
+    if (this.#rejected) return { frames: [], rejected: this.#rejected };
+    if (this.#ended) return this.#fail([], "frame_after_end");
     const frames: DecodedFrame[] = [];
     let at = 0;
     // 조각을 붙잡지 않고 머리 칸이나 지금 채우는 칸으로 옮긴다(Decoder와 같은 까닭).
     while (at < chunk.length) {
-      const target = this.value ?? this.head ?? this.body;
+      const target = this.#value ?? this.#head ?? this.#body;
       if (target === null) {
-        const n = Math.min(FRAME_PREFIX_BYTES - this.prefixFilled, chunk.length - at);
-        this.prefix.set(chunk.subarray(at, at + n), this.prefixFilled);
-        this.prefixFilled += n;
+        const n = Math.min(FRAME_PREFIX_BYTES - this.#prefixFilled, chunk.length - at);
+        this.#prefix.set(chunk.subarray(at, at + n), this.#prefixFilled);
+        this.#prefixFilled += n;
         at += n;
-        const kind = this.prefix[0];
-        if (kind !== FRAME_KIND_ENVELOPE && kind !== FRAME_KIND_CREDENTIAL) return this.fail(frames, "frame_unknown_kind");
-        if (this.prefixFilled < FRAME_PREFIX_BYTES) break;
-        const declared = (this.prefix[1]! << 16) | (this.prefix[2]! << 8) | this.prefix[3]!;
+        const kind = this.#prefix[0];
+        if (kind !== FRAME_KIND_ENVELOPE && kind !== FRAME_KIND_CREDENTIAL) return this.#fail(frames, "frame_unknown_kind");
+        if (this.#prefixFilled < FRAME_PREFIX_BYTES) break;
+        const declared = (this.#prefix[1]! << 16) | (this.#prefix[2]! << 8) | this.#prefix[3]!;
         if (kind === FRAME_KIND_ENVELOPE) {
-          if (declared === 0) return this.fail(frames, "frame_empty");
-          if (declared > FRAME_MAX_BODY_BYTES) return this.fail(frames, "frame_too_large");
-          this.body = new Uint8Array(declared);
+          if (declared === 0) return this.#fail(frames, "frame_empty");
+          if (declared > FRAME_MAX_BODY_BYTES) return this.#fail(frames, "frame_too_large");
+          this.#body = new Uint8Array(declared);
         } else {
-          if (declared === 0) return this.fail(frames, "frame_credential_empty");
-          if (declared > CREDENTIAL_MAX_BYTES) return this.fail(frames, "frame_credential_too_large");
-          this.head = new Uint8Array(CREDENTIAL_HEAD_BYTES);
-          this.valueLength = declared;
+          if (declared === 0) return this.#fail(frames, "frame_credential_empty");
+          if (declared > CREDENTIAL_MAX_BYTES) return this.#fail(frames, "frame_credential_too_large");
+          this.#head = new Uint8Array(CREDENTIAL_HEAD_BYTES);
+          this.#valueLength = declared;
         }
-        this.filled = 0;
+        this.#filled = 0;
         continue;
       }
-      const n = Math.min(target.length - this.filled, chunk.length - at);
-      target.set(chunk.subarray(at, at + n), this.filled);
-      this.filled += n;
+      const n = Math.min(target.length - this.#filled, chunk.length - at);
+      target.set(chunk.subarray(at, at + n), this.#filled);
+      this.#filled += n;
       at += n;
-      if (this.filled < target.length) break;
-      this.filled = 0;
-      if (target === this.body) {
-        this.body = null;
-        this.prefixFilled = 0;
+      if (this.#filled < target.length) break;
+      this.#filled = 0;
+      if (target === this.#body) {
+        this.#body = null;
+        this.#prefixFilled = 0;
         const parsed = parseEnvelope(target);
-        if (!parsed.ok) return this.fail(frames, parsed.reason);
+        if (!parsed.ok) return this.#fail(frames, parsed.reason);
         frames.push({ kind: "envelope", envelope: { bytes: target, value: parsed.value } });
-      } else if (target === this.head) {
-        if (!bytesFit(target.subarray(0, CREDENTIAL_RUN_ID_BYTES), runIdByteOk)) return this.fail(frames, "frame_credential_bad_run_id");
-        if (!bytesFit(target.subarray(CREDENTIAL_RUN_ID_BYTES), digestByteOk)) return this.fail(frames, "frame_credential_bad_digest");
-        this.value = new Uint8Array(this.valueLength);
+      } else if (target === this.#head) {
+        if (!bytesFit(target.subarray(0, CREDENTIAL_RUN_ID_BYTES), runIdByteOk)) return this.#fail(frames, "frame_credential_bad_run_id");
+        if (!bytesFit(target.subarray(CREDENTIAL_RUN_ID_BYTES), digestByteOk)) return this.#fail(frames, "frame_credential_bad_digest");
+        this.#value = new Uint8Array(this.#valueLength);
       } else {
-        const head = this.head!;
-        this.head = null;
-        this.value = null;
-        this.prefixFilled = 0;
+        const head = this.#head!;
+        this.#head = null;
+        this.#value = null;
+        this.#prefixFilled = 0;
         // 꼴을 본 ASCII라 글자 코드로 그대로 옮긴다.
         const runId = String.fromCharCode(...head.subarray(0, CREDENTIAL_RUN_ID_BYTES));
         const digest = String.fromCharCode(...head.subarray(CREDENTIAL_RUN_ID_BYTES));
@@ -317,24 +322,24 @@ class MixedDecoder implements MixedFrameDecoder {
   }
 
   end(): MixedDecodeStep {
-    if (this.rejected) return { frames: [], rejected: this.rejected };
-    this.ended = true;
-    if (this.prefixFilled > 0 || this.body !== null || this.head !== null) return this.fail([], "frame_truncated");
+    if (this.#rejected) return { frames: [], rejected: this.#rejected };
+    this.#ended = true;
+    if (this.#prefixFilled > 0 || this.#body !== null || this.#head !== null) return this.#fail([], "frame_truncated");
     return { frames: [], rejected: null };
   }
 
   heldBytes(): number {
-    return this.prefix.length + (this.body?.length ?? 0) + (this.head?.length ?? 0) + (this.value?.length ?? 0);
+    return this.#prefix.length + (this.#body?.length ?? 0) + (this.#head?.length ?? 0) + (this.#value?.length ?? 0);
   }
 
-  private fail(frames: DecodedFrame[], reason: MixedFrameRejectReason): MixedDecodeStep {
-    this.rejected = reason;
+  #fail(frames: DecodedFrame[], reason: MixedFrameRejectReason): MixedDecodeStep {
+    this.#rejected = reason;
     // 덜 온 값은 밖으로 나간 적이 없으니 여기서 지운다.
-    this.value?.fill(0);
-    this.body = null;
-    this.head = null;
-    this.value = null;
-    this.prefixFilled = 0;
+    this.#value?.fill(0);
+    this.#body = null;
+    this.#head = null;
+    this.#value = null;
+    this.#prefixFilled = 0;
     return { frames, rejected: reason };
   }
 }

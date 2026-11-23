@@ -24,11 +24,16 @@ import {
   type MixedFrameRejectReason,
 } from "../../src/transport/framing.ts";
 
-// 표본 값은 모두 여기서 지어낸 바이트다. 단언이 실패해도 진단문에 값이 실리지 않게, 값은 길이와 SHA-256 요약이나 불리언으로만 단언한다.
+// 표본 값은 모두 여기서 지어낸 바이트다. 실패한 단언의 진단문은 받은 것과 기대한 것을 그대로 찍으므로, 값이 될 수 있는 것은
+// 길이·SHA-256 요약·메모리에서 비교한 불리언으로만 단언에 넘긴다. 값의 배열이나 인코더의 반환 객체를 통째로 넘기지 않고,
+// 디코더나 인코더가 칸을 잘못 자르면 값의 조각이 될 수 있는 실행 ID·지문 글도 요약이나 불리언으로 넘긴다.
 
 const utf8 = (text: string) => new TextEncoder().encode(text);
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+const textSha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, i) => byte === b[i]);
+// 인코더가 그 사유로 거절했는가. 잘못 성공한 결과(틀에 값이 든다)도 진단문에 실리지 않게 불리언으로 바꾼다.
+const refused = (result: ReturnType<typeof encodeCredentialFrame>, reason: string) => !result.ok && result.reason === reason;
 
 function concat(...parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -65,7 +70,9 @@ function header(kind: number, length: number): Uint8Array {
   return Uint8Array.of(kind, (length >>> 16) & 0xff, (length >>> 8) & 0xff, length & 0xff);
 }
 
-type Summary = { kind: "envelope"; value: unknown } | { kind: "credential"; runId: string; digest: string; length: number; sha256: string };
+type Summary =
+  | { kind: "envelope"; value: unknown }
+  | { kind: "credential"; runIdSha256: string; digestSha256: string; length: number; sha256: string };
 
 function summarize(frames: readonly DecodedFrame[]): Summary[] {
   return frames.map((frame) =>
@@ -73,8 +80,8 @@ function summarize(frames: readonly DecodedFrame[]): Summary[] {
       ? { kind: "envelope", value: frame.envelope.value }
       : {
           kind: "credential",
-          runId: frame.credential.runId,
-          digest: frame.credential.digest,
+          runIdSha256: textSha256(frame.credential.runId),
+          digestSha256: textSha256(frame.credential.digest),
           length: frame.credential.value.length,
           sha256: sha256(frame.credential.value),
         },
@@ -85,13 +92,14 @@ function summarize(frames: readonly DecodedFrame[]): Summary[] {
 const safe = (step: MixedDecodeStep) => ({ frames: summarize(step.frames), rejected: step.rejected });
 const safeOld = (step: DecodeStep) => ({ count: step.envelopes.length, rejected: step.rejected });
 
-const credentialSummary = (value: Uint8Array, runId = RUN_ID): Summary => ({
+const summaryOf = (runId: string, valueSha256: string, length: number): Summary => ({
   kind: "credential",
-  runId,
-  digest: sha256(value),
-  length: value.length,
-  sha256: sha256(value),
+  runIdSha256: textSha256(runId),
+  digestSha256: textSha256(valueSha256),
+  length,
+  sha256: valueSha256,
 });
+const credentialSummary = (value: Uint8Array, runId = RUN_ID): Summary => summaryOf(runId, sha256(value), value.length);
 
 // 조각을 차례로 넣고 끝을 알린다. 거절은 처음 하나만 기록한다. 던진 오류는 문구만 남긴다.
 function run(chunks: Uint8Array[], decoder: MixedFrameDecoder = createMixedFrameDecoder()) {
@@ -164,8 +172,8 @@ test("보장 2 값 틀: 실행 ID·지문·값을 싣고 왕복하며, 바이트
     const frame = credentialFrame(value);
     expect(frame.length).toBe(FRAME_PREFIX_BYTES + CREDENTIAL_HEAD_BYTES + value.length);
     expect([...frame.subarray(0, FRAME_PREFIX_BYTES)]).toEqual([...header(FRAME_KIND_CREDENTIAL, value.length)]);
-    expect(String.fromCharCode(...frame.subarray(4, 40))).toBe(RUN_ID);
-    expect(String.fromCharCode(...frame.subarray(40, 104))).toBe(sha256(value));
+    expect(String.fromCharCode(...frame.subarray(4, 40)) === RUN_ID).toBe(true);
+    expect(String.fromCharCode(...frame.subarray(40, 104)) === sha256(value)).toBe(true);
     expect(sameBytes(frame.subarray(104), value)).toBe(true);
     const decoded = run([frame]);
     expect(decoded.rejected).toBeNull();
@@ -178,7 +186,7 @@ test("보장 2 값 틀: 실행 ID·지문·값을 싣고 왕복하며, 바이트
   const copied = credentialFrame(source);
   const before = sha256(source);
   source.fill(0);
-  expect(run([copied]).frames).toEqual([{ kind: "credential", runId: RUN_ID, digest: before, length: 20, sha256: before }]);
+  expect(run([copied]).frames).toEqual([summaryOf(RUN_ID, before, 20)]);
 });
 
 test("보장 2 상한과 0바이트: 머리 4바이트에서, 실행 ID·지문 칸과 값 버퍼를 잡기 전에 거절한다", () => {
@@ -199,8 +207,8 @@ test("보장 2 상한과 0바이트: 머리 4바이트에서, 실행 ID·지문 
   }
   // 인코더도 같은 경계에서 틀을 만들지 않는다.
   const digest = sha256(fake(1));
-  expect(encodeCredentialFrame(RUN_ID, digest, new Uint8Array(0))).toEqual({ ok: false, reason: "frame_credential_empty" });
-  expect(encodeCredentialFrame(RUN_ID, digest, fake(CREDENTIAL_MAX_BYTES + 1))).toEqual({ ok: false, reason: "frame_credential_too_large" });
+  expect(refused(encodeCredentialFrame(RUN_ID, digest, new Uint8Array(0)), "frame_credential_empty")).toBe(true);
+  expect(refused(encodeCredentialFrame(RUN_ID, digest, fake(CREDENTIAL_MAX_BYTES + 1)), "frame_credential_too_large")).toBe(true);
   expect(encodeCredentialFrame(RUN_ID, digest, fake(CREDENTIAL_MAX_BYTES)).ok).toBe(true);
 });
 
@@ -237,11 +245,11 @@ test("보장 2 꼴: 실행 ID·지문의 꼴이 틀리면 값을 내지 않고, 
     expect(safe(decoder.push(frame.subarray(headEnd))), JSON.stringify(text)).toEqual({ frames: [], rejected: reason });
     // 인코더도 같은 꼴을 받지 않는다(0xFF를 넘는 글자 코드가 잘려 올바른 바이트가 되는 경우 포함).
     const encoded = at === FRAME_PREFIX_BYTES ? encodeCredentialFrame(text, digest, value) : encodeCredentialFrame(RUN_ID, text, value);
-    expect(encoded, JSON.stringify(text)).toEqual({ ok: false, reason });
+    expect(refused(encoded, reason), JSON.stringify(text)).toBe(true);
   }
-  expect(encodeCredentialFrame(swap(RUN_ID, 0, "İ"), digest, value)).toEqual({ ok: false, reason: "frame_credential_bad_run_id" });
-  expect(encodeCredentialFrame(RUN_ID.slice(1), digest, value)).toEqual({ ok: false, reason: "frame_credential_bad_run_id" });
-  expect(encodeCredentialFrame(RUN_ID, `${digest}0`, value)).toEqual({ ok: false, reason: "frame_credential_bad_digest" });
+  expect(refused(encodeCredentialFrame(swap(RUN_ID, 0, "İ"), digest, value), "frame_credential_bad_run_id")).toBe(true);
+  expect(refused(encodeCredentialFrame(RUN_ID.slice(1), digest, value), "frame_credential_bad_run_id")).toBe(true);
+  expect(refused(encodeCredentialFrame(RUN_ID, `${digest}0`, value), "frame_credential_bad_digest")).toBe(true);
 });
 
 test("보장 3 값: 봉투처럼 보이는 바이트·NUL·깨진 UTF-8도 해석하지 않고 받은 그대로, 버퍼를 나누지 않는 새 배열로 낸다", () => {
@@ -262,7 +270,7 @@ test("보장 3 값: 봉투처럼 보이는 바이트·NUL·깨진 UTF-8도 해�
     if (first.kind !== "credential" || second.kind !== "credential") throw new Error("kind");
     const got = first.credential.value;
     expect(sameBytes(got, value)).toBe(true);
-    expect(first.credential.digest).toBe(sha256(value));
+    expect(first.credential.digest === sha256(value)).toBe(true);
     // 새 배열이고 다른 바이트와 버퍼를 나누지 않는다: 받은 조각, 실행 ID·지문 칸, 다음 값과 다른 버퍼다.
     expect(got.byteOffset === 0 && got.buffer.byteLength === value.length).toBe(true);
     expect(got.buffer === chunk.buffer || got.buffer === second.credential.value.buffer).toBe(false);
@@ -347,6 +355,23 @@ test("보장 3 거절에 값이 실리지 않는다: 거절의 사유·반환값
   expect(leaks(JSON.stringify(failures), value)).toBe(false);
   // 검사 자체가 표지를 찾는지 대조한다(성공한 값 틀은 값을 싣는다).
   expect(leaks(JSON.stringify(run([frame]).steps), value)).toBe(true);
+});
+
+test("보장 3 조립 중: 값의 일부만 받은 디코더 객체와 그 push의 반환을 직렬화해도 값·실행 ID·지문이 보이지 않는다", () => {
+  const value = fake(37, 12);
+  const digest = sha256(value);
+  const frame = credentialFrame(value);
+  const partial = frame.subarray(0, FRAME_PREFIX_BYTES + CREDENTIAL_HEAD_BYTES + MARK.length);
+  const decoder = createMixedFrameDecoder();
+  const step = decoder.push(partial);
+  // 대조: 디코더가 실제로 머리 칸과 값 버퍼를 쥐고 있다.
+  expect(decoder.heldBytes()).toBe(FRAME_PREFIX_BYTES + CREDENTIAL_HEAD_BYTES + value.length);
+  expect(step.rejected === null && step.frames.length === 0 && Object.keys(step).join() === "frames,rejected").toBe(true);
+  const shown = [JSON.stringify(decoder), JSON.stringify(step), String(decoder), Object.keys(decoder).join()];
+  expect(shown.some((text) => leaks(text, value))).toBe(false);
+  expect(shown.some((text) => text.includes(RUN_ID) || text.includes(digest))).toBe(false);
+  // 남은 바이트를 넣으면 같은 디코더가 값을 그대로 낸다.
+  expect(safe(decoder.push(frame.subarray(partial.length)))).toEqual({ frames: [credentialSummary(value)], rejected: null });
 });
 
 test("조각: 값 틀을 머리·실행 ID·지문·값의 어느 자리에서 잘라도, 봉투 틀과 섞여도 받은 순서 그대로 낸다", () => {
