@@ -352,6 +352,11 @@ export class WorkerExecutor {
     this.active = active;
     const finish = () => {
       if (this.active === active) this.active = undefined;
+      try {
+        this.options.credentials.forget?.(runId);
+      } catch {
+        // 우편함의 실패가 슬롯을 놓는 일을 막지 않는다
+      }
       release();
     };
     let accepted: boolean;
@@ -390,6 +395,8 @@ export class WorkerExecutor {
     const signal = active.controller.signal;
     let plan: LaunchPlan;
     let credential: string;
+    // 받은 값의 바이트. 대조와 문자열 변환이 끝나면 띄우든 띄우지 않든 아래 finally가 0으로 채운다(문자열 사본은 지울 수 없다).
+    let value: Uint8Array | null = null;
     try {
       // 접수를 적는 사이 연결이 바뀌거나 취소됐을 수 있다. 준비를 시작하기 전에 본다.
       const ready = this.launchBlocked(runId, active);
@@ -398,7 +405,7 @@ export class WorkerExecutor {
       // 자격을 요청하기 직전과 받은 직후에 다시 본다(연결, 세대, 취소, 기한, 임대).
       const before = this.launchBlocked(runId, active);
       if (before !== null) return this.notStarted(runId, before);
-      const value = await abortable(() => this.options.credentials.take(runId, record.credential_digest, signal), signal).catch(() => null);
+      value = await abortable(() => this.options.credentials.take(runId, record.credential_digest, signal), signal).catch(() => null);
       const after = this.launchBlocked(runId, active);
       if (after !== null) return this.notStarted(runId, after);
       if (value === null || !credentialMatches(value, record.credential_digest)) return this.notStarted(runId, "failed");
@@ -409,6 +416,8 @@ export class WorkerExecutor {
       assertLaunchSafe(this.profile, plan, credential);
     } catch {
       return this.notStarted(runId, active.cause ?? "failed");
+    } finally {
+      value?.fill(0);
     }
     // 띄우기 직전 확인. 여기서 launcher의 spawn까지 await가 없다.
     const blocked = this.launchBlocked(runId, active);

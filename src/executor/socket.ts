@@ -12,14 +12,31 @@
 //   오지 않아, 감독이 닫은 연결을 알아채지도 다시 붙지도 못한다. 대신 줄에 쌓인 틀의 바이트를 세어 상한(ReceivePolicy)을 넘으면
 //   그 연결을 닫는다.
 // - 틀이 거절하면 그 push에서 나온 앞의 온전한 틀도 넘기지 않고 연결을 닫는다(연결이 닫히면 link도 그 연결의 것을 받지 않는다).
+//   거절과 함께 온 앞선 정상 값은 0으로 채운다.
+// - 자격 값 틀은 줄에 넣지 않고 link.receive에도 넘기지 않는다. 그 연결이 맞춘 지금 연결일 때만 그 자리에서 우편함에 넘기고,
+//   아니면(link의 조회가 던져도) 값을 0으로 채우고 연결을 닫는다(credential_not_synced). 줄에 넣으면 닫힐 때 줄 안의 값을 찾아
+//   지우는 길이 하나 더 생긴다. 그래서 값은 같은 조각에서 그보다 앞에 받은 봉투의 처리를 기다리지 않는다.
+//   연결이 끝나면 우편함이 그 연결의 값을 버린다.
+// - 받은 바이트의 사본은 소켓이 끝낸다. 소켓의 data 조각은 이 연결의 Wire만 소비하고(다른 data 리스너를 달지 않는다), 디코더에
+//   넘긴 뒤 0으로 채운다. 연결이 어느 길로 닫히든 디코더를 끝내 조립 중이던 값을 0으로 채운다.
 // - 소켓이 끝나면 그 연결의 Connection을 바로 닫는다. 기다리는 challenge는 이때 버려지고(계약 v1 "버리는 때"의 (2)),
 //   다시 붙기를 기다리는 동안 남지 않는다. 그 연결의 줄에 남은 프레임은 버린다(그 연결로는 답을 보낼 수 없다).
 // - 다시 붙기는 실패마다 간격을 늘리고(상한까지), 그 연결이 맞춤을 끝냈을 때만 처음 간격으로 되돌린다.
 //   TLS는 붙었지만 감독이 받지 않는 연결(TLS 1.3에서는 붙은 뒤에 끊긴다, tls-client.ts)은 실패로 센다.
 // 밖으로 던지지 않는다. 결과는 onEvent의 구별된 사건으로만 알린다.
 import { canonicalJson, type Envelope } from "../contract/v1/index.ts";
-import { createFrameDecoder, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES, type FrameDecoder, type FrameRejectReason } from "../transport/framing.ts";
+import {
+  createMixedFrameDecoder,
+  type DecodedCredential,
+  type DecodedFrame,
+  encodeFrame,
+  FRAME_MAX_BODY_BYTES,
+  FRAME_PREFIX_BYTES,
+  type MixedFrameDecoder,
+  type MixedFrameRejectReason,
+} from "../transport/framing.ts";
 import { type ConnectFailure, type TlsClient, TlsConnectError, type VerifiedSupervisorConnection } from "../transport/tls-client.ts";
+import type { CredentialInbox } from "./credential-inbox.ts";
 import type { Connection, ExecutorLink, Transport } from "./link.ts";
 
 // setTimeout이 받는 가장 긴 기다림. 넘으면 런타임이 1ms로 바꾼다.
@@ -32,6 +49,9 @@ const FRAME_MAX_BYTES = FRAME_PREFIX_BYTES + FRAME_MAX_BODY_BYTES;
 export interface ReceivePolicy {
   // 줄에서 처리를 기다리는 완성된 틀의 전송 길이(접두 포함) 합의 상한. FRAME_MAX_BYTES(65,540) 이상의 JavaScript 안전 정수.
   // 넘으면 그 연결을 닫는다(receive_backlog). 처리 중인 틀 하나와 디코더의 덜 온 조각은 세지 않는다.
+  // 자격 값 틀도 세지 않는다: 줄에 들지 않는다. 값이 쥐는 메모리는 이 상한과 따로 묶인다(socket.md 보장 4): 우편함의 칸 하나와
+  // 내준 참조 하나, 디코더의 덜 온 값 하나(각 16,384바이트 이하), 그리고 한 조각에서 완성된 값 틀 N개를 넘기는 동안의
+  // N × 16,384바이트. N은 조각의 크기를 따르고 조각 크기의 상한은 이 모듈에 없다.
   readonly maxQueuedBytes: number;
 }
 
@@ -67,8 +87,10 @@ export type CloseReason =
   | "receive_failed"
   // 처리를 기다리는 받은 틀이 ReceivePolicy의 상한을 넘었다.
   | "receive_backlog"
+  // 맞춘 지금 연결이 아닌 때(맞추기 전, 지금 연결이 아님, 연결 번호가 다름) 자격 값 틀이 왔다. 그 값은 0으로 채웠다.
+  | "credential_not_synced"
   | "stopped"
-  | FrameRejectReason;
+  | MixedFrameRejectReason;
 
 export type SocketEvent =
   | { readonly kind: "connecting"; readonly attempt: number }
@@ -85,7 +107,9 @@ export type SocketEvent =
 export interface ExecutorSocketOptions {
   readonly client: Pick<TlsClient, "connect">;
   // 이 소켓 하나만 이 link에 연결을 연다. 둘이 같은 link를 쓰면 서로의 연결을 닫는다.
-  readonly link: Pick<ExecutorLink, "open" | "isCurrent">;
+  readonly link: Pick<ExecutorLink, "open" | "isCurrent" | "epoch">;
+  // 받은 자격 값을 넘길 우편함. 작업자의 credentials와 같은 객체여야 한다.
+  readonly inbox: Pick<CredentialInbox, "offer" | "dropEpoch">;
   readonly policy: ReconnectPolicy;
   readonly receive: ReceivePolicy;
   readonly timer: SocketTimer;
@@ -137,6 +161,11 @@ function validPolicy(policy: ReconnectPolicy): boolean {
 type RawSocket = VerifiedSupervisorConnection["socket"];
 
 const UTF8 = new TextEncoder();
+
+// 넘기지 않는 자격 값을 0으로 채운다. 그 값의 소유는 받은 쪽(이 소켓)에 있다(framing.md "거절").
+function wipeCredentials(frames: readonly DecodedFrame[]): void {
+  for (const frame of frames) if (frame.kind === "credential") frame.credential.value.fill(0);
+}
 
 class Socket implements ExecutorSocket {
   private state: SocketPhase = "idle";
@@ -276,6 +305,14 @@ class Socket implements ExecutorSocket {
     if (wire.closed) return;
     wire.closed = true;
     wire.release();
+    // 그 연결에서 받아 아직 쓰지 않은 값과, 그 연결에서 기다리던 take를 버린다.
+    if (wire.connection !== null) {
+      try {
+        this.options.inbox.dropEpoch(wire.connection.epoch);
+      } catch {
+        // 우편함의 실패가 연결의 끝을 막지 않는다
+      }
+    }
     try {
       wire.connection?.close();
     } catch {
@@ -296,6 +333,33 @@ class Socket implements ExecutorSocket {
     wire.synced = true;
     this.base = this.options.policy.initialDelayMs;
     this.emit({ kind: "synced", attempt: wire.attempt });
+  }
+
+  // 자격 값 틀 하나. 그 연결이 맞춘 지금 연결이고 연결 번호가 link의 지금 번호와 같을 때만 우편함에 넘긴다.
+  // 아니면 값을 0으로 채우고 false를 돌려준다(부르는 쪽이 그 연결을 닫는다).
+  offer(wire: Wire, credential: DecodedCredential): boolean {
+    const connection = wire.connection;
+    if (connection === null || !this.accepts(wire, connection)) {
+      credential.value.fill(0);
+      return false;
+    }
+    try {
+      this.options.inbox.offer(connection.epoch, credential);
+    } catch {
+      // 넘긴 뒤 값의 소유는 우편함에 있지만, 던졌으면 어디에 남았는지 모르므로 여기서도 지운다
+      credential.value.fill(0);
+    }
+    return true;
+  }
+
+  // 주입받은 link의 조회가 던지면 받을 수 없는 것으로 본다. 던짐이 data 콜백 밖으로 나가면 값의 정리와 닫힘을 모두 건너뛴다.
+  private accepts(wire: Wire, connection: Connection): boolean {
+    if (wire.closed || !wire.synced || this.current !== wire) return false;
+    try {
+      return this.options.link.isCurrent(connection) && this.options.link.epoch() === connection.epoch;
+    } catch {
+      return false;
+    }
   }
 
   private schedule(): void {
@@ -339,7 +403,7 @@ class Wire implements Transport {
   closed = false;
   synced = false;
   connection: Connection | null = null;
-  private readonly decoder: FrameDecoder = createFrameDecoder();
+  private readonly decoder: MixedFrameDecoder = createMixedFrameDecoder();
   // 받았지만 아직 receive에 넘기지 않은 틀과 그 바이트 수(접두 포함)의 합.
   private readonly queue: { readonly value: unknown; readonly bytes: number }[] = [];
   private queuedBytes = 0;
@@ -362,6 +426,7 @@ class Wire implements Transport {
     this.socket.on("end", () => {
       if (this.closed) return;
       const step = this.decoder.end();
+      wipeCredentials(step.frames);
       this.owner.shut(this, step.rejected ?? "peer_ended");
     });
   }
@@ -389,9 +454,16 @@ class Wire implements Transport {
   }
 
   // 줄에 남은 틀은 버린다. 처리 중인 receive는 거둘 수 없지만 그 연결이 닫혔으므로 link가 결과를 버린다.
+  // 모든 닫힘이 여기를 지나므로 디코더도 여기서 끝낸다. 상대의 끝 없이 닫히면(stop, link의 닫기, 오류) 조립 중이던 값이 디코더에
+  // 남기 때문이다. end는 덜 온 값을 0으로 채우고 놓는다. 그 거절 이름은 쓰지 않는다(닫힘 이유는 이미 정해졌다).
   release(): void {
     this.queue.length = 0;
     this.queuedBytes = 0;
+    try {
+      wipeCredentials(this.decoder.end().frames);
+    } catch {
+      // 디코더의 실패가 연결의 끝을 막지 않는다
+    }
     try {
       this.socket.destroy();
     } catch {
@@ -399,13 +471,34 @@ class Wire implements Transport {
     }
   }
 
+  // 소켓의 data 조각. 디코더는 필요한 바이트를 자기 배열로 옮기고 조각을 붙잡지 않으므로(framing.ts의 MixedDecoder.push),
+  // consume이 돌아오거나 던진 뒤 조각을 0으로 채운다. 그 사이 우편함의 offer가 불리므로 offer 안에서는 조각이 아직
+  // 지워지지 않았다. 이 Wire가 그 조각의 유일한 소비자라서 지워도 된다. 닫힌 뒤 온 조각, 거절된 조각, 처리 중 던진
+  // 조각도 같다.
   private take(chunk: Uint8Array): void {
+    try {
+      this.consume(chunk);
+    } finally {
+      chunk.fill(0);
+    }
+  }
+
+  private consume(chunk: Uint8Array): void {
     if (this.closed) return;
     const step = this.decoder.push(chunk);
-    if (step.rejected !== null) return this.owner.shut(this, step.rejected);
-    for (const envelope of step.envelopes) {
-      const bytes = FRAME_PREFIX_BYTES + envelope.bytes.length;
-      this.queue.push({ value: envelope.value, bytes });
+    if (step.rejected !== null) {
+      // 거절과 함께 온 앞선 정상 값은 넘기지 않으므로 여기서 지운다(step을 기록하지 않는다).
+      wipeCredentials(step.frames);
+      return this.owner.shut(this, step.rejected);
+    }
+    for (const [i, frame] of step.frames.entries()) {
+      if (frame.kind === "credential") {
+        if (this.owner.offer(this, frame.credential)) continue;
+        wipeCredentials(step.frames.slice(i + 1));
+        return this.owner.shut(this, "credential_not_synced");
+      }
+      const bytes = FRAME_PREFIX_BYTES + frame.envelope.bytes.length;
+      this.queue.push({ value: frame.envelope.value, bytes });
       this.queuedBytes += bytes;
     }
     // 읽기를 멈추지 않으므로 처리가 멈춘 동안 상대가 계속 보내면 여기서만 묶인다.

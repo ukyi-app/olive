@@ -56,12 +56,15 @@ export function fixProfile(profile: RoleProfile): RoleProfile {
   });
 }
 
-// 자격 값은 지시에 없다. 그 실행의 값을 내어 주는 곳이 따로 있다(실제 통로는 연결 위의 메시지로 뒤 작업에서 만든다).
+// 자격 값은 지시에 없다. 그 실행의 값을 내어 주는 곳이 따로 있다(같은 연결의 자격 값 틀을 받는 우편함, credential-inbox.ts).
 // 실행기는 받은 바이트의 SHA-256이 지시의 credential.digest와 같을 때만 쓴다.
 export interface CredentialSource {
   // 없으면 null. 돌려준 바이트를 그대로 대조하고 쓴다(인코딩·줄바꿈을 바꾸지 않는다).
   // signal이 중단되면 요청을 거둔다. 실행기는 중단 뒤 늦게 온 값을 쓰지 않는다.
   take(runId: string, digest: string, signal: AbortSignal): Promise<Uint8Array | null>;
+  // 그 실행이 끝났다(띄웠든 아니든). 그 실행을 위해 쥔 값을 버리고 0으로 채운다. 실행기는 실행이 끝날 때마다 한 번 부른다.
+  // 선택인 까닭: 값을 쥐지 않는 구현은 할 일이 없다.
+  forget?(runId: string): void;
 }
 
 // 정확한 바이트로 digest를 대조한다. digest 칸은 계약이 소문자 16진 64자로 묶는다.
@@ -81,7 +84,9 @@ export function credentialText(value: Uint8Array): string | null {
   }
   if (text.length === 0 || hasNul(text)) return null;
   const back = new TextEncoder().encode(text);
-  return back.length === value.length && back.every((byte, i) => byte === value[i]) ? text : null;
+  const same = back.length === value.length && back.every((byte, i) => byte === value[i]);
+  back.fill(0);
+  return same ? text : null;
 }
 
 export interface LaunchPlan {

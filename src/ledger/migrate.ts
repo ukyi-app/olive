@@ -1,7 +1,7 @@
 // 마이그레이션: migrations/ 폴더의 `NNNN-이름.sql`을 번호 순서대로 한 번씩만 적용한다.
 // - 판 하나는 트랜잭션 하나다. 도중에 실패하면(끊김 포함) 그 판의 표와 적용 기록이 함께 되돌려진다.
 // - 적용 기록(ledger_migrations)은 판 번호와 파일 이름이다. 장부의 판이 코드보다 높거나, 같은 번호의 이름이 다르면 열지 않는다.
-// - 첫 배포 뒤에는 적용된 파일을 고치지 않는다. 바꿀 것은 다음 번호의 파일로 더한다. 묶음마다 자기 마이그레이션을 더하는 쪽은 ledger.md에 있다.
+// - 병합된 판의 파일은 고치지 않는다(배포 전이어도 같다). 바꿀 것은 다음 번호의 파일로 더한다. 묶음마다 자기 마이그레이션을 더하는 쪽은 ledger.md에 있다.
 import type { Database } from "bun:sqlite";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";

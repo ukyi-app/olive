@@ -13,7 +13,8 @@
 // - 닫힘은 연결마다 한 번 closed로 알린다. closed를 넣는 길은 시계·복원기를 읽지 않는다. 닫힌 연결의 늦게 끝난 check 결과는 판단에 넘기지 않는다.
 // - 등록표를 적용할 때마다 registry 사건을 넣고, 봉투마다 지금의 등록표를 check에 넘긴다(연결을 맺을 때의 키를 쥐지 않는다).
 // - writeFrame은 지금 인정된 그 주체의 연결에만, 부르는 쪽이 이미 만든 틀 하나를 한 번의 write로 넘긴다. 서버의 확인을 모두 마친 뒤
-//   부르는 쪽의 lastCheck를 부르고, 그 확인이 기댄 인정(같은 복원기)이 그대로인지 다시 본 뒤 곧바로 write한다. 줄을 두지 않는다:
+//   부르는 쪽의 lastCheck를 부르고, 그 확인이 기댄 인정(같은 복원기)이 그대로인지 다시 보고, 부르는 쪽의 finalCheck(시간 확인)를
+//   부른 뒤 곧바로 write한다. 줄을 두지 않는다:
 //   묶였거나 대기량이 상한을 넘으면 넘기지 않고 그 연결을 닫는다. 넘긴 틀마다 settled를 로컬 쓰기가 끝났을 때, write가 던졌을 때,
 //   또는 그 전에 연결이 닫혔을 때 가운데 먼저 온 쪽에서 정확히 한 번 부른다.
 //
@@ -66,12 +67,18 @@ export interface ConnectionServerOptions {
   readonly maxPendingWriteBytes: number;
 }
 
-// writeFrame에 넘기는 부르는 쪽의 두 함수.
+// writeFrame에 넘기는 부르는 쪽의 함수. lastCheck와 settled는 꼭, finalCheck는 골라서 넘긴다.
 export interface WriteFrameOptions {
-  // 서버가 자기 확인을 모두 마친 뒤, write 바로 앞에서 한 번 부른다. 동기다. null이면 쓴다. 문자열이면 쓰지 않고 그 이름을 돌려준다.
-  // 시계·정지 세대·접수처럼 부르는 쪽만 아는 조건을 여기서 본다. 그 안에서 기다리거나 이 서버를 다시 부르거나 복원 상태를 바꾸지 않는다.
-  // null이어도 그 사이 연결이 닫혔거나 인정을 잃었으면(복원기 교체, 세대 모름) 쓰지 않는다.
+  // 서버가 자기 확인을 모두 마친 뒤 한 번 부른다. 동기다. null이면 쓴다. 문자열이면 쓰지 않고 그 이름을 돌려준다.
+  // 정지 세대·접수처럼 부르는 쪽만 아는 조건을 여기서 본다. 그 안에서 기다리거나 이 서버를 다시 부르거나 복원 상태를 바꾸지 않는다.
+  // null이어도 그 사이 연결이 닫혔거나 인정을 잃었으면(복원기 교체, 세대 모름) 쓰지 않는다. 그 재확인(복원기 포트)이 이 뒤에 돌므로
+  // 시계는 여기서 읽지 말고 finalCheck에서 읽는다.
   readonly lastCheck: () => string | null;
+  // lastCheck가 쓴다고 답하고 인정의 재확인까지 통과해 쓰기로 정한 뒤, write 바로 앞에서 한 번 부른다. 동기다. 답의 꼴은 lastCheck와 같다
+  // (null이면 쓴다, 문자열이면 refused와 그 이름, 던지거나 다른 값이면 check_failed. 어느 쪽이든 연결은 닫지 않는다).
+  // 서버는 그 뒤 다시 확인하지 않으므로 시계를 읽어 시한과 견주는 것만 한다: 기다리지 않고, 이 서버를 다시 부르지 않고, 복원 상태를 바꾸지 않는다.
+  // 돌아온 뒤 write까지는 서버 자기 기록만 본다. 없으면 재확인 뒤 곧바로 쓴다.
+  readonly finalCheck?: () => string | null;
   // 넘긴 틀의 끝. 로컬 쓰기가 끝났을 때(성공·오류) 또는 그 전에 연결이 닫혔을 때 정확히 한 번 부른다. 넘기지 않은 틀에는 부르지 않는다.
   // 던져도 서버의 상태는 바뀌지 않는다.
   readonly settled: (end: SendEnd) => void;
@@ -95,11 +102,11 @@ export const NOT_WRITTEN_REASONS = [
   "closed",
   // 스트림이 묶였거나 쓰기 대기량에 이 틀을 더하면 상한을 넘는다. 그 연결을 send_backlog로 닫았다.
   "backlog",
-  // lastCheck가 쓰지 말라고 답했다. 그 이름은 refusal에 있다. 연결은 그대로다.
+  // lastCheck나 finalCheck가 쓰지 말라고 답했다. 그 이름은 refusal에 있다. 연결은 그대로다.
   "refused",
-  // lastCheck가 던졌거나 null도 문자열도 아닌 값을 냈다. 부르는 쪽의 잘못이라 연결은 그대로다.
+  // lastCheck나 finalCheck가 던졌거나 null도 문자열도 아닌 값을 냈다. 부르는 쪽의 잘못이라 연결은 그대로다.
   "check_failed",
-  // 다른 writeFrame의 lastCheck나 그 뒤 인정의 재확인(복원기 포트) 안에서 불렸다. 바깥 쓰기의 대기량 확인이 낡지 않게 받지 않는다.
+  // 다른 writeFrame의 lastCheck, 그 뒤 인정의 재확인(복원기 포트), finalCheck 안에서 불렸다. 바깥 쓰기의 대기량 확인이 낡지 않게 받지 않는다.
   "reentered",
 ] as const;
 export type NotWrittenReason = (typeof NOT_WRITTEN_REASONS)[number];
@@ -540,11 +547,11 @@ class Server implements ConnectionServer {
   }
 
   // 순서가 보장 2다: 서버의 확인(인정, 소켓의 닫힘, 묶임과 대기량) → lastCheck → 인정의 재확인(그 객체의 세대, 그다음 복원기의
-  // 게시) → write. lastCheck가 쓴다고 답한 뒤 write까지는 연결이 닫히지 않았는지(link.dead)와 확인이 기댄 인정(같은 복원기 객체)이
-  // 그대로인지를 동기로 보고, 보낼 틀을 자기 기록에 더한다. 소켓의 접근자·시계·대기가 없다.
+  // 게시) → (있으면) finalCheck → write. lastCheck가 쓴다고 답한 뒤 write까지는 연결이 닫히지 않았는지(link.dead)와 확인이 기댄
+  // 인정(같은 복원기 객체)이 그대로인지를 동기로 보고, finalCheck를 부르고, 보낼 틀을 자기 기록에 더한다. 소켓의 접근자·시계·대기가 없다.
   writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult {
-    // 부르는 쪽 객체의 접근자가 lastCheck와 write 사이에서 불리지 않게 두 함수를 먼저 꺼낸다.
-    const { lastCheck, settled } = options;
+    // 부르는 쪽 객체의 접근자가 lastCheck와 write 사이에서 불리지 않게 함수를 먼저 꺼낸다.
+    const { lastCheck, settled, finalCheck } = options;
     if (this.checking) return { kind: "not_written", reason: "reentered" };
     // lastCheck가 "쓴다"고 답하는 근거가 이 복원기로 맞춘 인정이다. 재확인은 이 객체와 비교한다.
     const source = this.restorer();
@@ -559,25 +566,30 @@ class Server implements ConnectionServer {
     }
     let verdict: unknown;
     let kept = false;
+    let timing: unknown = null;
     this.checking = true;
     try {
       verdict = lastCheck();
       // 복원기 교체와 세대 모름은 서버를 거치지 않아 link.dead에 드러나지 않는다. 같은 복원기 객체가 지금도 이 연결을 인정하는지
-      // (세대 조회) 본 뒤, 마지막으로 그 객체가 아직 게시돼 있는지 본다. 세대 조회도 외부 코드라 그 도중 게시가 바뀔 수 있으므로
-      // 게시의 확인이 마지막 외부 읽기여야 한다: 그 뒤 write까지는 서버 자기 기록만 본다. 복원기 포트가 이 서버에 다시 써서
-      // 위의 대기량 확인이 낡지 않게 가드 안에서 본다(recognizedBy·restorer는 던지지 않는다).
+      // (세대 조회) 본 뒤, 그 객체가 아직 게시돼 있는지 본다. 세대 조회도 외부 코드라 그 도중 게시가 바뀔 수 있으므로
+      // 게시의 확인이 재확인의 마지막 외부 읽기여야 한다. 복원기 포트가 이 서버에 다시 써서 위의 대기량 확인이 낡지 않게
+      // 가드 안에서 본다(recognizedBy·restorer는 던지지 않는다).
       if (verdict === null && !link.dead) kept = this.recognizedBy(principal, source) === connection && this.restorer() === source;
+      // 쓰기로 정한 뒤의 마지막 외부 코드다. lastCheck와 재확인에 걸린 시간이 이 안에서 읽는 시각에 든다. 그 뒤 write까지는 서버 자기 기록만 본다.
+      // 게시 조회가 서버를 다시 불러 이 연결을 닫고 같은 객체를 돌려줄 수 있어 kept만으로는 열린 연결인지 모른다.
+      if (kept && !link.dead && finalCheck !== undefined) timing = finalCheck();
     } catch {
       return { kind: "not_written", reason: "check_failed" };
     } finally {
       this.checking = false;
     }
     if (verdict !== null) return typeof verdict === "string" ? { kind: "not_written", reason: "refused", refusal: verdict } : { kind: "not_written", reason: "check_failed" };
-    // lastCheck가 서버를 다시 불러 이 연결을 닫았으면 넘기지 않는다(자기 기록이다).
+    // lastCheck나 finalCheck가 서버를 다시 불러 이 연결을 닫았으면 넘기지 않는다(자기 기록이다).
     if (link.dead) return { kind: "not_written", reason: "closed" };
     // 인정을 잃은 연결은 여기서 닫지 않는다. 닫는 것은 판단의 일이다: 다음 tick이 그때도 객체 불일치나 세대 모름을 보면
     // restore_changed로 닫고, 일회성 포트 예외였으면 연결은 열린 채다.
     if (!kept) return { kind: "not_written", reason: "not_recognized" };
+    if (timing !== null) return typeof timing === "string" ? { kind: "not_written", reason: "refused", refusal: timing } : { kind: "not_written", reason: "check_failed" };
     const send: Send = { settled, done: false };
     link.sends.add(send);
     try {

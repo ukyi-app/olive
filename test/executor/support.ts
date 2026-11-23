@@ -134,13 +134,23 @@ export class FakeCredentials implements CredentialSource {
   values = new Map<string, Uint8Array>();
   calls: { runId: string; digest: string }[] = [];
   signals: AbortSignal[] = [];
+  // 내어 준 배열. 작업자가 쓴 뒤 0으로 채우므로 시험이 쥔 원본(values) 대신 사본을 내어 준다.
+  handed: Uint8Array[] = [];
+  forgotten: string[] = [];
   // 값을 내어 주기 전에 시험이 끼어드는 자리(준비 중 경합).
   before: (() => void | Promise<void>) | undefined;
   async take(runId: string, digest: string, signal?: AbortSignal) {
     this.calls.push({ runId, digest });
     if (signal) this.signals.push(signal);
     await this.before?.();
-    return this.values.get(runId) ?? null;
+    const value = this.values.get(runId);
+    if (value === undefined) return null;
+    const copy = new Uint8Array(value);
+    this.handed.push(copy);
+    return copy;
+  }
+  forget(runId: string) {
+    this.forgotten.push(runId);
   }
 }
 
