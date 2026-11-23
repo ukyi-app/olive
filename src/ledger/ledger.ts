@@ -2700,7 +2700,8 @@ export class Ledger {
   // 가운데 먼저 된 쪽에 따라 본체가 보는 단계와 같은 입력의 다음 배정이 다르다.
   // 그 실행의 task_start 지시가 없거나 session_start 지시가 있거나(작업자의 정상 이력에는 없다: startRun은 task_start만 적고 startSession은
   // 지시를 적지 않는다), now가 그 실행의 task_start·run_renew 지시의 발행 최댓값 + OPERATOR_CLOSE_AFTER_MS 전이면 닫지 않는다
-  // (start_may_launch: 기다린다). podStartedAt이 같은 한도 전이면 pod_started_too_early다(새 파드가 그 시작을 받을 수 있었다: 파드를
+  // (start_may_launch). podStartedAt ≤ now를 먼저 요구하므로 now가 한도 전이면 그 파드도 한도 전에 떴고, 같은 파드로는 기다려도
+  // 닫히지 않는다: 이력이 맞으면 한도까지 기다린 뒤 파드를 교체하고, 새 파드가 뜬 시각을 다시 읽어 닫는다. podStartedAt이 같은 한도 전이면 pod_started_too_early다(새 파드가 그 시작을 받을 수 있었다: 파드를
   // 한 번 더 바꾼다). 장부는 사람이 언제 확인했는지, 넘긴 파드의 시각이 맞는지 모른다(부르는 쪽이 지킬 조건).
   // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 작업자(run_not_worker) → 끝 상태 아님(run_ended) →
   // 종료 확인 없음(stop_confirmed) → unknown_running·stopping(transition_denied) → 정지 기록 있음(stop_unknown) →

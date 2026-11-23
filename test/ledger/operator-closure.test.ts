@@ -924,7 +924,9 @@ test("원 SQL: 근거의 정수 칸 셋(pod_started_at·stop_generation·closed_
   const valid = { pod_started_at: CLOSABLE_AT, stop_generation: 0, closed_at: LATER };
   type Column = keyof typeof valid;
   type Value = number | string | { real: number };
-  // 정수가 아닌 형의 값. INTEGER 칸이면 SQLite가 정수로 바꾼(반올림한) 뒤의 값을 트리거가 봤을 것들이다.
+  // 정수가 아닌 형의 값. INTEGER 칸이었다면 두 갈래로 나뉜다: 소수 REAL(v + 0.5)은 BEFORE 트리거까지 오지 않고 STRICT 형 오류가
+  // 나고, 정수 값 REAL과 정수로 바뀌는 TEXT(소수점·정수 꼴·지수·앞뒤 공백)는 칸의 형 변환(소수 부분이 있는 TEXT는 반올림) 뒤의
+  // 정수로 트리거가 비교했다.
   // { real }은 정수와 같은 값의 REAL이다(JS 숫자로 넘기면 정수로 묶이므로 SQL에서 CAST로 만든다).
   const shapes = (v: number): [string, Value][] => [
     ["소수점 TEXT", `${v}.0`],
