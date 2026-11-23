@@ -65,7 +65,7 @@ LifeTickResult =
 | `query` | 간격을 지났으면 `statusQueryDraft` → `sealDraft` → `sink.send`. 장부에 쓰지 않는다 |
 | `finalize` | 없음(`finalize_withheld`) |
 
-판단에 넘기는 값: `lease`는 장부가 끝을 아는 임대만(`expiresAt`이 `"unknown"`이거나 지시가 없거나 그 실행이 `unsentRenews`에 있으면 `null`이라 판단은 조회로 간다), `lastInstructionAt`은 `stopping`이면 `lastStopAt`, 결과 쪽 상태면 `lastFinalizeAt`(그 밖의 상태에서 판단은 이 값을 쓰지 않는다), `resultSettled`는 늘 `false`, `cancelRequested`는 이어진 입력의 `cancelled`(입력이 없는 실행은 `false`).
+판단에 넘기는 값: `lease`는 장부가 끝을 아는 임대만(`expiresAt`이 `"unknown"`이거나 지시가 없거나 그 실행이 `unsentRenews`에 있으면 `null`이라 판단은 조회로 간다), `lastInstructionAt`은 `stopping`이면 `lastStopAt`, 결과 쪽 상태면 `lastFinalizeAt`(그 밖의 상태에서 판단은 이 값을 쓰지 않는다), `resultSettled`는 늘 `false`(아래 "확정"), `cancelRequested`는 이어진 입력의 `cancelled`(입력이 없는 실행은 `false`).
 
 ## 판단에 쓰는 칸
 
@@ -118,7 +118,10 @@ LifeTickResult =
 
 ## 확정
 
-내지 않는다. 결과 보관(S6)이 없어 `resultSettled`는 늘 `false`이고, 판단이 그래도 확정을 내는 상태(`failed_stopped`·`cleanup_pending`)는 `finalize_withheld`로 남는다. 장부 포트에 확정 기록이 없다. 그 실행들은 자리를 쥔 채 남는다.
+내지 않는다. 판단이 그래도 확정을 내는 상태(`failed_stopped`·`cleanup_pending`)는 `finalize_withheld`로 남는다. 장부 포트에 확정 기록이 없다. 그 실행들은 자리를 쥔 채 남는다.
+
+- **`resultSettled`는 늘 `false`다.** 판단(`lifecycle.ts`)이 이 값을 보는 곳은 작업자의 `ready_result` 하나이고, `true`이면서 앞선 확정 지시가 없거나 그 답을 기다리는 시간(`answerTimeoutMs`)이 지났을 때 확정(`finalized`로 가는 의도)을 낸다. 그 시간 안이면 `true`여도 `wait`다. 확정 지시는 결과 digest와 보관 시각을 싣고 실행기에 정리를 청한다. 실행기가 결과 보고를 다시 보내지 않게 되는 것은 확정이 아니라 그 보고의 ack다(`src/executor/worker.ts`의 정리 길은 결과 사건의 받음 표시를 세우지 않고, 받음 표시가 없는 사건은 다시 보내며, 그 표시는 ack만 세운다). 확정은 되돌릴 수 없는 정리를 부르므로, `true`의 뜻은 "그 실행의 결과 보고가 저장 자리(`storedRef`)와 함께 장부에 반영됐고 그 digest가 실행 줄의 `resultDigest`와 같다"여야 한다. 장부에 그것을 읽는 공개 읽기가 없다: `pendingReports()`는 반영 전 보고만 내고, `markResult`는 보고 없이도 `ready_result`로 판정할 수 있어 상태만으로는 본문이 보관됐는지 모른다. 그래서 읽지 못함과 같이 `false`(확정을 내지 않는 쪽)로 넘긴다.
+- **결과 보고가 받아들여진 것은 종료 증명이나 게시 허가가 아니다(계약 v1).** 결과 보고가 반영되고 `ready_result`로 판정돼도 이 박자는 `wait`이고 자리를 풀지 않는다(시험이 지킨다).
 
 ## 겹쳐 부르기
 
@@ -162,4 +165,5 @@ LifeTickResult =
 - **`lastQueries`를 넘긴다.** 결과의 `at`(실은 뒤의 시각, 또는 봉투 시한)을 쓴다. 넘기지 않으면 조회가 필요한 실행을 박자마다 묻는다.
 - **실행별 연결·정지 세대를 실행기와 맞춘다.** 정지 중의 종료는 장부의 지금 세대를 싣는다. 실행기가 그 세대를 적용하기 전이면 `requested`·`deadline` 종료를 받지 않는다(높은 세대는 `emergency_stop`만 받는다). 세대 맞춤과 비상 종료는 다른 조각이고 기존 경로를 쓴다. 재전송은 장부의 기존 요청 ID와 본문을 쓴다.
 - **`halted`를 본다.** `threw`이면 앞 결과를 반영하고, 멈춘 실행(`haltedAt`)과 결과 목록에 없는 실행을 장부에서 다시 대조한다. `*_record_unknown`은 장부를 다시 읽어(종료는 `unansweredInstructions`의 그 요청 ID, 갱신은 `instructionTimes.renewIssued`의 발행 시각) 적혔는지 가린다.
+- **`resultSettled`는 장부의 읽기가 생긴 뒤에만 `true`로 넘긴다.** 그 실행의 결과 보고 가운데 저장 자리와 함께 반영된 것이 있고 그 digest가 실행 줄의 `resultDigest`와 같을 때만 `true`, 읽지 못하면 `false`다. 그 읽기와 확정 기록·송신은 같은 조각이 함께 연다(지금은 `true`여도 `finalize_withheld`다).
 - **박자를 되풀이해 부른다.** 갱신을 낼 수 있는 구간은 기본값에서 7000ms라(`ledger.md` "판단을 갱신 구간 안에서 부른다") 그 안에서 여러 번 부른다.
