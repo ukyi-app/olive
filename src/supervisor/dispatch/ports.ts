@@ -1,7 +1,7 @@
 // 배정기가 바깥과 닿는 자리(포트)의 꼴. 타입만 둔다. 실제 구현(소켓, 시계, 난수, 서명 키)은 진입점 조각이 만든다.
 // 순수 판단과 봉투 만들기(envelopes.ts)는 이 포트로만 시각·난수·서명·전송을 받으므로, 시험은 가짜 포트로 돌린다.
 import type { Action, Envelope, SealInput } from "../../contract/v1/index.ts";
-import type { CredentialRef } from "../../ledger/index.ts";
+import type { CredentialRef, Ledger } from "../../ledger/index.ts";
 
 // 지금 시각. Unix epoch 밀리초의 안전 정수.
 // 장부에 주입한 시계와 같은 시계여야 한다: 시작 지시의 발행 시각은 장부 시계가 정하고, 갱신 기록에 넘기는 now가 그보다 늦지 않으면
@@ -37,6 +37,11 @@ export type SendOutcome = "sent" | "no_connection" | "too_late_to_send";
 export interface InstructionSink {
   send(envelope: Envelope): Promise<SendOutcome>;
 }
+
+// 시작 봉투의 송신 표식. 박자가 쥔 장부 포트(openLedger가 연 Ledger)의 markStartDispatch 그대로다.
+// 함정: 표식은 장부 열기마다 따로 센다(D-90의 sent_by_other_open). 박자가 읽고 쓰는 장부 객체와 다른 열기의 객체를 넘기면
+// 그 표식은 이 박자의 열기에서 실은 시작을 가리지 못한다. 그래서 박자의 장부 포트에 함께 싣고 따로 받지 않는다.
+export type StartMarker = Pick<Ledger, "markStartDispatch">;
 
 // 고른 계정(selectAccount의 account·method)에 지금 쓸 자격의 revision과 digest를 붙인다. 값은 싣지 않는다.
 // 모르면 known: false이고 배정기는 그 실행을 시작하지 않는다(값을 지어내지 않는다).

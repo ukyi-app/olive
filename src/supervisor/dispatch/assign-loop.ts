@@ -6,7 +6,8 @@
 // 1. 닫혔거나 모르면 쓰지 않는다. 접수, 정지 세대, 대기 부탁 목록, 후보 연결, 맡기지 않을 실행기, 시작 판단의 읽기 넷을 쓰기 전에 모두 읽고,
 //    하나라도 닫힘·모름·틀림이면 그 박자에는 잇기도 시작도 부르지 않는다. 쓰기 직전마다 접수를 다시 본다(포트가 비동기라 박자 중에 닫힐 수 있다).
 // 2. 잇기는 pickAssignment가 assign을 낸 부탁만, 난수 포트에서 만든 새 실행 ID로 한다. 한 부탁의 보류·거절·실패는 그 부탁만 건너뛴다.
-// 3. 시작은 planNext의 작업자 후보만 startRun에 넘기고, 장부의 성공 답(issuedAt)을 받은 뒤에만 초안 → 봉하기 → 내보내기를 한다.
+// 3. 시작은 planNext의 작업자 후보만 startRun에 넘기고, 장부의 성공 답(issuedAt)을 받은 뒤에만 초안 → 봉하기 → 송신 표식 → 내보내기를 한다.
+//    표식과 내보내기는 send-gate.ts의 sendInstruction 하나로만 하고, 표식이 ok가 아니면 싣지 않는다(D-90 자동 닫기의 전제).
 // 4. 내보내지 못하면 그 실행을 장부에 적힌 그대로 두고, 새 실행 ID·새 요청 ID로 다시 만들지 않는다(다시 보내기는 뒤 조각).
 // 5. 맡기지 않을 실행기(withheld)에는 새 부탁을 잇지 않고, 그 실행기에 이미 배정된 대기 실행도 startRun 직전에 막는다.
 //    후보에서 빼기만 하면 이미 배정된 대기 실행은 장부 목록에서 따로 골라 시작되므로 두 자리 모두에서 본다.
@@ -32,9 +33,14 @@ import type { Candidate } from "../transport/connections.ts";
 import { newUuid, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, type StartDraftInput } from "./envelopes.ts";
 import { type Pick as PickResult, pickAssignment, type PickInput, type PreAssignFacts, type RunPlan } from "./pick.ts";
 import type { CredentialPort, InstructionSink, Random, Signer } from "./ports.ts";
+import { type MarkFailure, sendInstruction } from "./send-gate.ts";
 
-// 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다.
-export type AssignLoopLedger = Pick<Ledger, "listWaitingToolRequests" | "assignToolRequest" | "queueView" | "listRuns" | "slotHolds" | "listInputs" | "startRun">;
+// 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. markStartDispatch는 시작 봉투의 송신 표식이고,
+// startRun을 부른 그 장부 객체로 적는다(표식은 장부 열기마다 따로 센다).
+export type AssignLoopLedger = Pick<
+  Ledger,
+  "listWaitingToolRequests" | "assignToolRequest" | "queueView" | "listRuns" | "slotHolds" | "listInputs" | "startRun" | "markStartDispatch"
+>;
 
 // 접수와 정지 세대. 실제로는 재시작 복원기(Restorer)다. 정지 세대는 startRun과 시작 지시의 머리에 싣는다.
 export type IntakeSource = Pick<Restorer, "intakeOpen" | "stopGeneration">;
@@ -106,11 +112,15 @@ export type RequestOutcome =
 
 // 시작은 장부에 적혔지만 지시를 내보내지 못한 이유. 앞의 넷과 봉하기 거절은 봉투를 만들지 못한 것이고, no_connection·too_late_to_send는
 // 내보내기 포트의 거절이다. send_threw·send_answer_malformed는 포트가 연결에 실었는지 모른다(delivery: "unknown").
+// sink_unavailable은 내보내기 포트를 얻지 못해 부르지 않은 것이고(표식도 적지 않았다), start_unmarked는 송신 표식이 ok가 아니어서
+// 포트를 부르지 않은 것이다(markReason에 그 이유).
 export type NotSentReason =
   | "ledger_answer_malformed"
   | "draft_threw"
   | "seal_threw"
   | DraftRefusalReason
+  | "sink_unavailable"
+  | "start_unmarked"
   | "no_connection"
   | "too_late_to_send"
   | "send_threw"
@@ -132,6 +142,7 @@ export type StartOutcome =
       readonly delivery: "not_sent" | "unknown";
       readonly field?: string;
       readonly sealReason?: string;
+      readonly markReason?: MarkFailure;
     }
   | { readonly runId: string; readonly outcome: "start_refused"; readonly reason: LedgerRefusal }
   // 장부를 부르지 않았거나(random_unavailable) 장부가 던졌거나 답이 성공·거절의 꼴이 아니다. 적혔는지 모르므로 지시를 만들지 않는다.
@@ -469,8 +480,11 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
   const requestId = freshUuid(ports.random);
   if (requestId === null) return { runId, outcome: "start_failed", failure: "random_unavailable" };
   let answer: unknown;
+  // 송신 표식은 startRun을 부른 이 장부 객체로 적는다(포트의 접근자가 부를 때마다 다른 객체를 내도 같은 열기에 남긴다).
+  let ledger: AssignLoopLedger;
   try {
-    answer = ports.ledger.startRun({ runId, requestId, stopGeneration, now });
+    ledger = ports.ledger;
+    answer = ledger.startRun({ runId, requestId, stopGeneration, now });
   } catch {
     return { runId, outcome: "start_failed", failure: "threw" };
   }
@@ -482,7 +496,7 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
   const run = answer.run;
   const issuedAt = isTime(answer.issuedAt) ? answer.issuedAt : null;
   const executorId = isObject(run) && typeof run.executorId === "string" ? run.executorId : null;
-  const notSent = (reason: NotSentReason, extra: { field?: string; sealReason?: string; delivery?: "unknown" } = {}): StartOutcome => ({
+  const notSent = (reason: NotSentReason, extra: { field?: string; sealReason?: string; markReason?: MarkFailure; delivery?: "unknown" } = {}): StartOutcome => ({
     runId,
     outcome: "recorded_not_sent",
     requestId,
@@ -493,6 +507,7 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
     delivery: extra.delivery ?? "not_sent",
     ...(extra.field === undefined ? {} : { field: extra.field }),
     ...(extra.sealReason === undefined ? {} : { sealReason: extra.sealReason }),
+    ...(extra.markReason === undefined ? {} : { markReason: extra.markReason }),
   });
   if (!isObject(run) || run.runId !== runId) return notSent("ledger_answer_malformed");
 
@@ -515,12 +530,14 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
     return notSent("seal_threw");
   }
 
-  let sent: unknown;
-  try {
-    sent = await ports.sink.send(envelope);
-  } catch {
-    return notSent("send_threw", { delivery: "unknown" });
-  }
+  // 송신 표식 → 내보내기는 공유 함수 하나로만 한다(재전송 박자와 같은 자리, send-gate.md). 표식은 봉한 뒤, 포트 호출 직전이다:
+  // 그 앞의 실패(초안·봉하기)에는 표식이 남지 않는다. 표식이 ok가 아니면 싣지 않고, 장부에 적힌 시작은 그대로 둔다(재전송이 다시 시도한다).
+  // 표식은 이 박자의 now와 장부의 발행 시각 가운데 늦은 값(봉한 시각)으로 적는다. 박자는 시계 포트가 없고 그 뒤의 시각을 읽지 않는다.
+  const gate = await sendInstruction(ports, envelope, { marker: ledger, at: sealAt });
+  if (gate.kind === "unmarked") return notSent("start_unmarked", { markReason: gate.markReason });
+  if (gate.kind === "sink_unavailable") return notSent("sink_unavailable");
+  if (gate.kind !== "answered") return notSent("send_threw", { delivery: "unknown" });
+  const sent = gate.answer;
   if (sent === "sent") return { runId, outcome: "sent", requestId, issuedAt: envelope.header.issued_at, executorId: envelope.header.recipient };
   if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
   return notSent("send_answer_malformed", { delivery: "unknown" });

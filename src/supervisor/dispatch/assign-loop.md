@@ -8,7 +8,7 @@
 assignAndStartTick(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number): Promise<TickResult>
 
 AssignLoopPorts = {
-  ledger: Pick<Ledger, "listWaitingToolRequests" | "assignToolRequest" | "queueView" | "listRuns" | "slotHolds" | "listInputs" | "startRun">
+  ledger: Pick<Ledger, "listWaitingToolRequests" | "assignToolRequest" | "queueView" | "listRuns" | "slotHolds" | "listInputs" | "startRun" | "markStartDispatch">
   intake: Pick<Restorer, "intakeOpen" | "stopGeneration">
   connections: { candidates(): { known: true, value: Candidate[] } | { known: false } }
   withheld: { executors(): { known: true, value: string[] } | { known: false } }  // 맡기지 않을 실행기(작업자 실행기 주체 이름)
@@ -48,8 +48,8 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 
 | 실행마다 (`StartOutcome`) | 뜻 |
 |---|---|
-| `sent` + `requestId`, `issuedAt`, `executorId` | 시작을 적고 지시를 연결에 실었다(`sent`는 받았다는 뜻이 아니다) |
-| `recorded_not_sent` + `requestId`, `stopGeneration`, `issuedAt`, `executorId`, `reason`, `delivery` | 장부에는 시작이 적혔고 전송 성공을 확인하지 못했다. 연결에 실렸는지는 `delivery`로 읽는다(`unknown`이면 실렸을 수 있다). 아래 "내보내지 못했을 때" |
+| `sent` + `requestId`, `issuedAt`, `executorId` | 시작을 적고, 송신 표식을 커밋한 뒤 지시를 연결에 실었다(`sent`는 받았다는 뜻이 아니다) |
+| `recorded_not_sent` + `requestId`, `stopGeneration`, `issuedAt`, `executorId`, `reason`, `delivery` | 장부에는 시작이 적혔고 전송 성공을 확인하지 못했다. 연결에 실렸는지는 `delivery`로 읽는다(`unknown`이면 실렸을 수 있다). 표식이 `ok`가 아니어서 싣지 않았으면 `start_unmarked`(+ `markReason`). 아래 "내보내지 못했을 때" |
 | `start_refused` + `reason` | 장부가 거절했다. 지시를 만들지 않았다 |
 | `start_failed` + `failure` | `random_unavailable`(장부를 부르지 않음), `threw`, `malformed_answer`. 적혔는지 모르므로 지시를 만들지 않았다 |
 | `withheld` + `reason`, `executorId` | 이 호출은 `startRun`을 부르지 않았다(장부 쓰기·난수·송신 0, 그 실행을 `queued`에서 바꾸지 않았다). `listed`: 지정 실행기가 맡기지 않을 실행기다(`executorId`가 그 이름). `executor_unknown`: 실행 줄의 지정 실행기가 작업자 실행기 주체 이름으로 읽히지 않았다(집합이 비어 있어도). `withheld_unknown`: `startRun` 직전에 다시 읽은 집합이 모름이다. 뒤 둘은 `executorId: null` |
@@ -62,7 +62,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 1. `now`가 장부의 시각 꼴(양의 안전 정수 ms)이 아니면 `malformed_now`.
 2. **쓰기 전의 읽기.** 접수(`intakeOpen()`이 `true`가 아니면 `intake_closed`), 정지 세대(0 이상의 안전 정수가 아니면 `stop_generation_unknown`), 대기 부탁 목록, 후보 연결, 맡기지 않을 실행기(항목이 모두 작업자 실행기 주체 이름이 아니면 `withheld`, 아래 "맡기지 않을 실행기"), 시작 판단의 읽기 넷(`queueView`, `listRuns`, `slotHolds`, `listInputs`)을 이 차례로 읽는다. 하나라도 `known`이 불리언 `true`가 아니거나 던지거나 꼴이 틀리면(배열이 아님, 객체가 아닌 항목) 그 이름으로 `read_unknown`이다. `listRuns`의 대기 실행에 대한 `queueView`의 시작 불가 사유(`startBar`)는 명시적 `null`이거나 장부가 정한 이름(`StartBar`)이어야 하고, 줄이 없거나(두 읽기가 어긋남) 칸이 빠졌거나 다른 값이면 `queue_view`다. 이 검사는 행마다 본 범위에서다: 같은 실행의 `queueView` 행이 여럿이면 마지막 행만 보므로, 앞 행의 틀린 사유는 뒤의 정상 행에 가려져 시작이 불릴 수 있다(실제 장부는 한 실행에 한 행을 낸다). 읽기의 답은 받았으나 그 행을 해석하다 던지면(행의 칸 getter, 배열의 빈 원소) 구별된 결과 없이 박자가 예외로 끝난다(아래 "박자가 멈출 때").
 3. 그 읽기로 `planNext`의 입력을 만들어 부른다. 출처를 나누지 못한 입력(`originOf`가 `undefined`)은 넣지 않아 그 실행이 `input_unknown`으로 보류된다. `planNext`가 정책 검사에서 던지면 `policy_rejected`다.
-4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 맡기지 않을 실행기를 다시 읽어 그 실행의 지정 실행기와 대조하고(걸리면 `withheld`, 그 실행은 건너뛴다), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → `sink.send`. 거절·예외이면 지시를 만들지 않는다. 성공 답은 초안에 필요한 칸(실행 줄과 `issuedAt`)만 검증하고, 이 모듈이 쓰지 않는 칸(성공 답의 별도 `credential` 등)은 보지 않는다.
+4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 맡기지 않을 실행기를 다시 읽어 그 실행의 지정 실행기와 대조하고(걸리면 `withheld`, 그 실행은 건너뛴다), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → 송신 표식 → `sink.send`. 표식과 송신은 공유 함수 `sendInstruction`(`send-gate.md`) 하나로 하고, 표식은 `startRun`을 부른 그 장부 객체로 봉투의 실행·요청 ID를 봉한 시각(아래 "시각")에 적는다. 표식이 `ok`가 아니면 싣지 않는다(`start_unmarked`). 거절·예외이면 지시를 만들지 않는다. 성공 답은 초안에 필요한 칸(실행 줄과 `issuedAt`)만 검증하고, 이 모듈이 쓰지 않는 칸(성공 답의 별도 `credential` 등)은 보지 않는다.
 5. **잇기.** 대기 부탁마다 목록의 순서로: 사실 포트, 자격 포트, 접수와 맡기지 않을 실행기의 다시 읽기, 그 실행기를 뺀 후보로 `pickAssignment`. `assign`이면 고른 실행기를 같은 집합과 한 번 더 대조하고, 걸리지 않으면 난수 포트로 실행 ID를 만들어 `assignToolRequest`. 어느 답이든 그 부탁만의 결과이고 다음 부탁을 본다.
 
 2의 읽기에서 1~5의 어느 쓰기도 부르지 않는다. 읽기 하나라도 닫힘·모름·틀림이면 그 박자에는 잇기도 시작도 없다.
@@ -104,6 +104,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 
 - 판단(`pickAssignment`, `planNext`)과 장부 쓰기(`assignToolRequest`·`startRun`의 `now`)는 인자로 받은 `now` 하나를 쓴다.
 - 시작 지시의 머리 `issued_at`은 `startRun`이 돌려준 `issuedAt`이다(장부가 자기 시계로 정한 값, `envelopes.md` "시각 규칙").
+- **송신 표식의 시각(`marked_at`)은 봉하는 시각과 같다.** 이 박자가 아는 가장 늦은 시각이다. 표식의 시각은 장부가 판정에 쓰지 않는다(D-90은 표식의 열기 ID만 본다).
 - **봉하는 시각은 `now`와 `issuedAt` 가운데 늦은 값이다.** 장부는 박자의 `now`를 읽은 뒤 같은 시계로 발행 시각을 정하므로 `issuedAt`이 `now`보다 늦을 수 있고, 그때 `now`로 봉하면 `sealDraft`가 `issued_in_future`로 막는다. 늦은 값도 같은 시계에서 읽은 값이다. 실제로 싣는 시각의 봉투 시한과 작업 기한의 여유는 내보내기 포트가 다시 잰다(`ports.ts`의 `InstructionSink`).
 - **실행 기한(`deadlineAt`)은 박자의 `now`부터 센다.** 잇기는 사실·자격 포트를 기다린 뒤 장부에 쓰지만 `now`는 박자 처음의 값이라, 기다리는 동안 흐른 시간만큼 실제 잇는 순간보다 기한이 먼저 흐르고, 조회가 길면 이은 직후에 이미 지나 있을 수 있다(그 실행은 `planNext`가 `deadline_passed`로 보류한다).
 
@@ -120,8 +121,12 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 | `reason` | `delivery` |
 |---|---|
 | `ledger_answer_malformed`(답의 실행 ID가 넘긴 것과 다름 등), `draft_threw`, `startDraft`의 거절 이름, `seal_threw`, `sealDraft`의 거절 이름(`field`·`sealReason` 함께) | `not_sent` |
+| `sink_unavailable`(내보내기 포트나 그 `send`를 얻다 던지거나 함수가 아님. 포트를 부르지 않았고 표식도 적지 않았다) | `not_sent` |
+| `start_unmarked`(송신 표식이 `ok`가 아님. `markReason`: 장부의 거절 이름(`ledger_unwritable` 등), `threw`, `malformed_answer`, `envelope_unreadable`) | `not_sent` |
 | `no_connection`, `too_late_to_send` | `not_sent` |
 | `send_threw`, `send_answer_malformed` | `unknown`: 포트가 연결에 실었는지 모른다 |
+
+`start_unmarked`·`sink_unavailable`·봉투를 만들지 못한 실패는 포트를 부르지 않았으므로 실리지 않은 것이 확실하다. 실제 장부를 표식 포트로 쓰면 이번 배정 시도가 새 표식을 쓰지 않았고(앞선 시도나 재전송이 같은 시작의 표식을 이미 썼을 수 있다), 주입한 표식 포트가 커밋한 뒤 던지면 표식 한 줄이 남은 `start_unmarked`(`threw`)다(닫기를 덜 하는 쪽). 장부에 적힌 시작은 그대로 답을 기다리는 지시로 남고, 재전송 박자가 같은 요청으로 다시 표식을 적고 싣는다. 표식 뒤에 싣지 못한 길(`no_connection`·`too_late_to_send`·`delivery: "unknown"`, 포트 호출 전의 프로세스 죽음)은 `send-gate.md` "표식 뒤에 싣지 않고 돌아가는 길"이다. 이 박자에는 시계 포트가 없어 표식과 송신 사이에 시계를 다시 읽지 않는다.
 
 `requestId`, `runId`, `stopGeneration`, `issuedAt`(장부의 답에서 읽지 못했으면 `null`), `executorId`를 싣는다. 이 값은 처음 지시를 가리키는 식별값이고, 본문을 다시 만들 재료는 아니다. 본문(예산 등)은 장부의 실행 줄에서 오므로 그 뒤 장부가 바뀌면 같은 식별값으로 다시 만든 본문이 처음과 다를 수 있다. 결과에는 본문이나 자격 참조를 싣지 않는다.
 
