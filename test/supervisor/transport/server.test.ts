@@ -1330,6 +1330,42 @@ describe("(5) 인정된 연결에 틀 하나를 쓴다(recognized, writeFrame)",
     expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
   });
 
+  test("재확인의 세대 조회 안에서 같은 세대의 새 복원기를 게시해도 넘기지 않는다: 재확인의 마지막 외부 읽기는 복원기 게시의 확인이다", async () => {
+    const original: { stopGeneration(): number | null } = { stopGeneration: () => GENERATION };
+    const box: { source: StopGenerationSource } = { source: original };
+    const h = await start({ restorer: () => box.source });
+    const a = await greet(h, K1, R1);
+    const raw = rawOf(a);
+    const handedA = handedTo(serverSocket(h, a));
+
+    // lastCheck가 쓴다고 답한 뒤의 세대 조회에서만 게시를 바꾼다. 처음 인정을 볼 때의 세대 조회는 그대로 둔다.
+    let armed = false;
+    let published = 0;
+    original.stopGeneration = () => {
+      if (armed) {
+        armed = false;
+        published++;
+        box.source = { stopGeneration: () => GENERATION };
+      }
+      return GENERATION;
+    };
+    const swapped = caller(() => {
+      armed = true;
+      return null;
+    });
+    const result = h.server.writeFrame(a.id, R1, frame({ never: "swapped" }), swapped.options);
+    await Bun.sleep(20);
+    expect({ result, handed: handedA.length, received: raw().byteLength, ends: swapped.ends }).toEqual({ result: NOT_RECOGNIZED, handed: 0, received: 0, ends: [] });
+    expect([swapped.checks(), published]).toEqual([1, 1]);
+    expect(h.closedNotes(a.id)).toEqual([]);
+    expect(phaseOf(h, a)).toBe("greeted");
+
+    // 새 복원기로 맞춘 적이 없으므로 다음 박자의 판단이 닫는다. 넘기지 않은 틀의 끝은 그 뒤에도 오지 않는다.
+    h.server.tick();
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment" }]);
+    expect(swapped.ends).toEqual([]);
+  });
+
   test("줄을 두지 않는다: 하위 쓰기를 붙든 채 대기량이 상한 정각이면 넘기고, 넘으면 넘기지 않고 send_backlog로 닫는다. 묶인 스트림도 같다", async () => {
     const LIMIT = 300;
     const h = await start({ maxPendingWriteBytes: LIMIT });
@@ -1484,8 +1520,8 @@ describe("(5) 인정된 연결에 틀 하나를 쓴다(recognized, writeFrame)",
     expect(result).toEqual(WRITTEN);
     const l = order.indexOf("lastCheck");
     const w = order.indexOf("write");
-    // lastCheck 뒤에 서버가 읽는 것은 확인이 기댄 인정을 다시 보는 복원기 포트 둘뿐이다.
-    expect(order.slice(l, w + 1)).toEqual(["lastCheck", "clock", "lastCheck:end", "restorer", "stopGeneration", "write"]);
+    // lastCheck 뒤에 서버가 읽는 것은 확인이 기댄 인정을 다시 보는 복원기 포트 둘뿐이고, 마지막이 복원기 게시의 읽기다.
+    expect(order.slice(l, w + 1)).toEqual(["lastCheck", "clock", "lastCheck:end", "stopGeneration", "restorer", "write"]);
     // 서버의 확인(복원기, 소켓의 닫힘·묶임·대기량)은 lastCheck 앞에 있고, 서버는 시계를 읽지 않는다.
     expect(order.slice(0, l)).toEqual(expect.arrayContaining(["restorer", "stopGeneration", "writableCorked", "writableLength"]));
     expect(order.slice(0, l)).not.toContain("clock");

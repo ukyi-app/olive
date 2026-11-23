@@ -30,14 +30,18 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 
 이 면이 주장하는 것은 아래 넷뿐이다.
 
-1. **인정된 연결에만 쓴다.** 그 번호의 연결이 서버에 살아 있고, 부르는 순간의 복원기로 맞춰 인사까지 끝났고(연결 판단의 `candidates(지금의 복원기)`에 있다: `greeted`, 맞춤에 답한 복원기가 지금의 복원기, 인사 있음, 그 복원기가 세대를 안다), 맞춤의 주체가 부르는 쪽이 댄 주체와 같을 때만 쓴다. 같은 주체의 인정된 연결이 둘 이상으로 보이면 아무 연결도 인정하지 않는다. 아니면 넘긴 바이트 0이고 `not_recognized`다. 그래서 맞춤 전의 연결, 맞춤의 답을 넘기고 완료를 기다리는 연결(`requested`), 답은 실었고 인사 전인 연결(`answered`), 닫혔거나 다른 주체의 연결, 복원기가 바뀌었거나 세대를 모르게 된 뒤의 옛 연결(박자가 닫기 전이어도)에는 한 바이트도 넘기지 않는다. 이 인정은 `lastCheck`가 쓴다고 답한 뒤에 같은 복원기 객체로 다시 본다(아래 2의 5): `lastCheck` 도중 복원기가 바뀌었거나(같은 세대의 새 객체여도) 세대를 모르게 됐어도 `not_recognized`다. 맞춤의 답이 넘길 때 빈 버퍼를 요구하는 규칙(`write_busy`)과 부딪히지 않는다: 이 면이 쓰는 연결은 답의 완료를 이미 처리한 연결뿐이다. 서버 쪽 소켓이 이미 파기됐거나 쓸 수 없으면 `closed`다(닫힘은 소켓의 `close` 사건이 처리한다).
+1. **인정된 연결에만 쓴다.** 그 번호의 연결이 서버에 살아 있고, 부르는 순간의 복원기로 맞춰 인사까지 끝났고(연결 판단의 `candidates(지금의 복원기)`에 있다: `greeted`, 맞춤에 답한 복원기가 지금의 복원기, 인사 있음, 그 복원기가 세대를 안다), 맞춤의 주체가 부르는 쪽이 댄 주체와 같을 때만 쓴다. 같은 주체의 인정된 연결이 둘 이상으로 보이면 아무 연결도 인정하지 않는다. 아니면 넘긴 바이트 0이고 `not_recognized`다. 그래서 맞춤 전의 연결, 맞춤의 답을 넘기고 완료를 기다리는 연결(`requested`), 답은 실었고 인사 전인 연결(`answered`), 닫혔거나 다른 주체의 연결, 복원기가 바뀌었거나 세대를 모르게 된 뒤의 옛 연결(박자가 닫기 전이어도)에는 한 바이트도 넘기지 않는다. 이 인정은 `lastCheck`가 쓴다고 답한 뒤에 같은 복원기 객체로 다시 본다(아래 2의 5): `lastCheck` 도중이나 그 재확인의 세대 조회 도중 복원기가 바뀌었거나(같은 세대의 새 객체여도) 세대를 모르게 됐어도 `not_recognized`다. 맞춤의 답이 넘길 때 빈 버퍼를 요구하는 규칙(`write_busy`)과 부딪히지 않는다: 이 면이 쓰는 연결은 답의 완료를 이미 처리한 연결뿐이다. 서버 쪽 소켓이 이미 파기됐거나 쓸 수 없으면 `closed`다(닫힘은 소켓의 `close` 사건이 처리한다).
 2. **마지막 확인과 쓰기 사이에는 대기·소켓 접근자·시계 읽기가 없다. 그 사이에 하는 것은 연결이 닫히지 않았는지와 확인이 기댄 인정(같은 복원기)이 그대로인지의 동기 확인뿐이다**(그 밖에는 `lastCheck`의 답을 가르고 보낼 틀을 자기 기록에 더한다). 차례는 이렇다.
    1. 다른 `writeFrame`의 `lastCheck`나 그 뒤 인정의 재확인(5) 안이면 `reentered`(바깥 쓰기의 대기량 확인이 낡지 않게).
    2. 인정(위 1). 복원기 포트를 불러 받은 객체와 그 `stopGeneration()`을 여기서 읽고, 그 객체를 5까지 쥔다. 던지면 인정하지 않는다.
    3. 소켓의 `destroyed`·`writable`, 그다음 묶임과 대기량(아래 3).
    4. `lastCheck()`를 한 번 부른다. `null`이면 5로 간다. 문자열이면 쓰지 않고 `refused`와 그 이름(`refusal`)을 돌려준다. 던지거나 `null`도 문자열도 아닌 값이면 `check_failed`다. 어느 쪽이든 넘긴 바이트 0이고 **연결은 닫지 않는다**(부르는 쪽의 잘못이다).
-   5. 확인이 기댄 것이 그대로인지 동기로 본다. `lastCheck`가 서버를 다시 불러 그 연결을 닫았으면(`link.dead`) `closed`. 아니면 복원기 포트를 다시 불러 받은 객체가 2의 객체와 같고, 그 객체로 그 연결이 여전히 인정되는지(위 1의 조건 그대로: 그 `stopGeneration()`을 다시 읽는다) 본다. 아니면 `not_recognized`다. 복원기 교체와 세대 모름은 서버를 거치지 않아 연결의 닫힘으로 드러나지 않으므로 여기서 잡는다. 어느 쪽이든 넘긴 바이트 0, `settled` 0번이고 **연결은 닫지 않는다**: 닫는 것은 판단의 일이고 다음 `tick()`이 `restore_changed`로 닫는다.
+   5. 확인이 기댄 것이 그대로인지 동기로 본다. `lastCheck`가 서버를 다시 불러 그 연결을 닫았으면(`link.dead`) `closed`다(포트를 다시 읽지 않는다). 아니면 먼저 2의 객체로 그 연결이 여전히 인정되는지(위 1의 조건 그대로: 그 `stopGeneration()`을 다시 읽는다) 보고, 인정될 때만 마지막으로 복원기 포트를 다시 불러 받은 객체가 2의 객체와 같은지 본다. 하나라도 아니면 `not_recognized`다. 복원기 교체와 세대 모름은 서버를 거치지 않아 연결의 닫힘으로 드러나지 않으므로 여기서 잡는다. 게시의 확인이 마지막인 까닭: 세대 조회도 외부 코드라 그 도중 게시가 바뀔 수 있고, 이 읽기 뒤 `write`까지는 서버 자기 기록(`link.dead`, 보낼 틀의 기록)만 보므로 그 뒤에 바뀐 것을 잡을 자리가 없다. 어느 쪽이든 넘긴 바이트 0, `settled` 0번이고 **연결은 닫지 않는다**: 닫는 것은 판단의 일이다. 다음 `tick()`이 **그때도** 객체 불일치나 세대 모름을 보면 판단의 사유 `restore_changed`로 닫는다(서버가 적는 닫힘 사유는 `judgment`). 복원기 포트나 세대 조회의 일회성 예외였으면 연결은 열린 채이고 다음 쓰기가 성공할 수 있다. 세대 조회가 박자에서도 계속 던지면 판단이 던진 박자이므로 열린 연결 전부가 `judgment_failed`로 닫힌다.
    6. 곧바로 소켓의 `write(frame, 완료 콜백)`. 5와 6 사이에는 보낼 틀의 기록을 더하는 것뿐이다.
+
+   그래서 정상 쓰기의 외부 읽기는 복원기 포트 → 그 `stopGeneration()` → `lastCheck` → 그 `stopGeneration()` → 복원기 포트 → `write`다. 1에서 4 사이에서 돌아가거나(`reentered`, 처음 인정 실패, `closed`, `backlog`, `lastCheck`의 이름·던짐·꼴 아닌 값) 5에서 연결이 닫혔으면 재확인을 하지 않고, 재확인의 세대 조회로 인정되지 않으면 복원기 포트를 다시 읽지 않는다.
+
+   **5가 기대는 전제.** 복원기 포트는 읽힌 순간 게시된 객체를 돌려준다. 읽는 도중 게시를 바꾸고 옛 객체를 돌려주거나 돌려줄 객체의 세대를 모르게 하는 포트는 계약 밖이다. `lastCheck`와 그 아래에서 부르는 포트, 세대 조회는 복원기를 게시하지 않는다는 것이 조립의 전제다. 어겨도 5의 마지막 게시 확인은 그 읽기 앞에서 바뀐 게시를 모두 잡는다(`lastCheck` 안, 그 아래 포트, 재확인의 세대 조회 안. 시험이 세대 조회 안의 게시를 넣어 넘긴 바이트 0을 본다). 그 읽기 뒤에는 `write`까지 외부 코드가 돌지 않으므로 그 사이에 바뀌는 게시는 없다. 잡지 못하는 것은 위의 계약 밖 포트뿐이다: 마지막 읽기 자체가 옛 객체를 돌려주거나 그 호출 안에서 돌려줄 객체의 세대를 모르게 하면 서버는 알아채지 못한다(코드로 본 것이고 시험은 없다).
 
    서버는 이 면에서 시계를 읽지 않는다. 봉투의 시한, 작업 기한의 여유, 정지 세대, 접수, 맡기지 않을 실행기는 서버가 모르는 조건이라 부르는 쪽이 `lastCheck`에서 본다. 맞춤의 답이 "버퍼 확인 → 시계 → `write`"인 것과 같은 차례이고, 이 면은 시계와 `write` 사이에 위 5의 동기 재확인이 더 있다. 그 읽기와 `write` 호출 사이의 선점은 이 모듈이 막지 못한다(맞춤의 답과 같다).
 3. **줄을 두지 않는다.** 스트림이 묶였거나(`writableCorked !== 0`) 쓰기 대기량에 이 틀을 더한 값(`writableLength + frame.byteLength`)이 `maxPendingWriteBytes`를 넘으면 넘기지 않고(넘긴 바이트 0, `lastCheck`도 부르지 않는다) 그 연결을 `send_backlog`로 닫고 `backlog`를 돌려준다. 상한 정각은 넘긴다. 서버는 넘기지 못한 틀을 쥐었다가 뒤에 쓰지 않는다: `writeFrame`이 돌아온 뒤 서버 안에 "나중에 쓸 것"이 없다. 상한 안이면 앞선 바이트 뒤에 붙인다(아래 "정한 것" 9). 상한은 기본값이 없고 진입점이 넣는다. 1부터 `Number.MAX_SAFE_INTEGER`까지의 정수가 아니면 시작하지 않는다(`bad_settings`). 비교는 시작 때 검사한 그 값으로 한다(옵션 칸을 다시 읽지 않는다).
@@ -50,7 +54,7 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 | 이름 | 꼴 |
 |---|---|
 | `startConnectionServer(options)` | `ConnectionServerOptions` → `Promise<StartResult>`. 실패는 `bad_settings`(먼저 서버 자체의 시작 검사: `maxPendingWriteBytes`가 1부터 `Number.MAX_SAFE_INTEGER`까지의 정수가 아니다(빠짐 포함). 그다음 연결 판단이 받지 않는 설정), `no_material`(자기 TLS 재료, 사유 그대로), `listen_failed` |
-| `ConnectionServer` | `port`, `table()`(지금의 연결 표: `get`·`candidates`·`occupancy`를 읽는다), `registry()`(지금 판), `applyRegistry(input)`(적용 결과 그대로), `tick()`, `recognized(principal)`(부를 때마다 복원기 포트와 그 `stopGeneration()`을 읽는다), `writeFrame(connection, principal, frame, options)`(인정을 볼 때와 `lastCheck`가 쓴다고 답한 뒤의 재확인에서 복원기 포트와 그 `stopGeneration()`을 읽는다), `close()` |
+| `ConnectionServer` | `port`, `table()`(지금의 연결 표: `get`·`candidates`·`occupancy`를 읽는다), `registry()`(지금 판), `applyRegistry(input)`(적용 결과 그대로), `tick()`, `recognized(principal)`(부를 때마다 복원기 포트와 그 `stopGeneration()`을 읽는다), `writeFrame(connection, principal, frame, options)`(인정을 볼 때 복원기 포트와 그 `stopGeneration()`을 읽는다. `lastCheck`가 쓴다고 답하고 연결이 열려 있으면 그 객체의 `stopGeneration()`을 다시 읽고, 그것으로 인정될 때만 마지막으로 복원기 포트를 다시 읽는다. 그 앞에서 돌아가면 다시 읽지 않는다. 위 "틀 쓰기 면" 2), `close()` |
 | `WriteFrameOptions` | `lastCheck: () => string \| null`(동기, 쓰기 바로 앞), `settled: (end: SendEnd) => void`(넘긴 틀마다 정확히 한 번). 둘 다 꼭 넘긴다 |
 | `SendEnd` | `flushed`(로컬 쓰기가 오류 없이 끝남), `failed`(로컬 쓰기 오류 또는 `write`가 던짐, 연결은 `send_failed`로 닫힘), `closed`(완료 전에 연결이 닫힘) |
 | `WriteFrameResult` | `written`(틀 전부를 한 번의 `write`로 넘겼다. 상대가 받았다는 뜻이 아니다), `not_written`(넘긴 바이트 0: `reason`이 `NOT_WRITTEN_REASONS` 가운데 하나, `refused`면 `refusal`에 `lastCheck`의 이름), `unknown`(`write`가 던졌다. 연결을 닫았고, 돌아오기 전에 `settled`를 이미 한 번 불렀다) |
@@ -66,7 +70,7 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 | `host`, `port`, `material` | `tls-server.ts`의 것 그대로 | 상호 TLS 수신 |
 | `clock` | `() => number` | 받은 시각(`check`의 `now`), 넘기기 앞의 시각(`reply_sent`의 `at`), 쓰기를 마친 시각(`reply_written`의 `done`), `tick()`의 박자 시각(쓰기 대기의 기한과 그 박자의 판단 시각에 함께 쓴다), 판단 시각(`step`의 `now`), 자기 TLS 재료와 상대 인증서의 기간. 던지면 닫는 범위는 아래 "시계를 읽는 자리" |
 | `registry` | `RegistryState` | 시작할 때 믿는 판. 이후 `applyRegistry`만 바꾼다. `check`·`step`에 그때의 판을 넘긴다 |
-| `restorer` | `() => StopGenerationSource` | `check`·`step`마다 부르는 순간의 복원기(`closed`를 넣을 때는 읽지 않는다). `recognized`는 부를 때마다, `writeFrame`은 인정을 볼 때와 `lastCheck`가 쓴다고 답한 뒤에 한 번씩 읽고 두 객체가 같아야 쓴다(위 "틀 쓰기 면" 2). 던지면 세대를 모르는 복원기(`stopGeneration() === null`)로 넘긴다(인정되는 연결이 없다) |
+| `restorer` | `() => StopGenerationSource` | `check`·`step`마다 부르는 순간의 복원기(`closed`를 넣을 때는 읽지 않는다). `recognized`는 부를 때마다 읽는다. `writeFrame`은 인정을 볼 때 한 번 읽고, `lastCheck`가 쓴다고 답한 뒤 연결이 열려 있고 처음 객체의 세대로 여전히 인정될 때만 한 번 더 읽어(재확인의 마지막 외부 읽기) 두 객체가 같아야 쓴다(위 "틀 쓰기 면" 2). 읽힌 순간 게시된 객체를 돌려줘야 한다. 던지면 세대를 모르는 복원기(`stopGeneration() === null`)로 넘긴다(인정되는 연결이 없다) |
 | `runGeneration` | `(runId) => number \| undefined` | `check`(hello·status_report의 실행 세대 대조) |
 | `nonces` | `NonceStore` | `check`. 던지거나 거절된 약속이면 그 연결을 `check_failed`로 닫는다 |
 | `reply` | `ReplyTools` | `step`(맞춤 답 서명, 요청 ID, nonce) |
@@ -130,13 +134,15 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 - **`restorer`는 박자에 넘기는 그 복원기 객체를 돌려준다.** 다시 복원하면 이 포트와 박자의 것을 함께 바꾼다. 후보와 점유는 늘 지금의 복원기로 읽는다(`table().candidates(지금의 복원기)`, `table().occupancy(지금의 복원기)`).
 - **복원 1단계 전에는 그 복원기의 `stopGeneration()`이 `null`이어야 한다.** 그래야 판단이 맞춤에 답하지 않는다(계약 v1 "구현이 지킬 것").
 - **`tick()`을 박자마다 부른다.** 이 서버에는 타이머가 없다. 부르지 않으면 hello 대기(`hello_late`)와 복원기가 바뀐 연결(`restore_changed`)이 다음 사건이 올 때까지 닫히지 않는다. 기한 정각부터 답을 넘기지 않는 것은 `tick` 없이도 지켜진다. **박자의 주기가 남는 틈의 길이를 정한다**: 넘긴 답의 완료를 기다리는 연결은 기한 정각 뒤 첫 박자에서 끊기므로, 그 사이(최대 박자 하나) 하위 쓰기가 나가 상대가 답을 받을 수 있다.
-- **`writeFrame`의 `lastCheck`는 동기이고 그 안에서 기다리거나 이 서버를 다시 부르거나 복원 상태를 바꾸지 않는다.** 봉투의 시한·작업 기한의 여유(시계는 여기서 읽는다), 정지 세대, 접수, 맡기지 않을 실행기는 `lastCheck`에서 본다. 그 앞에서 본 값을 믿지 않는다. 어겨도 쓰지는 않지만(다시 쓰면 `reentered`, 그 연결을 닫으면 `closed`, 복원기를 바꾸거나 세대를 모르게 하면 `not_recognized`) 그 밖의 효과는 이미 일어난다.
+- **`writeFrame`의 `lastCheck`는 동기이고 그 안에서 기다리거나 이 서버를 다시 부르거나 복원 상태를 바꾸지 않는다.** 봉투의 시한·작업 기한의 여유(시계는 여기서 읽는다), 정지 세대, 접수, 맡기지 않을 실행기는 `lastCheck`에서 본다. 그 앞에서 본 값을 믿지 않는다. 어겼을 때 `reentered`가 되는 것은 `lastCheck` 안에서 다시 부른 `writeFrame`뿐이다. 바깥 호출은 자기 `lastCheck`의 반환값과 그 뒤의 연결 상태로 정해진다: 그 연결을 닫았으면 `closed`, 복원기를 바꾸거나 세대를 모르게 했으면 `not_recognized`이고, 다시 부른 `tick()`처럼 이 연결과 그 인정을 바꾸지 않았으면 `null`을 돌려줄 때 바깥은 쓴다. 어느 쪽이든 다시 부른 것의 효과(판단, 등록표 적용, 닫기)는 이미 일어난다. 복원기 게시와 세대가 `lastCheck`·재확인 동안 바뀌지 않는다는 것이 조립의 전제다(위 "틀 쓰기 면" 2의 "5가 기대는 전제").
+- **자격 값을 보낼 때는 접수된 그 연결·그 실행과 지금의 실행 상태를 `lastCheck`에서 본다.** 앞의 공통 조건(시한·접수·정지 세대)만으로는 값을 받을 실행인지 가르지 못한다.
 - **`recognized`의 번호는 후보를 고르는 데만 쓴다. 실제로 실었는지는 `writeFrame`의 결과로 정한다.** 서버 쪽 소켓이 파기된 직후(닫힘 사건을 처리하기 전)나 서버가 닫히는 중(`close()`가 연결을 하나씩 닫는 사이, 앞 연결의 닫힘을 알리는 콜백 안)에도 닫히는 연결의 번호가 잠깐 보일 수 있다. 조회를 기다리는 것은 쓰기 전에 연결 번호에 묶고, 쓰지 못하면 거둔다.
 - **서버를 닫기 시작하면 조립이 새 발급(지시·값)을 먼저 막는다.** `close()`는 연결을 차례로 닫으므로 그 사이 아직 닫히지 않은 연결에는 `writeFrame`이 쓸 수 있다. 이 서버는 종료가 시작된 순간 모든 쓰기를 막는다고 약속하지 않는다.
 - **넘긴 틀과 값의 버퍼는 `settled` 뒤에만 0으로 채운다.** `not_written`이면 그 자리에서 채운다. `written`·`unknown`이면 `settled`가 한 번 온다. `unknown`은 돌아오기 전에 이미 `settled`를 불렀으므로 반환을 보고 정리를 한 번 더 하거나 그때 처음 정리를 등록하지 않는다. `settled`는 던지지 않게 쓴다(던져도 서버는 다시 부르지 않는다).
 - **틀은 한 호출에 하나를 통째로 넘긴다.** 틀을 나눠 두 번 넘기면 그 사이에 다른 틀이 끼고, 앞 조각만 넘긴 뒤 상한에 걸리면 상대의 디코더가 어긋난다.
 - **`maxPendingWriteBytes`는 진입점이 시작할 때 주입한다.** 같은 박자에 한 연결로 나가는 틀(받음 확인, 지시, 값 틀)을 함께 담을 만큼 둔다. 작으면 그 연결이 `send_backlog`로 닫힌다. 서버는 시작 때 한 번 읽은 값만 쓴다.
-- **`written`은 접수가 아니다.** 상대가 받았는지는 실행기의 영수증으로 안다. `failed`·`closed`여도 상대가 틀 전체를 받았을 수 있다(`unknown`의 `failed`도 같다).
+- **결과를 구분해 옮긴다.** `refused`면 `refusal`을 읽는다. 시한 거절은 `too_late_to_send`, 연결 없음(`recognized`가 `null`, `not_recognized`)·닫힘(`closed`)·상한(`backlog`)은 `no_connection`, `unknown`은 송달 모름으로 옮긴다.
+- **`written`은 접수가 아니다.** 상대가 받았는지는 실행기의 영수증으로 안다. `written`·`flushed`를 접수로 기록하지 않는다. `failed`·`closed`여도 상대가 틀 전체를 받았을 수 있다(`unknown`의 `failed`도 같다).
 - **맞춤이 끝나기 전의 연결에 다른 것을 쓰지 않는다.** `writeFrame`은 인정된 연결에만 쓰므로 이 규칙을 지킨다. 서버가 받은 연결의 소켓에 쓰거나 묶었고(`cork`), 맞춤의 답을 넘기려는 때에도 그 바이트가 쓰기 버퍼에 남아 있거나 묶여 있으면 답이 넘겨지지 않고 그 연결이 `write_busy`로 닫힌다. 앞서 쓴 것이 그때 이미 다 나갔고 묶이지 않았으면 맞춤은 정상으로 끝난다.
 - **재접속·빈도·동시 처리의 제한을 정한다(계약 v1 구현 인수 조건 2).** 숫자를 정하면 `settings`로 넘기고, 주체별 요청 빈도·동시 검증 수·연결마다 대기열의 상한은 새로 둔다.
 - **반쯤 열린 연결의 감지를 정한다.** TCP keepalive나 계약의 확인 메시지와 유휴 시간을 정한 뒤 `closed`로 이어지게 한다.

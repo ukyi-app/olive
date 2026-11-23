@@ -44,7 +44,9 @@ export interface ConnectionServerOptions {
   readonly clock: () => number;
   // 시작할 때 믿는 등록표. 적용 전이면 RegistryState.start(설정)이다(아무도 믿지 않는다).
   readonly registry: RegistryState;
-  // 부르는 순간의 복원기. check·step·recognized마다 새로 읽고, writeFrame은 lastCheck 앞과 뒤에 한 번씩 읽는다.
+  // 부르는 순간의 게시된 복원기. check·step·recognized마다 새로 읽고, writeFrame은 lastCheck 앞에서 한 번, lastCheck가 쓴다고 답한 뒤
+  // 그 연결이 열려 있고 처음 객체의 세대로 여전히 인정될 때 한 번 더 읽는다(그 재확인의 마지막 외부 읽기다).
+  // 읽는 도중 게시나 세대를 바꾸고 옛 것을 돌려주는 포트는 계약 밖이다.
   // 연결 표와 박자에 같은 객체를 넘기는 것은 부르는 쪽의 일이다.
   readonly restorer: () => StopGenerationSource;
   // 감독 장부가 아는 실행의 세대. 모르면 undefined.
@@ -537,9 +539,9 @@ class Server implements ConnectionServer {
     return found.length === 1 ? found[0]! : null;
   }
 
-  // 순서가 보장 2다: 서버의 확인(인정, 소켓의 닫힘, 묶임과 대기량) → lastCheck → 인정의 재확인 → write. lastCheck가 쓴다고 답한 뒤
-  // write까지는 연결이 닫히지 않았는지(link.dead)와 확인이 기댄 인정(같은 복원기 객체)이 그대로인지를 동기로 보고, 보낼 틀을
-  // 자기 기록에 더한다. 소켓의 접근자·시계·대기가 없다.
+  // 순서가 보장 2다: 서버의 확인(인정, 소켓의 닫힘, 묶임과 대기량) → lastCheck → 인정의 재확인(그 객체의 세대, 그다음 복원기의
+  // 게시) → write. lastCheck가 쓴다고 답한 뒤 write까지는 연결이 닫히지 않았는지(link.dead)와 확인이 기댄 인정(같은 복원기 객체)이
+  // 그대로인지를 동기로 보고, 보낼 틀을 자기 기록에 더한다. 소켓의 접근자·시계·대기가 없다.
   writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult {
     // 부르는 쪽 객체의 접근자가 lastCheck와 write 사이에서 불리지 않게 두 함수를 먼저 꺼낸다.
     const { lastCheck, settled } = options;
@@ -561,8 +563,10 @@ class Server implements ConnectionServer {
     try {
       verdict = lastCheck();
       // 복원기 교체와 세대 모름은 서버를 거치지 않아 link.dead에 드러나지 않는다. 같은 복원기 객체가 지금도 이 연결을 인정하는지
-      // 다시 본다. 복원기 포트가 이 서버에 다시 써서 위의 대기량 확인이 낡지 않게 가드 안에서 본다(recognizedBy는 던지지 않는다).
-      if (verdict === null && !link.dead) kept = this.restorer() === source && this.recognizedBy(principal, source) === connection;
+      // (세대 조회) 본 뒤, 마지막으로 그 객체가 아직 게시돼 있는지 본다. 세대 조회도 외부 코드라 그 도중 게시가 바뀔 수 있으므로
+      // 게시의 확인이 마지막 외부 읽기여야 한다: 그 뒤 write까지는 서버 자기 기록만 본다. 복원기 포트가 이 서버에 다시 써서
+      // 위의 대기량 확인이 낡지 않게 가드 안에서 본다(recognizedBy·restorer는 던지지 않는다).
+      if (verdict === null && !link.dead) kept = this.recognizedBy(principal, source) === connection && this.restorer() === source;
     } catch {
       return { kind: "not_written", reason: "check_failed" };
     } finally {
@@ -571,7 +575,8 @@ class Server implements ConnectionServer {
     if (verdict !== null) return typeof verdict === "string" ? { kind: "not_written", reason: "refused", refusal: verdict } : { kind: "not_written", reason: "check_failed" };
     // lastCheck가 서버를 다시 불러 이 연결을 닫았으면 넘기지 않는다(자기 기록이다).
     if (link.dead) return { kind: "not_written", reason: "closed" };
-    // 인정을 잃은 연결은 여기서 닫지 않는다. 닫는 것은 판단의 일이고 다음 tick이 restore_changed로 닫는다.
+    // 인정을 잃은 연결은 여기서 닫지 않는다. 닫는 것은 판단의 일이다: 다음 tick이 그때도 객체 불일치나 세대 모름을 보면
+    // restore_changed로 닫고, 일회성 포트 예외였으면 연결은 열린 채다.
     if (!kept) return { kind: "not_written", reason: "not_recognized" };
     const send: Send = { settled, done: false };
     link.sends.add(send);
