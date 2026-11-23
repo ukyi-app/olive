@@ -472,8 +472,9 @@ class Wire implements Transport {
   }
 
   // 소켓의 data 조각. 디코더는 필요한 바이트를 자기 배열로 옮기고 조각을 붙잡지 않으므로(framing.ts의 MixedDecoder.push),
-  // 넘긴 뒤 조각을 0으로 채운다. 이 Wire가 그 조각의 유일한 소비자라서 지워도 된다. 닫힌 뒤 온 조각, 거절된 조각,
-  // 처리 중 던진 조각도 같다.
+  // consume이 돌아오거나 던진 뒤 조각을 0으로 채운다. 그 사이 우편함의 offer가 불리므로 offer 안에서는 조각이 아직
+  // 지워지지 않았다. 이 Wire가 그 조각의 유일한 소비자라서 지워도 된다. 닫힌 뒤 온 조각, 거절된 조각, 처리 중 던진
+  // 조각도 같다.
   private take(chunk: Uint8Array): void {
     try {
       this.consume(chunk);

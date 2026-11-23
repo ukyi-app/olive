@@ -196,6 +196,32 @@ test("우편함: 주입받은 signal의 리스너 떼기가 던져도 forget은 
   expect(sumOf(await b.inbox.take(next.runId, next.digest, new AbortController().signal))).toBe(next.sum);
 });
 
+test("우편함: 떼지 못한 옛 실행의 중단 리스너가 늦게 불려도 다음 실행들의 상태를 바꾸지 않는다", async () => {
+  const b = box();
+  const a = credential(randomUUID());
+  const runB = credential(randomUUID());
+  const c = credential(randomUUID());
+  const stale = new AbortController();
+  stale.signal.removeEventListener = () => {
+    throw new Error("리스너 떼기 실패");
+  };
+  b.inbox.offer(1, a);
+  expect((await b.inbox.take(a.runId, a.digest, stale.signal)) === a.value).toBe(true);
+  b.inbox.forget(a.runId);
+  // B는 기다리다 취소되고 정리된다.
+  const cancelB = new AbortController();
+  const waitingB = b.inbox.take(runB.runId, runB.digest, cancelB.signal);
+  cancelB.abort();
+  expect((await waitingB) === null).toBe(true);
+  b.inbox.forget(runB.runId);
+  expect(b.inbox.offer(1, c)).toBe("held");
+  // A의 리스너는 forget에서 떼지 못했으므로 여기서 불린다.
+  stale.abort();
+  expect(b.inbox.offer(1, runB)).toBe("discarded");
+  expect([zeroed(runB.value), zeroed(c.value)]).toEqual([true, false]);
+  expect((await b.inbox.take(c.runId, c.digest, new AbortController().signal)) === c.value).toBe(true);
+});
+
 test("우편함: 기다리는 take가 있는데 또 부르면 뒤 take는 곧바로 null이고 앞 take는 그대로 기다린다", async () => {
   const b = box();
   const v = credential(randomUUID());

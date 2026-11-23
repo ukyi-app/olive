@@ -20,7 +20,8 @@ CredentialInbox = CredentialSource & {
 - `epoch`는 `link.epoch()`다(맞춘 지금 연결의 번호, 없으면 `null`). 던지면 `null`로 본다. `offer`·`take`·`dropEpoch` 안에서만 부르므로 `ExecutorLink`를 우편함과 작업자보다 뒤에 만들어도 된다.
 - `offer`가 받은 `DecodedCredential.value`의 소유는 우편함으로 넘어온다. 부른 쪽은 그 배열을 다시 쓰지 않는다. 돌려준 이름은 값을 싣지 않는다.
 - `forget`은 `CredentialSource`의 선택 메서드다. 작업자가 실행이 끝날 때마다 부른다.
-- `dropEpoch`·`forget`은 던지지 않고 정리(칸 값과 내준 값의 0 채우기, 기다리던 `take`를 `null`로 끝내기)를 끝낸다. 둘이 주입받은 것을 부르는 자리는 끝난 `take`의 `signal`에서 리스너를 떼는 한 곳뿐이고, 그 호출은 정리를 마친 뒤에 하며 그 던짐을 삼킨다. 소켓은 연결의 끝에 `dropEpoch`를 부르므로 여기서 던지면 그 연결의 값이 남는다.
+- `dropEpoch`·`forget`은 던지지 않고 정리(칸 값과 내준 값의 0 채우기, 기다리던 `take`를 `null`로 끝내기)를 끝낸다. 둘이 주입받은 것을 부르는 자리는 끝난 `take`의 `signal`에서 리스너를 떼는 한 곳뿐이고, 그 호출은 정리를 마친 뒤에 하며 그 던짐을 삼킨다. 소켓은 연결의 끝에 `dropEpoch`를 부르므로 여기서 던지면 그 연결의 값이 남는다. 떼지 못한 리스너는 자기 `take`의 기록이 지금 기록이 아니면 아무것도 하지 않는다: 늦게 불려 끝난 실행의 기억을 덮으면, 앞서 닫은 다음 실행의 늦은 값이 칸에 들어가 그 뒤 실행의 값을 밀어낸다(시험).
+- **`take`에 넘기는 `signal`의 `addEventListener`는 던지지 않는다(넘기는 쪽의 전제).** 우편함은 대기 기록이나 내준 기록을 세운 뒤 리스너를 단다. 던지면 그 `take`는 값을 내주지 않고 실패하지만(기다리는 분기는 거절된 약속, 칸에서 곧바로 내주는 분기는 그 호출의 던짐) 방금 세운 기록이 남는다: 대기 기록이 남은 동안 다음 `take`는 곧바로 `null`이고, 내준 기록의 값은 그 실행의 `forget`이나 연결의 끝에 0으로 채워진다. 작업자는 실행마다 자체 `AbortController`를 만들고(`worker.ts`의 실행 상태) 그 `signal`로 `take`를 부른다.
 - **한 실행에 한 번 내주는 것은 작업자가 같은 실행 ID로 다시 `take`하지 않는다는 전제에 기댄다.** 우편함은 값을 더 받지 않는 실행을 마지막 하나만 기억한다(아래 "정한 것"). 그보다 앞 실행의 ID로 `take`가 다시 오면 칸에 남은 그 실행의 늦은 값을 내줄 수 있다. 작업자는 실행 기록이 있는 실행에 다시 `execute`하지 않는다(`worker.ts`의 `onStart`: 기록이 있으면 영수증만 다시 보내고 돌아간다).
 
 ## 규칙
@@ -40,7 +41,7 @@ CredentialInbox = CredentialSource & {
 | `take`: 이미 중단된 `signal`, 맞춘 연결 없음 | `null`. 그 실행은 끝난 것으로 본다 |
 | `take`: 다른 `take`가 기다리는 중 | 뒤 `take`는 곧바로 `null`. 앞 `take`와 칸은 그대로 |
 | `take`: 이미 끝난 실행 | `null` |
-| `signal` 중단 | 기다리던 `take`는 `null`. 그 실행의 칸 값과 내준 값을 0으로 채운다 |
+| `signal` 중단 | 기다리던 `take`는 `null`. 그 실행의 칸 값과 내준 값을 0으로 채운다. 그 `take`의 기록이 아직 지금 기록일 때만이다: 치운 뒤 떼지 못한 리스너가 늦게 불리면 아무 상태도 바꾸지 않는다 |
 | `dropEpoch(e)` | 연결 `e`에서 받은 칸 값을 버린다. 연결 `e`에서 기다리던 `take`는 `null`, 그 `take`에 내준 값은 0으로 채운다 |
 | `forget(runId)` | 그 실행의 기다림을 `null`로 끝내고 칸 값과 내준 값을 0으로 채운다 |
 
@@ -50,7 +51,7 @@ CredentialInbox = CredentialSource & {
 
 | 자리 | 파일 |
 |---|---|
-| 소켓이 받은 원시 조각(디코더에 넘긴 직후. 닫힌 뒤 온 조각, 거절된 조각, 처리 중 던진 조각 포함) | `socket.ts` `Wire.take` |
+| 소켓이 받은 원시 조각(그 조각의 처리 `Wire.consume`이 돌아오거나 던진 뒤. 그 안의 `offer` 동안은 아직 지우지 않았다. 닫힌 뒤 온 조각, 거절된 조각, 처리 중 던진 조각 포함) | `socket.ts` `Wire.take` |
 | 디코더가 조립 중이던 값(모든 닫힘: `stop`, `link`의 닫기·교체, 오류, 거절, 상대의 끝) | `socket.ts` `Wire.release` → `framing.ts` `end` |
 | 섞어 받는 디코더가 거절과 함께 돌려준 앞선 정상 값 | `socket.ts` `Wire.consume`(거절 step), `Wire.follow`의 끝 알림 |
 | 맞추기 전·지금 연결이 아님·연결 번호가 다름·`link` 조회가 던짐 | `socket.ts` `Socket.offer` |

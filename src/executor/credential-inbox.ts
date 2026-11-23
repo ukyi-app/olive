@@ -87,9 +87,9 @@ class Inbox implements CredentialInbox {
       wipe(held.value);
     }
     return new Promise((resolve) => {
-      const onAbort = () => this.#closeRun(runId);
-      this.#taking = { runId, digest, epoch, signal, onAbort, resolve, lent: null };
-      signal.addEventListener("abort", onAbort, { once: true });
+      const taking: Taking = { runId, digest, epoch, signal, onAbort: () => this.#abortTaking(taking), resolve, lent: null };
+      this.#taking = taking;
+      signal.addEventListener("abort", taking.onAbort, { once: true });
     });
   }
 
@@ -147,10 +147,16 @@ class Inbox implements CredentialInbox {
 
   // 칸의 값을 내준다. 중단·연결의 끝·잊기에 그 배열을 다시 0으로 채우도록 기억한다.
   #lend(runId: string, digest: string, epoch: number, signal: AbortSignal, value: Uint8Array): void {
-    const onAbort = () => this.#closeRun(runId);
-    this.#taking = { runId, digest, epoch, signal, onAbort, resolve: null, lent: value };
+    const taking: Taking = { runId, digest, epoch, signal, onAbort: () => this.#abortTaking(taking), resolve: null, lent: value };
+    this.#taking = taking;
     this.#closedRun = runId;
-    signal.addEventListener("abort", onAbort, { once: true });
+    signal.addEventListener("abort", taking.onAbort, { once: true });
+  }
+
+  // 중단 콜백은 자기를 설치한 take가 아직 지금 기록일 때만 닫는다. 치운 뒤 떼지 못한 옛 콜백이 늦게 불려
+  // #closedRun을 덮으면, 앞서 닫은 다음 실행의 늦은 값이 칸에 들어가 그 뒤 실행의 값을 밀어낸다.
+  #abortTaking(taking: Taking): void {
+    if (this.#taking === taking) this.#closeRun(taking.runId);
   }
 
   // 끝난 take의 기록을 치운다(내준 값은 0으로). 기다리는 take는 치우지 않는다.
@@ -164,7 +170,8 @@ class Inbox implements CredentialInbox {
     try {
       taking.signal.removeEventListener("abort", taking.onAbort);
     } catch {
-      // 떼지 못한 리스너는 늦게 불려도 #closeRun(닫는 쪽)만 부른다. 이 take의 내준 값은 이미 0이다
+      // 떼지 못한 리스너는 늦게 불려도 이 기록이 지금 #taking이 아니므로 아무 상태도 바꾸지 않는다(#abortTaking).
+      // 이 take의 내준 값은 이미 0이다
     }
   }
 
