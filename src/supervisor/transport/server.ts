@@ -12,6 +12,9 @@
 //   완료를 기다리는 동안 그 연결의 다음 판단은 기다린다. 완료 전에 기한 정각 이후의 tick이 오면 남은 쓰기를 버리고 끊는다.
 // - 닫힘은 연결마다 한 번 closed로 알린다. closed를 넣는 길은 시계·복원기를 읽지 않는다. 닫힌 연결의 늦게 끝난 check 결과는 판단에 넘기지 않는다.
 // - 등록표를 적용할 때마다 registry 사건을 넣고, 봉투마다 지금의 등록표를 check에 넘긴다(연결을 맺을 때의 키를 쥐지 않는다).
+// - writeFrame은 지금 인정된 그 주체의 연결에만, 부르는 쪽이 이미 만든 틀 하나를 한 번의 write로 넘긴다. 서버의 확인을 모두 마친 뒤
+//   부르는 쪽의 lastCheck를 부르고 곧바로 write한다. 줄을 두지 않는다: 묶였거나 대기량이 상한을 넘으면 넘기지 않고 그 연결을 닫는다.
+//   넘긴 틀마다 settled를 로컬 쓰기가 끝났을 때 또는 그 전에 연결이 닫혔을 때 정확히 한 번 부른다.
 //
 // 타이머를 두지 않는다. 시간이 흘러 생기는 판단(답·hello의 기한, 복원기가 바뀜)은 부르는 쪽이 tick()을 불러야 일어난다.
 import type * as tls from "node:tls";
@@ -53,7 +56,54 @@ export interface ConnectionServerOptions {
   readonly deliver: (output: Delivered) => void;
   // 기록용. 던져도 무시한다.
   readonly observe?: (note: ServerNote) => void;
+  // writeFrame이 넘기려는 때 그 소켓의 쓰기 대기량(writableLength)에 그 틀을 더한 값의 상한(바이트, 정각 포함 허용).
+  // 기본값이 없다: 진입점이 정해 넣는다. 양의 정수가 아니면 시작하지 않는다(bad_settings).
+  readonly maxPendingWriteBytes: number;
 }
+
+// writeFrame에 넘기는 부르는 쪽의 두 함수.
+export interface WriteFrameOptions {
+  // 서버가 자기 확인을 모두 마친 뒤, write 바로 앞에서 한 번 부른다. 동기다. null이면 쓴다. 문자열이면 쓰지 않고 그 이름을 돌려준다.
+  // 시계·정지 세대·접수처럼 부르는 쪽만 아는 조건을 여기서 본다. 그 안에서 기다리거나 이 서버를 다시 부르지 않는다.
+  readonly lastCheck: () => string | null;
+  // 넘긴 틀의 끝. 로컬 쓰기가 끝났을 때(성공·오류) 또는 그 전에 연결이 닫혔을 때 정확히 한 번 부른다. 넘기지 않은 틀에는 부르지 않는다.
+  // 던져도 서버의 상태는 바뀌지 않는다.
+  readonly settled: (end: SendEnd) => void;
+}
+
+export type SendEnd =
+  // 로컬 쓰기가 오류 없이 끝났다. 상대가 받았다는 뜻이 아니다.
+  | "flushed"
+  // 로컬 쓰기가 오류로 끝났거나 write가 던졌다. 그 연결은 send_failed로 닫혔다.
+  | "failed"
+  // 로컬 쓰기가 끝나기 전에 연결이 닫혔다. 소켓을 파기해 아직 하위 쓰기로 가지 않은 바이트를 버렸다.
+  | "closed";
+
+// writeFrame이 넘기지 않은 까닭. 모두 넘긴 바이트 0이고 settled를 부르지 않는다.
+export const NOT_WRITTEN_REASONS = [
+  // 그 번호의 연결이 없거나(번호 없음, 이미 닫혀 빠짐), 지금의 복원기로 맞춰 인사까지 끝난 연결이 아니거나, 맞춤의 주체가 다르다.
+  // 같은 주체의 인정된 연결이 둘 이상으로 보이는 때도 여기다(누구인지 모른다).
+  "not_recognized",
+  // 소켓이 이미 파기됐거나 쓸 수 없다, 또는 lastCheck를 부르는 사이 그 연결이 닫혔다. 이 까닭으로는 연결을 닫지 않는다(이미 닫히는 중이다).
+  "closed",
+  // 스트림이 묶였거나 쓰기 대기량에 이 틀을 더하면 상한을 넘는다. 그 연결을 send_backlog로 닫았다.
+  "backlog",
+  // lastCheck가 쓰지 말라고 답했다. 그 이름은 refusal에 있다. 연결은 그대로다.
+  "refused",
+  // lastCheck가 던졌거나 null도 문자열도 아닌 값을 냈다. 부르는 쪽의 잘못이라 연결은 그대로다.
+  "check_failed",
+  // 다른 writeFrame의 lastCheck 안에서 불렸다. 바깥 쓰기의 대기량 확인이 낡지 않게 받지 않는다.
+  "reentered",
+] as const;
+export type NotWrittenReason = (typeof NOT_WRITTEN_REASONS)[number];
+
+export type WriteFrameResult =
+  // 틀 전부를 한 번의 write로 스트림에 넘겼다. 상대가 받았다는 뜻이 아니다. settled가 뒤에 정확히 한 번 불린다.
+  | { readonly kind: "written" }
+  | { readonly kind: "not_written"; readonly reason: Exclude<NotWrittenReason, "refused"> }
+  | { readonly kind: "not_written"; readonly reason: "refused"; readonly refusal: string }
+  // write가 던졌다. 넘긴 바이트가 있는지 모른다. 그 연결을 send_failed로 닫았고 settled("failed")를 한 번 불렀다.
+  | { readonly kind: "unknown" };
 
 // 이 서버가 실행하는 출력(send_reply, close) 밖의 넷.
 export type Delivered = Extract<Output, { readonly kind: "occupancy" | "candidate" | "withdrawn" | "forward" }>;
@@ -85,6 +135,10 @@ export const LINK_CLOSE_CAUSES = [
   "deliver_failed",
   // 주입한 시계가 던졌다. 받은 시각, 넘길 시각, 쓰기를 마친 시각 가운데 하나를 모른다.
   "clock_failed",
+  // writeFrame이 넘기려는 때 스트림이 묶였거나 쓰기 대기량에 그 틀을 더하면 상한을 넘었다. 넘기지 않았다(그 틀의 바이트 0).
+  "send_backlog",
+  // writeFrame으로 넘긴 틀의 로컬 쓰기가 오류로 끝났거나 write가 던졌다.
+  "send_failed",
   // 서버를 닫는다.
   "shutdown",
 ] as const;
@@ -119,12 +173,19 @@ export interface ConnectionServer {
   registry(): RegistryState;
   // 등록표를 적용하고(바이트는 복사본으로), registry 사건을 넣어 더는 믿지 않는 연결을 닫는다. 적용의 결과를 그대로 돌려준다.
   applyRegistry(input: RegistryInput): ApplyOutcome;
-  // 시간이 흘렀다. 판단의 tick을 넣는다(답·hello의 기한, 복원기가 바뀜).
+  // 시간이 흘렀다. 판단의 tick을 넣는다(답·hello의 기한, 복원기가 바뀜). writeFrame으로 넘긴 틀의 완료 대기는 만료하지 않는다.
   tick(): void;
+  // 지금 인정된 그 주체의 연결 번호: 부르는 순간의 복원기로 맞춰 인사까지 끝났고 그 복원기가 세대를 알며 서버가 아직 닫지 않은 연결.
+  // 없거나 둘 이상이면 null. 동기이고 캐시하지 않는다.
+  recognized(principal: string): number | null;
+  // 인정된 연결 하나에 부르는 쪽이 이미 만든 틀 하나를 넘긴다. 기다리지 않고, 넘기지 못한 틀을 쥐었다가 뒤에 쓰지 않는다.
+  writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult;
   close(): Promise<void>;
 }
 
 export async function startConnectionServer(options: ConnectionServerOptions): Promise<StartResult> {
+  const limit = options.maxPendingWriteBytes;
+  if (!Number.isSafeInteger(limit) || limit <= 0) return { ok: false, failure: { kind: "bad_settings", message: "maxPendingWriteBytes는 양의 정수다" } };
   let table: Connections;
   try {
     table = Connections.start(options.settings ?? {});
@@ -168,8 +229,16 @@ interface Link {
   replyMark: number | null;
   // 넘긴 뒤 완료를 기다리는 답. null이 아니면 이 연결의 다음 봉투를 판단에 넘기지 않는다.
   writing: Writing | null;
+  // writeFrame으로 넘긴 뒤 끝을 알리지 않은 틀. 완료 콜백이나 닫힘 가운데 먼저 온 쪽이 빼고 settled를 부른다.
+  readonly sends: Set<Send>;
   busy: boolean;
   dead: boolean;
+}
+
+interface Send {
+  readonly settled: (end: SendEnd) => void;
+  // 끝을 이미 알렸다. 뒤에 온 완료 콜백이나 닫힘은 settled를 다시 부르지 않는다.
+  done: boolean;
 }
 
 interface Writing {
@@ -184,6 +253,8 @@ class Server implements ConnectionServer {
   private readonly links = new Map<number, Link>();
   private tls: TlsServer | null = null;
   private stopping = false;
+  // writeFrame의 lastCheck를 부르는 중이다.
+  private checking = false;
 
   constructor(
     private readonly options: ConnectionServerOptions,
@@ -235,6 +306,7 @@ class Server implements ConnectionServer {
       received: 0,
       replyMark: null,
       writing: null,
+      sends: new Set(),
       busy: false,
       dead: false,
     };
@@ -423,14 +495,87 @@ class Server implements ConnectionServer {
   }
 
   // 소켓을 닫고 판단에 closed를 한 번 알린다. 대기열을 비우고, 진행 중인 check의 결과는 pump가 버린다.
+  // 끝을 알리지 않은 틀은 파기 앞에서 끝난 것으로 표시하고(파기가 완료 콜백을 부르는 시점과 상관없이 끝은 closed다),
+  // 판단과 서버의 상태를 다 바꾼 뒤에 settled를 부른다.
   private closeLink(link: Link, cause: LinkCloseCause, frame?: FrameRejectReason): void {
     if (link.dead) return;
     link.dead = true;
     link.queue.length = 0;
     this.links.delete(link.id);
+    const unsettled = [...link.sends];
+    link.sends.clear();
+    for (const send of unsettled) send.done = true;
     link.socket.destroy();
     this.note(frame === undefined ? { kind: "closed", connection: link.id, cause } : { kind: "closed", connection: link.id, cause, frame });
     this.step({ kind: "closed", connection: link.id }, link);
+    for (const send of unsettled) settle(send, "closed");
+  }
+
+  recognized(principal: string): number | null {
+    let ids: number[];
+    try {
+      ids = this.current.candidates(this.restorer()).map((candidate) => candidate.connection);
+    } catch {
+      // 복원기의 stopGeneration()이 던졌다. 세대를 모르는 복원기와 같이 아무 연결도 인정하지 않는다.
+      return null;
+    }
+    const found = ids.filter((id) => {
+      const link = this.links.get(id);
+      return link !== undefined && !link.dead && link.writing === null && this.current.get(id)?.sync?.principal === principal;
+    });
+    return found.length === 1 ? found[0]! : null;
+  }
+
+  // 순서가 보장 2다: 서버의 확인(인정, 소켓의 닫힘, 묶임과 대기량) → lastCheck → write. lastCheck가 쓴다고 답한 뒤 write까지는
+  // 자기 기록(lastCheck의 답, link.dead, 보낼 틀의 기록)만 보고 대입한다. 소켓의 접근자·시계·대기·다른 콜백이 없다.
+  writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult {
+    // 부르는 쪽 객체의 접근자가 lastCheck와 write 사이에서 불리지 않게 두 함수를 먼저 꺼낸다.
+    const { lastCheck, settled } = options;
+    if (this.checking) return { kind: "not_written", reason: "reentered" };
+    if (this.recognized(principal) !== connection) return { kind: "not_written", reason: "not_recognized" };
+    const link = this.links.get(connection)!;
+    const socket = link.socket;
+    if (socket.destroyed || !socket.writable) return { kind: "not_written", reason: "closed" };
+    // 줄을 두지 않는다. 상한 안이면 앞선 바이트 뒤에 붙인다(차례는 스트림이 지킨다). 묶였거나 상한을 넘으면 쥐고 기다리지 않고 닫는다.
+    if (socket.writableCorked !== 0 || socket.writableLength + frame.byteLength > this.options.maxPendingWriteBytes) {
+      this.closeLink(link, "send_backlog");
+      return { kind: "not_written", reason: "backlog" };
+    }
+    let verdict: unknown;
+    this.checking = true;
+    try {
+      verdict = lastCheck();
+    } catch {
+      return { kind: "not_written", reason: "check_failed" };
+    } finally {
+      this.checking = false;
+    }
+    if (verdict !== null) return typeof verdict === "string" ? { kind: "not_written", reason: "refused", refusal: verdict } : { kind: "not_written", reason: "check_failed" };
+    // lastCheck가 서버를 다시 불러 이 연결을 닫았으면 넘기지 않는다(자기 기록이다).
+    if (link.dead) return { kind: "not_written", reason: "closed" };
+    const send: Send = { settled, done: false };
+    link.sends.add(send);
+    try {
+      // 틀 하나를 통째로 한 번에 넘긴다. 반환값(false는 버퍼가 찼다는 뜻)으로 가르지 않고 완료 콜백과 닫힘으로만 끝을 안다.
+      socket.write(frame, (error) => this.sent(link, send, error));
+    } catch {
+      // 넘긴 바이트가 있는지 모른다. 닫아서 남은 바이트를 버린 뒤 끝을 한 번 알린다. 뒤에 완료 콜백이 와도 다시 부르지 않는다.
+      send.done = true;
+      link.sends.delete(send);
+      this.closeLink(link, "send_failed");
+      settle(send, "failed");
+      return { kind: "unknown" };
+    }
+    return { kind: "written" };
+  }
+
+  // writeFrame으로 넘긴 틀의 로컬 쓰기가 끝났다. 닫힘이 먼저 끝을 알렸으면 아무것도 하지 않는다.
+  private sent(link: Link, send: Send, error: Error | null | undefined): void {
+    if (send.done) return;
+    send.done = true;
+    link.sends.delete(send);
+    if (error) this.closeLink(link, "send_failed");
+    settle(send, error ? "failed" : "flushed");
   }
 
   applyRegistry(input: RegistryInput): ApplyOutcome {
@@ -461,6 +606,15 @@ class Server implements ConnectionServer {
 }
 
 const UNKNOWN_GENERATION: StopGenerationSource = Object.freeze({ stopGeneration: () => null });
+
+// 부르는 쪽의 정리(예: 보낸 버퍼를 0으로 채우기)가 던져도 연결과 서버의 상태에 영향을 주지 않는다.
+function settle(send: Send, end: SendEnd): void {
+  try {
+    send.settled(end);
+  } catch {
+    // 끝은 이미 알렸다. 다시 부르지 않는다.
+  }
+}
 
 // 넘긴 바이트가 앞선 바이트를 기다리지 않고 곧바로 하위 쓰기로 가는 상태: 쓰기 버퍼가 비었고, 비우기를 기다리지 않고, 묶이지 않았다.
 // 하위 쓰기 아래(TLS·커널·네트워크)에서 밀리는 것은 여기서 보이지 않는다. 이 서버는 맞춤의 답 전에 소켓에 쓰는 것이 없으므로

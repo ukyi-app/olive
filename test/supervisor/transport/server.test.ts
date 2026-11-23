@@ -7,7 +7,16 @@ import type * as tls from "node:tls";
 import { type Envelope, limits, type NonceStore, rawPublicKey, type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import { Connections, type Event, type ReplyTools, type StopGenerationSource } from "../../../src/supervisor/transport/connections.ts";
 import { type RegistrySettings, RegistryState } from "../../../src/supervisor/transport/registry.ts";
-import { type ConnectionServer, type ConnectionServerOptions, type Delivered, type ServerNote, startConnectionServer } from "../../../src/supervisor/transport/server.ts";
+import {
+  type ConnectionServer,
+  type ConnectionServerOptions,
+  type Delivered,
+  type SendEnd,
+  type ServerNote,
+  startConnectionServer,
+  type WriteFrameOptions,
+  type WriteFrameResult,
+} from "../../../src/supervisor/transport/server.ts";
 import { createFrameDecoder, encodeFrame } from "../../../src/transport/framing.ts";
 import type { RawTlsMaterial } from "../../../src/transport/tls-policy.ts";
 import { createTlsClient } from "../../../src/transport/tls-client.ts";
@@ -182,6 +191,7 @@ async function start(over: Partial<ConnectionServerOptions> = {}): Promise<Harne
       notes.push(note);
       harness.onNote(note);
     },
+    maxPendingWriteBytes: limits.MAX_MESSAGE_BYTES,
     ...over,
   });
   if (!result.ok) throw new Error(`서버가 시작하지 않았다: ${result.failure.kind}`);
@@ -1074,10 +1084,456 @@ describe("시작", () => {
       nonces: heldNonces().store,
       reply: { seal: (input) => sealEnvelope(input, SUP.privateKey), requestId: uuid, nonce: hex32 } as ReplyTools,
       deliver: () => {},
+      maxPendingWriteBytes: limits.MAX_MESSAGE_BYTES,
     } satisfies ConnectionServerOptions;
     const bad = await startConnectionServer({ ...base, settings: { helloWaitMs: 0 } });
     expect(bad.ok ? null : bad.failure.kind).toBe("bad_settings");
     const wrong = await startConnectionServer({ ...base, material: material(pki.executor()) });
     expect(wrong.ok ? null : wrong.failure).toEqual({ kind: "no_material", reason: "certificate_shape" });
+  });
+});
+
+describe("(5) 인정된 연결에 틀 하나를 쓴다(recognized, writeFrame)", () => {
+  const WRITTEN: WriteFrameResult = { kind: "written" };
+  const NOT_RECOGNIZED: WriteFrameResult = { kind: "not_written", reason: "not_recognized" };
+  const BACKLOG: WriteFrameResult = { kind: "not_written", reason: "backlog" };
+
+  // 길이가 정확히 n바이트인 틀(접두 4 + `{"p":"…"}`).
+  const sized = (n: number, fill = "x") => frame({ p: fill.repeat(n - 12) });
+  const concat = (...parts: Uint8Array[]) => new Uint8Array(Buffer.concat(parts));
+
+  // 상대가 받은 바이트를 이 함수를 부른 뒤부터 모은다.
+  function rawOf(peer: Peer): () => Uint8Array {
+    const chunks: Buffer[] = [];
+    peer.socket.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    return () => new Uint8Array(Buffer.concat(chunks));
+  }
+
+  // 부르는 쪽 흉내. lastCheck를 부른 수와 settled에 온 끝을 적는다.
+  function caller(verdict: () => string | null = () => null) {
+    let checks = 0;
+    const ends: SendEnd[] = [];
+    const options: WriteFrameOptions = {
+      lastCheck: () => {
+        checks++;
+        return verdict();
+      },
+      settled: (end) => {
+        ends.push(end);
+      },
+    };
+    return { ends, options, checks: () => checks };
+  }
+
+  test("상한은 진입점이 넣는다: 양의 정수가 아니면 시작하지 않는다", async () => {
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(start({ maxPendingWriteBytes: bad })).rejects.toThrow("bad_settings");
+    }
+  });
+
+  test("인정된 연결에 넘긴 틀은 상대의 디코더에 같은 바이트로 닿고, 연달아 넘긴 틀은 순서대로 섞이지 않고 닿는다. 끝은 틀마다 한 번이다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const raw = rawOf(a);
+    expect(h.server.recognized(R1)).toBe(a.id);
+    expect(h.server.recognized(R2)).toBeNull();
+
+    const one = frame({ n: 1 });
+    const c1 = caller();
+    expect(h.server.writeFrame(a.id, R1, one, c1.options)).toEqual(WRITTEN);
+    expect(c1.checks()).toBe(1);
+    await until(() => a.frames.length === 2);
+    expect(raw()).toEqual(one);
+    expect(a.frames[1] as unknown).toEqual({ n: 1 });
+    await until(() => c1.ends.length > 0);
+    expect(c1.ends).toEqual(["flushed"]);
+
+    // 큰 틀은 TLS 레코드 여럿으로 나뉘어 나간다. 바로 뒤에 넘긴 작은 틀이 그 사이에 끼지 않는다.
+    const two = sized(60_000, "a");
+    const three = frame({ n: 3 });
+    const c2 = caller();
+    const c3 = caller();
+    expect(h.server.writeFrame(a.id, R1, two, c2.options)).toEqual(WRITTEN);
+    expect(h.server.writeFrame(a.id, R1, three, c3.options)).toEqual(WRITTEN);
+    await until(() => a.frames.length === 4);
+    expect(raw()).toEqual(concat(one, two, three));
+    expect(a.frames.slice(2) as unknown).toEqual([{ p: "a".repeat(60_000 - 12) }, { n: 3 }]);
+    await until(() => c2.ends.length + c3.ends.length === 2);
+    expect([c2.ends, c3.ends]).toEqual([["flushed"], ["flushed"]]);
+
+    // 끝을 알린 뒤 연결이 닫혀도 다시 부르지 않는다.
+    a.socket.destroy();
+    await until(() => h.closedNotes(a.id).length > 0);
+    await Bun.sleep(20);
+    expect([c1.ends, c2.ends, c3.ends]).toEqual([["flushed"], ["flushed"], ["flushed"]]);
+  });
+
+  test("인정되지 않은 연결에는 한 바이트도 넘기지 않고 lastCheck·settled를 부르지 않는다: 맞춤 전, 답의 완료 대기, 인사 전, 다른 주체, 없는 번호, 닫힌 연결, 복원기가 바뀐 뒤", async () => {
+    const original: { stopGeneration(): number | null } = { stopGeneration: () => GENERATION };
+    const box: { source: StopGenerationSource } = { source: original };
+    const h = await start({ restorer: () => box.source });
+    const refused: ReturnType<typeof caller>[] = [];
+    const attempt = (id: number, principal: string, expected: WriteFrameResult) => {
+      const c = caller();
+      refused.push(c);
+      expect(h.server.writeFrame(id, principal, frame({ never: id }), c.options)).toEqual(expected);
+    };
+
+    // 맞춤 전.
+    const p = await connect(h);
+    const handedP = handedTo(serverSocket(h, p));
+    attempt(p.id, R1, NOT_RECOGNIZED);
+    expect(handedP).toEqual([]);
+
+    // 맞춤의 답을 넘기고 완료를 기다리는 중. 답의 길은 그대로 끝나고(write_busy 없음), 인사 전에도 쓰지 않는다.
+    const q = await connect(h);
+    const sq = serverSocket(h, q);
+    const handedQ = handedTo(sq);
+    const lowerQ = holdLowerWrite(sq);
+    q.send(syncRequest(K2, R2, h.clock.t));
+    await until(lowerQ.entered);
+    expect(phaseOf(h, q)).toBe("requested");
+    attempt(q.id, R2, NOT_RECOGNIZED);
+    expect(handedQ).toHaveLength(1);
+    lowerQ.release();
+    await until(() => phaseOf(h, q) === "answered" && q.frames.length === 1);
+    attempt(q.id, R2, NOT_RECOGNIZED);
+    expect(handedQ).toHaveLength(1);
+    q.send(hello(K2, R2, h.clock.t));
+    await until(() => phaseOf(h, q) === "greeted");
+    expect(h.closedNotes(q.id)).toEqual([]);
+    expect(replies(q)).toBe(1);
+    expect(h.server.recognized(R2)).toBe(q.id);
+
+    // 인정된 연결이어도 주체가 다르거나 번호가 없으면 쓰지 않는다.
+    const a = await greet(h, K1, R1);
+    const handedA = handedTo(serverSocket(h, a));
+    attempt(a.id, R2, NOT_RECOGNIZED);
+    attempt(q.id, R1, NOT_RECOGNIZED);
+    attempt(9_999, R1, NOT_RECOGNIZED);
+    expect(handedA).toEqual([]);
+
+    // 복원기가 바뀌었거나 세대를 모르게 되면 박자가 옛 연결을 닫기 전에도 인정하지 않는다. 지금의 복원기를 부를 때마다 본다.
+    box.source = { stopGeneration: () => GENERATION };
+    expect(h.server.recognized(R1)).toBeNull();
+    attempt(a.id, R1, NOT_RECOGNIZED);
+    box.source = original;
+    original.stopGeneration = () => null;
+    expect(h.server.recognized(R1)).toBeNull();
+    attempt(a.id, R1, NOT_RECOGNIZED);
+    original.stopGeneration = () => {
+      throw new Error("시험: 세대 읽기 실패");
+    };
+    expect(h.server.recognized(R1)).toBeNull();
+    attempt(a.id, R1, NOT_RECOGNIZED);
+    original.stopGeneration = () => GENERATION;
+    expect(h.server.recognized(R1)).toBe(a.id);
+    expect(handedA).toEqual([]);
+
+    // 서버 쪽 소켓이 파기된 그 순간(close 사건을 처리하기 전)과 닫힘을 처리한 뒤.
+    const sa = serverSocket(h, a);
+    sa.destroy();
+    expect(serverLinks(h).has(a.id)).toBe(true);
+    const closing = caller();
+    refused.push(closing);
+    expect(h.server.writeFrame(a.id, R1, frame({ never: "closing" }), closing.options)).toEqual({ kind: "not_written", reason: "closed" });
+    await until(() => h.closedNotes(a.id).length > 0);
+    attempt(a.id, R1, NOT_RECOGNIZED);
+    expect(handedA).toEqual([]);
+    expect(h.server.recognized(R1)).toBeNull();
+
+    await Bun.sleep(20);
+    expect(refused.map((c) => [c.checks(), c.ends.length])).toEqual(refused.map(() => [0, 0]));
+    expect(p.frames).toEqual([]);
+    expect(q.frames).toHaveLength(1);
+    expect(a.frames).toHaveLength(1);
+  });
+
+  test("줄을 두지 않는다: 하위 쓰기를 붙든 채 대기량이 상한 정각이면 넘기고, 넘으면 넘기지 않고 send_backlog로 닫는다. 묶인 스트림도 같다", async () => {
+    const LIMIT = 300;
+    const h = await start({ maxPendingWriteBytes: LIMIT });
+
+    // 100 + 200 = 상한 정각까지 넘긴다. 셋째는 넘기지 않고 닫는다.
+    const a = await greet(h, K1, R1);
+    const sa = serverSocket(h, a);
+    const handedA = handedTo(sa);
+    const lowerA = holdLowerWrite(sa);
+    const first = sized(100);
+    const second = sized(200);
+    const [c1, c2, c3] = [caller(), caller(), caller()];
+    expect(h.server.writeFrame(a.id, R1, first, c1.options)).toEqual(WRITTEN);
+    await until(lowerA.entered);
+    expect(sa.writableLength).toBe(100);
+    expect(h.server.writeFrame(a.id, R1, second, c2.options)).toEqual(WRITTEN);
+    expect(sa.writableLength).toBe(LIMIT);
+    expect(h.server.writeFrame(a.id, R1, sized(13), c3.options)).toEqual(BACKLOG);
+    expect(handedA).toEqual([first, second]);
+    expect(c3.checks()).toBe(0);
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "send_backlog" }]);
+    expect([c1.ends, c2.ends, c3.ends]).toEqual([["closed"], ["closed"], []]);
+    // 파기 뒤에 붙든 쓰기가 끝나도 끝을 다시 알리지 않고, 넘기지 않은 틀을 뒤에 쓰지 않는다.
+    lowerA.complete();
+    await until(() => a.closed());
+    await Bun.sleep(20);
+    expect([c1.ends, c2.ends, c3.ends]).toEqual([["closed"], ["closed"], []]);
+    expect(handedA).toEqual([first, second]);
+    expect(a.frames).toHaveLength(1);
+
+    // 100 + 201 = 상한 + 1이면 둘째를 넘기지 않는다.
+    const b = await greet(h, K2, R2);
+    const sb = serverSocket(h, b);
+    const handedB = handedTo(sb);
+    const lowerB = holdLowerWrite(sb);
+    const d1 = caller();
+    const d2 = caller();
+    expect(h.server.writeFrame(b.id, R2, first, d1.options)).toEqual(WRITTEN);
+    await until(lowerB.entered);
+    expect(h.server.writeFrame(b.id, R2, sized(201), d2.options)).toEqual(BACKLOG);
+    expect(handedB).toEqual([first]);
+    expect(d2.checks()).toBe(0);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "send_backlog" }]);
+    expect([d1.ends, d2.ends]).toEqual([["closed"], []]);
+
+    // 빈 스트림을 묶기만 했다. 넘기지 않고 닫는다. 뒤에 풀어도 나갈 것이 없다.
+    const c = await greet(h, K1, R1);
+    const sc = serverSocket(h, c);
+    const handedC = handedTo(sc);
+    sc.cork();
+    const e = caller();
+    expect(h.server.writeFrame(c.id, R1, sized(20), e.options)).toEqual(BACKLOG);
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "send_backlog" }]);
+    sc.uncork();
+    await until(() => c.closed());
+    await Bun.sleep(20);
+    expect(handedC).toEqual([]);
+    expect([e.checks(), e.ends]).toEqual([0, []]);
+    expect(c.frames).toHaveLength(1);
+  });
+
+  test("lastCheck가 이름을 답하거나 던지면 넘긴 바이트 0이고 연결은 열린 채다. 그 안에서 다시 쓰거나 그 연결을 닫으면 넘기지 않는다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const handedA = handedTo(serverSocket(h, a));
+
+    const named = caller(() => "too_late");
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 1 }), named.options)).toEqual({ kind: "not_written", reason: "refused", refusal: "too_late" });
+    const threw = caller(() => {
+      throw new Error("시험: lastCheck 실패");
+    });
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 2 }), threw.options)).toEqual({ kind: "not_written", reason: "check_failed" });
+    const odd = caller(() => undefined as unknown as null);
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 3 }), odd.options)).toEqual({ kind: "not_written", reason: "check_failed" });
+    let inner = null as WriteFrameResult | null;
+    const innerCaller = caller();
+    const nested = caller(() => {
+      inner = h.server.writeFrame(a.id, R1, frame({ n: "inner" }), innerCaller.options);
+      return "stop";
+    });
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 4 }), nested.options)).toEqual({ kind: "not_written", reason: "refused", refusal: "stop" });
+    expect(inner).toEqual({ kind: "not_written", reason: "reentered" });
+    expect(handedA).toEqual([]);
+    expect(h.closedNotes(a.id)).toEqual([]);
+    expect(phaseOf(h, a)).toBe("greeted");
+    expect([named, threw, odd, nested].map((c) => c.checks())).toEqual([1, 1, 1, 1]);
+    expect([named, threw, odd, nested, innerCaller].map((c) => c.ends)).toEqual([[], [], [], [], []]);
+
+    // 같은 연결에 이어서 쓸 수 있다.
+    const ok = caller();
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 5 }), ok.options)).toEqual(WRITTEN);
+    await until(() => a.frames.length === 2);
+    expect(a.frames[1] as unknown).toEqual({ n: 5 });
+
+    // lastCheck가 등록표를 적용해 그 연결이 닫혔으면 쓴다고 답해도 넘기지 않는다.
+    const b = await greet(h, K2, R2);
+    const handedB = handedTo(serverSocket(h, b));
+    const dropping = caller(() => {
+      h.server.applyRegistry({ kind: "content", content: doc(2, [row(K1, "r1", "s1")]) });
+      return null;
+    });
+    expect(h.server.writeFrame(b.id, R2, frame({ n: 6 }), dropping.options)).toEqual({ kind: "not_written", reason: "closed" });
+    expect(handedB).toEqual([]);
+    expect(dropping.ends).toEqual([]);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment" }]);
+    await until(() => b.closed());
+    expect(b.frames).toHaveLength(1);
+  });
+
+  test("서버의 확인 → lastCheck → write: lastCheck가 주입 시계를 읽은 뒤 write까지 소켓의 접근자·시계·복원기 읽기가 없다", async () => {
+    const shared = { t: Date.now() };
+    const order: string[] = [];
+    const injected = () => {
+      order.push("clock");
+      return shared.t;
+    };
+    const h = await start({ clock: injected });
+    h.onRestorer = () => order.push("restorer");
+    const a = await greet(h, K1, R1);
+    const sa = serverSocket(h, a);
+    const candidates = ["destroyed", "writable", "writableLength", "writableNeedDrain", "writableCorked", "writableEnded", "writableFinished", "writableHighWaterMark", "writableObjectMode", "readyState", "bufferSize", "pending", "connecting"];
+    const watched = candidates.filter((name) => {
+      try {
+        onAccess(sa, name, () => order.push(name));
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    expect(watched).toEqual(expect.arrayContaining(["writableLength", "writableCorked"]));
+    const write = sa.write;
+    sa.write = function (this: ServerSocket, ...args: unknown[]) {
+      order.push("write");
+      return (write as (...a: unknown[]) => boolean).apply(this, args);
+    } as typeof sa.write;
+    const deadline = shared.t + 1;
+    order.length = 0;
+    const result = h.server.writeFrame(a.id, R1, frame({ n: 1 }), {
+      lastCheck: () => {
+        order.push("lastCheck");
+        const now = injected();
+        order.push("lastCheck:end");
+        return now < deadline ? null : "too_late";
+      },
+      settled: () => {},
+    });
+    expect(result).toEqual(WRITTEN);
+    const l = order.indexOf("lastCheck");
+    const w = order.indexOf("write");
+    expect(order.slice(l, w + 1)).toEqual(["lastCheck", "clock", "lastCheck:end", "write"]);
+    // 서버의 확인(복원기, 소켓의 닫힘·묶임·대기량)은 lastCheck 앞에 있고, 서버는 시계를 읽지 않는다.
+    expect(order.slice(0, l)).toEqual(expect.arrayContaining(["restorer", "writableCorked", "writableLength"]));
+    expect(order.slice(0, l)).not.toContain("clock");
+    await until(() => a.frames.length === 2);
+
+    // lastCheck가 읽은 시각이 기한 정각이면 넘기지 않는다.
+    shared.t = deadline;
+    order.length = 0;
+    const late = h.server.writeFrame(a.id, R1, frame({ n: 2 }), {
+      lastCheck: () => (injected() < deadline ? null : "too_late"),
+      settled: () => {},
+    });
+    expect(late).toEqual({ kind: "not_written", reason: "refused", refusal: "too_late" });
+    expect(order).not.toContain("write");
+  });
+
+  test("넘긴 틀의 끝은 정확히 한 번이다: 완료 오류, 완료 전의 닫힘(상대, 등록표, 서버 종료), 닫힌 뒤 늦게 온 완료", async () => {
+    const h = await start();
+
+    // 완료가 오류면 send_failed로 닫고 failed를 한 번.
+    const a = await greet(h, K1, R1);
+    const lowerA = holdLowerWrite(serverSocket(h, a));
+    const ca = caller();
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 1 }), ca.options)).toEqual(WRITTEN);
+    await until(lowerA.entered);
+    expect(ca.ends).toEqual([]);
+    lowerA.complete(new Error("시험: 로컬 쓰기 실패"));
+    await until(() => ca.ends.length > 0);
+    expect(ca.ends).toEqual(["failed"]);
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "send_failed" }]);
+    await until(() => a.closed());
+
+    // 상대가 닫는다. 하위 쓰기에 하나, 스트림 버퍼에 하나. 둘 다 closed 한 번이고 뒤늦은 완료는 무시한다.
+    const b = await greet(h, K2, R2);
+    const lowerB = holdLowerWrite(serverSocket(h, b));
+    const [b1, b2] = [caller(), caller()];
+    expect(h.server.writeFrame(b.id, R2, frame({ n: 2 }), b1.options)).toEqual(WRITTEN);
+    expect(h.server.writeFrame(b.id, R2, frame({ n: 3 }), b2.options)).toEqual(WRITTEN);
+    await until(lowerB.entered);
+    b.socket.destroy();
+    await until(() => h.closedNotes(b.id).length > 0);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "peer" }]);
+    expect([b1.ends, b2.ends]).toEqual([["closed"], ["closed"]]);
+    lowerB.complete();
+    await Bun.sleep(20);
+    expect([b1.ends, b2.ends]).toEqual([["closed"], ["closed"]]);
+
+    // 등록표에서 빠진다. 뒤늦은 완료가 오류여도 그대로다.
+    const c = await greet(h, K1, R1);
+    const lowerC = holdLowerWrite(serverSocket(h, c));
+    const cc = caller();
+    expect(h.server.writeFrame(c.id, R1, frame({ n: 4 }), cc.options)).toEqual(WRITTEN);
+    await until(lowerC.entered);
+    expect(h.server.applyRegistry({ kind: "content", content: doc(2, [row(K2, "r2", "s2")]) }).kind).toBe("applied");
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "judgment" }]);
+    expect(cc.ends).toEqual(["closed"]);
+    lowerC.complete(new Error("시험: 닫힌 뒤 온 오류"));
+    await Bun.sleep(20);
+    expect(cc.ends).toEqual(["closed"]);
+
+    // 서버를 닫는다.
+    const d = await greet(h, K2, R2);
+    const lowerD = holdLowerWrite(serverSocket(h, d));
+    const cd = caller();
+    expect(h.server.writeFrame(d.id, R2, frame({ n: 5 }), cd.options)).toEqual(WRITTEN);
+    await until(lowerD.entered);
+    h.server.tick();
+    expect(cd.ends).toEqual([]);
+    await h.server.close();
+    expect(h.closedNotes(d.id)).toEqual([{ kind: "closed", connection: d.id, cause: "shutdown" }]);
+    expect(cd.ends).toEqual(["closed"]);
+    lowerD.complete();
+    await Bun.sleep(20);
+    expect(cd.ends).toEqual(["closed"]);
+  });
+
+  test("settled가 던지거나 write가 던져도 다른 연결과 tick·applyRegistry·close가 그대로다. write가 던지면 닫고 모른다고 하며 끝은 한 번이다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const b = await greet(h, K2, R2);
+    let thrown = 0;
+    const throwing: WriteFrameOptions = {
+      lastCheck: () => null,
+      settled: () => {
+        thrown++;
+        throw new Error("시험: settled 실패");
+      },
+    };
+
+    // 완료에서 던진다. 연결은 열린 채다.
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 1 }), throwing)).toEqual(WRITTEN);
+    await until(() => thrown === 1);
+    expect(phaseOf(h, a)).toBe("greeted");
+    expect(h.closedNotes(a.id)).toEqual([]);
+
+    // 하위 쓰기를 붙든 A에 둘을 넘긴 채 B·박자·등록표가 돈다. A를 닫을 때 둘 다 던져도 각자 한 번씩이다.
+    const lowerA = holdLowerWrite(serverSocket(h, a));
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 2 }), throwing)).toEqual(WRITTEN);
+    expect(h.server.writeFrame(a.id, R1, frame({ n: 3 }), throwing)).toEqual(WRITTEN);
+    await until(lowerA.entered);
+    const cb = caller();
+    expect(h.server.writeFrame(b.id, R2, frame({ n: 4 }), cb.options)).toEqual(WRITTEN);
+    await until(() => cb.ends.length > 0 && b.frames.length === 2);
+    h.server.tick();
+    expect(h.server.applyRegistry({ kind: "content", content: doc(2, [row(K1, "r1", "s1"), row(K2, "r2", "s2")]) }).kind).toBe("applied");
+    expect(phaseOf(h, a)).toBe("greeted");
+    a.socket.destroy();
+    await until(() => h.closedNotes(a.id).length > 0);
+    expect(thrown).toBe(3);
+    expect(h.server.table().get(a.id)).toBeUndefined();
+    expect(h.delivered.filter((o) => o.kind === "withdrawn" && o.connection === a.id)).toHaveLength(1);
+    expect(phaseOf(h, b)).toBe("greeted");
+
+    // write가 콜백을 맡은 뒤 던진다. 그 자리에서 닫고 unknown, 끝은 failed 한 번이고 뒤에 온 콜백은 무시한다.
+    const sb = serverSocket(h, b);
+    const write = sb.write;
+    sb.write = function (this: ServerSocket, ...args: unknown[]) {
+      (write as (...a: unknown[]) => boolean).apply(this, args);
+      throw new Error("시험: write가 던짐");
+    } as typeof sb.write;
+    const cw = caller();
+    expect(h.server.writeFrame(b.id, R2, frame({ n: 5 }), cw.options)).toEqual({ kind: "unknown" });
+    expect(cw.ends).toEqual(["failed"]);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "send_failed" }]);
+    await until(() => b.closed());
+    await Bun.sleep(20);
+    expect(cw.ends).toEqual(["failed"]);
+    expect(cb.ends).toEqual(["flushed"]);
+
+    // 서버는 그대로 새 연결을 받아 쓴다.
+    h.server.tick();
+    const c = await greet(h, K1, R1);
+    const cc = caller();
+    expect(h.server.writeFrame(c.id, R1, frame({ n: 6 }), cc.options)).toEqual(WRITTEN);
+    await until(() => c.frames.length === 2 && cc.ends.length === 1);
+    expect(cc.ends).toEqual(["flushed"]);
   });
 });
