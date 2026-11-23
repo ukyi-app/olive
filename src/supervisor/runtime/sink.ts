@@ -2,8 +2,10 @@
 // 감독 연결 서버의 쓰기 면(recognized, writeFrame) 위에 만든다. 설명 문서는 sink.md다.
 //
 // 이 파일이 지키는 것:
-// - 싣는 순간의 확인은 서버가 write 바로 앞에서 부르는 lastCheck 안에서만 한다. 시계를 거기서 한 번 읽고 시한 → 작업 기한 →
-//   정지 세대 → (새 실행을 여는 지시면) 접수 → 맡기지 않을 실행기 차례로 본다. 그 앞에서 읽은 값으로 대신하지 않는다.
+// - 싣는 순간의 확인은 서버가 부르는 두 콜백 안에서만 한다. lastCheck(서버 확인 뒤)에서 정지 세대 → (새 실행을 여는 지시면) 접수 →
+//   맡기지 않을 실행기를 보고, finalCheck(서버의 인정 재확인 뒤, write 바로 앞)에서 시계를 한 번 읽어 시한과 작업 기한의 여유를 본다.
+//   시계를 그보다 앞에서 읽으면 그 뒤의 동기 조회(장부 읽기 포함)와 서버 재확인에 걸린 시간만큼 실제 쓰기 때의 여유가 약속보다 준다.
+//   그 앞에서 읽은 값으로 대신하지 않는다.
 // - 포트는 동기로 끝난다. 이 파일에는 기다림·타이머·뒤로 미룬 콜백이 없고, 돌아온 뒤 이 포트나 서버에 쓸 것이 남지 않는다.
 //   봉투를 쌓거나 저장하지 않는다.
 // - 기다리는 조회는 쓰기 전에 그 연결 번호와 함께 등록하고, 결과가 written이 아니면 거둔다.
@@ -12,11 +14,11 @@
 import { type Action, canonicalJson, type Envelope, isAction, type Link, limits, mayIssue as contractMayIssue, STARTS_RUN } from "../../contract/v1/index.ts";
 import type { Restorer } from "../../ledger/index.ts";
 import { encodeFrame } from "../../transport/framing.ts";
-import type { WithheldSource } from "../dispatch/assign-loop.ts";
+import { isWorkerName, type WithheldSource } from "../dispatch/assign-loop.ts";
 import type { Clock, InstructionSink, SendOutcome } from "../dispatch/ports.ts";
 import type { AnswerLinks, SentQuery } from "../dispatch/receipts.ts";
 import { RENEW_MARGIN_MS } from "../scheduler/lifecycle.ts";
-import type { ConnectionServer, SendEnd } from "../transport/server.ts";
+import { type ConnectionServer, NOT_WRITTEN_REASONS, type SendEnd } from "../transport/server.ts";
 
 // 봉할 때(envelopes.ts의 sealDraft)와 같은 여유. 실행기가 자기 시계로 받는 시각에도 봉투 시한과 작업 기한이 남게 한다.
 const SEND_MARGIN_MS = limits.DELIVERY_MAX_MS + limits.CLOCK_SKEW_MS;
@@ -34,7 +36,8 @@ export interface QueryBook {
   remove(query: SentQuery): void;
 }
 
-// lastCheck가 싣지 말라고 답한 이름. too_late·deadline만 too_late_to_send이고 나머지는 no_connection으로 옮긴다(sink.md "옮김 표").
+// lastCheck·finalCheck가 싣지 말라고 답한 이름. too_late·deadline만 too_late_to_send이고 나머지는 no_connection으로 옮긴다(sink.md "옮김 표").
+// clock_unavailable·too_late·deadline은 finalCheck, 나머지는 lastCheck가 낸다(check_threw는 둘 다).
 export const SINK_REFUSALS = [
   // 시계가 던졌거나 안전 정수가 아닌 값을 냈다.
   "clock_unavailable",
@@ -50,7 +53,7 @@ export const SINK_REFUSALS = [
   "intake_closed",
   // 새 실행을 여는 지시인데 받는 실행기가 맡기지 않을 실행기 집합에 있다.
   "withheld",
-  // 새 실행을 여는 지시인데 맡기지 않을 실행기 집합을 모른다(던짐, 꼴이 틀림).
+  // 새 실행을 여는 지시인데 맡기지 않을 실행기 집합을 모른다(던짐, 꼴이 틀림, 작업자 실행기 이름이 아닌 원소).
   "withheld_unknown",
   // 확인 안에서 뜻밖의 예외가 났다.
   "check_threw",
@@ -74,7 +77,8 @@ export type SinkNote =
       readonly requestId: string;
       readonly recipient: string;
       readonly outcome: "no_connection" | "too_late_to_send";
-      // recognized가 null이면 not_recognized, writeFrame이 refused면 SINK_REFUSALS의 이름, 그 밖은 writeFrame의 reason 그대로다.
+      // recognized가 null이면 not_recognized, writeFrame이 refused면 SINK_REFUSALS의 이름, 그 밖은 writeFrame의 reason 그대로다
+      // (NOT_WRITTEN_REASONS에 있는 것만. 없는 사유는 꼴 아닌 결과다).
       readonly reason: string;
     }
   | { readonly kind: "unsendable"; readonly reason: Unsendable }
@@ -127,6 +131,7 @@ const NOTHING_TO_SETTLE = (_end: SendEnd): void => {};
 const UTF8 = new TextEncoder();
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const isText = (value: unknown): value is string => typeof value === "string" && value !== "";
+const SERVER_REASONS: readonly unknown[] = NOT_WRITTEN_REASONS;
 
 export function createWireSink(ports: WireSinkPorts): WireSink {
   const note = (value: SinkNote): void => {
@@ -138,7 +143,8 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
   };
 
   // 한 번의 싣기. 지시(ack가 null)는 recognized로 받는 실행기의 인정된 연결을 고르고, ack는 그 영수증이 온 연결에만 쓴다.
-  // 차례: 봉투를 읽고 틀을 만든다 → 연결을 고른다 → (조회) 등록 → writeFrame(그 안의 lastCheck) → (조회) written이 아니면 거둠.
+  // 차례: 봉투를 읽고 틀을 만든다 → 연결을 고른다 → (조회) 등록 → writeFrame(그 안의 lastCheck, 서버 재확인, finalCheck)
+  // → (조회) written이 아니면 거둠.
   const deliver = (envelope: unknown, ack: { readonly connection: number } | null): AckOutcome => {
     const head = readEnvelope(envelope);
     if (typeof head === "string") {
@@ -158,10 +164,14 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
     // 새 실행을 여는 지시에만 접수와 맡기지 않을 실행기를 건다. 취소·조회·갱신·확정까지 막으면 멈춰야 할 실행을 멈추지 못한다.
     const opening = ack === null && STARTS_RUN.includes(head.action);
     const margin = head.action === "run_renew" ? RENEW_MARGIN_MS : SEND_MARGIN_MS;
-    // lastCheck가 낸 이름. 서버가 돌려주는 refusal 대신 이 값으로 가른다.
+    // lastCheck·finalCheck가 낸 이름. 서버가 돌려주는 refusal 대신 이 값으로 가른다.
     const seen: { refusal: SinkRefusal | null } = { refusal: null };
     const lastCheck = (): string | null => {
-      seen.refusal = judge(head, margin, opening, ports);
+      seen.refusal = judge(head, opening, ports);
+      return seen.refusal;
+    };
+    const finalCheck = (): string | null => {
+      seen.refusal = timeVerdict(head, margin, ports.clock);
       return seen.refusal;
     };
     let query: SentQuery | null = null;
@@ -173,7 +183,7 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
         query = { requestId: head.requestId, recipient: head.recipient, runIds: head.runIds, connection };
         ports.queries.add(query);
       }
-      const result: unknown = ports.server.writeFrame(connection, head.recipient, head.frame, { lastCheck, settled: NOTHING_TO_SETTLE });
+      const result: unknown = ports.server.writeFrame(connection, head.recipient, head.frame, { lastCheck, finalCheck, settled: NOTHING_TO_SETTLE });
       const kind = isRecord(result) ? result.kind : undefined;
       written = kind === "written";
       if (written) return "sent";
@@ -181,14 +191,17 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
         note({ kind: "delivery_unknown", ...named, reason: "write_unknown" });
         return "unknown";
       }
-      if (kind !== "not_written") {
+      // 넘긴 바이트 0이라는 답은 서버의 결과 타입이 허락한 꼴일 때만 믿는다. 사유가 없거나 모르는 사유, refusal이 없는 refused는
+      // 서버가 무엇을 했는지 모르는 답이라 송달 모름으로 둔다(no_connection으로 옮기면 박자가 확정 미송신으로 적는다).
+      const reason = (result as { reason?: unknown }).reason;
+      const wellFormed = kind === "not_written" && SERVER_REASONS.includes(reason) && (reason !== "refused" || typeof (result as { refusal?: unknown }).refusal === "string");
+      if (!wellFormed) {
         note({ kind: "delivery_unknown", ...named, reason: "result_malformed" });
         return "unknown";
       }
-      const reason = (result as { reason?: unknown }).reason;
       const refusal = seen.refusal;
       if (reason === "refused" && refusal !== null) return refused(refusal === "too_late" || refusal === "deadline" ? "too_late_to_send" : "no_connection", refusal);
-      return refused("no_connection", typeof reason === "string" ? reason : "result_malformed");
+      return refused("no_connection", reason as string);
     } catch {
       note({ kind: "delivery_unknown", ...named, reason: "port_threw" });
       return "unknown";
@@ -236,14 +249,10 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
   };
 }
 
-// 서버가 write 바로 앞에서 부른다. 시계를 한 번 읽고 정한 차례로 본다. 이 안에서는 서버를 부르지 않고 기록도 남기지 않는다
-// (observe가 서버를 다시 부를 수 있다). 포트가 던지면 그 조건을 모름으로 보고 싣지 않는다.
-function judge(head: Head, margin: number, opening: boolean, ports: WireSinkPorts): SinkRefusal | null {
+// lastCheck. 서버가 자기 확인 뒤에 부른다. 정한 차례로 보고 시계는 읽지 않는다(시간은 finalCheck가 본다). 이 안에서는 서버를 부르지 않고
+// 기록도 남기지 않는다(observe가 서버를 다시 부를 수 있다). 포트가 던지면 그 조건을 모름으로 보고 싣지 않는다.
+function judge(head: Head, opening: boolean, ports: WireSinkPorts): SinkRefusal | null {
   try {
-    const now = readNow(ports.clock);
-    if (now === null) return "clock_unavailable";
-    if (head.expiresAt - now < margin) return "too_late";
-    if (head.deadlineAt !== null && head.deadlineAt - now < SEND_MARGIN_MS) return "deadline";
     let source: Pick<Restorer, "stopGeneration" | "intakeOpen">;
     let generation: unknown;
     try {
@@ -268,7 +277,22 @@ function judge(head: Head, margin: number, opening: boolean, ports: WireSinkPort
   }
 }
 
-// 맡기지 않을 실행기 집합을 한 번 읽는다. value는 한 번만 읽고, 원소가 문자열이 아니면 모름이다(빈 칸 포함).
+// finalCheck. 서버가 인정의 재확인까지 마쳐 쓰기로 정한 뒤, write 바로 앞에서 부른다. 서버는 그 뒤 다시 확인하지 않으므로 여기서는
+// 시계를 한 번 읽고 시한·작업 기한의 여유와 견주는 것만 한다(포트·서버·기록을 부르지 않는다).
+function timeVerdict(head: Head, margin: number, clock: Clock): SinkRefusal | null {
+  try {
+    const now = readNow(clock);
+    if (now === null) return "clock_unavailable";
+    if (head.expiresAt - now < margin) return "too_late";
+    if (head.deadlineAt !== null && head.deadlineAt - now < SEND_MARGIN_MS) return "deadline";
+    return null;
+  } catch {
+    return "check_threw";
+  }
+}
+
+// 맡기지 않을 실행기 집합을 한 번 읽는다. value는 한 번만 읽고, 원소 하나라도 작업자 실행기 이름이 아니면(빈 칸 포함) 모름이다.
+// 배정 박자(assign-loop.ts의 readWithheld)와 같은 검사다: 같은 원천을 두 곳이 다르게 읽으면 배정은 모름으로 멈추고 송신은 싣는다.
 function withheldVerdict(source: WithheldSource, recipient: string): SinkRefusal | null {
   try {
     const answer: unknown = source.executors();
@@ -278,7 +302,7 @@ function withheldVerdict(source: WithheldSource, recipient: string): SinkRefusal
     let listed = false;
     for (let i = 0; i < names.length; i += 1) {
       const name: unknown = names[i];
-      if (typeof name !== "string") return "withheld_unknown";
+      if (!isWorkerName(name)) return "withheld_unknown";
       if (name === recipient) listed = true;
     }
     return listed ? "withheld" : null;

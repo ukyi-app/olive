@@ -1,12 +1,17 @@
 // 내보내기 포트와 연결 문(src/supervisor/runtime/sink.ts)의 보장 넷. 서버는 쓰기 면(recognized, writeFrame)만 흉내 낸 가짜다:
-// writeFrame은 실제 서버의 차례(서버 확인 → lastCheck 한 번 → 재확인 → write)를 따르고, 넘긴 틀을 적는다.
+// writeFrame은 실제 서버의 차례(서버 확인 → lastCheck 한 번 → 재확인 → finalCheck 한 번 → write)를 따르고, 넘긴 틀을 적는다.
 // 시계는 시험이 쥔 값이고 실제 시간을 기다리지 않는다. 실제 서버로 가는 길은 sink-loopback.test.ts가 본다.
 import { describe, expect, test } from "bun:test";
+import { generateKeyPairSync, getRandomValues } from "node:crypto";
+import { sealEnvelope } from "../../../src/contract/v1/index.ts";
+import { RESTORE_KEY } from "../../../src/ledger/ledger.ts";
+import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
 import { createFrameDecoder } from "../../../src/transport/framing.ts";
 import type { SentQuery } from "../../../src/supervisor/dispatch/receipts.ts";
 import { createWireSink, type SinkNote, type WireServer } from "../../../src/supervisor/runtime/sink.ts";
 import type { SendEnd, WriteFrameOptions, WriteFrameResult } from "../../../src/supervisor/transport/server.ts";
 import { list, readText } from "../../files.ts";
+import { id, must, NOW, open, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 const R1 = "executor/isolated_reader/r1/s1";
 const R2 = "executor/isolated_reader/r2/s2";
@@ -51,7 +56,9 @@ const ack = () => envelope("ack", { ids: [uuid()] });
 type Before = Extract<WriteFrameResult, { kind: "not_written" }>["reason"];
 
 // 시험이 고르는 가짜 서버의 답.
-// before: lastCheck를 부르기 전에 돌려줄 결과(서버의 인정·닫힘·대기량 확인에서 걸림). after: lastCheck가 null을 낸 뒤의 결과.
+// before: lastCheck를 부르기 전에 돌려줄 결과(서버의 인정·닫힘·대기량 확인에서 걸림).
+// after: lastCheck가 null을 낸 뒤의 결과. not_recognized·closed는 재확인에서 걸린 것이라 finalCheck를 부르지 않는다.
+// 나머지는 finalCheck가 null을 낸 뒤의 결과다(no_reason·odd_reason·refused_bare는 서버 결과 타입에 없는 not_written).
 interface World {
   now: number;
   generation: number | null;
@@ -59,9 +66,11 @@ interface World {
   withheld: { known: true; value: readonly unknown[] } | { known: false };
   recognized: number | null;
   before: Before | null;
-  after: "written" | "unknown" | "not_recognized" | "closed" | "throw" | "malformed";
+  after: "written" | "unknown" | "not_recognized" | "closed" | "throw" | "malformed" | "no_reason" | "odd_reason" | "refused_bare";
   // writeFrame이 lastCheck를 부르기 바로 앞에 바꿀 것(앞에서 본 값을 믿지 않는지 본다).
   beforeCheck: () => void;
+  // 포트가 읽힐 때마다 그 이름(차례 표시 포함)으로 부른다. 그 읽기에 시간이 걸린 것을 시계를 옮겨 흉내 낸다.
+  onRead: (name: string) => void;
 }
 
 function harness(over: Partial<World> = {}) {
@@ -74,12 +83,16 @@ function harness(over: Partial<World> = {}) {
     before: null,
     after: "written",
     beforeCheck: () => {},
+    onRead: () => {},
     ...over,
   };
-  // 포트가 읽힌 차례. lastCheck 안이면 그 표시가 함께 붙는다.
+  // 포트가 읽힌 차례. lastCheck 안이면 check:, 서버의 재확인이면 recheck:, finalCheck 안이면 final:이 붙는다.
   const reads: string[] = [];
-  let inCheck = false;
-  const read = (name: string) => reads.push(inCheck ? `check:${name}` : name);
+  let phase = "";
+  const read = (name: string) => {
+    reads.push(phase + name);
+    world.onRead(phase + name);
+  };
   const frames: { connection: number; principal: string; frame: Uint8Array }[] = [];
   const settles: ((end: SendEnd) => void)[] = [];
   const book: SentQuery[] = [];
@@ -96,14 +109,32 @@ function harness(over: Partial<World> = {}) {
       read("writeFrame");
       if (world.before !== null) return { kind: "not_written", reason: world.before } as WriteFrameResult;
       world.beforeCheck();
-      inCheck = true;
+      phase = "check:";
       let verdict: string | null;
       try {
         verdict = options.lastCheck();
       } finally {
-        inCheck = false;
+        phase = "";
       }
       if (verdict !== null) return { kind: "not_written", reason: "refused", refusal: verdict };
+      // 서버의 인정 재확인: 같은 복원기의 세대를 다시 읽는다.
+      phase = "recheck:";
+      try {
+        restorer.stopGeneration();
+      } finally {
+        phase = "";
+      }
+      if (world.after === "not_recognized" || world.after === "closed") return { kind: "not_written", reason: world.after };
+      if (options.finalCheck !== undefined) {
+        phase = "final:";
+        let timing: string | null;
+        try {
+          timing = options.finalCheck();
+        } finally {
+          phase = "";
+        }
+        if (timing !== null) return { kind: "not_written", reason: "refused", refusal: timing };
+      }
       switch (world.after) {
         case "written":
           frames.push({ connection, principal, frame });
@@ -116,8 +147,12 @@ function harness(over: Partial<World> = {}) {
           throw new Error("writeFrame 던짐");
         case "malformed":
           return { kind: "maybe" } as never;
-        default:
-          return { kind: "not_written", reason: world.after };
+        case "no_reason":
+          return { kind: "not_written" } as never;
+        case "odd_reason":
+          return { kind: "not_written", reason: "gone_fishing" } as never;
+        case "refused_bare":
+          return { kind: "not_written", reason: "refused" } as never;
       }
     },
   };
@@ -182,10 +217,19 @@ describe("보장 1: 싣는 순간(lastCheck)에 다시 보고, 하나라도 아�
     expect(h.notes).toEqual([]);
   });
 
-  test("차례: lastCheck 안에서 시계 한 번 → (시한·기한) → 복원기 → 세대 → 접수 → 맡기지 않을 실행기. 그 앞에서는 recognized 말고 읽지 않는다", async () => {
+  test("차례: lastCheck 안에서 복원기 → 세대 → 접수 → 맡기지 않을 실행기, 서버의 재확인 뒤 finalCheck 안에서 시계 한 번. 그 앞에서는 recognized 말고 읽지 않는다", async () => {
     const h = harness();
     await h.wire.sink.send(start());
-    expect(h.reads).toEqual([`recognized:${R1}`, "writeFrame", "check:clock", "check:restorer", "check:stopGeneration", "check:intakeOpen", "check:withheld"]);
+    expect(h.reads).toEqual([
+      `recognized:${R1}`,
+      "writeFrame",
+      "check:restorer",
+      "check:stopGeneration",
+      "check:intakeOpen",
+      "check:withheld",
+      "recheck:stopGeneration",
+      "final:clock",
+    ]);
   });
 
   test("앞에서 본 값을 믿지 않는다: send를 부른 뒤 lastCheck 직전에 바뀐 세대·접수·집합·시계를 lastCheck가 잡는다", async () => {
@@ -287,6 +331,11 @@ describe("보장 1: 싣는 순간(lastCheck)에 다시 보고, 하나라도 아�
       ["문자열 아님", { known: true, value: [R2, 3] }, "withheld_unknown"],
       // 빈 칸이 있는 배열을 일부러 넣는다.
       ["빈 칸", { known: true, value: [R2, , R1] }, "withheld_unknown"],
+      // 배정 박자와 같은 검사(작업자 실행기 주체 이름)다. 문자열이어도 그 이름이 아니면 집합을 모른다.
+      ["빈 문자열", { known: true, value: [""] }, "withheld_unknown"],
+      ["모르는 역할", { known: true, value: [R2, "executor/no_such_role/r1/s1"] }, "withheld_unknown"],
+      ["작업자 실행기가 아닌 주체", { known: true, value: ["supervisor"] }, "withheld_unknown"],
+      ["세션 실행기", { known: true, value: ["executor/session/r1/s1"] }, "withheld_unknown"],
     ];
     for (const [name, withheld, reason] of cases) {
       const h = harness(withheld === "throw" ? {} : { withheld });
@@ -317,12 +366,18 @@ describe("보장 1: 싣는 순간(lastCheck)에 다시 보고, 하나라도 아�
     expect(h.notes).toEqual([expect.objectContaining({ kind: "not_sent", outcome: "no_connection", reason: "not_recognized" })]);
   });
 
-  test("시계는 lastCheck마다 한 번 읽는다(모든 확인을 지나는 시작과 일찍 걸리는 시작 모두)", async () => {
-    for (const over of [{}, { generation: GEN + 1 }, { now: T0 + LIFETIME }, { withheld: { known: true as const, value: [R1] } }]) {
+  test("시계는 finalCheck 안에서만 한 번 읽는다. lastCheck에서 걸리면 시계를 읽지 않는다", async () => {
+    const cases: [Partial<World>, number][] = [
+      [{}, 1],
+      [{ now: T0 + LIFETIME }, 1],
+      [{ generation: GEN + 1 }, 0],
+      [{ withheld: { known: true as const, value: [R1] } }, 0],
+    ];
+    for (const [over, reads] of cases) {
       const h = harness(over);
       await h.wire.sink.send(start());
-      expect(h.reads.filter((r) => r === "check:clock")).toHaveLength(1);
-      expect(h.reads.filter((r) => r.endsWith("clock") && !r.startsWith("check:"))).toEqual([]);
+      expect([over, h.reads.filter((r) => r === "final:clock").length]).toEqual([over, reads]);
+      expect(h.reads.filter((r) => r.endsWith("clock") && !r.startsWith("final:"))).toEqual([]);
     }
   });
 
@@ -332,6 +387,116 @@ describe("보장 1: 싣는 순간(lastCheck)에 다시 보고, 하나라도 아�
       expect([await h.wire.sink.send(start()), h.frames.length]).toEqual(["no_connection", 0]);
       expect((h.notes[0] as { reason: string }).reason).toBe("clock_unavailable");
     }
+  });
+});
+
+describe("시간은 쓰기 바로 앞(finalCheck)에서 본다: 그 앞의 동기 조회와 서버 재확인에 흐른 시간이 여유에 든다", () => {
+  // 시작의 시한 여유가 정확히 11,000ms인 시각. 이 시각에 시간이 더 흐르지 않으면 싣는다(대조군).
+  const EDGE = T0 + LIFETIME - SEND_MARGIN;
+
+  test("대조군: 여유 11,000ms에서 아무 읽기에도 시간이 흐르지 않으면 싣는다", async () => {
+    const h = harness({ now: EDGE });
+    expect(await h.wire.sink.send(start(T0 + 600_000, { request_id: FIXED_ID }))).toBe("sent");
+    expect(h.frames).toHaveLength(1);
+  });
+
+  test("lastCheck 안의 동기 조회(맡기지 않을 실행기 집합)에 1ms가 흐르면 too_late_to_send, 넘긴 바이트 0", async () => {
+    const h = harness({ now: EDGE, onRead: (name) => name === "check:withheld" && (h.world.now += 1) });
+    expect(await h.wire.sink.send(start(T0 + 600_000, { request_id: FIXED_ID }))).toBe("too_late_to_send");
+    expect([h.frames.length, h.notes]).toEqual([0, [notSent("too_late_to_send", "too_late")]]);
+  });
+
+  test("서버 재확인의 세대 조회에 1ms가 흐르면 too_late_to_send, 넘긴 바이트 0(시작과 ack 모두)", async () => {
+    const h = harness({ now: EDGE, onRead: (name) => name === "recheck:stopGeneration" && (h.world.now += 1) });
+    expect(await h.wire.sink.send(start(T0 + 600_000, { request_id: FIXED_ID }))).toBe("too_late_to_send");
+    expect([h.frames.length, h.notes]).toEqual([0, [notSent("too_late_to_send", "too_late")]]);
+    const a = harness({ now: EDGE, onRead: (name) => name === "recheck:stopGeneration" && (a.world.now += 1) });
+    expect(a.wire.writeAck(CONNECTION, ack())).toBe("too_late_to_send");
+    expect(a.frames).toHaveLength(0);
+  });
+
+  test("finalCheck 안에서 시계가 정각을 넘으면(봉투 시한, 작업 기한) too_late_to_send, 넘긴 바이트 0", async () => {
+    const e = harness({ now: EDGE, onRead: (name) => name === "final:clock" && (e.world.now += 1) });
+    expect(await e.wire.sink.send(start(T0 + 600_000, { request_id: FIXED_ID }))).toBe("too_late_to_send");
+    expect([e.frames.length, e.notes]).toEqual([0, [notSent("too_late_to_send", "too_late")]]);
+    const d = harness({ onRead: (name) => name === "final:clock" && (d.world.now += 1) });
+    expect(await d.wire.sink.send(start(T0 + SEND_MARGIN, { request_id: FIXED_ID }))).toBe("too_late_to_send");
+    expect([d.frames.length, d.notes]).toEqual([0, [notSent("too_late_to_send", "deadline")]]);
+  });
+
+  // 실제 재전송 박자 → sendInstruction → createWireSink. 장부는 임시 폴더의 실제 장부, 서버는 실제 서버의 차례를 따르는 가짜다.
+  async function resendThroughSink(withheldTakesMs: number) {
+    let now = NOW;
+    const ledger = open(tempPath(), { clock: () => now });
+    must(ledger.applyStop({ generation: 0, stopped: false, now }));
+    const attempt = ledger.beginRestore(RESTORE_KEY);
+    ledger.pinRestore(RESTORE_KEY, attempt);
+    expect(ledger.grantIntake(RESTORE_KEY, attempt)).toBe(true);
+    const admitted = must(ledger.admitRun(worker()));
+    const requestId = id();
+    must(ledger.startRun({ runId: admitted.run.runId, requestId, stopGeneration: 0, now }));
+    const source = { stopGeneration: () => ledger.syncStopGeneration(attempt), intakeOpen: () => ledger.intakeOpen(attempt) };
+    const published = () => source;
+    const recognizedBy = (principal: string, restorer: typeof source) => (principal === WORKER_EXECUTOR && restorer.stopGeneration() !== null ? CONNECTION : null);
+    const frames: Uint8Array[] = [];
+    const notes: SinkNote[] = [];
+    const server: WireServer = {
+      recognized: (principal) => recognizedBy(principal, published()),
+      writeFrame(connection, principal, frame, options) {
+        const restorer = published();
+        if (recognizedBy(principal, restorer) !== connection) return { kind: "not_written", reason: "not_recognized" };
+        const verdict = options.lastCheck();
+        if (verdict !== null) return { kind: "not_written", reason: "refused", refusal: verdict };
+        if (recognizedBy(principal, restorer) !== connection || published() !== restorer) return { kind: "not_written", reason: "not_recognized" };
+        const timing = options.finalCheck === undefined ? null : options.finalCheck();
+        if (timing !== null) return { kind: "not_written", reason: "refused", refusal: timing };
+        frames.push(frame);
+        options.settled("flushed");
+        return { kind: "written" };
+      },
+    };
+    const wire = createWireSink({
+      server,
+      restorer: published,
+      withheld: {
+        executors: () => {
+          now += withheldTakesMs;
+          return { known: true, value: [] };
+        },
+      },
+      clock: { now: () => now },
+      queries: { add() {}, remove() {} },
+      observe: (note) => notes.push(note),
+    });
+    const { privateKey } = generateKeyPairSync("ed25519");
+    // 발행 뒤 19,000ms: 시작 봉투(수명 30,000ms)의 시한 여유가 정확히 11,000ms다.
+    now = NOW + 19_000;
+    const result = await resendTick(
+      {
+        ledger,
+        intake: source,
+        links: wire.links,
+        sink: wire.sink,
+        clock: { now: () => now },
+        signer: { seal: (input) => sealEnvelope(input, privateKey) },
+        random: { bytes: (length) => getRandomValues(new Uint8Array(length)) },
+      },
+      { resendEveryMs: 5_000 },
+      { lastResends: [] },
+    );
+    if (!("instructions" in result)) throw new Error(`박자가 돌지 않음: ${JSON.stringify(result)}`);
+    return { result, frames, notes, requestId };
+  }
+
+  test("실제 재전송 박자: 집합 읽기에 1ms가 흐른 시작은 resent가 아니라 not_sent(too_late_to_send, delivery not_sent)이고 넘긴 바이트 0", async () => {
+    const control = await resendThroughSink(0);
+    expect([control.result.instructions.map((row) => [row.requestId, row.outcome]), control.frames.length]).toEqual([[[control.requestId, "resent"]], 1]);
+
+    const late = await resendThroughSink(1);
+    expect(late.result.instructions).toEqual([
+      expect.objectContaining({ requestId: late.requestId, outcome: "not_sent", reason: "too_late_to_send", delivery: "not_sent" }),
+    ]);
+    expect([late.frames.length, late.notes.map((n) => n.kind === "not_sent" && [n.outcome, n.reason])]).toEqual([0, [["too_late_to_send", "too_late"]]]);
   });
 });
 
@@ -481,7 +646,7 @@ describe("보장 4: 연결 문과 AnswerLinks는 부르는 순간의 인정된 �
     const sent = ack();
     expect(h.wire.writeAck(CONNECTION + 3, sent)).toBe("sent");
     expect(h.frames.map((f) => [f.connection, f.principal])).toEqual([[CONNECTION + 3, R1]]);
-    expect(h.reads).toEqual(["writeFrame", "check:clock", "check:restorer", "check:stopGeneration"]);
+    expect(h.reads).toEqual(["writeFrame", "check:restorer", "check:stopGeneration", "recheck:stopGeneration", "final:clock"]);
     expect(decoded(h.frames[0]!.frame)).toEqual(JSON.parse(JSON.stringify(sent)));
   });
 
@@ -526,6 +691,10 @@ describe("옮김 표: writeFrame의 결과 → SendOutcome(그리고 기록의 �
       ["unknown", { after: "unknown" }, "rejected", [unknownNote("write_unknown")]],
       ["writeFrame 던짐", { after: "throw" }, "rejected", [unknownNote("port_threw")]],
       ["꼴 아닌 답", { after: "malformed" }, "rejected", [unknownNote("result_malformed")]],
+      // 서버의 결과 타입에 없는 not_written은 넘긴 바이트 0이라는 답으로 믿지 않는다.
+      ["사유 없는 not_written", { after: "no_reason" }, "rejected", [unknownNote("result_malformed")]],
+      ["모르는 사유의 not_written", { after: "odd_reason" }, "rejected", [unknownNote("result_malformed")]],
+      ["refusal 없는 refused", { after: "refused_bare" }, "rejected", [unknownNote("result_malformed")]],
     ];
     for (const [name, over, outcome, notes] of rows) {
       const h = harness(over);
@@ -538,6 +707,15 @@ describe("옮김 표: writeFrame의 결과 → SendOutcome(그리고 기록의 �
     const h = harness();
     expect(await h.wire.sink.send(start(T0 + 1, { request_id: FIXED_ID }))).toBe("too_late_to_send");
     expect(h.notes).toEqual([notSent("too_late_to_send", "deadline")]);
+  });
+
+  test("서버 결과 타입에 없는 not_written: 조회는 등록을 거두고 약속을 거절하고, ack는 unknown이다", async () => {
+    for (const after of ["no_reason", "odd_reason", "refused_bare"] as const) {
+      const q = harness({ after });
+      await expect(q.wire.sink.send(query())).rejects.toThrow();
+      expect([after, q.book, q.notes.map((n) => n.kind === "delivery_unknown" && n.reason)]).toEqual([after, [], ["result_malformed"]]);
+      expect([after, harness({ after }).wire.writeAck(CONNECTION, ack())]).toEqual([after, "unknown"]);
+    }
   });
 
   test("recognized가 던지면 writeFrame을 부르지 않고 약속을 거절한다(port_threw)", async () => {

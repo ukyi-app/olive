@@ -202,7 +202,8 @@ function readList<T>(read: () => unknown): readonly T[] | null {
   }
 }
 
-const isWorkerName = (value: unknown): value is string => parsePrincipal(value)?.kind === "worker_executor";
+// 내보내기 포트(runtime/sink.ts)도 같은 집합의 원소를 이 검사로 본다. 둘이 같은 목록을 다르게 읽지 않게 한 곳에 둔다.
+export const isWorkerName = (value: unknown): value is string => parsePrincipal(value)?.kind === "worker_executor";
 
 // 맡기지 않을 실행기의 집합. 포트가 없거나 던지거나 꼴이 틀리면(배열이 아님, 작업자 실행기 주체 이름이 아닌 항목) null(모름)이다.
 // value는 한 번만 읽고 그 값에 배열 검사와 원소 검사를 모두 건다: 읽을 때마다 다른 값을 내는 접근자면 검사한 값과 쓰는 값이 갈린다.
