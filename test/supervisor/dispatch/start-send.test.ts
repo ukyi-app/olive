@@ -2,7 +2,8 @@
 // 장부의 D-90 자동 닫기는 "송신 표식이 없는 실행은 실린 적이 없다"에 기대므로, 표식을 지나지 않는 송신 자리가 생기면 이 시험이 먼저 잡는다.
 // 보는 것: src/의 모든 .ts에서 송신처럼 보이는 자리(메서드 호출 .send(, 꺼낸 함수의 호출, Reflect.apply, .send.call/apply/bind,
 // 이름을 문자열로 쓴 접근, send 꺼내기)와 시작 봉투를 만들 수 있는 자리(startDraft 호출, task_start 문자열, 서명 포트·계약의 봉하기 호출).
-// 보지 못하는 것: 실행 중에 만든 이름("se" + "nd"), 다른 이름으로 감싼 포트를 넘겨받아 부르는 함수, eval·new Function, src/ 밖의 코드.
+// 보지 못하는 것: 실행 중에 만든 이름("se" + "nd"), 중괄호가 겹친 구조 분해·함수 매개변수의 구조 분해, await 낱말 없이 .then(으로 미룬 포트 호출,
+// 다른 이름으로 감싼 포트를 넘겨받아 부르는 함수, eval·new Function, src/ 밖의 코드.
 import { expect, test } from "bun:test";
 import { list, readText } from "../../files.ts";
 
@@ -22,7 +23,8 @@ const SEND_SHAPES: readonly [string, RegExp][] = [
   ["bare_call", /(?<![\w$.])send\s*\((?![^)\n]*\)\s*:)/g],
   ["reflect", /\bReflect\s*\.\s*apply\s*\(/g],
   ["computed", /\[\s*["'`]send["'`]\s*\]/g],
-  ["destructure", /\{[^}\n]*\bsend\b[^}\n]*\}\s*=[^=>]/g],
+  // 중괄호 안에 다른 중괄호가 없는 구조 분해. 여러 줄과 별칭({ send: forward })도 잡는다.
+  ["destructure", /\{[^{}]*\bsend\b[^{}]*\}\s*=[^=>]/g],
 ];
 
 function sendSites(source: string): string[] {
@@ -98,8 +100,9 @@ test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례�
   expect(at("send = (target as InstructionSink).send")).toBeLessThan(at("mark(envelope, start)"));
   expect(at("mark(envelope, start)")).toBeLessThan(at("start.lastCheck?.()"));
   expect(at("start.lastCheck?.()")).toBeLessThan(at("Reflect.apply("));
-  // 표식과 포트 호출 사이에 기다림이 없다(첫 await가 포트 호출이다).
-  expect(body.indexOf("await ")).toBe(at("await Reflect.apply("));
+  // 표식과 포트 호출 사이에 기다림이 없다(첫 await가 포트 호출이다). 뒤에 줄바꿈이 오는 await도 낱말로 찾는다.
+  // .then( 콜백으로 포트 호출을 미루는 것처럼 await 낱말이 없는 양보는 보지 못한다(send-gate.md "정적 시험").
+  expect(body.search(/\bawait\b/)).toBe(at("await Reflect.apply("));
   // 공유 함수는 시계·난수를 직접 부르지 않는다.
   for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process."]) {
     expect([banned, gate.includes(banned)]).toEqual([banned, false]);
@@ -116,10 +119,11 @@ test("대조군: 송신 자리의 모양을 실제로 잡는다", () => {
         "Reflect.apply(fn, sink, [envelope]);",
         'ports.sink["send"](envelope);',
         "const { send } = ports.sink;",
+        "const {\n  send: forward,\n} = sink;",
         "ports.sink.send.call(ports.sink, envelope);",
         "  send(envelope: Envelope): Promise<SendOutcome>;",
       ].join("\n"),
     ),
-  ).toEqual(["bare_call", "computed", "destructure", "method_call", "read", "read", "reflect"]);
+  ).toEqual(["bare_call", "computed", "destructure", "destructure", "method_call", "read", "read", "reflect"]);
   expect(startDraftCalls("export function startDraft(input) {}\nconst d = startDraft({ run });")).toBe(1);
 });

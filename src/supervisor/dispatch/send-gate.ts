@@ -28,7 +28,7 @@ export type GateResult<S> =
   | { readonly kind: "answered"; readonly answer: unknown }
   // 포트를 불렀고 던졌다. 실렸는지 모른다.
   | { readonly kind: "threw" }
-  // 포트를 얻다 던지거나 send가 함수가 아니어서 부르지 않았다. 시작이어도 표식을 적지 않았다.
+  // 포트를 얻다 던지거나 send가 함수가 아니어서 부르지 않았다. 시작이어도 이번 시도는 표식을 적지 않았다(앞선 시도의 표식은 남아 있을 수 있다).
   | { readonly kind: "sink_unavailable" }
   // 시작인데 표식이 ok가 아니어서 부르지 않았다.
   | { readonly kind: "unmarked"; readonly markReason: MarkFailure }
@@ -58,14 +58,22 @@ function mark(envelope: Envelope, start: StartMark<unknown>): MarkFailure | null
     return "envelope_unreadable";
   }
   if (typeof runId !== "string" || typeof requestId !== "string") return "envelope_unreadable";
-  let answer: unknown;
+  // 답의 칸은 접근자일 수 있다. 칸마다 한 번만 읽어 지역 값에 담고, 판정과 반환은 그 값으로만 한다: 다시 읽으면 검사한 값과
+  // 돌려주는 값이 달라져 거절이 성공(null)으로 바뀔 수 있다. 칸을 읽다 던지면 표식 메서드가 던진 것과 같다.
+  let ok: unknown;
+  let created: unknown;
+  let reason: unknown;
   try {
-    answer = start.marker.markStartDispatch({ runId, requestId, now: start.at });
+    const answer: unknown = start.marker.markStartDispatch({ runId, requestId, now: start.at });
+    if (!isObject(answer)) return "malformed_answer";
+    ok = answer.ok;
+    if (ok === true) created = answer.created;
+    else if (ok === false) reason = answer.reason;
   } catch {
     return "threw";
   }
-  if (isObject(answer) && answer.ok === true && typeof answer.created === "boolean") return null;
-  if (isObject(answer) && answer.ok === false && isRefusal(answer.reason)) return answer.reason;
+  if (ok === true && typeof created === "boolean") return null;
+  if (ok === false && isRefusal(reason)) return reason;
   return "malformed_answer";
 }
 

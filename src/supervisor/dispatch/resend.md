@@ -40,7 +40,7 @@ START_LAST_SEAL_MS = 19000   // 시작을 다시 봉할 수 있는 발행 뒤 �
 | `stop_generation_mismatch` + `stopGeneration`, `currentStopGeneration` | 항목의 정지 세대가 장부의 지금 세대와 다르다 |
 | `withheld` + `reason` | 내보내기 포트를 부르지 않았다. 대부분 봉하기 전이고, 시작의 마지막 시계 읽기(아래 순서 12·14)에서 난 `clock_unavailable`은 이미 서명한 봉투를 버린 것이다(14에서 났으면 송신 표식은 남는다): `session_run`(세션 실행의 지시), `stop_recorded`(종료가 적힌 실행의 시작), `intake_closed`(시작만), `no_connection`(연결 포트가 문자열 `reason`과 함께 거절), `link_unknown`(연결 포트가 던지거나 답이 정의 밖), `clock_unavailable`(시계가 던지거나, 양의 안전 정수가 아니거나, 앞서 읽은 시각보다 이름), `read_unknown`(싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸이 처음과 다름. 대조하는 칸은 동작·실행 ID·실행 세대·지정 실행기·정지 세대·발행 시각과 본문을 다시 만들 칸 전부) |
 | `not_sealed` + `reason`(`field`, `sealReason`) | 초안·봉하기의 거절 이름, `draft_threw`, `seal_threw`. 실리지 않았다 |
-| `not_sent` + `reason`, `delivery`, `executorId`, `sealedAt` (+ `at`, `markReason`) | `no_connection`·`too_late_to_send`(포트가 싣지 않았다고 답함), `sink_unavailable`(`sink`나 `sink.send`를 얻다 던지거나 함수가 아니어서 포트를 부르지 않음. 표식도 없다), `start_unmarked`(시작의 송신 표식이 `ok`가 아니어서 포트를 부르지 않음. `markReason`에 장부의 거절 이름·`threw`·`malformed_answer`·`envelope_unreadable`). 이 넷은 `delivery: "not_sent"`, `at` 없음. `send_threw`·`send_answer_malformed`(`delivery: "unknown"`: 실렸을 수 있다. `at`은 `resent`와 같은 규칙) |
+| `not_sent` + `reason`, `delivery`, `executorId`, `sealedAt` (+ `at`, `markReason`) | `no_connection`·`too_late_to_send`(포트가 싣지 않았다고 답함), `sink_unavailable`(`sink`나 `sink.send`를 얻다 던지거나 함수가 아니어서 포트를 부르지 않음. 이번 시도는 새 표식을 쓰지 않았다. 앞선 시도의 표식은 남아 있을 수 있다), `start_unmarked`(시작의 송신 표식이 `ok`가 아니어서 포트를 부르지 않음. `markReason`에 장부의 거절 이름·`threw`·`malformed_answer`·`envelope_unreadable`. 실제 장부를 표식 포트로 쓰면 이번 시도의 표식은 없지만, 주입한 표식 포트가 커밋한 뒤 던지면 표식 한 줄이 남는다: `send-gate.md` "표식 뒤에 싣지 않고 돌아가는 길"). 이 넷은 `delivery: "not_sent"`, `at` 없음. `send_threw`·`send_answer_malformed`(`delivery: "unknown"`: 실렸을 수 있다. `at`은 `resent`와 같은 규칙) |
 | `malformed` + `field` | 항목의 칸을 읽을 수 없다(`requestId`를 읽지 못했으면 `null`). 같은 요청 ID의 항목이 둘 이상이면 모두 `malformed`(`requestId`) |
 
 모든 항목(`malformed` 밖)은 `requestId`, `runId`, `action`을 싣는다. 결과에는 본문·자격 참조·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
@@ -66,9 +66,10 @@ START_LAST_SEAL_MS = 19000   // 시작을 다시 봉할 수 있는 발행 뒤 �
 | 12 | 내보내기 포트의 수신 객체(`ports.sink`)와 함수(`sink.send`)를 얻는다. 얻지 못했으면 시작은 시계를 다시 읽어 발행 + 19000ms 이하인지 먼저 보고(표식 없이), 그다음 포트를 부르지 않는다 | `withheld`(`clock_unavailable`), `start_expired`, 그다음 `not_sent`(`sink_unavailable`) |
 | 13 | 시작이면 송신 표식: 1에서 다시 읽은 그 장부 객체로 `markStartDispatch({ runId, requestId, now: 마지막으로 읽은 시각 })`. `ok`가 아니면 포트를 부르지 않는다 | `not_sent`(`start_unmarked`) |
 | 14 | 시작이면 표식 뒤 시계를 다시 읽어 발행 + 19000ms 이하(봉한 봉투는 버린다. 표식은 남는다) | `withheld`(`clock_unavailable`), `start_expired` |
-| 15 | 12에서 얻은 함수를 수신 객체를 `this`로 해 부르고, 돌아온 뒤 시계를 읽어 `at`을 정한다 | `resent`, `not_sent` |
+| 15 | 12에서 얻은 함수를 수신 객체를 `this`로 해 부른다. 공유 함수는 포트의 답을 받는 즉시 돌아온다 | `not_sent`(`no_connection`, `too_late_to_send`) |
+| 16 | 박자: 포트의 답이 `sent`이거나 실렸는지 모르는 결과(포트가 던짐, 정의 밖의 답)일 때만 시계를 읽어 `at`을 정한다(읽지 못하면 봉투의 시한). 12~15에서 돌아온 다른 결과에는 읽지 않는다 | `resent`, `not_sent`(`send_threw`, `send_answer_malformed`) |
 
-12~15는 공유 함수 `sendInstruction` 안에서 이 차례로 한다(`send-gate.md`). 4의 시계 읽기부터 15의 포트 호출까지 `await`가 없다. 봉하는 시각은 취소·확정이면 4에서, 시작이면 10에서 읽은 값이다. **표식의 커밋은 시작의 마지막 시계 읽기(14)보다 앞이다**: 커밋(fsync)에 걸린 시간을 그 읽기가 잰다. 마지막 시계 읽기와 포트 호출 사이에는 포트의 접근자도 다른 포트 호출도 없고, 표식과 포트 호출 사이에는 그 시계 읽기뿐이다. 취소·확정은 13·14 없이 12·15만 한다(표식을 부르지 않는다). 취소·확정도 같은 순서로 포트를 얻고 부른다(한도는 시작에만 걸린다). 시계를 다시 읽을 때마다 그 박자에서 앞서 읽은 시각보다 이르면 읽지 못한 것이다.
+12~15는 공유 함수 `sendInstruction` 안에서 이 차례로 하고(`send-gate.md`), 16은 공유 함수가 돌아온 뒤 재전송 박자가 한다. 포트 직전의 시계 읽기(12·14)는 공유 함수 안에서 부르는 박자의 확인이고, 송신 뒤의 읽기(16)는 다음 박자에 넘길 `at`을 위한 것이다. 4의 시계 읽기부터 15의 포트 호출까지 `await`가 없다. 봉하는 시각은 취소·확정이면 4에서, 시작이면 10에서 읽은 값이다. **표식의 커밋은 시작의 마지막 시계 읽기(14)보다 앞이다**: 커밋(fsync)에 걸린 시간을 그 읽기가 잰다. 마지막 시계 읽기와 포트 호출 사이에는 포트의 접근자도 다른 포트 호출도 없고, 표식과 포트 호출 사이에는 그 시계 읽기뿐이다. 취소·확정은 13·14 없이 12·15만 한다(표식을 부르지 않는다). 취소·확정도 같은 순서로 포트를 얻고 부른다(한도는 시작에만 걸린다). 시계를 다시 읽을 때마다 그 박자에서 앞서 읽은 시각보다 이르면 읽지 못한 것이다.
 
 ## 같은 요청
 

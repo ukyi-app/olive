@@ -128,6 +128,7 @@ function unanswered(w: World): UnansweredInstructions {
   return read.value;
 }
 
+// 실행 줄과 답을 기다리는 지시 줄. 송신 표식(start_dispatches)은 담지 않는다: 표식은 marks로 따로 센다.
 function snapshot(w: World): unknown {
   const runs = w.ledger.listRuns();
   if (!runs.known) throw new Error("실행 목록을 읽지 못함");
@@ -186,7 +187,7 @@ function expectSameRequest(first: Envelope, again: Envelope): void {
 }
 
 describe("보장 1: 같은 요청으로만 다시 낸다", () => {
-  test("시작은 요청 ID·본문·세대·발행 시각·시한이 처음과 같고 장부에 쓰지 않는다", async () => {
+  test("시작은 요청 ID·본문·세대·발행 시각·시한이 처음과 같고, 실행 줄과 답을 기다리는 지시 줄을 바꾸지 않는다(송신 표식 한 줄은 쓴다)", async () => {
     const w = world();
     const s = started(w);
     const before = snapshot(w);
@@ -198,6 +199,7 @@ describe("보장 1: 같은 요청으로만 다시 낸다", () => {
     expect(again.header.issued_at).toBe(NOW);
     expect(again.header.expires_at).toBe(s.first.header.expires_at);
     expect(snapshot(w)).toEqual(before);
+    expect(marks(w)).toEqual([{ run_id: s.runId, request_id: s.requestId, marked_at: NOW + 6_000 }]);
   });
 
   test("취소·확정은 같은 요청 ID·본문으로, 머리 시각만 봉한 때로 다시 낸다", async () => {
@@ -702,12 +704,13 @@ describe("보장 4: 실패는 결과를 지우지 않는다", () => {
   });
 });
 
-test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고 장부에 쓰지 않는다", async () => {
+test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고, 실행 줄·지시 줄의 장부 쓰기를 부르지 않는다", async () => {
   const source = (await Bun.file(new URL("../../../src/supervisor/dispatch/resend.ts", import.meta.url)).text()).replace(/\/\/.*$/gm, "");
   for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process.", "newUuid"]) {
     expect(source).not.toContain(banned);
   }
-  // 장부 쓰기 연산의 이름. 포트 타입이 읽기 하나뿐이지만 이름으로도 막는다.
+  // 실행 줄·지시 줄을 쓰는 장부 연산의 이름. 장부 포트는 읽기와 송신 표식이고, 표식은 공유 함수(send-gate.ts)가 부른다
+  // (start-send.test.ts가 본다). 포트 타입 밖의 쓰기도 이름으로 막는다.
   for (const write of [/\brecord[A-Z]\w*Instruction\b/, /\bstartRun\b/, /\bassignToolRequest\b/, /\bcancelToolRequest\b/, /\bapplyReceipt\b/, /\bmarkLost\w*\b/, /\bmarkResult\b/]) {
     expect(source).not.toMatch(write);
   }
@@ -722,6 +725,25 @@ function marks(w: { ledger: Ledger; path: string }): { run_id: string; request_i
   } finally {
     raw.close();
   }
+}
+
+// 표식 포트의 답. 칸을 읽을 때마다 그 칸의 다음 값을 내고(끝 값에서 멈춘다, Error면 던진다) 읽은 횟수를 reads에 센다.
+function answerOf(fields: Record<string, unknown[]>, reads: Record<string, number>): object {
+  const answer = {};
+  for (const [name, values] of Object.entries(fields)) {
+    reads[name] = 0;
+    Object.defineProperty(answer, name, {
+      enumerable: true,
+      get: () => {
+        const count = reads[name] ?? 0;
+        reads[name] = count + 1;
+        const value = values[Math.min(count, values.length - 1)];
+        if (value instanceof Error) throw value;
+        return value;
+      },
+    });
+  }
+  return answer;
 }
 
 // 표식 포트를 부를 때 기록에 남긴다.
@@ -771,6 +793,49 @@ describe("송신 표식: 재전송의 시작도 표식이 ok인 뒤에만 내보
       expect([markReason, outcomes(await tick(v))]).toEqual([markReason, [expect.objectContaining({ requestId: t.requestId, outcome: "not_sent", reason: "start_unmarked", markReason })]]);
       expect(v.sent).toEqual([]);
     }
+  });
+
+  test("표식의 답은 칸마다 한 번만 읽고 그 값으로 판정한다. 읽을 때마다 바뀌거나 읽다 던지는 답은 싣지 않고, 박자는 뒤 항목을 잇는다", async () => {
+    // 표식 포트는 장부에 쓰지 않고(표식 0줄) 이 답을 낸다. 둘째 읽기에서 거절 사유가 null(성공 표시)이 되어도 첫 값으로 판정한다.
+    const cases: ["intake_closed" | "threw", Record<string, unknown[]>][] = [
+      ["intake_closed", { ok: [false], reason: ["intake_closed", null] }],
+      ["intake_closed", { ok: [false, true], created: [true], reason: ["intake_closed"] }],
+      ["threw", { ok: [new Error("ok 접근자 실패")] }],
+      ["threw", { ok: [false], reason: [new Error("사유 접근자 실패")] }],
+    ];
+    for (const [markReason, fields] of cases) {
+      const w = world();
+      // 장부는 작업자 실행을 한 번에 하나만 둔다(slot_busy). 그래서 시작 항목은 하나이고, 박자가 멈추지 않았음은 halted로 본다.
+      const s = started(w);
+      const reads: Record<string, number> = {};
+      w.wrapMark(() => answerOf(fields, reads));
+      w.setClock(NOW + 6_000);
+      const result = ran(await tick(w));
+      const label = JSON.stringify(fields, (_key, value) => (value instanceof Error ? "Error" : value));
+      expect([label, result.instructions]).toEqual([
+        label,
+        [{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId: s.run.executorId, sealedAt: NOW + 6_000, markReason }],
+      ]);
+      expect([label, result.halted, result.haltedAt]).toEqual([label, null, null]);
+      expect([label, w.log, w.sent.length]).toEqual([label, ["seal"], 0]);
+      expect([label, Object.values(reads).every((n) => n <= 1)]).toEqual([label, true]);
+      expect([label, marks(w)]).toEqual([label, []]);
+    }
+  });
+
+  test("ok가 첫 읽기에 true이면(실제 장부가 커밋한 뒤) 둘째 읽기의 값과 상관없이 싣는다. ok는 한 번만 읽는다", async () => {
+    const w = world();
+    const s = started(w);
+    const reads: Record<string, number> = {};
+    w.wrapMark((_input, real) => {
+      const answer = real() as { ok: boolean; created?: boolean };
+      if (answer.ok !== true) throw new Error("표식 거절");
+      return answerOf({ ok: [true, false], created: [answer.created] }, reads);
+    });
+    w.setClock(NOW + 6_000);
+    expect(outcomes(await tick(w))).toEqual([expect.objectContaining({ requestId: s.requestId, outcome: "resent" })]);
+    expect([reads.ok, w.sent.length]).toEqual([1, 1]);
+    expect(marks(w)).toEqual([{ run_id: s.runId, request_id: s.requestId, marked_at: NOW + 6_000 }]);
   });
 
   test("표식의 커밋은 마지막 시계 읽기보다 앞이다: 커밋 중에 한도가 지나면 싣지 않는다(표식은 남는다)", async () => {

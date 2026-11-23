@@ -1023,6 +1023,25 @@ function marks(w: World): { run_id: string; request_id: string; marked_at: numbe
   }
 }
 
+// 표식 포트의 답. 칸을 읽을 때마다 그 칸의 다음 값을 내고(끝 값에서 멈춘다, Error면 던진다) 읽은 횟수를 reads에 센다.
+function answerOf(fields: Record<string, unknown[]>, reads: Record<string, number>): object {
+  const answer = {};
+  for (const [name, values] of Object.entries(fields)) {
+    reads[name] = 0;
+    Object.defineProperty(answer, name, {
+      enumerable: true,
+      get: () => {
+        const count = reads[name] ?? 0;
+        reads[name] = count + 1;
+        const value = values[Math.min(count, values.length - 1)];
+        if (value instanceof Error) throw value;
+        return value;
+      },
+    });
+  }
+  return answer;
+}
+
 // 표식 포트를 부를 때 기록에 남긴다(장부 → 서명 → 표식 → 내보내기의 차례를 본다).
 function logMarks(w: World): void {
   w.wrap({
@@ -1098,6 +1117,49 @@ describe("송신 표식: 시작 봉투는 표식이 ok인 뒤에만 내보내기
       expect([markReason, second.starts]).toEqual([markReason, [expect.objectContaining({ runId, outcome: "recorded_not_sent", reason: "start_unmarked", delivery: "not_sent", markReason })]]);
       expect([markReason, w.log.includes("send"), w.sent.length]).toEqual([markReason, false, 0]);
     }
+  });
+
+  test("표식의 답은 칸마다 한 번만 읽고 그 값으로 판정한다. 읽을 때마다 바뀌거나 읽다 던지는 답은 싣지 않고, 박자는 뒤 항목을 잇는다", async () => {
+    // 표식 포트는 장부에 쓰지 않고(표식 0줄) 이 답을 낸다. 둘째 읽기에서 거절 사유가 null(성공 표시)이 되어도 첫 값으로 판정한다.
+    const cases: [string, Record<string, unknown[]>][] = [
+      ["intake_closed", { ok: [false], reason: ["intake_closed", null] }],
+      ["intake_closed", { ok: [false, true], created: [true], reason: ["intake_closed"] }],
+      ["threw", { ok: [new Error("ok 접근자 실패")] }],
+      ["threw", { ok: [false], reason: [new Error("사유 접근자 실패")] }],
+    ];
+    for (const [markReason, fields] of cases) {
+      const w = world();
+      const reads: Record<string, number> = {};
+      w.wrap({ markStartDispatch: (() => answerOf(fields, reads)) as never });
+      w.enqueueRequest();
+      ran(await assignAndStartTick(w.ports, POLICY, NOW));
+      // 시작 뒤에 이을 부탁. 시작 항목의 결과가 박자를 멈추지 않으면 이 부탁의 결과도 나온다.
+      const { ref: nextRef } = w.enqueueRequest();
+      const second = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+      const label = JSON.stringify(fields, (_key, value) => (value instanceof Error ? "Error" : value));
+      expect([label, second.starts]).toEqual([label, [expect.objectContaining({ outcome: "recorded_not_sent", reason: "start_unmarked", delivery: "not_sent", markReason })]]);
+      expect([label, second.halted, second.requests.map((r) => r.ref)]).toEqual([label, null, [nextRef]]);
+      expect([label, w.log.includes("send"), w.sent.length]).toEqual([label, false, 0]);
+      expect([label, Object.values(reads).every((n) => n <= 1)]).toEqual([label, true]);
+      expect([label, marks(w)]).toEqual([label, []]);
+    }
+  });
+
+  test("ok가 첫 읽기에 true이면(실제 장부가 커밋한 뒤) 둘째 읽기의 값과 상관없이 싣는다. ok는 한 번만 읽는다", async () => {
+    const w = world();
+    const reads: Record<string, number> = {};
+    w.wrap({
+      markStartDispatch: ((input: Parameters<Ledger["markStartDispatch"]>[0]) => {
+        const real = w.ledger.markStartDispatch(input);
+        if (!real.ok) throw new Error(`표식 거절: ${real.reason}`);
+        return answerOf({ ok: [true, false], created: [real.created] }, reads);
+      }) as never,
+    });
+    const { runId, second } = await assignThenStart(w);
+    const start = second.starts[0];
+    if (start?.outcome !== "sent") throw new Error(JSON.stringify(second));
+    expect([reads.ok, w.sent.length]).toEqual([1, 1]);
+    expect(marks(w)).toEqual([{ run_id: runId, request_id: start.requestId, marked_at: NOW }]);
   });
 
   test("표식은 장부가 시작을 승인하고 봉한 뒤에만 부른다. 거절·봉하기 실패·포트를 얻지 못함에는 표식이 없다", async () => {
