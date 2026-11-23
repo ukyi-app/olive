@@ -18,7 +18,8 @@ const isBudget = (value: unknown): value is number => Number.isSafeInteger(value
 
 // 이 판단이 실행 줄에서 읽는 칸. 모두 장부의 Run에 있는 칸이고 상태 이름도 장부 그대로다.
 // startBar는 queueView()가 대기 실행에 붙여 주는 값이다. 끝난 실행처럼 장부가 붙이지 않는 줄은 null을 넣는다.
-export type SchedulerRun = Pick<Run, "runId" | "kind" | "role" | "state" | "queueSeq" | "inputRequestId" | "deadlineAt" | "budgetLeft"> & {
+// closedByOperator는 not_started 줄이 관리자가 실패로 닫은 줄인가(장부의 listRuns가 싣는다). budgetBar만 읽는다.
+export type SchedulerRun = Pick<Run, "runId" | "kind" | "role" | "state" | "queueSeq" | "inputRequestId" | "deadlineAt" | "budgetLeft" | "closedByOperator"> & {
   startBar: StartBar | null;
 };
 
@@ -74,7 +75,7 @@ export type HoldReason =
   | "budget_unknown"
   // 남은 예산이 없다(이 실행, 또는 같은 입력에 묶인 다른 실행 중 하나. 대기 순번과 무관하다).
   | "budget_exhausted"
-  // 같은 입력 ID의 앞 순번 실행이나 상태가 queued가 아닌 실행보다 남은 예산이 많다(시작 전에 닫힌 not_started 줄은 비교하지 않는다).
+  // 같은 입력 ID의 앞 순번 실행이나 상태가 queued가 아닌 실행보다 남은 예산이 많다(관리자가 닫지 않은 not_started 줄은 비교하지 않는다).
   | "budget_replenished";
 
 export interface Held {
@@ -133,11 +134,13 @@ function budgetBar(view: SchedulerView, run: SchedulerRun): HoldReason | null {
   // 모름보다 먼저 본다.
   if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
   if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
-  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. not_started 행은 뺀다: 장부에서 not_started로 가는 길은
-  // queued에서, 또는 닫기 근거가 있을 때(D-90)뿐이다. queued에서 닫힌 줄의 숫자는 시작하지 않은 줄의 배정액이고, D-90으로 닫힌 줄은
-  // 장부가 시작 지시에 고정된 예산에서 감액이 적히지 않았을 때만 닫으므로 그 숫자도 쓰고 남긴 잔액이 아니다. 시험이 표를 읽어
-  // 이 전제를 지킨다. 잔액 0의 not_started는 위의 소진 검사가 이미 막는다.
-  const bounds = others.filter((other) => other.state !== "not_started" && (other.queueSeq < run.queueSeq || other.state !== "queued"));
+  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. 관리자가 닫지 않은 not_started 행(closedByOperator가
+  // false)은 뺀다: 장부에서 not_started로 가는 길은 queued에서, D-90 닫기(근거 줄이 있을 때), 관리자 닫기(D-91, 근거 줄이 있을 때)뿐이다.
+  // queued에서 닫힌 줄의 숫자는 시작하지 않은 줄의 배정액이고, D-90으로 닫힌 줄은 장부가 시작 지시에 고정된 예산에서 감액이 적히지
+  // 않았을 때만 닫으므로 그 숫자도 쓰고 남긴 잔액이 아니다. 관리자가 닫은 줄은 "실패로 끝남"이고 이미 돌았을 수 있어 그 숫자는
+  // 쓰고 남긴 잔액이다: 시작한 줄과 같이 상한으로 센다. 관리자가 닫았는지 모르는 not_started 줄(칸이 없거나 불리언이 아님)도
+  // 상한으로 센다(막는 쪽). 시험이 전이표를 읽어 이 전제를 지킨다. 잔액 0의 not_started는 위의 소진 검사가 이미 막는다.
+  const bounds = others.filter((other) => !(other.state === "not_started" && other.closedByOperator === false) && (other.queueSeq < run.queueSeq || other.state !== "queued"));
   if (bounds.some((other) => run.budgetLeft > other.budgetLeft)) return "budget_replenished";
   return null;
 }

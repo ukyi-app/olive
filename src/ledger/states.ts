@@ -1,4 +1,4 @@
-// 감독 장부의 실행 상태와 허용된 전이(supervisor.md §3). 같은 표가 마이그레이션 0001·0006의 run_transitions에 있고,
+// 감독 장부의 실행 상태와 허용된 전이(supervisor.md §3). 같은 표가 마이그레이션 0001·0006·0007의 run_transitions에 있고,
 // 시험이 둘을 대조한다. 여기서 바꾸면 그 표도 바꿔야 한다(첫 배포 뒤에는 새 번호의 마이그레이션으로).
 
 export const LEDGER_RUN_STATES = [
@@ -23,9 +23,10 @@ export const SLOT_FREE: readonly LedgerRunState[] = ["queued", "finalized", "not
 export const TERMINAL: readonly LedgerRunState[] = ["finalized", "not_started"];
 
 // not_started로 가는 길은 queued에서, 또는 닫기 근거가 있을 때만이다. 지시를 낸 뒤에는 실행기가 띄우지 않았다는 증명이 계약에 없으므로
-// 보통은 슬롯을 놓지 않는다(끊기면 unknown_running). 예외가 작업자의 preparing·unknown_running → not_started 두 줄이다(D-90:
-// 실행기가 받은 적 없는 실행). 장부의 트리거(판 6의 runs_not_started_needs_closure)가 queued 밖에서 not_started로 가는 갱신을
-// 닫기 근거 줄(unreceived_closures)이 있을 때만 허락한다. 그 근거를 적는 연산은 ledger.ts의 closeUnreceivedRun 하나다.
+// 보통은 슬롯을 놓지 않는다(끊기면 unknown_running). 예외가 작업자의 preparing·unknown_running·stopping → not_started 세 줄이다.
+// preparing·unknown_running은 D-90(실행기가 받은 적 없는 실행, closeUnreceivedRun), unknown_running·stopping은 D-91(관리자가 확인한
+// 뒤 실패로 닫음, closeRunByOperator)이 쓴다. 장부의 트리거(판 7이 다시 만든 runs_not_started_needs_closure)가 queued 밖에서
+// not_started로 가는 갱신을 두 근거 표(unreceived_closures·operator_closures) 가운데 하나에 같은 앞 상태의 줄이 있을 때만 허락한다.
 // 장부의 checking은 종료 확인 영수증이 이미 적힌 뒤의 감독 쪽 결과 검사다. 끊김·재시작이 그 증명을 지우지 않으므로
 // checking에서 unknown_running으로 가는 길은 없다(계약의 stateAfterLoss는 종료 증명이 없는 실행기 상태에만 쓴다).
 export const TRANSITIONS: Readonly<Record<RunKind, Readonly<Partial<Record<LedgerRunState, readonly LedgerRunState[]>>>>> = {
@@ -33,7 +34,7 @@ export const TRANSITIONS: Readonly<Record<RunKind, Readonly<Partial<Record<Ledge
     queued: ["preparing", "not_started"],
     preparing: ["running", "stopping", "unknown_running", "checking", "failed_stopped", "not_started"],
     running: ["stopping", "unknown_running", "checking", "failed_stopped"],
-    stopping: ["unknown_running", "checking", "failed_stopped"],
+    stopping: ["unknown_running", "checking", "failed_stopped", "not_started"],
     unknown_running: ["stopping", "checking", "failed_stopped", "not_started"],
     checking: ["ready_result", "failed_stopped"],
     ready_result: ["finalized", "cleanup_pending"],

@@ -3,10 +3,10 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { limits } from "../../src/contract/v1/index.ts";
-import { type Ledger, type LedgerRunState, loadMigrations, type OpenResult, openLedger, TRANSITIONS } from "../../src/ledger/index.ts";
+import { type Ledger, LEDGER_RUN_STATES, type LedgerRunState, loadMigrations, type OpenResult, openLedger, TRANSITIONS } from "../../src/ledger/index.ts";
 import { type LifecyclePolicy, type LifecycleView, nextIntent } from "../../src/supervisor/scheduler/lifecycle.ts";
 import { type Origin, planNext, type SchedulerInput, type SchedulerPolicy, type SchedulerRun, type SchedulerView } from "../../src/supervisor/scheduler/queue.ts";
-import { clock, digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, tempPath, worker } from "./helpers.ts";
+import { clock, digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
 
 // 숫자는 이 시험이 고른 값이다. 운영값이 아니다.
 const POLICY: SchedulerPolicy = { alertMaxWaitMs: 60_000 };
@@ -457,19 +457,23 @@ function startedReachesNotStarted(table: Partial<Record<LedgerRunState, readonly
 }
 
 test("시작 전에 닫힌 줄은 상한이 아님", () => {
-  // 장부에서 not_started로 들어오는 길은 queued에서, 또는 닫기 근거가 있을 때(D-90)이고, 시작한 줄은 대기로 돌아가지 않는다.
-  // queued에서 닫힌 줄은 시작한 적이 없고, D-90으로 닫힌 줄은 시작 지시에 고정된 예산에서 감액이 적히지 않았을 때만 닫혀서
-  // 어느 쪽이든 숫자가 쓰고 남긴 잔액이 아니다.
+  // 장부에서 not_started로 들어오는 길은 queued에서, 또는 닫기 근거가 있을 때(D-90, 관리자 닫기 D-91)이고, 시작한 줄은 대기로
+  // 돌아가지 않는다. queued에서 닫힌 줄은 시작한 적이 없고, D-90으로 닫힌 줄은 시작 지시에 고정된 예산에서 감액이 적히지 않았을
+  // 때만 닫혀서 어느 쪽이든 숫자가 쓰고 남긴 잔액이 아니다. 관리자가 닫은 줄은 이미 돌았을 수 있어 상한으로 센다(아래 시험).
   for (const kind of ["worker", "session"] as const) {
     const into = Object.entries(TRANSITIONS[kind])
       .filter(([, to]) => to?.includes("not_started"))
       .map(([from]) => from);
-    // 예외는 작업자의 D-90 닫기 두 줄뿐이다: 장부 트리거가 실행기가 받은 적 없는(쓴 예산이 없는) 실행의 근거 줄이 있을 때만 허락한다.
-    const closure: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
+    // 예외는 작업자의 닫기 줄뿐이다. 장부 트리거가 근거 줄이 있을 때만 허락한다: D-90(preparing·unknown_running, 실행기가 받은 적
+    // 없는 실행, 쓴 예산 없음)과 관리자 닫기(unknown_running·stopping, 이미 돌았을 수 있음).
+    const unreceived: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
+    const operator: readonly LedgerRunState[] = kind === "worker" ? ["unknown_running", "stopping"] : [];
+    const closure = LEDGER_RUN_STATES.filter((state) => unreceived.includes(state) || operator.includes(state));
+    expect(closure, kind).toEqual(kind === "worker" ? ["preparing", "stopping", "unknown_running"] : []);
     expect(into, kind).toEqual(["queued", ...closure]);
     const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
     expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
-    // 닫기 두 줄을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
+    // 닫기 간선 셋(preparing·stopping·unknown_running → not_started)을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
     const requeue = { ...withoutClosure, running: [...(withoutClosure.running ?? []), "queued" as const] };
     expect(startedReachesNotStarted(requeue), kind).toBe(true);
   }
@@ -493,4 +497,38 @@ test("시작 전에 닫힌 줄은 상한이 아님", () => {
   expect(decision).toEqual({ candidates: [{ runId: current.runId, kind: "worker", origin: "admin", budgetLeft: 10 }], held: [] });
   // 후보를 따라 부른 시작이 실제로 커밋된다.
   expect(ledger.startRun({ runId: current.runId, requestId: id(), stopGeneration: 0, now: NOW + 1 })).toMatchObject({ ok: true, run: { state: "preparing", budgetLeft: 10 } });
+});
+
+test("관리자가 닫은 줄의 잔액은 같은 입력의 다음 실행의 상한이고(감액이 적혔든 아니든), D-90으로 닫은 줄은 상한이 아니다", () => {
+  // closed: 먼저 시작해 닫힌 실행의 예산, reduced: 시작 뒤 적힌 잔액(없으면 감액 없음), next: 같은 입력의 다음 실행의 예산.
+  const cases = [
+    { by: "operator", closed: 10, reduced: 4, next: 10, held: true },
+    { by: "operator", closed: 10, reduced: null, next: 12, held: true },
+    { by: "operator", closed: 10, reduced: 4, next: 4, held: false },
+    { by: "unreceived", closed: 10, reduced: null, next: 12, held: false },
+  ] as const;
+  for (const c of cases) {
+    const label = JSON.stringify(c);
+    const ledger = ready(open(tempPath()));
+    const requestId = enqueue(ledger, "admin-dm", NOW);
+    const first = must(ledger.admitRun(worker({ inputRequestId: requestId, budgetLeft: c.closed }))).run;
+    must(ledger.startRun({ runId: first.runId, requestId: id(), stopGeneration: 0, now: NOW }));
+    if (c.reduced !== null) must(ledger.recordBudget({ runId: first.runId, budgetLeft: c.reduced, now: NOW }));
+    if (c.by === "operator") {
+      must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
+      must(ledger.closeRunByOperator({ runId: first.runId, checkedBy: "pod_replaced", podName: "worker-a-0", podStartedAt: NOW + 31_000, now: NOW + 31_000 }));
+    } else {
+      must(ledger.closeUnreceivedRun({ runId: first.runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_001, now: NOW + 30_002 }, { sender: WORKER_EXECUTOR }));
+    }
+    const next = must(ledger.admitRun(worker({ inputRequestId: requestId, budgetLeft: c.next }))).run;
+    const view = assemble(ledger, NOW + 40_000);
+    expect(view.runs.map((r) => [r.runId, r.state, r.budgetLeft, r.closedByOperator]), label).toEqual([
+      [first.runId, "not_started", c.reduced ?? c.closed, c.by === "operator"],
+      [next.runId, "queued", c.next, undefined],
+    ]);
+    const decision = planNext(view, POLICY);
+    if (c.held) expect(decision, label).toEqual({ candidates: [], held: [{ runId: next.runId, kind: "worker", reason: "budget_replenished" }] });
+    else expect(decision.candidates.map((x) => x.runId), label).toEqual([next.runId]);
+    ledger.close();
+  }
 });
