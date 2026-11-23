@@ -32,8 +32,10 @@ const utf8 = (text: string) => new TextEncoder().encode(text);
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const textSha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
 const sameBytes = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((byte, i) => byte === b[i]);
-// 인코더가 그 사유로 거절했는가. 잘못 성공한 결과(틀에 값이 든다)도 진단문에 실리지 않게 불리언으로 바꾼다.
-const refused = (result: ReturnType<typeof encodeCredentialFrame>, reason: string) => !result.ok && result.reason === reason;
+// 인코더가 그 사유로 거절했고 거절 결과에 ok·reason 밖의 칸이 없는가. 잘못 성공한 결과(틀에 값이 든다)나 여분의 칸이
+// 진단문에 실리지 않게 불리언으로 바꾼다.
+const refused = (result: ReturnType<typeof encodeCredentialFrame>, reason: string) =>
+  result.ok === false && result.reason === reason && Object.keys(result).sort().join() === "ok,reason";
 
 function concat(...parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -370,6 +372,12 @@ test("보장 3 조립 중: 값의 일부만 받은 디코더 객체와 그 push�
   const shown = [JSON.stringify(decoder), JSON.stringify(step), String(decoder), Object.keys(decoder).join()];
   expect(shown.some((text) => leaks(text, value))).toBe(false);
   expect(shown.some((text) => text.includes(RUN_ID) || text.includes(digest))).toBe(false);
+  // 머리 칸만 보통 속성이 되어도 JSON에는 바이트가 숫자 칸으로 나와 위의 글 검색을 지나간다. 데이터 칸이 아예 없는지 본다.
+  const ownData = Reflect.ownKeys(decoder).filter((key) => {
+    const desc = Object.getOwnPropertyDescriptor(decoder, key);
+    return desc !== undefined && desc.enumerable === true && "value" in desc;
+  });
+  expect(ownData.length === 0).toBe(true);
   // 남은 바이트를 넣으면 같은 디코더가 값을 그대로 낸다.
   expect(safe(decoder.push(frame.subarray(partial.length)))).toEqual({ frames: [credentialSummary(value)], rejected: null });
 });
