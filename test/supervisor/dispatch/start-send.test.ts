@@ -57,14 +57,24 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
 });
 
 test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재전송 박자뿐이고, 둘 다 포트를 직접 부르지 않고 sendInstruction을 한 번 부른다", () => {
+  // 자격 값 보내기는 task_start 글자를 쓰지만 시작 봉투를 만들거나 봉하거나 싣거나 송신 표식을 적는 자리가 될 수 없다.
+  const credentialSend = src("src/supervisor/dispatch/credential-send.ts");
+  expect([
+    startDraftCalls(credentialSend),
+    sealCalls(credentialSend),
+    sendSites(credentialSend),
+    [...credentialSend.matchAll(/\bmarkStartDispatch\b/g)].length,
+  ]).toEqual([0, 0, [], 0]);
   const drafting = files.filter((file) => startDraftCalls(src(file)) > 0);
   expect(drafting).toEqual(["src/supervisor/dispatch/assign-loop.ts", "src/supervisor/dispatch/resend.ts"]);
   for (const file of drafting) {
     expect([file, sendSites(src(file))]).toEqual([file, []]);
     expect([file, [...src(file).matchAll(/\bsendInstruction\s*\(/g)].length]).toEqual([file, 1]);
   }
-  // task_start를 문자열로 쓰는 모듈(초안을 손으로 꾸밀 수 있는 자리)도 정한 셋뿐이다. 초안 모듈 자체는 포트를 부르지 않는다.
+  // task_start를 문자열로 쓰는 모듈(초안을 손으로 꾸밀 수 있는 자리)도 정한 넷뿐이다. 초안 모듈 자체는 포트를 부르지 않는다.
+  // credential-send.ts는 받은 영수증의 instruction 칸을 견주기만 하고 초안을 꾸미지 않는다(이 시험 첫머리의 단언).
   expect(files.filter((file) => startLiterals(src(file)) > 0 && !file.startsWith("src/contract/") && !file.startsWith("src/ledger/") && !file.startsWith("src/executor/"))).toEqual([
+    "src/supervisor/dispatch/credential-send.ts",
     "src/supervisor/dispatch/envelopes.ts",
     "src/supervisor/dispatch/resend.ts",
     GATE,

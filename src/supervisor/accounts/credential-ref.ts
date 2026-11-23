@@ -6,6 +6,7 @@ import { constants, type Stats } from "node:fs";
 import { type FileHandle, lstat, open, realpath, stat } from "node:fs/promises";
 import { join, sep } from "node:path";
 import type { CredentialRef } from "../../ledger/index.ts";
+import { CREDENTIAL_MAX_BYTES } from "../../transport/framing.ts";
 import type { CredentialPort } from "../dispatch/ports.ts";
 import { AUTH_METHODS, type AuthMethod } from "../roles/policy.ts";
 import { REVISION } from "../roles/assign.ts";
@@ -122,6 +123,79 @@ export async function resolveCredentialRef(
   } finally {
     // 이 버퍼의 바이트만 지운다. 커널의 페이지 캐시, 포트 구현 안의 다른 사본, 해시 객체 내부 상태는 이 줄이 지우지 못한다.
     bytes.fill(0);
+  }
+}
+
+export const CREDENTIAL_BORROW_REFUSALS = [
+  "policy_invalid",
+  // 정책의 maxBytes가 값 틀의 상한(CREDENTIAL_MAX_BYTES)보다 크다. 틀로 만들 수 없는 크기까지 읽지 않는다.
+  "limit_above_frame",
+  "account_malformed",
+  "method_unknown",
+  "method_not_configured",
+  "digest_malformed",
+  "missing",
+  "not_a_file",
+  "outside_account",
+  "read_failed",
+  "empty",
+  "too_large",
+  "digest_mismatch",
+] as const;
+export type CredentialBorrowRefusal = (typeof CREDENTIAL_BORROW_REFUSALS)[number];
+
+// ok면 value는 부른 쪽의 것이다: 다 쓴 뒤(보낸 쓰기가 끝난 뒤) 부른 쪽이 0으로 채운다. 거절에는 바이트가 없다.
+export type CredentialBorrow =
+  | { readonly ok: true; readonly value: Uint8Array }
+  | { readonly ok: false; readonly reason: CredentialBorrowRefusal };
+
+const DIGEST_HEX = /^[0-9a-f]{64}$/;
+
+// 실행 줄의 참조(account·method·digest)로 그 계정의 자격 파일을 다시 읽어, 바이트의 지문이 참조의 digest와 같을 때만 그 바이트를 빌려준다.
+// 소속은 resolveCredentialRef와 같은 포트·같은 경로 규칙(계정 폴더 안의 그 방식의 키)으로 본다: 지문만 보면 다른 계정의 같은 파일을 가르지 못한다.
+// revision은 대조하지 않는다. 실행기는 값을 지문으로만 대조하고(src/executor/profile.ts의 credentialMatches), 같은 바이트면 같은 값이다.
+// 던지지 않는다. 거절의 길에서는 포트가 준 버퍼를 여기서 0으로 채운다.
+export async function borrowCredentialValue(
+  files: CredentialFiles,
+  policy: CredentialRefPolicy,
+  ref: { readonly account: unknown; readonly method: unknown; readonly digest: unknown },
+): Promise<CredentialBorrow> {
+  const refuse = (reason: CredentialBorrowRefusal): CredentialBorrow => ({ ok: false, reason });
+  if (!validPolicy(policy)) return refuse("policy_invalid");
+  if (policy.maxBytes > CREDENTIAL_MAX_BYTES) return refuse("limit_above_frame");
+  const account = ref?.account;
+  if (typeof account !== "string" || !ACCOUNT_NAME.test(account)) return refuse("account_malformed");
+  const method = ref.method;
+  if (!(AUTH_METHODS as readonly unknown[]).includes(method)) return refuse("method_unknown");
+  const key = Object.hasOwn(policy.keys, method as AuthMethod) ? policy.keys[method as AuthMethod] : undefined;
+  if (key === undefined) return refuse("method_not_configured");
+  if (typeof key !== "string" || !KEY_NAME.test(key)) return refuse("policy_invalid");
+  const digest = ref.digest;
+  if (typeof digest !== "string" || !DIGEST_HEX.test(digest)) return refuse("digest_malformed");
+
+  let read: CredentialRead;
+  try {
+    read = await files.read({ dir: policy.dir, account, key }, policy.maxBytes);
+  } catch {
+    return refuse("read_failed");
+  }
+  if (read?.kind === "missing") return refuse("missing");
+  if (read?.kind === "not_a_file") return refuse("not_a_file");
+  if (read?.kind === "outside_account") return refuse("outside_account");
+  if (read?.kind === "too_large") return refuse("too_large");
+  if (read?.kind !== "bytes" || !(read.bytes instanceof Uint8Array)) return refuse("read_failed");
+
+  const bytes = read.bytes;
+  let lent = false;
+  try {
+    if (bytes.length === 0) return refuse("empty");
+    if (bytes.length > policy.maxBytes) return refuse("too_large");
+    // 지문은 참조를 만들 때와 같이 읽은 바이트 그대로 낸다.
+    if (createHash("sha256").update(bytes).digest("hex") !== digest) return refuse("digest_mismatch");
+    lent = true;
+    return { ok: true, value: bytes };
+  } finally {
+    if (!lent) bytes.fill(0);
   }
 }
 
