@@ -166,12 +166,14 @@ class Inbox implements CredentialInbox {
     const taking = this.#taking;
     if (taking === null || taking.resolve !== null) return;
     wipe(taking.lent);
+    // 떼지 못한 리스너는 신호가 남는 동안 이 기록을 붙잡는다. 내준 배열까지 붙잡지 않게 참조를 끊는다.
+    taking.lent = null;
     this.#taking = null;
     try {
       taking.signal.removeEventListener("abort", taking.onAbort);
     } catch {
       // 떼지 못한 리스너는 늦게 불려도 이 기록이 지금 #taking이 아니므로 아무 상태도 바꾸지 않는다(#abortTaking).
-      // 이 take의 내준 값은 이미 0이다
+      // 이 take의 내준 값은 이미 0이고 그 참조도 끊었다
     }
   }
 

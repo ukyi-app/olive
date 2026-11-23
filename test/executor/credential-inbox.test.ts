@@ -196,6 +196,34 @@ test("우편함: 주입받은 signal의 리스너 떼기가 던져도 forget은 
   expect(sumOf(await b.inbox.take(next.runId, next.digest, new AbortController().signal))).toBe(next.sum);
 });
 
+test("우편함: 리스너 떼기가 던져 신호가 옛 기록을 붙잡아도 forget 뒤 내준 배열은 붙잡지 않는다", async () => {
+  const b = box();
+  // 칸에 먼저 둔 값과 기다리던 take에 내준 값, 두 대여 경로를 모두 본다.
+  const lend = async (waitFirst: boolean) => {
+    const signal = new AbortController().signal;
+    signal.removeEventListener = () => {
+      throw new Error("리스너 떼기 실패");
+    };
+    const v = credential(randomUUID(), new Uint8Array(16_384).fill(7));
+    if (!waitFirst) b.inbox.offer(1, v);
+    const pending = b.inbox.take(v.runId, v.digest, signal);
+    if (waitFirst) b.inbox.offer(1, v);
+    const handed = (await pending) === v.value;
+    b.inbox.forget(v.runId);
+    return { signal, handed, wiped: zeroed(v.value), ref: new WeakRef(v.value) };
+  };
+  const lent = [await lend(false), await lend(true)];
+  // 배열의 참조가 이 함수의 스택에 남지 않게 차례를 넘기며 거둔다.
+  for (let i = 0; i < 5; i++) {
+    await Bun.sleep(5);
+    Bun.gc(true);
+  }
+  expect(lent.map((l) => l.handed && l.wiped)).toEqual([true, true]);
+  expect(lent.map((l) => l.ref.deref() === undefined)).toEqual([true, true]);
+  // 신호가 여기까지 살아 있어 떼지 못한 리스너와 옛 기록도 살아 있었다.
+  expect(lent.every((l) => !l.signal.aborted)).toBe(true);
+});
+
 test("우편함: 떼지 못한 옛 실행의 중단 리스너가 늦게 불려도 다음 실행들의 상태를 바꾸지 않는다", async () => {
   const b = box();
   const a = credential(randomUUID());
