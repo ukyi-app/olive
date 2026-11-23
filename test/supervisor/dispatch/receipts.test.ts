@@ -268,6 +268,36 @@ describe("보장 2: 장부가 받은 것에만 ack", () => {
     }
   });
 
+  test("장부의 답에서 칸을 읽다 던지면 예외가 새지 않고 malformed_answer이며 그 문구를 싣지 않는다(가짜 장부)", async () => {
+    const v = await verified("receipt_stopped", WORKER_EXECUTOR, { receipt_id: id(), run_id: id(), remaining_processes: 0, exit: "completed", stopped_at: NOW }, 1, () => 1);
+    const receiptId = (v.body as Bodies["receipt_stopped"]).receipt_id;
+    const marker = `장부답표본-${id()}`;
+    const boom = (): never => {
+      throw new Error(marker);
+    };
+    const answers: (() => unknown)[] = [
+      () => ({ get ok() { return boom(); } }),
+      () => ({ ok: true, get delivery() { return boom(); }, ack: receiptId }),
+      () => ({ ok: true, delivery: "new", get ack() { return boom(); } }),
+      () => ({ ok: false, get reason() { return boom(); } }),
+    ];
+    for (const answer of answers) {
+      const random = fakeRandom();
+      // 예외의 문구가 시험 출력에 실리지 않게 던졌는지만 센다.
+      let outcome: ReceiptOutcome | undefined;
+      let threw = false;
+      try {
+        outcome = handleForward(forward(v), { ledger: spyLedger(answer), random });
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(false);
+      expect(outcome).toEqual({ outcome: "ledger_failed", action: "receipt_stopped", id: receiptId, failure: "malformed_answer" });
+      expect(JSON.stringify(outcome).includes(marker)).toBe(false);
+      expect(random.calls).toBe(0);
+    }
+  });
+
   test("ack 초안은 장부가 ok를 돌려준 뒤에만 만든다(호출 순서)", async () => {
     const v = await verified("receipt_cleaned", WORKER_EXECUTOR, { receipt_id: id(), run_id: id(), instruction_request_id: id(), cleaned_at: NOW }, 1, () => 1);
     const order: string[] = [];
@@ -354,25 +384,25 @@ describe("보장 3: status_report는 감독이 낸 조회의 답일 때만 받�
   });
 });
 
-describe("보장 4: 결과 보고는 아직 받지 않는다", () => {
+describe("보장 4: 결과 보고는 보관 포트 없이 받지 않는다(보관·기록·ack는 receipts-results.test.ts)", () => {
   const result: Bodies["report_result"]["result"] = { role: "diagnosis", outcome: "completed", summary: "요약", items: [], refs: [] };
 
-  test("report_result는 장부에 넘기지 않고 ack도 없다(실제 장부)", async () => {
+  test("결과 포트가 없으면 report_result는 장부에 넘기지 않고 ack도 없다(실제 장부)", async () => {
     const { ledger, runId, generation } = realLedger();
     const reportId = id();
     const v = await verified("report_result", WORKER_EXECUTOR, { report_id: reportId, run_id: runId, result }, 1, generation);
     const random = fakeRandom();
     const outcome = handleForward(forward(v), { ledger, random });
-    expect(outcome).toEqual({ outcome: "result_not_supported_yet", id: reportId, runId });
+    expect(outcome).toEqual({ outcome: "result_unknown", id: reportId, runId, at: "ports" });
     expectNoAck(outcome);
     expect(random.calls).toBe(0);
     expect(ledger.pendingReports()).toEqual({ known: true, value: [] });
   });
 
-  test("report_result는 장부 포트를 부르지 않는다(가짜 장부)", async () => {
+  test("결과 포트가 없으면 report_result는 장부 포트를 부르지 않는다(가짜 장부)", async () => {
     const v = await verified("report_result", WORKER_EXECUTOR, { report_id: id(), run_id: id(), result }, 1, () => 1);
     const spy = spyLedger();
-    expect(handleForward(forward(v), { ledger: spy, random: fakeRandom() }).outcome).toBe("result_not_supported_yet");
+    expect(handleForward(forward(v), { ledger: spy, random: fakeRandom() }).outcome).toBe("result_unknown");
     expect(spy.calls).toHaveLength(0);
   });
 
