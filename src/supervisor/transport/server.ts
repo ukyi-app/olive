@@ -6,10 +6,10 @@
 // - 연결 하나의 봉투는 받은 순서대로, 받은 시각(주입받은 시계를 바이트가 온 순간에 읽은 값)과 함께 넘긴다. 앞 봉투의 check가 끝나고
 //   step이 돈 뒤에 다음 봉투의 check를 시작한다. 틀이 거절한 바이트는 판단에 닿지 않고 그 연결을 닫는다.
 // - step은 await 뒤의 지금 연결 표에 건다. check를 시작한 때의 표에 걸면 그 사이 다른 연결이 바꾼 상태가 되돌아간다.
-// - 답은 틀을 다 만든 뒤, 소켓의 쓰기 버퍼가 비었고 묶이지 않았을 때만, 넘기기 바로 앞에서 읽은 시각이 기한 정각 전이면 소켓에
-//   넘긴다. 버퍼가 비지 않았으면 쥐고 기다리다 drain이나 tick에서 시각을 다시 읽는다. 기한 정각부터는 넘기지 않는다.
+// - 답은 틀을 다 만든 뒤 소켓의 쓰기 버퍼를 보고, 그다음 시계를 읽고, 곧바로 소켓에 넘긴다. 버퍼가 비지 않았거나 묶였으면
+//   넘기지 않고 그 연결을 write_busy로 닫는다(답을 쥐고 기다리지 않는다). 읽은 시각이 기한 정각 이후면 넘기지 않는다.
 //   reply_sent는 로컬 쓰기가 오류 없이 끝난 것을 안 뒤에, 그때도 기한 정각 전이고 연결이 살아 있으면 넘긴 시각으로 한 번 넣는다.
-//   쥐고 있거나 완료를 기다리는 동안 그 연결의 다음 판단은 기다린다. 넘긴 뒤 완료 전에 기한 정각의 tick이 오면 남은 쓰기를 버리고 끊는다.
+//   완료를 기다리는 동안 그 연결의 다음 판단은 기다린다. 완료 전에 기한 정각 이후의 tick이 오면 남은 쓰기를 버리고 끊는다.
 // - 닫힘은 연결마다 한 번 closed로 알린다. closed를 넣는 길은 시계·복원기를 읽지 않는다. 닫힌 연결의 늦게 끝난 check 결과는 판단에 넘기지 않는다.
 // - 등록표를 적용할 때마다 registry 사건을 넣고, 봉투마다 지금의 등록표를 check에 넘긴다(연결을 맺을 때의 키를 쥐지 않는다).
 //
@@ -70,10 +70,12 @@ export const LINK_CLOSE_CAUSES = [
   "before_reply",
   // check가 던졌다(nonce 저장소 오류 등). 검증 결과를 모른다.
   "check_failed",
-  // step이 던졌다(복원기 읽기 오류 등). 판단 결과를 모른다.
+  // step이 던졌거나 tick()의 시각을 읽지 못했다. 판단 결과를 모른다.
   "judgment_failed",
   // 답을 바이트로 만들지 못했거나, 소켓에 넘기지 못했거나, 로컬 쓰기가 오류로 끝났거나, 끝났을 때 소켓이 이미 닫혔다.
   "write_failed",
+  // 답을 넘기려는 때 소켓의 쓰기 버퍼가 비지 않았거나 묶여 있었다. 넘기지 않았다(넘긴 바이트 0).
+  "write_busy",
   // 넘긴 답의 로컬 쓰기가 끝난 것을 안 때가 기한 정각 이후이거나, 완료 전에 기한 정각 이후의 tick이 왔다(남은 쓰기를 버리고 끊는다).
   // 상대가 받았을 수 있어도 기한 안에 답한 것으로 치지 않는다.
   "write_late",
@@ -81,7 +83,7 @@ export const LINK_CLOSE_CAUSES = [
   "reply_late",
   // 부르는 쪽의 deliver가 던졌다. 그 출력이 처리됐는지 모른다.
   "deliver_failed",
-  // 주입한 시계가 던졌다. 받은 시각, 넘길 시각, 쓰기를 마친 시각, tick에서 쥔 답·쓰기 대기의 기한을 볼 시각 가운데 하나를 모른다.
+  // 주입한 시계가 던졌다. 받은 시각, 넘길 시각, 쓰기를 마친 시각 가운데 하나를 모른다.
   "clock_failed",
   // 서버를 닫는다.
   "shutdown",
@@ -164,17 +166,10 @@ interface Link {
   received: number;
   // 답을 소켓에 넘긴 때까지 받은 봉투의 수. 차례가 이보다 작은 봉투는 답을 넘기기 전에 받은 것이다. 넘기기 전이면 null.
   replyMark: number | null;
-  // 소켓이 곧바로 받아 줄 수 없어 넘기지 않고 쥔 답. null이 아니면 이 연결의 다음 봉투를 판단에 넘기지 않는다.
-  held: Held | null;
   // 넘긴 뒤 완료를 기다리는 답. null이 아니면 이 연결의 다음 봉투를 판단에 넘기지 않는다.
   writing: Writing | null;
   busy: boolean;
   dead: boolean;
-}
-
-interface Held {
-  readonly frame: Uint8Array;
-  readonly deadline: number;
 }
 
 interface Writing {
@@ -239,7 +234,6 @@ class Server implements ConnectionServer {
       queue: [],
       received: 0,
       replyMark: null,
-      held: null,
       writing: null,
       busy: false,
       dead: false,
@@ -251,8 +245,6 @@ class Server implements ConnectionServer {
     socket.on("end", () => this.closeLink(link, "peer"));
     socket.on("close", () => this.closeLink(link, "peer"));
     socket.on("data", (chunk: Buffer) => this.receive(link, chunk));
-    // 쓰기 버퍼가 비우기를 기다리다 빈 때. 쥔 답이 있으면 그 자리에서 기한을 다시 읽는다. drain이 오지 않는 비기는 tick이 본다.
-    socket.on("drain", () => this.offer(link));
     if (socket.destroyed) this.closeLink(link, "peer");
     this.run(opened.outputs);
   }
@@ -269,13 +261,13 @@ class Server implements ConnectionServer {
     void this.pump(link);
   }
 
-  // 연결 하나의 봉투를 차례대로 하나씩 판단에 넘긴다. 한 연결에 하나만 돈다. 답을 쥐고 있거나 쓰기의 완료를 기다리는 동안은
-  // 멈추고, 완료를 처리한 뒤 다시 부른다.
+  // 연결 하나의 봉투를 차례대로 하나씩 판단에 넘긴다. 한 연결에 하나만 돈다. 답 쓰기의 완료를 기다리는 동안은 멈추고,
+  // 완료를 처리한 뒤 다시 부른다.
   private async pump(link: Link): Promise<void> {
     if (link.busy) return;
     link.busy = true;
     try {
-      while (!link.dead && link.held === null && link.writing === null && link.queue.length > 0) {
+      while (!link.dead && link.writing === null && link.queue.length > 0) {
         const frame = link.queue.shift()!;
         if (link.replyMark !== null && frame.index < link.replyMark) return this.closeLink(link, "before_reply");
         let checked: Checked;
@@ -320,22 +312,25 @@ class Server implements ConnectionServer {
   }
 
   // 지금의 연결 표에 사건 하나를 넣고 낸 것을 실행한다. 판단이 던지면 결과를 모르므로 닫는다:
-  // 연결 하나의 사건이면 그 연결, 아니면(tick, registry) 열린 연결 전부.
-  private step(event: Event, link?: Link): void {
+  // 연결 하나의 사건이면 그 연결, 아니면(tick, registry) 열린 연결 전부. now를 주면 판단 시각으로 시계 대신 그 값을 쓴다.
+  private step(event: Event, link?: Link, now?: number): void {
     let result: ReturnType<Connections["step"]>;
     try {
-      result = this.current.step(event, event.kind === "closed" ? this.closedContext() : this.context(), this.options.reply);
+      result = this.current.step(event, event.kind === "closed" ? this.closedContext() : this.context(now), this.options.reply);
     } catch {
       if (link) return this.closeLink(link, "judgment_failed");
-      for (const each of [...this.links.values()]) this.closeLink(each, "judgment_failed");
-      return;
+      return this.failAll();
     }
     this.current = result.table;
     this.run(result.outputs);
   }
 
-  private context(): StepContext {
-    return { now: this.options.clock(), registry: this.trusted, stop: this.restorer() };
+  private failAll(): void {
+    for (const each of [...this.links.values()]) this.closeLink(each, "judgment_failed");
+  }
+
+  private context(now?: number): StepContext {
+    return { now: now ?? this.options.clock(), registry: this.trusted, stop: this.restorer() };
   }
 
   // 판단의 닫힘 처리는 연결 번호만 쓴다. 여기서 시계·복원기를 읽으면 그 읽기가 던질 때 closed가 판단에 들어가지 않아
@@ -375,37 +370,29 @@ class Server implements ConnectionServer {
     }
   }
 
+  // 순서가 보장 2다: 틀 → 소켓의 관측(닫힘, 쓰기 버퍼) → 시계 → write. 기한은 마지막 시계 읽기로 판정하므로 그 읽기와
+  // write 사이에 소켓의 접근자·다른 시계 읽기·대기를 두지 않는다(그 사이에 흐른 시간은 판정에 들지 않는다).
   private sendReply(output: Extract<Output, { kind: "send_reply" }>): void {
     const link = this.links.get(output.connection);
     if (!link || link.dead) return;
+    const deadline = output.deadline;
     const frame = frameOf(output.envelope);
     if (frame === null) return this.closeLink(link, "write_failed");
-    link.held = { frame, deadline: output.deadline };
-    this.offer(link);
-  }
-
-  // 쥔 답을 소켓에 넘길 수 있으면 넘긴다. sendReply, 소켓의 drain, tick()에서 부른다.
-  private offer(link: Link): void {
-    const held = link.held;
-    if (held === null || link.dead) return;
-    // 기한은 틀을 다 만든 뒤 넘기기 바로 앞에서 읽은 시각으로 판정한다. 이 읽기와 write 사이에 시간이 드는 일을 두지 않는다.
+    const socket = link.socket;
+    if (socket.destroyed || !socket.writable) return this.closeLink(link, "write_failed");
+    // 버퍼에 앞선 바이트가 있거나 묶여 있으면 넘긴 답이 그 뒤에서 기다리다 기한 정각 이후에 나갈 수 있고, 넘긴 바이트는 되돌릴 수 없다.
+    // 넘기지 않고 닫는다. 실행기는 닫힌 연결에서 다시 붙어 맞춘다.
+    if (!idle(socket)) return this.closeLink(link, "write_busy");
+    const mark = link.received;
     const at = this.now();
     if (at === null) return this.closeLink(link, "clock_failed");
-    if (!(at < held.deadline)) {
-      link.held = null;
-      return this.late(link, held.deadline, at);
-    }
-    if (link.socket.destroyed || !link.socket.writable) return this.closeLink(link, "write_failed");
-    // 버퍼에 앞선 바이트가 있거나 묶여 있으면 넘긴 답이 그 뒤에서 기다리다 기한 정각 이후에 나갈 수 있고, 넘긴 바이트는 되돌릴 수 없다.
-    // 그래서 넘기지 않고 쥔다. 버퍼가 비면 drain이나 다음 tick에서 이 자리로 다시 와 시각을 읽는다.
-    if (!idle(link.socket)) return;
-    link.held = null;
+    if (!(at < deadline)) return this.late(link, deadline, at);
     // write의 반환값(false)은 버퍼가 찼다는 뜻일 뿐 실패가 아니고, true도 내보냈다는 뜻이 아니다. 완료 콜백으로만 가른다.
-    const writing: Writing = { at, deadline: held.deadline };
+    const writing: Writing = { at, deadline };
     link.writing = writing;
-    link.replyMark = link.received;
+    link.replyMark = mark;
     try {
-      link.socket.write(held.frame, (error) => this.written(link, writing, error));
+      socket.write(frame, (error) => this.written(link, writing, error));
     } catch {
       this.closeLink(link, "write_failed");
     }
@@ -416,14 +403,6 @@ class Server implements ConnectionServer {
     this.note({ kind: "reply_not_sent", connection: link.id, deadline, at });
     this.step({ kind: "tick" });
     if (!link.dead && this.current.get(link.id)?.phase === "requested") this.closeLink(link, "reply_late");
-  }
-
-  // 넘긴 답의 완료를 기다리는 연결에 기한 정각 이후의 박자가 왔다. 완료를 기다리지 않고 소켓을 파기해 남은 쓰기를 버린다.
-  // 이미 하위 쓰기로 나간 바이트는 되돌리지 못한다(server.md의 남는 한계).
-  private overdue(link: Link, writing: Writing): void {
-    const at = this.now();
-    if (at === null) return this.closeLink(link, "clock_failed");
-    if (!(at < writing.deadline)) this.closeLink(link, "write_late");
   }
 
   // 답의 로컬 쓰기가 끝났다. 오류 없이 끝났고, 그때도 기한 정각 전이고, 연결이 살아 있을 때만 reply_sent를 한 번 넣는다.
@@ -448,7 +427,6 @@ class Server implements ConnectionServer {
     if (link.dead) return;
     link.dead = true;
     link.queue.length = 0;
-    link.held = null;
     this.links.delete(link.id);
     link.socket.destroy();
     this.note(frame === undefined ? { kind: "closed", connection: link.id, cause } : { kind: "closed", connection: link.id, cause, frame });
@@ -462,16 +440,17 @@ class Server implements ConnectionServer {
     return outcome;
   }
 
-  // 판단의 tick보다 먼저 쥔 답과 완료를 기다리는 답을 본다. 쥔 답은 버퍼가 비었으면 넘기고 기한이 지났으면 늦은 답으로,
-  // 완료를 기다리는 답은 기한이 지났으면 write_late로 끊는다(판단의 answer_late보다 사유가 정확하다).
+  // 박자의 시각은 한 번 읽어 완료 대기의 만료와 판단의 tick에 함께 쓴다. 그 읽기가 던지면 판단의 tick이 던진 때와 같이
+  // 열린 연결을 모두 닫는다: 어느 한 연결의 읽기 실패로 받으면 나머지 연결이 이 박자의 판단을 건너뛴 채 남는다.
+  // 완료 대기의 만료를 판단의 tick보다 먼저 본다. 판단이 먼저면 그 연결이 answer_late(judgment)로 닫혀 쓰기의 만료가 가려진다.
   tick(): void {
+    const at = this.now();
+    if (at === null) return this.failAll();
     for (const link of [...this.links.values()]) {
-      // 앞 연결의 늦은 답이 넣은 tick이 이 연결을 이미 닫았을 수 있다.
-      if (link.dead) continue;
-      if (link.held !== null) this.offer(link);
-      else if (link.writing !== null) this.overdue(link, link.writing);
+      // 완료를 기다리지 않고 소켓을 파기해 남은 쓰기를 버린다. 이미 하위 쓰기로 나간 바이트는 되돌리지 못한다(server.md의 남는 한계).
+      if (!link.dead && link.writing !== null && !(at < link.writing.deadline)) this.closeLink(link, "write_late");
     }
-    this.step({ kind: "tick" });
+    this.step({ kind: "tick" }, undefined, at);
   }
 
   async close(): Promise<void> {
@@ -484,7 +463,8 @@ class Server implements ConnectionServer {
 const UNKNOWN_GENERATION: StopGenerationSource = Object.freeze({ stopGeneration: () => null });
 
 // 넘긴 바이트가 앞선 바이트를 기다리지 않고 곧바로 하위 쓰기로 가는 상태: 쓰기 버퍼가 비었고, 비우기를 기다리지 않고, 묶이지 않았다.
-// 하위 쓰기 아래(TLS·커널·네트워크)에서 밀리는 것은 여기서 보이지 않는다.
+// 하위 쓰기 아래(TLS·커널·네트워크)에서 밀리는 것은 여기서 보이지 않는다. 이 서버는 맞춤의 답 전에 소켓에 쓰는 것이 없으므로
+// 갓 받은 연결은 이 상태다.
 function idle(socket: tls.TLSSocket): boolean {
   return socket.writableLength === 0 && !socket.writableNeedDrain && socket.writableCorked === 0;
 }

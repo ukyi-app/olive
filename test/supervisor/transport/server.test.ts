@@ -272,20 +272,62 @@ function handedTo(socket: ServerSocket): unknown[] {
   return handed;
 }
 
-// 하위 쓰기를 붙든다. 서버가 넘긴 바이트가 운영체제로 나가지 않아 완료 콜백이 오지 않는다. release는 원래 하위 쓰기로 넘긴다.
+// 서버가 그 소켓에 넘긴 쓰기의 완료 콜백이 서버에 닿을 때마다 그 결과를 적는다(서버의 콜백은 바로 이어서 불린다).
+function completionsOf(socket: ServerSocket): (Error | null)[] {
+  const completed: (Error | null)[] = [];
+  const write = socket.write;
+  socket.write = function (this: ServerSocket, ...args: unknown[]) {
+    const last = args.length - 1;
+    const callback = args[last];
+    if (typeof callback === "function") {
+      args[last] = (error?: Error | null) => {
+        completed.push(error ?? null);
+        (callback as (error?: Error | null) => void)(error);
+      };
+    }
+    return (write as (...a: unknown[]) => boolean).apply(this, args);
+  } as typeof socket.write;
+  return completed;
+}
+
+// 하위 쓰기를 붙든다. 서버가 넘긴 바이트가 운영체제로 나가지 않아 완료 콜백이 오지 않는다. release는 원래 하위 쓰기로 넘기고,
+// complete는 하위 쓰기 없이 완료 콜백을 시험이 정한 결과로 부른다(바이트는 나가지 않는다).
 function holdLowerWrite(socket: ServerSocket) {
   const original = socket._write;
-  let pending: (() => void) | null = null;
+  let pending: { chunk: unknown; encoding: string; done: (error?: Error | null) => void } | null = null;
   socket._write = (chunk, encoding, done) => {
-    pending = () => original.call(socket, chunk, encoding, done);
+    pending = { chunk, encoding, done };
   };
   return {
     entered: () => pending !== null,
     release: () => {
       socket._write = original;
-      pending!();
+      original.call(socket, pending!.chunk, pending!.encoding, pending!.done);
+    },
+    complete: (error?: Error) => {
+      socket._write = original;
+      pending!.done(error ?? null);
     },
   };
+}
+
+// 그 소켓에서만 접근자 하나를 감싸 읽힐 때마다 before를 먼저 부른다(원래 접근자의 값을 그대로 돌려준다).
+function onAccess(socket: object, name: string, before: () => void): void {
+  let owner: object | null = socket;
+  let descriptor: PropertyDescriptor | undefined;
+  while (owner !== null && descriptor === undefined) {
+    descriptor = Object.getOwnPropertyDescriptor(owner, name);
+    owner = Object.getPrototypeOf(owner) as object | null;
+  }
+  const get = descriptor?.get;
+  if (get === undefined) throw new Error(`시험: ${name}은 접근자가 아니다`);
+  Object.defineProperty(socket, name, {
+    configurable: true,
+    get(this: object) {
+      before();
+      return get.call(this);
+    },
+  });
 }
 
 // 맞춤과 인사를 마친 연결.
@@ -472,6 +514,7 @@ describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => 
     const sa = serverSocket(h, a);
     // 서버는 빈 소켓에 답을 넘기고, 시험이 하위 쓰기를 붙들어 완료 콜백이 오지 않게 한다.
     const lowerA = holdLowerWrite(sa);
+    const completedA = completionsOf(sa);
     a.send(syncRequest(K1, R1, h.clock.t));
     await until(lowerA.entered);
     expect(phaseOf(h, a)).toBe("requested");
@@ -499,23 +542,40 @@ describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => 
     expect(h.server.table().get(a.id)).toBeUndefined();
     expect(h.delivered.filter((o) => o.connection === a.id)).toEqual([]);
     expect(phaseOf(h, b)).toBe("greeted");
+    // 파기 뒤에 쓰기의 완료가 오류로 돌아와도 닫힌 연결의 상태·사건·기록은 그대로다.
+    const closedA = h.closedNotes(a.id);
+    let notes = h.notes.length;
+    let events = steps.length;
+    lowerA.complete(new Error("시험: 파기 뒤 돌아온 오류"));
+    await until(() => completedA.length === 1);
+    expect(completedA[0]).toBeInstanceOf(Error);
+    expect(h.notes.length).toBe(notes);
+    expect(steps.length).toBe(events);
+    expect(h.closedNotes(a.id)).toEqual(closedA);
+    expect(h.server.table().get(a.id)).toBeUndefined();
 
-    // 쓰기를 기다리는 연결도, 묶인 소켓이라 답을 쥐고 기다리는 연결도 서버를 닫으면 닫힌다.
-    const c = await connect(h);
-    const sc = serverSocket(h, c);
-    sc.cork();
-    c.send(syncRequest(K1, R1, h.clock.t));
-    await until(() => phaseOf(h, c) === "requested");
+    // 넘긴 답의 완료를 기다리는 연결도 서버를 닫으면 닫히고 표에서 빠진다. 그 뒤 완료가 성공으로 돌아와도 바뀌는 것이 없다.
     const d = await connect(h);
-    const lowerD = holdLowerWrite(serverSocket(h, d));
+    const sd = serverSocket(h, d);
+    const lowerD = holdLowerWrite(sd);
+    const completedD = completionsOf(sd);
     d.send(syncRequest(K2, R2, h.clock.t));
     await until(lowerD.entered);
+    expect(phaseOf(h, d)).toBe("requested");
     await h.server.close();
-    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "shutdown" }]);
-    expect(repliesSent(steps, c.id)).toBe(0);
-    expect(h.server.table().get(c.id)).toBeUndefined();
     expect(h.closedNotes(d.id)).toEqual([{ kind: "closed", connection: d.id, cause: "shutdown" }]);
     expect(repliesSent(steps, d.id)).toBe(0);
+    expect(h.server.table().get(d.id)).toBeUndefined();
+    notes = h.notes.length;
+    events = steps.length;
+    lowerD.complete();
+    await until(() => completedD.length === 1);
+    expect(completedD[0]).toBeNull();
+    expect(h.notes.length).toBe(notes);
+    expect(steps.length).toBe(events);
+    expect(h.closedNotes(d.id)).toEqual([{ kind: "closed", connection: d.id, cause: "shutdown" }]);
+    expect(h.notes.filter((n) => n.kind === "reply_written" && n.connection === d.id)).toEqual([]);
+    expect(h.server.table().get(d.id)).toBeUndefined();
   });
 
   test("로컬 쓰기의 완료가 오류면 reply_sent를 넣지 않고, 밀렸다가 끝나면 한 번 넣고, 끝난 때가 기한 정각 이후면 닫는다", async () => {
@@ -561,85 +621,167 @@ describe("(2) 답은 기한 안에만 싣고 실은 순간을 알린다", () => 
     await until(() => phaseOf(h, b) === "greeted");
     expect(repliesSent(steps, b.id)).toBe(1);
 
-    // 쓰기를 묶어 둔 사이 기한 정각이 된다. 묶인 소켓에는 답을 넘기지 않고 쥐므로 정각에 풀려도 나갈 답이 없고, 정각의 박자가 닫는다.
+    // 쓰기를 묶어 둔 소켓에는 답을 넘기지 않고 곧바로 닫는다. 정각에 풀고 박자를 줘도 나갈 답이 없다.
     const c = await connect(h);
     const sc = serverSocket(h, c);
     const handed = handedTo(sc);
     sc.cork();
     const T = h.clock.t;
     c.send(syncRequest(K1, R1, T));
-    await until(() => phaseOf(h, c) === "requested");
+    await until(() => h.closedNotes(c.id).length > 0);
+    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "write_busy" }]);
+    expect(repliesSent(steps, c.id)).toBe(0);
+    expect(h.server.table().get(c.id)).toBeUndefined();
     h.clock.t = T + ANSWER;
     sc.uncork();
     h.server.tick();
-    await until(() => h.closedNotes(c.id).length > 0);
-    expect(h.closedNotes(c.id)).toEqual([{ kind: "closed", connection: c.id, cause: "judgment" }]);
-    expect(repliesSent(steps, c.id)).toBe(0);
-    expect(h.server.table().get(c.id)).toBeUndefined();
     expect(handed).toEqual([]);
-    expect(h.notes).toContainEqual({ kind: "reply_not_sent", connection: c.id, deadline: T + ANSWER, at: T + ANSWER });
+    expect(h.notes.filter((n) => (n.kind === "reply_not_sent" || n.kind === "reply_written") && n.connection === c.id)).toEqual([]);
     await until(() => c.closed());
     expect(replies(c)).toBe(0);
   });
 
-  test("쓰기 버퍼에 앞선 바이트가 남았으면 답을 넘기지 않고 쥔다: 버퍼가 기한 전에 비면 그때 넘기고, 정각 이후에 비면 넘기지 않는다", async () => {
+  test("답을 넘기려는 때 쓰기 버퍼에 앞선 바이트가 남았거나 묶였으면 넘기지 않고 곧바로 닫는다. 버퍼가 뒤에 비어도 넘길 답이 없다", async () => {
     const h = await start();
     const steps = spySteps();
-    // 시험이 서버 소켓에 먼저 바이트를 넣고 묶는다. 임계값을 1로 낮춰 그 바이트가 나가 버퍼가 비면 drain이 온다.
-    const prepare = async (keys: Keys, sender: string) => {
-      const peer = await connect(h);
-      const socket = serverSocket(h, peer);
-      socket._writableState.highWaterMark = 1;
-      socket.cork();
-      socket.write(frame({ prior: peer.id }));
-      const handed = handedTo(socket);
-      const T = h.clock.t;
-      peer.send(syncRequest(keys, sender, T));
-      await until(() => phaseOf(h, peer) === "requested");
-      expect(socket.writableLength).toBeGreaterThan(0);
-      expect(handed).toEqual([]);
-      return { peer, socket, handed, T };
+    const unsent = (peer: Peer) => {
+      expect(h.closedNotes(peer.id)).toEqual([{ kind: "closed", connection: peer.id, cause: "write_busy" }]);
+      expect(repliesSent(steps, peer.id)).toBe(0);
+      expect(h.notes.filter((n) => (n.kind === "reply_written" || n.kind === "reply_not_sent") && n.connection === peer.id)).toEqual([]);
+      expect(h.server.table().get(peer.id)).toBeUndefined();
     };
+    // 판단이 답을 낸 뒤까지 기다린다: 연결이 닫혔거나 답을 기다리는 단계다(닫히지 않은 경우는 뒤 단언이 잡는다).
+    const settled = (peer: Peer) => until(() => h.closedNotes(peer.id).length > 0 || phaseOf(h, peer) === "requested");
 
-    // (가) 버퍼가 기한 정각에 빈다. drain에서 시각을 다시 읽고 넘기지 않는다.
-    const a = await prepare(K1, R1);
-    h.clock.t = a.T + ANSWER;
-    a.socket.uncork();
-    await until(() => h.closedNotes(a.peer.id).length > 0);
-    expect(a.handed).toEqual([]);
-    expect(h.notes).toContainEqual({ kind: "reply_not_sent", connection: a.peer.id, deadline: a.T + ANSWER, at: a.T + ANSWER });
-    expect(h.closedNotes(a.peer.id)).toEqual([{ kind: "closed", connection: a.peer.id, cause: "judgment" }]);
-    expect(repliesSent(steps, a.peer.id)).toBe(0);
-    expect(h.server.table().get(a.peer.id)).toBeUndefined();
-    await until(() => a.peer.closed());
-    expect(replies(a.peer)).toBe(0);
-
-    // (나) 버퍼가 기한 1ms 전에 빈다. 그때 넘기고 reply_sent를 한 번 넣는다.
-    const b = await prepare(K2, R2);
-    h.clock.t = b.T + ANSWER - 1;
-    b.socket.uncork();
-    await until(() => phaseOf(h, b.peer) === "answered");
-    expect(b.handed).toHaveLength(1);
-    expect(repliesSent(steps, b.peer.id)).toBe(1);
-    expect(h.server.table().get(b.peer.id)!.sync!.answeredAt).toBe(b.T + ANSWER - 1);
-    await until(() => replies(b.peer) === 1);
-
-    // drain 없이 비는 버퍼(묶기만 한 소켓)는 다음 박자가 본다. 기한 전의 박자면 넘긴다.
-    const c = await connect(h);
-    const sc = serverSocket(h, c);
-    const handed = handedTo(sc);
-    sc.cork();
+    // 시험이 서버 소켓에 먼저 바이트를 넣고 묶는다. 버퍼가 기한 1ms 전에 비어도 넘기지 않는다.
+    const a = await connect(h);
+    const sa = serverSocket(h, a);
+    sa._writableState.highWaterMark = 1;
+    sa.cork();
+    sa.write(frame({ prior: a.id }));
+    const handedA = handedTo(sa);
     const T = h.clock.t;
-    c.send(syncRequest(K1, R1, T));
-    await until(() => phaseOf(h, c) === "requested");
+    a.send(syncRequest(K1, R1, T));
+    await settled(a);
+    expect(sa.destroyed || sa.writableLength > 0).toBe(true);
     h.clock.t = T + ANSWER - 1;
-    sc.uncork();
-    expect(handed).toEqual([]);
+    sa.uncork();
     h.server.tick();
-    expect(handed).toHaveLength(1);
-    await until(() => phaseOf(h, c) === "answered");
-    expect(repliesSent(steps, c.id)).toBe(1);
-    await until(() => replies(c) === 1);
+    expect(handedA).toEqual([]);
+    unsent(a);
+    await until(() => a.closed());
+    expect(replies(a)).toBe(0);
+
+    // 빈 스트림을 묶기만 했다. 세대를 모르는 복원기로 바꾼 뒤 기한 전의 박자를 줘도 옛 답의 쓰기를 시도하지 않는다.
+    const b = await connect(h);
+    const sb = serverSocket(h, b);
+    const handedB = handedTo(sb);
+    sb.cork();
+    const T1 = h.clock.t;
+    b.send(syncRequest(K2, R2, T1));
+    await settled(b);
+    (h.restorer as unknown as { stopGeneration: () => number | null }).stopGeneration = () => null;
+    sb.uncork();
+    h.clock.t = T1 + ANSWER - 1;
+    h.server.tick();
+    expect(handedB).toEqual([]);
+    unsent(b);
+    await until(() => b.closed());
+    expect(replies(b)).toBe(0);
+  });
+
+  test("기한은 버퍼를 본 뒤 write 바로 앞에서 읽은 시각으로 판정한다: 버퍼를 보는 사이 정각이 되면 넘기지 않는다", async () => {
+    const h = await start();
+    const steps = spySteps();
+
+    // 정상 맞춤: 갓 받은 연결의 빈 버퍼에 넘긴다. write 바로 앞의 일은 시계 읽기이고, 버퍼의 관측은 그보다 앞선다.
+    const a = await connect(h);
+    const sa = serverSocket(h, a);
+    const order: string[] = [];
+    for (const name of ["writableLength", "writableNeedDrain", "writableCorked"]) onAccess(sa, name, () => order.push(name));
+    h.onClock = () => order.push("clock");
+    const handedA = handedTo(sa);
+    const write = sa.write;
+    sa.write = function (this: ServerSocket, ...args: unknown[]) {
+      order.push("write");
+      return (write as (...a: unknown[]) => boolean).apply(this, args);
+    } as typeof sa.write;
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(() => phaseOf(h, a) === "answered");
+    h.onClock = () => {};
+    const w = order.indexOf("write");
+    expect(order.slice(w - 4, w + 1)).toEqual(["writableLength", "writableNeedDrain", "writableCorked", "clock", "write"]);
+    expect(handedA).toHaveLength(1);
+    expect(repliesSent(steps, a.id)).toBe(1);
+    await until(() => replies(a) === 1);
+
+    // 버퍼를 보는 사이 시계가 4,999ms에서 5,000ms가 된다. 넘긴 것 0, 판단이 늦은 답으로 닫는다.
+    const b = await connect(h);
+    const sb = serverSocket(h, b);
+    const T = h.clock.t;
+    let armed = false;
+    h.onSeal = () => {
+      h.clock.t = T + ANSWER - 1;
+      armed = true;
+    };
+    onAccess(sb, "writableCorked", () => {
+      if (!armed) return;
+      armed = false;
+      h.clock.t = T + ANSWER;
+    });
+    const handedB = handedTo(sb);
+    b.send(syncRequest(K2, R2, T));
+    await until(() => h.closedNotes(b.id).length > 0);
+    expect(handedB).toEqual([]);
+    expect(repliesSent(steps, b.id)).toBe(0);
+    expect(h.notes).toContainEqual({ kind: "reply_not_sent", connection: b.id, deadline: T + ANSWER, at: T + ANSWER });
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment" }]);
+    await until(() => b.closed());
+    expect(replies(b)).toBe(0);
+  });
+
+  test("박자의 시각을 한 번 읽는다: 그 읽기만 던져도 판단의 tick이 던진 때와 같이 열린 연결을 모두 닫는다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const lowerA = holdLowerWrite(serverSocket(h, a));
+    a.send(syncRequest(K1, R1, h.clock.t));
+    await until(lowerA.entered);
+    const b = await connect(h);
+    let fail = 1;
+    h.onClock = () => {
+      if (fail-- > 0) throw new Error("시험: 박자의 첫 시계 읽기");
+    };
+    h.server.tick();
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "judgment_failed" }]);
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "judgment_failed" }]);
+    // 이어서 보낸 맞춤과 인사에서도 답·후보·점유가 나오지 않는다.
+    b.send(syncRequest(K2, R2, h.clock.t), hello(K2, R2, h.clock.t));
+    await until(() => b.closed() && a.closed());
+    expect(replies(b)).toBe(0);
+    expect(h.delivered.filter((o) => o.connection === b.id && (o.kind === "candidate" || o.kind === "occupancy"))).toEqual([]);
+    expect(h.server.table().candidates(h.restorer)).toEqual([]);
+    expect(h.server.table().occupancy(h.restorer)).toEqual([]);
+  });
+
+  test("한 박자에 완료 대기가 만료된 연결은 다른 연결이 있어도 write_late로 닫힌다", async () => {
+    const h = await start();
+    const steps = spySteps();
+    // 먼저 등록된 연결 하나는 묶인 소켓이라 답이 넘겨지지 않는다. 그 연결이 박자 안에서 판단의 tick을 먼저 넣지 않는지 본다.
+    const a = await connect(h);
+    serverSocket(h, a).cork();
+    const T = h.clock.t;
+    a.send(syncRequest(K1, R1, T));
+    await until(() => h.closedNotes(a.id).length > 0 || phaseOf(h, a) === "requested");
+    const b = await connect(h);
+    const lowerB = holdLowerWrite(serverSocket(h, b));
+    b.send(syncRequest(K2, R2, T));
+    await until(lowerB.entered);
+    h.clock.t = T + ANSWER;
+    h.server.tick();
+    expect(h.closedNotes(b.id)).toEqual([{ kind: "closed", connection: b.id, cause: "write_late" }]);
+    expect(repliesSent(steps, b.id)).toBe(0);
+    expect(h.server.table().get(b.id)).toBeUndefined();
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "write_busy" }]);
   });
 
   test("넘긴 답의 완료를 기다리는 동안 기한 정각의 박자가 오면 곧바로 끊는다. 그 전에 하위 쓰기가 나가면 막지 못한다", async () => {
