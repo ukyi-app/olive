@@ -245,7 +245,59 @@ test("시작: 자격 digest가 값과 다르면 띄우지 않는다(정확한 �
   expect(stateOf(r, runId)).toBe("not_started");
   // 자격 값이 영수증 어디에도 없다.
   const text = new TextDecoder().decode(value);
-  expect(JSON.stringify(r.transport.sent)).not.toContain(text);
+  expect(JSON.stringify(r.transport.sent).includes(text)).toBe(false);
+});
+
+test("자격: 받은 값의 배열은 대조·변환 뒤 띄우든 띄우지 않든 0으로 채우고, 실행이 끝나면 자격의 출처에 그 실행을 잊게 한다", async () => {
+  const zeroed = (value: Uint8Array) => value.every((byte) => byte === 0);
+  // 띄운 실행.
+  const r = await make();
+  const { runId } = await start(r);
+  await r.worker.idle();
+  expect(r.launcher.spawned).toBe(1);
+  expect(r.credentials.handed.map(zeroed)).toEqual([true]);
+  expect(r.credentials.forgotten).toEqual([runId]);
+
+  // 지문이 달라 띄우지 않은 실행.
+  const mismatch = await make();
+  const value = credentialValue();
+  const bad = await start(mismatch, { value, digest: sha256("다른 값") });
+  await mismatch.worker.idle();
+  expect(mismatch.launcher.spawned).toBe(0);
+  expect(mismatch.credentials.handed.map(zeroed)).toEqual([true]);
+  expect(mismatch.credentials.forgotten).toEqual([bad.runId]);
+
+  // 받은 직후 연결이 끊겨 대조 전에 멈춘 실행.
+  const lost = await make();
+  lost.credentials.before = () => lost.connection.close();
+  const dropped = await start(lost);
+  await lost.worker.idle();
+  expect(lost.launcher.spawned).toBe(0);
+  expect(lost.credentials.handed.map(zeroed)).toEqual([true]);
+  expect(lost.credentials.forgotten).toEqual([dropped.runId]);
+});
+
+test("자격: 문자 검사가 값의 글에서 다시 만든 바이트 배열도 비교 뒤 0으로 채운다", async () => {
+  const r = await make();
+  const value = credentialValue();
+  const sum = sha256(value);
+  // 값과 같은 바이트로 만들어진 배열을 모은다(문자 검사의 왕복 검사 배열).
+  const remade: Uint8Array[] = [];
+  const original = TextEncoder.prototype.encode;
+  TextEncoder.prototype.encode = function (this: TextEncoder, input?: string) {
+    const out = original.call(this, input);
+    if (out.length === value.length && sha256(out) === sum) remade.push(out);
+    return out;
+  };
+  try {
+    await start(r, { value });
+    await r.worker.idle();
+  } finally {
+    TextEncoder.prototype.encode = original;
+  }
+  expect(r.launcher.spawned).toBe(1);
+  expect(remade.length).toBeGreaterThanOrEqual(1);
+  expect(remade.every((array) => array.every((byte) => byte === 0))).toBe(true);
 });
 
 test("시작: 연결이 없거나 맞춤 전이면 새 실행 0·새 자격 0", async () => {
@@ -285,9 +337,9 @@ test("환경: 띄운 프로그램이 받는 환경은 허용 목록뿐이고 자
     const received = JSON.parse(readFileSync(join(r.cwd, "received-env.json"), "utf8")) as Record<string, string>;
     const credential = new TextDecoder().decode(value);
     expect(Object.keys(received).sort()).toEqual(["LANG", "OLIVE_CREDENTIAL", "OLIVE_ROLE"]);
-    expect(received.OLIVE_CREDENTIAL).toBe(credential);
+    expect(received.OLIVE_CREDENTIAL === credential).toBe(true);
     expect(Object.entries(received).filter(([, v]) => v.includes(credential)).map(([k]) => k)).toEqual(["OLIVE_CREDENTIAL"]);
-    expect(JSON.stringify(r.transport.sent)).not.toContain(credential);
+    expect(JSON.stringify(r.transport.sent).includes(credential)).toBe(false);
   } finally {
     delete process.env.OLIVE_PARENT_ONLY;
   }
