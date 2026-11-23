@@ -22,9 +22,10 @@ export type OfferOutcome = "handed" | "held" | "discarded";
 export interface CredentialInbox extends CredentialSource {
   // 소켓이 맞춘 지금 연결에서 받은 값 틀을 넘긴다. 받은 뒤 그 값의 소유는 우편함에 있다(부른 쪽은 그 배열을 다시 쓰지 않는다).
   offer(epoch: number, credential: DecodedCredential): OfferOutcome;
-  // 그 연결이 끝났다. 그 연결에서 받은 값을 버리고, 그 연결에서 기다리던 take는 null로 끝낸다.
+  // 그 연결이 끝났다. 그 연결에서 받은 값을 버리고, 그 연결에서 기다리던 take는 null로 끝낸다. 던지지 않는다.
   dropEpoch(epoch: number): void;
-  // 그 실행이 끝났다. 그 실행의 기다림·칸·내준 값을 버리고, 뒤에 온 그 실행의 값은 곧바로 버린다.
+  // 그 실행이 끝났다. 그 실행의 기다림·칸·내준 값을 버리고, 뒤에 온 그 실행의 값은 곧바로 버린다. 던지지 않는다.
+  // 한 실행에 한 번 내주는 것은 작업자가 같은 실행 ID로 다시 take하지 않는다는 전제에 기댄다(credential-inbox.md).
   forget(runId: string): void;
 }
 
@@ -153,12 +154,18 @@ class Inbox implements CredentialInbox {
   }
 
   // 끝난 take의 기록을 치운다(내준 값은 0으로). 기다리는 take는 치우지 않는다.
+  // forget이 주입받은 것을 부르는 자리는 이 리스너 떼기뿐이라, 정리를 마친 뒤에 두고 그 던짐을 삼킨다: forget은 던지지 않고
+  // 정리를 끝낸다.
   #retire(): void {
     const taking = this.#taking;
     if (taking === null || taking.resolve !== null) return;
     wipe(taking.lent);
-    taking.signal.removeEventListener("abort", taking.onAbort);
     this.#taking = null;
+    try {
+      taking.signal.removeEventListener("abort", taking.onAbort);
+    } catch {
+      // 떼지 못한 리스너는 늦게 불려도 #closeRun(닫는 쪽)만 부른다. 이 take의 내준 값은 이미 0이다
+    }
   }
 
   #discard(value: Uint8Array): OfferOutcome {

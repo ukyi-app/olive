@@ -37,7 +37,7 @@ test("우편함: 값이 take보다 먼저 와도, 나중에 와도 그 실행에
   const got = await b.inbox.take(run, early.digest, new AbortController().signal);
   expect(sumOf(got)).toBe(early.sum);
   // 내준 뒤 칸은 비었고 같은 실행에 다시 내주지 않는다.
-  expect(await b.inbox.take(run, early.digest, new AbortController().signal)).toBeNull();
+  expect((await b.inbox.take(run, early.digest, new AbortController().signal)) === null).toBe(true);
 
   const later = randomUUID();
   const late = credential(later);
@@ -65,12 +65,12 @@ test("우편함: 다른 실행·다른 지문·옛 연결 번호의 값은 내�
   const c = box(5);
   const held = [credential(randomUUID()), credential(randomUUID())];
   expect(c.inbox.offer(5, held[0]!)).toBe("held");
-  expect(await settledWithin(c.inbox.take(held[0]!.runId, sha256("다른 지문"), new AbortController().signal))).toEqual({ done: false });
+  expect((await settledWithin(c.inbox.take(held[0]!.runId, sha256("다른 지문"), new AbortController().signal))).done).toBe(false);
   expect(zeroed(held[0]!.value)).toBe(true);
   const d = box(5);
   expect(d.inbox.offer(5, held[1]!)).toBe("held");
   d.epoch = 6;
-  expect(await settledWithin(d.inbox.take(held[1]!.runId, held[1]!.digest, new AbortController().signal))).toEqual({ done: false });
+  expect((await settledWithin(d.inbox.take(held[1]!.runId, held[1]!.digest, new AbortController().signal))).done).toBe(false);
   expect(zeroed(held[1]!.value)).toBe(true);
   // 맞춘 연결이 없을 때 온 값도 받지 않는다.
   const none = box(null);
@@ -85,11 +85,11 @@ test("우편함: take가 중단되면 null이고, 그 뒤 늦게 온 그 실행�
   const controller = new AbortController();
   const waiting = b.inbox.take(run, sha256("x"), controller.signal);
   controller.abort();
-  expect(await waiting).toBeNull();
+  expect((await waiting) === null).toBe(true);
   const late = credential(run);
   expect(b.inbox.offer(1, late)).toBe("discarded");
   expect(zeroed(late.value)).toBe(true);
-  expect(await b.inbox.take(run, late.digest, new AbortController().signal)).toBeNull();
+  expect((await b.inbox.take(run, late.digest, new AbortController().signal)) === null).toBe(true);
 
   // 이미 중단된 signal로 부르면 칸의 그 실행 값도 버린다.
   const c = box();
@@ -97,7 +97,7 @@ test("우편함: take가 중단되면 null이고, 그 뒤 늦게 온 그 실행�
   c.inbox.offer(1, early);
   const aborted = new AbortController();
   aborted.abort();
-  expect(await c.inbox.take(early.runId, early.digest, aborted.signal)).toBeNull();
+  expect((await c.inbox.take(early.runId, early.digest, aborted.signal)) === null).toBe(true);
   expect(zeroed(early.value)).toBe(true);
 
   // 내준 뒤 중단되면 내준 배열도 0으로 채운다(작업자가 받지 못한 경합에서 값이 남지 않게).
@@ -134,7 +134,7 @@ test("우편함: 다른 실행의 값이 새로 오면 칸의 앞 값을 0으로
   expect(b.inbox.offer(1, a)).toBe("held");
   expect(b.inbox.offer(1, c)).toBe("held");
   expect(zeroed(a.value)).toBe(true);
-  expect(await settledWithin(b.inbox.take(a.runId, a.digest, new AbortController().signal))).toEqual({ done: false });
+  expect((await settledWithin(b.inbox.take(a.runId, a.digest, new AbortController().signal))).done).toBe(false);
 });
 
 test("우편함: 연결이 끝나면 그 연결의 칸을 비우고 0으로 채우며, 그 연결에서 기다리던 take는 null이다", async () => {
@@ -146,12 +146,12 @@ test("우편함: 연결이 끝나면 그 연결의 칸을 비우고 0으로 채�
   b.inbox.dropEpoch(3);
   expect(zeroed(held.value)).toBe(true);
   b.epoch = 4;
-  expect(await settledWithin(b.inbox.take(held.runId, held.digest, new AbortController().signal))).toEqual({ done: false });
+  expect((await settledWithin(b.inbox.take(held.runId, held.digest, new AbortController().signal))).done).toBe(false);
 
   const c = box(7);
   const waiting = c.inbox.take(randomUUID(), sha256("y"), new AbortController().signal);
   c.inbox.dropEpoch(7);
-  expect(await waiting).toBeNull();
+  expect((await waiting) === null).toBe(true);
 });
 
 test("우편함: 실행을 잊으면 그 실행의 칸·내준 값을 0으로 채우고, 뒤에 온 그 실행의 값을 버린다", async () => {
@@ -172,12 +172,36 @@ test("우편함: 실행을 잊으면 그 실행의 칸·내준 값을 0으로 �
   expect(zeroed(got!)).toBe(true);
 });
 
+test("우편함: 주입받은 signal의 리스너 떼기가 던져도 forget은 던지지 않고 정리를 끝내며, 다음 실행의 take를 막지 않는다", async () => {
+  const b = box();
+  const used = credential(randomUUID());
+  b.inbox.offer(1, used);
+  const signal = new AbortController().signal;
+  signal.removeEventListener = () => {
+    throw new Error("리스너 떼기 실패");
+  };
+  const got = await b.inbox.take(used.runId, used.digest, signal);
+  expect(zeroed(got!)).toBe(false);
+  let threw = false;
+  try {
+    b.inbox.forget(used.runId);
+  } catch {
+    threw = true;
+  }
+  expect(threw).toBe(false);
+  expect(zeroed(got!)).toBe(true);
+  // 끝난 take의 기록이 치워져 다음 실행의 값을 내준다.
+  const next = credential(randomUUID());
+  b.inbox.offer(1, next);
+  expect(sumOf(await b.inbox.take(next.runId, next.digest, new AbortController().signal))).toBe(next.sum);
+});
+
 test("우편함: 기다리는 take가 있는데 또 부르면 뒤 take는 곧바로 null이고 앞 take는 그대로 기다린다", async () => {
   const b = box();
   const v = credential(randomUUID());
   const first = b.inbox.take(v.runId, v.digest, new AbortController().signal);
-  expect(await b.inbox.take(randomUUID(), sha256("z"), new AbortController().signal)).toBeNull();
-  expect(await b.inbox.take(v.runId, v.digest, new AbortController().signal)).toBeNull();
+  expect((await b.inbox.take(randomUUID(), sha256("z"), new AbortController().signal)) === null).toBe(true);
+  expect((await b.inbox.take(v.runId, v.digest, new AbortController().signal)) === null).toBe(true);
   expect(b.inbox.offer(1, v)).toBe("handed");
   expect(sumOf(await first)).toBe(v.sum);
 });

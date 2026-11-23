@@ -63,7 +63,7 @@ export interface CredentialSource {
   // signal이 중단되면 요청을 거둔다. 실행기는 중단 뒤 늦게 온 값을 쓰지 않는다.
   take(runId: string, digest: string, signal: AbortSignal): Promise<Uint8Array | null>;
   // 그 실행이 끝났다(띄웠든 아니든). 그 실행을 위해 쥔 값을 버리고 0으로 채운다. 실행기는 실행이 끝날 때마다 한 번 부른다.
-  // 선택인 까닭: 값을 쥐지 않는 구현(시험의 가짜 등)은 할 일이 없다.
+  // 선택인 까닭: 값을 쥐지 않는 구현은 할 일이 없다.
   forget?(runId: string): void;
 }
 
@@ -84,7 +84,9 @@ export function credentialText(value: Uint8Array): string | null {
   }
   if (text.length === 0 || hasNul(text)) return null;
   const back = new TextEncoder().encode(text);
-  return back.length === value.length && back.every((byte, i) => byte === value[i]) ? text : null;
+  const same = back.length === value.length && back.every((byte, i) => byte === value[i]);
+  back.fill(0);
+  return same ? text : null;
 }
 
 export interface LaunchPlan {

@@ -10,11 +10,11 @@ import type { Connection, Transport } from "../../src/executor/link.ts";
 import type { StoreIo } from "../../src/executor/store.ts";
 import { createExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
 import { startTlsServer, type TlsServer } from "../../src/supervisor/transport/tls-server.ts";
-import { createFrameDecoder, encodeCredentialFrame, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES } from "../../src/transport/framing.ts";
+import { createFrameDecoder, encodeCredentialFrame, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES, type MixedFrameDecoder } from "../../src/transport/framing.ts";
 import { createTlsClient, type TlsClient } from "../../src/transport/tls-client.ts";
 import type { RawTlsMaterial } from "../../src/transport/tls-policy.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
-import { barrier, fromSupervisor, gate, type Rig, rig, scriptedIo, sha256, syncReply } from "./support.ts";
+import { barrier, credentialValue, fromSupervisor, gate, type Rig, rig, scriptedIo, sha256, syncReply, taskStartBody } from "./support.ts";
 
 const HOST = "127.0.0.1";
 const pki = makePki();
@@ -86,6 +86,8 @@ class FakeTimer {
 // link를 감싸 연결마다 판단에 닿은 프레임을 적는다. hold가 있으면 그 연결의 receive를 거기서 붙든다.
 interface Opened {
   readonly connection: Connection;
+  // 소켓이 link.open에 넘긴 Wire. 디코더가 쥔 양을 시험이 직접 본다.
+  readonly transport: Transport;
   readonly seen: unknown[];
   hold: Promise<void> | undefined;
   // 참이면 그 연결의 receive가 던진다(처리의 실패).
@@ -93,14 +95,17 @@ interface Opened {
   inFlight: number;
   maxInFlight: number;
 }
+// fault.query가 있으면 그 조회(isCurrent 또는 epoch)가 던진다.
 function recordingLink(r: Rig) {
   const opened: Opened[] = [];
+  const fault: { query: "isCurrent" | "epoch" | null } = { query: null };
   return {
     opened,
+    fault,
     link: {
       open(transport: Transport): Connection {
         const connection = r.link.open(transport);
-        const entry: Opened = { connection, seen: [], hold: undefined, fail: false, inFlight: 0, maxInFlight: 0 };
+        const entry: Opened = { connection, transport, seen: [], hold: undefined, fail: false, inFlight: 0, maxInFlight: 0 };
         const receive = connection.receive.bind(connection);
         connection.receive = async (raw: unknown) => {
           entry.seen.push(raw);
@@ -116,8 +121,14 @@ function recordingLink(r: Rig) {
         opened.push(entry);
         return connection;
       },
-      isCurrent: (connection: Connection) => r.link.isCurrent(connection),
-      epoch: () => r.link.epoch(),
+      isCurrent: (connection: Connection) => {
+        if (fault.query === "isCurrent") throw new Error("조회 실패");
+        return r.link.isCurrent(connection);
+      },
+      epoch: () => {
+        if (fault.query === "epoch") throw new Error("조회 실패");
+        return r.link.epoch();
+      },
     },
   };
 }
@@ -132,6 +143,7 @@ interface Setup {
   socket: ReturnType<typeof made>;
   inbox: CredentialInbox;
   offered: Uint8Array[];
+  fault: ReturnType<typeof recordingLink>["fault"];
 }
 function made(result: ReturnType<typeof createExecutorSocket>) {
   if (!result.ok) throw new Error(result.reason);
@@ -178,7 +190,7 @@ async function setup(
     }),
   );
   cleanup.push(() => socket.stop());
-  return { r, peers, client, timer, events, opened: rec.opened, socket, inbox, offered };
+  return { r, peers, client, timer, events, opened: rec.opened, socket, inbox, offered, fault: rec.fault };
 }
 
 const kinds = (s: Setup) => s.events.map((e) => e.kind);
@@ -256,11 +268,11 @@ const zeroed = (value: Uint8Array) => value.every((byte) => byte === 0);
 // 소켓 안에서만 쥐다 버리는 값(우편함에 넘기지 않은 값)이 0으로 채워졌는지 본다. 그 길이의 배열에 0을 채우는 호출마다
 // 채우기 직전의 digest와 배열을 모은다. 길이를 다른 배열과 겹치지 않는 값으로 고른다.
 const WIPE_PROBE_BYTES = 777;
-function watchWipes(): { wiped: { sum: string; array: Uint8Array }[]; restore: () => void } {
+function watchWipes(length = WIPE_PROBE_BYTES): { wiped: { sum: string; array: Uint8Array }[]; restore: () => void } {
   const wiped: { sum: string; array: Uint8Array }[] = [];
   const original = Uint8Array.prototype.fill;
   Uint8Array.prototype.fill = function (this: Uint8Array, ...args: Parameters<typeof original>) {
-    if (this.length === WIPE_PROBE_BYTES && args[0] === 0 && args.length === 1) wiped.push({ sum: sha256(this), array: this });
+    if (this.length === length && args[0] === 0 && args.length === 1) wiped.push({ sum: sha256(this), array: this });
     return original.apply(this, args);
   } as typeof original;
   const restore = () => {
@@ -270,6 +282,21 @@ function watchWipes(): { wiped: { sum: string; array: Uint8Array }[]; restore: (
   return { wiped, restore };
 }
 const wipedValue = (wiped: { sum: string; array: Uint8Array }[], sum: string) => wiped.some((w) => w.sum === sum && zeroed(w.array));
+// 소켓이 받은 원시 조각을 시험도 쥔다. connect를 감싸 소켓보다 먼저 data 리스너를 달고 받은 조각의 참조를 모은다.
+function rawChunks(): { chunks: Uint8Array[]; bytes: () => number; wrap: (client: TlsClient) => Pick<TlsClient, "connect"> } {
+  const chunks: Uint8Array[] = [];
+  return {
+    chunks,
+    bytes: () => chunks.reduce((n, chunk) => n + chunk.length, 0),
+    wrap: (client) => ({
+      connect: async (signal) => {
+        const verified = await client.connect(signal);
+        verified.socket.on("data", (chunk: Uint8Array) => chunks.push(chunk));
+        return verified;
+      },
+    }),
+  };
+}
 
 test("자격 값: 감독이 encodeCredentialFrame으로 만든 틀이 맞춘 뒤 take로 나오고, 같은 조각의 봉투는 줄로 차례대로 가며 값은 link.receive에 닿지 않는다", async () => {
   const s = await setup();
@@ -348,7 +375,85 @@ test("자격 값: 연결이 끝나면 우편함의 칸이 비고 그 값은 0으
   peer.socket.destroy();
   await until(() => closedReasons(s).length === 1);
   expect(zeroed(s.offered[0]!)).toBe(true);
-  expect(await s.inbox.take(runId, sha256(value), new AbortController().signal)).toBeNull();
+  expect((await s.inbox.take(runId, sha256(value), new AbortController().signal)) === null).toBe(true);
+});
+
+test("자격 값: 정상 인계 뒤 소켓이 받은 원시 조각은 0이고, 작업자의 영수증·보고와 연결은 그대로다", async () => {
+  const raw = rawChunks();
+  const s = await setup({ wrap: raw.wrap });
+  // 작업자가 이 소켓의 우편함에서 값을 꺼낸다(진입점이 할 조립과 같다).
+  let taken = 0;
+  s.r.credentials.take = ((runId: string, digest: string, signal?: AbortSignal) => {
+    taken++;
+    return s.inbox.take(runId, digest, signal ?? new AbortController().signal);
+  }) as typeof s.r.credentials.take;
+  s.r.credentials.forget = (runId: string) => s.inbox.forget(runId);
+  s.socket.start();
+  const peer = await syncPeer(s, 0);
+  const runId = randomUUID();
+  const value = credentialValue();
+  const body = taskStartBody(s.r, runId, sha256(value));
+  peer.socket.write(frame(fromSupervisor(s.r.clock, s.r.worker.name, "task_start", body, { stop_generation: 0, run_generation: 1 })));
+  await until(() => actionsOf(peer).includes("receipt_accepted") && taken === 1);
+  const before = raw.bytes();
+  const sent = credentialFrame(runId, value);
+  peer.socket.write(sent);
+  await until(() => actionsOf(peer).includes("report_result"));
+  await s.r.worker.idle();
+  expect(s.r.launcher.spawned).toBe(1);
+  expect((["receipt_accepted", "receipt_started", "report_result"] as const).map((a) => actionsOf(peer).includes(a))).toEqual([true, true, true]);
+  // 값 틀이 지난 조각까지 소켓이 받은 모든 원시 조각이 0이다. 우편함에 넘긴 배열은 작업자가 0으로 채웠다.
+  expect(raw.bytes() - before).toBeGreaterThanOrEqual(sent.length);
+  expect(raw.chunks.every(zeroed)).toBe(true);
+  expect(s.offered.map(zeroed)).toEqual([true]);
+  expect(closedReasons(s)).toEqual([]);
+  expect(s.r.link.live()).toBe(true);
+});
+
+test("자격 값: 값 틀을 반쯤 받은 채 멈추면 디코더가 조립 중이던 값을 0으로 채우고 놓으며, 닫힘 이유는 stopped다", async () => {
+  const raw = rawChunks();
+  const s = await setup({ wrap: raw.wrap });
+  s.socket.start();
+  const peer = await syncPeer(s, 0);
+  const value = randomBytes(64);
+  const sent = credentialFrame(randomUUID(), value);
+  // 접두 4 + 실행 ID·지문 100 + 값의 앞 32바이트.
+  const part = sent.subarray(0, 4 + 100 + 32);
+  const before = raw.bytes();
+  peer.socket.write(part);
+  await until(() => raw.bytes() - before >= part.length);
+  const decoder = (s.opened[0]!.transport as unknown as { decoder: MixedFrameDecoder }).decoder;
+  // 겨냥한 상태: 디코더가 접두·실행 ID·지문 칸과 값 배열 전체를 쥐었다.
+  expect(decoder.heldBytes()).toBe(4 + 100 + 64);
+  const probe = watchWipes(64);
+  await s.socket.stop();
+  probe.restore();
+  expect(closedReasons(s)).toEqual(["stopped"]);
+  expect(decoder.heldBytes()).toBeLessThanOrEqual(4);
+  // 0으로 채운 배열은 값의 앞 32바이트를 받은 바로 그 배열이다.
+  expect(wipedValue(probe.wiped, sha256(concat(value.subarray(0, 32), new Uint8Array(32))))).toBe(true);
+  expect(s.offered).toHaveLength(0);
+  expect(raw.chunks.every(zeroed)).toBe(true);
+});
+
+test("자격 값: 주입한 link의 조회가 던지면 그 값과 같은 조각의 뒤 값을 0으로 채우고 credential_not_synced로 그 연결을 닫는다", async () => {
+  for (const query of ["isCurrent", "epoch"] as const) {
+    const s = await setup();
+    s.socket.start();
+    const peer = await syncPeer(s, 0);
+    // 맞춤 처리 뒤의 조회(received)가 끝난 다음에 던지게 한다.
+    await until(() => kinds(s).includes("synced"));
+    const values = [randomBytes(WIPE_PROBE_BYTES), randomBytes(WIPE_PROBE_BYTES)];
+    const probe = watchWipes();
+    s.fault.query = query;
+    peer.socket.write(concat(...values.map((v) => credentialFrame(randomUUID(), v))));
+    await until(() => closedReasons(s).length === 1);
+    probe.restore();
+    s.fault.query = null;
+    expect(closedReasons(s)).toEqual(["credential_not_synced"]);
+    expect(s.offered).toHaveLength(0);
+    expect(values.map((v) => wipedValue(probe.wiped, sha256(v)))).toEqual([true, true]);
+  }
 });
 
 test("새 연결: 앞 연결이 끝나면 그 대기값과 남은 프레임을 버리고, 늦게 끝난 처리는 새 연결의 맞춤이 되지 않는다", async () => {
