@@ -440,7 +440,8 @@ interface Seen {
 // 감독 쪽 틀 인코딩까지 실제로 지나는 대역. 실행기가 보낸 봉투를 풀어 모은다.
 function wired(marker: string) {
   const h = harness({ marker });
-  const wire = Object.assign(new EventEmitter(), { destroyed: false, write: (_bytes: Uint8Array) => true, destroy: () => {} });
+  // 실행기 소켓은 붙은 소켓에 keepalive를 켜지 못하면 link에 열지 않는다(src/transport/keepalive.ts).
+  const wire = Object.assign(new EventEmitter(), { destroyed: false, write: (_bytes: Uint8Array) => true, destroy: () => {}, setKeepAlive: () => undefined });
   const got: Seen[] = [];
   const decoder = createFrameDecoder();
   const closed = new Promise<void>((resolve) => wire.once("close", resolve));

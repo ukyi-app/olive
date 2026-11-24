@@ -43,7 +43,7 @@ ExecutorSocket = {
 |---|---|
 | `connecting` + `attempt` | 붙기를 시작했다. `attempt`는 1부터 붙기마다 하나씩 는다 |
 | `connected` + `attempt` | 감독 인증서를 확인한 연결을 받아 `link.open`에 넘긴다. 감독이 이 실행기를 받아들였다는 뜻은 아니다(`tls-client.ts` 머리말) |
-| `connect_failed` + `attempt`, `reason` | `TlsConnectError`의 `kind`(`no_material`·`peer_rejected`·`tls_error`·`aborted`) 또는 `threw`. 돌려받은 소켓이 이미 끊겼으면 `tls_error`다 |
+| `connect_failed` + `attempt`, `reason` | `TlsConnectError`의 `kind`(`no_material`·`peer_rejected`·`tls_error`·`aborted`) 또는 `threw`. 돌려받은 소켓이 이미 끊겼으면 `tls_error`, 그 소켓에 keepalive를 켜지 못했으면 `keepalive_failed`다(아래 "반쯤 열린 연결") |
 | `synced` + `attempt` | 그 연결의 맞춤이 끝났다(`link`의 `Connection.state === "synced"`). 다음 다시 붙기의 기준값은 처음 간격이다 |
 | `closed` + `attempt`, `reason` | 그 연결이 끝났다. 아래 표 |
 | `retry_scheduled` + `delayMs` | 다시 붙기를 걸었다 |
@@ -123,9 +123,17 @@ ExecutorSocket = {
 - **기다리는 challenge를 버리는 때 셋:** (1) 25초 기한은 `link.ts`(`tick`과 받는 순간의 `expireIfDue`)의 몫이고 `tick`을 주기로 부르는 것은 진입점의 몫이다(아래 "뒤 조각이 지켜야 할 것"). (2) 연결이 끝남은 **이 소켓의 몫이다**: 소켓의 끝을 그 순간 `Connection.close()`로 알린다. (3) 맞춤 성공은 `link.ts`의 몫이다.
 - **새 정지 세대 적용(원자적, 단조 증가 재확인):** `worker.ts`(`adopt`·`syncTo`)와 `store.ts`(`adoptStopGeneration`)의 몫이다. 이 소켓은 받은 프레임을 겹치지 않고 받은 차례로 넘길 뿐, 세대를 읽거나 적지 않는다.
 
+## 반쯤 열린 연결 (TCP keepalive)
+
+감독이 FIN·RST 없이 사라지면 소켓은 끝을 알리지 않는다. 이 소켓은 붙은 소켓을 `link.open`에 넘기기 전에 `src/transport/keepalive.ts`의 `enableKeepAlive`로 TCP keepalive를 켜서, 운영체제가 그런 연결을 끊게 한다. 계약 v1 메시지는 바꾸지 않는다. 값(`KEEPALIVE_INITIAL_DELAY_MS`, 30,000ms)은 감독 서버와 같은 한 자리이고 **T1 실측 뒤 조정한다.**
+
+- **켜지 못하면 열지 않는다.** `setKeepAlive`의 읽기나 호출이 던지면 소켓을 닫고 `connect_failed`(`keepalive_failed`)를 알리고 실패로 세어 간격을 두고 다시 붙는다. 이 확인은 멈춤·다른 붙기로 넘어감의 확인 뒤, `destroyed` 확인 앞이다.
+- **끊긴 뒤는 기존 닫힘 길이다.** 운영체제가 소켓을 오류(`ETIMEDOUT`)로 끝내면 `closed`(`socket_error`)이고 `Connection.close()` 뒤 간격을 두고 다시 붙는다.
+- **끊기까지의 시간과 한계는 감독 쪽과 같다**(`src/supervisor/transport/server.md` "반쯤 열린 연결"): 첫 탐침 지연 + 운영체제의 탐침 간격 × 수(Linux 기본 75초 × 9), 보내고 답을 못 받은 바이트가 있으면 재전송 시간 초과가 끊고, 감독 프로세스가 멈췄어도 그 노드의 커널이 답하면 끊지 않는다.
+
 ## 남는 한계
 
-- **반쯤 열린 연결은 알아채지 못한다.** 상대가 사라졌는데 소켓이 끝을 알리지 않으면 그 연결은 열린 채 남는다. 맞춤 전이면 `link.tick`의 맞춤 기한이 닫지만, 맞춘 뒤의 조용한 연결을 닫는 방법(keepalive, 받음 기한)과 시간은 정하지 않았다.
+- **반쯤 열린 연결은 운영체제 기한 뒤에야 닫힌다.** 위 TCP keepalive의 시간 동안 그 연결은 열린 채 남는다. 맞춤 전이면 `link.tick`의 맞춤 기한이 먼저 닫는다. 계약 메시지나 받은 바이트로 재는 받음 기한은 두지 않았다.
 - **처리가 멈추면 그 연결의 뒤 프레임은 넘기지 않는다.** 상대의 끝은 알아채고, 상대가 더 보내 줄이 상한을 넘으면 닫는다. 하지만 상대가 연결을 연 채 더 보내지 않으면 멈춘 처리에는 기한이 없다. 세대 저장의 멈춤만 `link`의 상한이 닫는다. 끝을 알아챈 뒤에도 멈춘 `receive`의 약속은 남아 그 연결의 객체를 쥐고 있다.
 - **앞 연결이 공유 저장소를 계속 쥐고 있으면 새 연결도 맞춤을 끝내지 못한다.** 저장소의 nonce 기록은 연결과 무관하게 한 줄로 직렬된다(`store.ts`). 앞 연결의 처리가 그 기록에서 멈춘 채 풀리지 않으면, 새 연결은 맞춤 요청을 보낼 수 있고 감독이 곧바로 답해도 그 답의 nonce 기록이 앞 것 뒤에서 기다려 맞춤을 끝내지 못한다. 결국 `link`의 25초 맞춤 기한(`link.tick`)에 `link_closed`로 닫히고 `hello`는 오지 않는다. 이 소켓은 그 멈춤을 풀거나 거둘 수 없다.
 - **쓰기 버퍼에 상한이 없다.** 상대가 읽지 않으면 실은 바이트가 메모리에 쌓인다. 실행기가 내는 양은 영수증·보고·답으로 묶이지만 바이트 상한은 두지 않았다.
@@ -135,7 +143,7 @@ ExecutorSocket = {
 
 ## 이 PR에 없는 것
 
-실행기 진입점과 기동 순서(저장소 열기 → 프로필·키 → 기동 대조 → `recover` → 연결), 감독이 자격 값을 보내는 일, 인증서 재료가 바뀐 뒤의 재인증과 `peerNotAfter` 전 재연결, 감독 쪽 서버 조립, `link.tick`·`worker.tick`을 주기로 부르는 일, 반쯤 열린 연결의 감지, 쓰기 버퍼의 상한, 간격과 받아 둘 양의 운영 값.
+실행기 진입점과 기동 순서(저장소 열기 → 프로필·키 → 기동 대조 → `recover` → 연결), 감독이 자격 값을 보내는 일, 인증서 재료가 바뀐 뒤의 재인증과 `peerNotAfter` 전 재연결, 감독 쪽 서버 조립, `link.tick`·`worker.tick`을 주기로 부르는 일, 쓰기 버퍼의 상한, 간격과 받아 둘 양의 운영 값.
 
 ## 뒤 조각이 지켜야 할 것
 

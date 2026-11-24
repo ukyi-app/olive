@@ -11,9 +11,11 @@ import type { StoreIo } from "../../src/executor/store.ts";
 import { createExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
 import { startTlsServer, type TlsServer } from "../../src/supervisor/transport/tls-server.ts";
 import { createFrameDecoder, encodeCredentialFrame, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES, type MixedFrameDecoder } from "../../src/transport/framing.ts";
+import { KEEPALIVE_INITIAL_DELAY_MS } from "../../src/transport/keepalive.ts";
 import { createTlsClient, type TlsClient } from "../../src/transport/tls-client.ts";
 import type { RawTlsMaterial } from "../../src/transport/tls-policy.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
+import { tcpTimer } from "../transport/tcp-timers.ts";
 import { barrier, credentialValue, fromSupervisor, gate, type Rig, rig, scriptedIo, sha256, syncReply, taskStartBody } from "./support.ts";
 
 const HOST = "127.0.0.1";
@@ -883,4 +885,78 @@ test("정책: 간격의 숫자가 범위 밖이면 소켓을 만들지 않고 �
     expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy: POLICY, receive, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(receive)).toEqual({ ok: false, reason: "policy_rejected" });
   }
   expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy: POLICY, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }).ok).toBe(true);
+});
+
+// 감독 흉내(tls-server.ts)는 keepalive를 켜지 않는다. 켜는 것은 실행기 소켓의 connected뿐이다.
+function capturing(sockets: tls.TLSSocket[], before?: (socket: tls.TLSSocket) => void) {
+  return (client: TlsClient): Pick<TlsClient, "connect"> => ({
+    connect: async (signal) => {
+      const verified = await client.connect(signal);
+      sockets.push(verified.socket);
+      before?.(verified.socket);
+      return verified;
+    },
+  });
+}
+
+test("keepalive: 붙은 소켓에 커널 keepalive 타이머가 걸리고 첫 탐침까지 KEEPALIVE_INITIAL_DELAY_MS 이하다. 감독 쪽 소켓에는 없다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw) });
+  s.socket.start();
+  await until(() => s.opened.length === 1 && s.peers.length === 1);
+  const own = raw[0]!;
+  await until(() => tcpTimer(own.localPort!, own.remotePort!).kind === 2);
+  const timer = tcpTimer(own.localPort!, own.remotePort!);
+  expect(timer.remainingMs).toBeLessThanOrEqual(KEEPALIVE_INITIAL_DELAY_MS);
+  expect(timer.remainingMs).toBeGreaterThan(KEEPALIVE_INITIAL_DELAY_MS - 10_000);
+  const peer = s.peers[0]!.socket;
+  expect(tcpTimer(peer.localPort!, peer.remotePort!).kind).toBe(0);
+});
+
+test("keepalive: 켜지 못하면(호출이 던짐, 메서드 읽기가 던짐) link에 열지 않고 닫은 뒤 실패로 세어 간격을 두고 다시 붙는다", async () => {
+  const faults: ((socket: tls.TLSSocket) => void)[] = [
+    (socket) => {
+      socket.setKeepAlive = () => {
+        throw new Error("시험: setsockopt 실패");
+      };
+    },
+    (socket) =>
+      Object.defineProperty(socket, "setKeepAlive", {
+        configurable: true,
+        get() {
+          throw new Error("시험: 메서드 읽기 실패");
+        },
+      }),
+  ];
+  for (const fault of faults) {
+    const raw: tls.TLSSocket[] = [];
+    const s = await setup({ wrap: capturing(raw, fault) });
+    s.socket.start();
+    await until(() => s.timer.waits.length === 1);
+    expect(s.opened).toHaveLength(0);
+    expect(s.events.filter((e) => e.kind !== "connecting")).toEqual([
+      { kind: "connect_failed", attempt: 1, reason: "keepalive_failed" },
+      { kind: "retry_scheduled", delayMs: 100 },
+    ]);
+    expect(raw[0]!.destroyed).toBe(true);
+    await until(() => s.client.openConnections() === 0);
+    // 감독이 받기 전에 끊겨 감독 쪽 연결이 생기지 않을 수도 있다. 생겼어도 받은 틀은 없다(맞춤 요청을 싣지 않았다).
+    expect(s.peers.flatMap((p) => p.got)).toEqual([]);
+  }
+});
+
+test("keepalive: 커널이 조용한 감독을 끊으면(keepalive 만료의 ETIMEDOUT 흉내) 그 연결을 닫고 간격을 두고 다시 붙는다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw) });
+  s.socket.start();
+  await syncPeer(s, 0);
+  // keepalive 탐침이 모두 답을 못 받으면 운영체제가 소켓을 ETIMEDOUT으로 끝낸다. 런타임은 그것을 error 뒤 close로 알린다.
+  raw[0]!.destroy(Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }));
+  await until(() => s.timer.waits.length === 1);
+  expect(closedReasons(s)).toEqual(["socket_error"]);
+  expect(s.opened[0]!.connection.state).toBe("closed");
+  expect(s.timer.waits.map((w) => w.ms)).toEqual([100]);
+  s.timer.waits[0]!.fire();
+  await syncPeer(s, 1);
+  expect(s.opened).toHaveLength(2);
 });

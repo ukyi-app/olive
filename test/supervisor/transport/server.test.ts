@@ -18,9 +18,11 @@ import {
   type WriteFrameResult,
 } from "../../../src/supervisor/transport/server.ts";
 import { createFrameDecoder, encodeFrame } from "../../../src/transport/framing.ts";
+import { KEEPALIVE_INITIAL_DELAY_MS } from "../../../src/transport/keepalive.ts";
 import type { RawTlsMaterial } from "../../../src/transport/tls-policy.ts";
 import { createTlsClient } from "../../../src/transport/tls-client.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../../transport/certs.ts";
+import { tcpTimer } from "../../transport/tcp-timers.ts";
 
 const HOST = "127.0.0.1";
 const ANSWER = limits.STOP_SYNC_ANSWER_MAX_MS;
@@ -1879,5 +1881,78 @@ describe("(5) 인정된 연결에 틀 하나를 쓴다(recognized, writeFrame)",
     await Bun.sleep(20);
     expect([ca.ends, cb.ends, cc.ends]).toEqual([["failed"], ["flushed"], ["failed"]]);
     expect(rawA()).toEqual(new Uint8Array(0));
+  });
+});
+
+describe("(6) 반쯤 열린 연결: 서버 쪽 소켓의 TCP keepalive", () => {
+  // 실행기 쪽 흉내(tls-client.ts)는 keepalive를 켜지 않는다. 켜는 것은 서버의 admit뿐이다.
+  test("판단에 연 연결의 서버 쪽 소켓에 커널 keepalive 타이머가 걸리고, 첫 탐침까지 KEEPALIVE_INITIAL_DELAY_MS 이하다. 상대 쪽 소켓에는 없다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    const server = serverSocket(h, a);
+    await until(() => tcpTimer(server.localPort!, server.remotePort!).kind === 2);
+    const timer = tcpTimer(server.localPort!, server.remotePort!);
+    expect(timer.remainingMs).toBeLessThanOrEqual(KEEPALIVE_INITIAL_DELAY_MS);
+    expect(timer.remainingMs).toBeGreaterThan(KEEPALIVE_INITIAL_DELAY_MS - 10_000);
+    // 상대 쪽은 keepalive가 아니다(보낼 것이 남았으면 재전송 타이머 1, 없으면 0).
+    expect(tcpTimer(a.socket.localPort!, a.socket.remotePort!).kind).not.toBe(2);
+  });
+
+  test("keepalive를 켜지 못하면(호출이 던짐, 메서드 읽기가 던짐) 판단에 열지 않고 닫는다. 이미 연 연결은 그대로다", async () => {
+    const h = await start();
+    const first = await connect(h);
+    // 서버 쪽 소켓의 setKeepAlive를 가진 원형을 찾아 바꾼다(런타임의 클래스 이름에 기대지 않는다).
+    let owner: object | null = serverSocket(h, first);
+    while (owner !== null && !Object.hasOwn(owner, "setKeepAlive")) owner = Object.getPrototypeOf(owner) as object | null;
+    if (owner === null) throw new Error("시험: setKeepAlive가 없다");
+    const original = Object.getOwnPropertyDescriptor(owner, "setKeepAlive")!;
+    const target = owner;
+    cleanup.push(() => Object.defineProperty(target, "setKeepAlive", original));
+    const faults: PropertyDescriptor[] = [
+      {
+        configurable: true,
+        value: () => {
+          throw new Error("시험: setsockopt 실패");
+        },
+      },
+      {
+        configurable: true,
+        get() {
+          throw new Error("시험: 메서드 읽기 실패");
+        },
+      },
+    ];
+    for (const [i, fault] of faults.entries()) {
+      Object.defineProperty(target, "setKeepAlive", fault);
+      const client = createTlsClient({ address: HOST, port: h.server.port, supervisorDnsName: SUPERVISOR_DNS, supervisorUri: SUPERVISOR_URI, material: material(pki.executor()), now: Date.now });
+      cleanup.push(() => client.close());
+      // TLS 1.3에서는 클라이언트의 핸드셰이크가 먼저 끝나므로 붙은 뒤에 끊기는 것이 보통이다. 끊김이 먼저 오면 붙기가 실패한다.
+      const conn = await client.connect().catch(() => null);
+      await until(() => h.notes.filter((n) => n.kind === "keepalive_failed").length === i + 1);
+      if (conn !== null) {
+        conn.socket.on("error", () => {});
+        await until(() => conn.socket.destroyed);
+      }
+    }
+    Object.defineProperty(target, "setKeepAlive", original);
+    expect(h.notes.filter((n) => n.kind === "opened")).toEqual([{ kind: "opened", connection: first.id }]);
+    expect(h.server.table().get(first.id + 1)).toBeUndefined();
+    expect(first.closed()).toBe(false);
+  });
+
+  test("커널이 조용한 상대를 끊으면(keepalive 만료의 ETIMEDOUT 흉내) 인정된 연결이 닫혀 연결 상실 박자가 읽는 occupancy에서 빠진다", async () => {
+    const h = await start();
+    const a = await greet(h, K1, R1);
+    const b = await greet(h, K2, R2);
+    expect(h.server.recognized(R1)).toBe(a.id);
+    expect(h.server.table().occupancy(h.restorer).map((o) => o.executorId).sort()).toEqual([R1, R2]);
+    // keepalive 탐침이 모두 답을 못 받으면 운영체제가 소켓을 ETIMEDOUT으로 끝낸다. 런타임은 그것을 error 뒤 close로 알린다.
+    serverSocket(h, a).destroy(Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }));
+    await until(() => h.closedNotes(a.id).length === 1);
+    expect(h.closedNotes(a.id)).toEqual([{ kind: "closed", connection: a.id, cause: "peer" }]);
+    expect(h.server.recognized(R1)).toBeNull();
+    expect(h.server.table().occupancy(h.restorer).map((o) => o.executorId)).toEqual([R2]);
+    expect(h.delivered.filter((o) => o.kind === "withdrawn")).toEqual([{ kind: "withdrawn", connection: a.id, principal: R1 }]);
+    expect(b.closed()).toBe(false);
   });
 });
