@@ -11,6 +11,9 @@
 //    처리기를 한 번 부를 때마다 다시 본다(앞 처리의 기록이나 장부 쓰기가 같은 동기 구간에서 그 신호를 바꿀 수 있다).
 // 3. 연결 대조는 소비하는 순간에 한다: 상태 보고는 처리기의 links(내보내기 포트의 answers.current), 인사는 그때의 연결 표로.
 //    조회 대조는 받은 때 등록돼 있던 항목만으로 하고, 대조에 성공한 답 하나가 항목 하나만 끝낸다(같은 조회를 두 번 실으면 항목도 둘이다).
+//    받은 때 등록부를 읽지 못한 답은 어느 항목과도 대조하지 않고 그 실행을 다시 묻는다.
+//    처리기가 쓸 항목은 답을 줄에서 빼는 순간 사용 중으로 두어, 처리 도중 들어온 철회가 그 항목을 줄에 남은 다른 답에 주지 않는다.
+//    철회된 연결은 줄에 선 그 연결의 답이 다 처리될 때까지 정리할 목록에 남아, 답이 쓰지 않은 항목을 끝낸다.
 // 4. deliver는 던지지 않는다. 처리기와 장부를 부르는 흐름에 기다림이 없다(모두 한 동기 구간).
 // 5. 맡기지 않을 실행기 집합은 인사가 줄에 들어온 때부터 그 실행기의 현재 연결 인사가 반영될 때까지 그 실행기를 싣는다.
 //    반영한 뒤 연결 확인이 한 번 실패하면 반영한 연결 번호를 쥐고 다음 처리에서 해제 조건만 다시 본다(인사를 다시 넘기지 않는다).
@@ -91,7 +94,7 @@ type StatusItem = {
   readonly kind: "status";
   readonly forward: Extract<Delivered, { kind: "forward" }>;
   // 받은 때 등록돼 있던 같은 요청 ID의 항목(등록부가 쥔 그 객체). 받은 뒤 더한 항목은 이 답의 조회가 아니다: 같은 키로 나중에 실은
-  // 조회와 맞추면 그 조회의 진짜 답이 unknown_query로 버려진다. 받은 때 등록부를 읽지 못했으면 null(넘길 때의 항목으로 대조한다).
+  // 조회와 맞추면 그 조회의 진짜 답이 unknown_query로 버려진다. 받은 때 등록부를 읽지 못했으면 null이고 어느 항목과도 대조하지 않는다.
   readonly asked: readonly SentQuery[] | null;
 };
 
@@ -138,6 +141,18 @@ function inReplyTo(forward: Extract<Delivered, { kind: "forward" }>): string {
   }
 }
 
+// 상태 보고가 실은 실행 ID. 꼴이 틀린 항목은 건너뛴다.
+function runIdsOf(forward: Extract<Delivered, { kind: "forward" }>): string[] {
+  try {
+    const verified: unknown = forward.verified;
+    const body = isRecord(verified) ? verified.body : undefined;
+    const runs = isRecord(body) ? body.runs : undefined;
+    return Array.isArray(runs) ? runs.flatMap((run: unknown) => (isRecord(run) && isText(run.run_id) ? [run.run_id] : [])) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
   const lines = new Map<string, Line>();
   const requery = new Set<string>();
@@ -145,6 +160,10 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
   const dirty = new Set<string>();
   // 대조에 성공한 답이 쓴 등록 항목 중 등록부의 settle이 던져 아직 끝내지 못한 것. 처리마다 다시 끝내 보고, 그동안 어느 답과도 대조하지 않는다.
   const unsettled = new Set<SentQuery>();
+  // 줄에서 뺀 답을 처리기에 넘기는 동안 그 답이 쓸 항목. 그 사이(장부 쓰기 안) 들어온 철회는 이 항목을 남기고 줄에 남은 답에 주지 않는다.
+  const claimed = new Set<SentQuery>();
+  // 철회됐지만 등록 정리를 마치지 못한 연결. 줄에 선 그 연결의 답이 쓸 항목을 남겼거나 정리 중 등록부가 던졌다.
+  const withdrawnLinks = new Set<number>();
   let draining = false;
   let faulted = false;
 
@@ -252,11 +271,45 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     }
   };
 
-  // 지금 등록부의 항목 중 이 답과 대조할 것: 받은 때 있던 항목이고 아직 끝내지 않은 것. 등록부가 던지면 그대로 던진다(줄은 바꾸기 전이다).
+  // 지금 등록부의 항목 중 이 답과 대조할 것: 받은 때 있던 항목이고 아직 끝내지 않았고 처리 중인 답이 쓰지 않는 것. 받은 때 등록부를
+  // 읽지 못한 답은 어느 항목과도 대조하지 않는다(받은 뒤 같은 키로 등록한 조회를 끝낼 수 있다). 등록부가 던지면 그대로 던진다(줄은 바꾸기 전이다).
   const askedNow = (item: StatusItem): SentQuery[] => {
+    if (item.asked === null) return [];
     const wanted = inReplyTo(item.forward);
-    const known = item.asked === null ? null : new Set(item.asked);
-    return ports.queries.pending().filter((entry) => isRecord(entry) && entry.requestId === wanted && !unsettled.has(entry) && (known === null || known.has(entry)));
+    const known = new Set(item.asked);
+    return ports.queries.pending().filter((entry) => isRecord(entry) && entry.requestId === wanted && known.has(entry) && !unsettled.has(entry) && !claimed.has(entry));
+  };
+
+  // 철회된 연결의 항목 중 남길 것은 처리 중인 답이 쓰는 항목과, 철회 전에 받아 줄에 선 그 연결의 답마다 그 답이 쓸 항목 하나(받은 차례로
+  // 앞 항목부터)다. 나머지를 끝낸다. 남길 것이 없으면 그 연결의 정리를 마친다. 등록부가 던지면 그대로 던진다(연결은 정리할 목록에 남는다).
+  const reclaim = (connection: number): void => {
+    const live = ports.queries.pending();
+    const keep = new Set<SentQuery>();
+    for (const entry of claimed) if (entry.connection === connection) keep.add(entry);
+    for (const line of lines.values()) {
+      for (const item of line.items) {
+        if (item.kind !== "status" || item.asked === null || item.forward.connection !== connection) continue;
+        const wanted = inReplyTo(item.forward);
+        const known = new Set(item.asked);
+        const entry = live.find(
+          (query) =>
+            isRecord(query) && query.requestId === wanted && query.connection === connection && known.has(query) && !keep.has(query) && !unsettled.has(query) && !claimed.has(query),
+        );
+        if (entry !== undefined) keep.add(entry);
+      }
+    }
+    ports.queries.dropConnection(connection, keep);
+    if (keep.size === 0) withdrawnLinks.delete(connection);
+  };
+
+  const tryReclaim = (connection: number): void => {
+    try {
+      reclaim(connection);
+    } catch {
+      // 연결은 정리할 목록에 남아 다음 pump에서 다시 정리한다.
+      faulted = true;
+      note({ kind: "fault", where: "drain" });
+    }
   };
 
   // 인사가 반영됐을 때 그 연결이 지금 그 실행기의 인정된 연결이고 붙든 인사가 더 없으면 맡기지 않음을 내린다. 확인이 실패하거나 거짓이면
@@ -342,12 +395,28 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       }
       // 등록부를 줄에서 빼기 전에 읽는다: 읽기가 던지면 답은 줄 맨 앞에 남는다.
       const asked = askedNow(head);
-      line.items.shift();
       const forward = head.forward;
-      const outcome = handleForward(
-        { forward, now, stopGeneration: stopGeneration(), pendingQueries: asked, links: ports.wire.answers, backlog: line.backlog },
-        { ledger: ports.ledger, random: ports.random, results: ports.results },
-      );
+      // 처리기가 고를 항목(답이 온 연결의 첫 항목)을 줄에서 빼는 그 순간 사용 중으로 둔다. 서버는 철회를 동기로 넘기므로 처리기의 장부
+      // 쓰기 중에도 철회가 들어올 수 있고, 그때 이 항목이 줄에 남은 같은 조회의 답에 남겨지면 이 답이 그 항목을 끝내 뒤 답의 근거가 사라진다.
+      const entry = asked.find((query) => query.connection === forward.connection);
+      line.items.shift();
+      if (entry !== undefined) claimed.add(entry);
+      let outcome: ReceiptOutcome;
+      try {
+        outcome = handleForward(
+          { forward, now, stopGeneration: stopGeneration(), pendingQueries: asked, links: ports.wire.answers, backlog: line.backlog },
+          { ledger: ports.ledger, random: ports.random, results: ports.results },
+        );
+      } finally {
+        if (entry !== undefined) claimed.delete(entry);
+      }
+      // 대조에 성공한 답(matched·not_current)만 그 항목 하나를 끝낸다. 처리기는 답이 온 연결의 첫 항목과 맞추므로 같은 항목이다. 기록보다
+      // 먼저 끝낼 항목으로 옮긴다: 기록 중 들어온 철회도 이 항목을 남은 답에 주지 않는다.
+      // 맞지 않은 답(unknown_query·runs_mismatch 등)은 항목을 남긴다: 같은 조회의 올바른 답이 뒤에 올 수 있다.
+      const matched = outcome.outcome === "status_matched" || outcome.outcome === "status_not_current";
+      if (matched && entry !== undefined) unsettled.add(entry);
+      // 받은 때 등록을 입증하지 못한 답은 대조하지 않았으므로 그 관측을 같은 실행 ID로 다시 묻는다.
+      if (head.asked === null) for (const runId of runIdsOf(forward)) requery.add(runId);
       // 줄의 상태를 먼저 옮긴다. 기록이나 등록 마감이 던져도 반영한 사본을 다시 넘기거나 받은 답을 잃지 않는다.
       if (outcome.outcome === "status_matched") {
         takeSettlements(outcome.settled);
@@ -358,13 +427,9 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         if (outcome.answer.runs.some(isPositive)) line.backlog = Object.freeze([...line.backlog, keepCopy(outcome.answer)]);
       }
       note({ kind: "status", executor: executorId, connection: forward.connection, outcome });
-      // 대조에 성공한 답(matched·not_current)만 그 항목 하나를 끝낸다. 처리기는 답이 온 연결의 첫 항목과 맞추므로 같은 항목을 고른다.
-      // 맞지 않은 답(unknown_query·runs_mismatch 등)은 항목을 남긴다: 같은 조회의 올바른 답이 뒤에 올 수 있다.
-      if (outcome.outcome === "status_matched" || outcome.outcome === "status_not_current") {
-        const entry = asked.find((query) => query.connection === forward.connection);
-        if (entry !== undefined) unsettled.add(entry);
-        settleQueries();
-      }
+      if (matched) settleQueries();
+      // 철회된 연결의 답이면 그 답이 쓰지 않은 항목(맞지 않은 답이 남긴 것 등)을 줄에 남은 답이 더 쓰지 않을 때 끝낸다.
+      if (withdrawnLinks.has(forward.connection)) tryReclaim(forward.connection);
     }
   };
 
@@ -395,8 +460,8 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     }
   };
 
-  // 받은 때 등록돼 있던 같은 요청 ID의 항목. 읽지 못하면 답은 버리지 않고 null로 줄에 세우되, 줄의 상태를 다 안다고 하지 않는다
-  // (그 답은 넘길 때의 항목으로 대조하므로 받은 뒤 더한 항목과 맞을 수 있다).
+  // 받은 때 등록돼 있던 같은 요청 ID의 항목. 읽지 못하면 답은 버리지 않고 null로 줄에 세운다(차례를 지키고, 넘길 때 대조 없이
+  // unknown_query로 끝내 그 실행을 다시 묻는다). 뜻밖의 예외라 줄의 상태를 다 안다고 하지 않는다.
   const askedAt = (forward: Extract<Delivered, { kind: "forward" }>): readonly SentQuery[] | null => {
     const wanted = inReplyTo(forward);
     try {
@@ -417,21 +482,9 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       }
       case "withdrawn": {
         // 철회 전에 받아 줄에 선 그 연결의 답이 쓸 항목은 남긴다. 지우면 받을 때 유효했던 답이 unknown_query로 버려져
-        // 그 답의 "안다"는 관측이 밀린 목록에도 남지 않는다. 답 하나에 항목 하나를 받은 차례로 맞춘다(넘길 때도 앞 항목부터 쓴다).
-        const live = ports.queries.pending();
-        const keep = new Set<SentQuery>();
-        for (const line of lines.values()) {
-          for (const item of line.items) {
-            if (item.kind !== "status" || item.forward.connection !== output.connection) continue;
-            const wanted = inReplyTo(item.forward);
-            const known = item.asked === null ? null : new Set(item.asked);
-            const entry = live.find(
-              (query) => query.requestId === wanted && query.connection === output.connection && !keep.has(query) && !unsettled.has(query) && (known === null || known.has(query)),
-            );
-            if (entry !== undefined) keep.add(entry);
-          }
-        }
-        ports.queries.dropConnection(output.connection, keep);
+        // 그 답의 "안다"는 관측이 밀린 목록에도 남지 않는다. 등록부를 읽기 전에 연결부터 적는다: 정리가 던져도 다음 pump에서 다시 한다.
+        withdrawnLinks.add(output.connection);
+        reclaim(output.connection);
         return null;
       }
       case "occupancy": {
@@ -471,6 +524,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     pump(): void {
       try {
         settleQueries();
+        for (const connection of [...withdrawnLinks]) tryReclaim(connection);
         drain([...lines.keys()]);
       } catch {
         faulted = true;

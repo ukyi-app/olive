@@ -585,3 +585,117 @@ describe("반영한 인사의 해제 재확인(C15·C29·C19)", () => {
     expect(h.calls.map((c) => `${c.kind}@${c.answeredAt}`)).toEqual([`full@${NOW}`, `full@${NOW + 10}`]);
   });
 });
+
+// 등록부 읽기(pending)를 다음 한 번만 던지게 한다.
+const failPendingOnce = (h: ReturnType<typeof harness>): void => {
+  const pending = h.queries.pending.bind(h.queries);
+  const port = h.ports.queries as { pending: () => readonly SentQuery[] };
+  port.pending = () => {
+    port.pending = pending;
+    throw new Error("등록부");
+  };
+};
+
+describe("철회와 등록 정리(C43·C20·C15)", () => {
+  // 서버는 바뀐 등록표를 적용하며 철회를 동기로 넘기므로, 처리기를 부른 뒤의 기록이나 처리기 안의 장부 쓰기 중에도 철회가 들어온다.
+  for (const during of ["기록", "장부 쓰기"] as const) {
+    test(`같은 조회의 첫 답을 처리하는 도중(${during}) 연결이 철회돼도 줄에 남은 두 번째 답의 항목은 남아, 그 안다는 사본이 밀린 목록에 남는다`, () => {
+      const h = harness({ settled: false });
+      h.table.greet(1, R1, []);
+      const q = h.ask(1, R1, [RUN]);
+      h.queries.add({ ...q, runIds: [...q.runIds] });
+      h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "not_known")], NOW + 1));
+      h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "stopping")], NOW + 2));
+      let withdrawn = false;
+      const withdraw = (): void => {
+        if (withdrawn) return;
+        withdrawn = true;
+        h.table.close(1);
+        h.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+      };
+      if (during === "기록") {
+        (h.ports as { observe: AnswerLinePorts["observe"] }).observe = (n) => {
+          h.notes.push(n);
+          if (n.kind === "status") withdraw();
+        };
+      } else {
+        const ledger = h.ports.ledger as { applyExecutorAnswer: ReceiptLedger["applyExecutorAnswer"] };
+        const apply = ledger.applyExecutorAnswer.bind(ledger);
+        ledger.applyExecutorAnswer = (input, from) => {
+          const result = apply(input, from);
+          withdraw();
+          return result;
+        };
+      }
+      h.state.settled = true;
+      h.lines.pump();
+      expect(statusOutcomes(h.notes)).toEqual(["status_matched", "status_not_current"]);
+      expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`not_known@${NOW + 1}`]);
+      expect(h.lines.backlog(R1).map((c) => `${c.runs[0]?.state}@${c.answeredAt}`)).toEqual([`stopping@${NOW + 2}`]);
+      expect(h.queries.pending()).toEqual([]);
+      expect(h.lines.takeRequery()).toEqual([RUN]);
+    });
+  }
+
+  test("받은 때 등록부를 읽지 못한 답은 받은 뒤 같은 키로 등록한 조회를 끝내지 않고, 그 실행을 다시 물을 실행으로 낸다", () => {
+    const h = harness({ settled: false });
+    h.table.greet(1, R1, []);
+    const requestId = uuid();
+    failPendingOnce(h);
+    h.lines.deliver(statusForward(1, R1, requestId, [run(RUN, "not_known")], NOW + 1));
+    h.queries.add({ requestId, recipient: R1, runIds: [RUN], connection: 1 });
+    h.lines.deliver(statusForward(1, R1, requestId, [run(RUN, "stopping")], NOW + 2));
+    h.state.settled = true;
+    h.lines.pump();
+    expect(statusOutcomes(h.notes)).toEqual(["unknown_query", "status_matched"]);
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`stopping@${NOW + 2}`]);
+    expect(h.queries.pending()).toEqual([]);
+    expect(h.lines.takeRequery()).toEqual([RUN]);
+    expect(h.lines.withheld.executors()).toEqual({ known: false });
+  });
+
+  test("철회 전에 줄에 선 답이 물은 실행과 맞지 않으면, 그 답을 처리한 뒤 철회된 연결의 항목이 남지 않는다", () => {
+    const h = harness({ settled: false });
+    h.table.greet(1, R1, []);
+    const q = h.ask(1, R1, [RUN]);
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN2, "running")], NOW + 1));
+    h.table.close(1);
+    h.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+    expect(h.queries.pending().map((p) => p.requestId)).toEqual([q.requestId]);
+    h.state.settled = true;
+    h.lines.pump();
+    expect(statusOutcomes(h.notes)).toEqual(["runs_mismatch"]);
+    expect(h.queries.pending()).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
+  test("철회 전에 맞지 않는 답과 올바른 답이 차례로 줄에 섰으면, 맞지 않는 답을 처리한 뒤에도 올바른 답의 항목이 남아 그 답이 대조된다", () => {
+    const h = harness({ settled: false });
+    h.table.greet(1, R1, []);
+    const q = h.ask(1, R1, [RUN]);
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN2, "running")], NOW + 1));
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "running")], NOW + 2));
+    h.table.close(1);
+    h.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+    h.state.settled = true;
+    h.lines.pump();
+    expect(statusOutcomes(h.notes)).toEqual(["runs_mismatch", "status_not_current"]);
+    expect(h.lines.backlog(R1).map((c) => `${c.runs[0]?.state}@${c.answeredAt}`)).toEqual([`running@${NOW + 2}`]);
+    expect(h.queries.pending()).toEqual([]);
+    expect(h.calls).toEqual([]);
+  });
+
+  test("철회를 처리할 때 등록부 읽기가 한 번 던져도 다음 처리에서 철회된 연결의 답하지 않은 항목을 끝낸다", () => {
+    const h = harness();
+    h.table.greet(1, R1, []);
+    h.ask(1, R1, [RUN]);
+    h.ask(1, R1, [RUN2]);
+    const other = h.ask(2, R2, [RUN2]);
+    h.table.close(1);
+    failPendingOnce(h);
+    h.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+    expect(h.queries.pending().length).toBe(3);
+    h.lines.pump();
+    expect(h.queries.pending().map((p) => p.requestId)).toEqual([other.requestId]);
+  });
+});
