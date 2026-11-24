@@ -28,6 +28,14 @@ const sampleBytes = () => new TextEncoder().encode(SAMPLE);
 const DIGEST = createHash("sha256").update(sampleBytes()).digest("hex");
 const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
 const allZero = (bytes: Uint8Array) => bytes.every((b) => b === 0);
+// 관측에서 뽑은 이름 목록의 단언. 원래 문자열끼리 견준 결과는 불리언으로 보고, 실패 진단에는 ":"로 나눈 조각이 모두 허용된
+// 이름(또는 연결 번호)인 항목만 그대로 싣는다. 관측에 표본이 섞이는 회귀가 생겨도 실패 메시지가 표본을 다시 찍지 않는다.
+const NAMES = new Set(["ack", "issuance_closed", "server_closed", "server_close_failed", "close", "after_flag", "written", "blocked", "intake_closed"]);
+const shown = (list: readonly string[]) => list.map((item) => (item.split(":").every((part) => part === "" || /^\d+$/.test(part) || NAMES.has(part)) ? item : "<not_allowed>"));
+function expectNames(actual: readonly string[], wanted: readonly string[]): void {
+  const equal = actual.length === wanted.length && actual.every((item, i) => item === wanted[i]);
+  expect({ names: shown(actual), equal }).toEqual({ names: shown(wanted), equal: true });
+}
 
 const cleanup: (() => unknown)[] = [];
 afterEach(async () => {
@@ -259,7 +267,7 @@ test("루프백: 접수 영수증 뒤 자격 값 틀 하나가 그 연결의 실
   expect(server.recognized(R1)).toBe(one.connection);
   one.put("receipt_accepted", accept, 1);
   await one.envelopes.next((e) => e.header.action === "ack");
-  expect(await attempts.next(() => true)).toBe(`${one.connection}:written:`);
+  expectNames([await attempts.next(() => true)], [`${one.connection}:written:`]);
   const got = await one.credentials.next(() => true);
   expect(one.rejected()).toBeNull();
   expect(one.credentials.all().length).toBe(1);
@@ -280,15 +288,18 @@ test("루프백: 접수 영수증 뒤 자격 값 틀 하나가 그 연결의 실
   expect(forgotten).toEqual([one.connection]);
   await hellos.next((kind) => kind === "applied" && server.recognized(R1) === two.connection);
   two.put("receipt_accepted", accept, 1);
-  expect(await attempts.next((value) => value.startsWith(`${two.connection}:`))).toBe(`${two.connection}:blocked:intake_closed`);
-  expect(sinkNotes.flatMap((n) => (n.kind === "not_sent" ? [`${n.action}:${n.reason}`] : []))).toEqual(["ack:issuance_closed"]);
+  expectNames([await attempts.next((value) => value.startsWith(`${two.connection}:`))], [`${two.connection}:blocked:intake_closed`]);
+  expectNames(
+    sinkNotes.flatMap((n) => (n.kind === "not_sent" ? [`${n.action}:${n.reason}`] : [])),
+    ["ack:issuance_closed"],
+  );
   expect(lent.length).toBe(1);
 
   // 3. 종료: 깃발이 선 뒤에만 서버를 닫는다. 닫힘의 철회도 기억을 지운다. 둘째 연결에는 값 틀도 ack도 닿지 않았다.
   await issuance.shutdown();
   await two.closed.next(() => true);
   await withdrawn.next((connection) => connection === two.connection);
-  expect(order).toEqual(["issuance_closed", "close:after_flag", "server_closed"]);
+  expectNames(order, ["issuance_closed", "close:after_flag", "server_closed"]);
   expect(forgotten).toEqual([one.connection, two.connection]);
   expect(two.credentials.all().length).toBe(0);
   expect(two.envelopes.all().filter((e) => e.header.action === "ack").length).toBe(0);

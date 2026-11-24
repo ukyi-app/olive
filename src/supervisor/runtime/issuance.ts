@@ -3,9 +3,12 @@
 // 차례로 한다. 설명 문서는 issuance.md다.
 //
 // 이 파일이 지키는 것:
-// 1. 답 줄이 넘긴 영수증(장부가 받은 것)은 그대로 송신기의 onReceipt로, 철회는 forgetConnection으로 간다. 송신기는 이 객체가 하나만 만든다.
-// 2. 깃발이 서면 자격 값의 읽기 앞 확인과 lastCheck가 접수 닫힘(intake_closed)으로 막는다. 깃발을 읽는 것은 읽기뿐이다(상태를 쓰지 않는다).
-// 3. shutdown()은 closeIssuance()가 돌아온 뒤에만 server.close()를 부른다. 몇 번 불러도 닫기는 한 번이다.
+// 1. 장부가 받아들인 영수증(new·duplicate)마다 그대로 송신기의 onReceipt로, 철회는 forgetConnection으로 간다. 같은 본문의 재전송이면
+//    onReceipt도 그만큼 불린다. 계정 읽기와 값 틀 송신은 송신기가 (연결, 실행)마다 각각 최대 1회로 막는다. 송신기는 이 객체가 하나만 만든다.
+// 2. 깃발이 서면 자격 값의 읽기 앞 확인과 lastCheck가 막는다. 거절 이름은 송신기의 우선순위를 따른다(정지 세대 모름이 intake_closed보다
+//    먼저). 깃발을 읽는 것은 읽기뿐이다(상태를 쓰지 않는다).
+// 3. shutdown()은 closeIssuance()가 돌아온 뒤에만 server.close()를 부른다. 몇 번 불러도, 닫기 안에서 다시 불러도 닫기는 한 번이다.
+//    닫기 실패는 고정된 이름의 오류로만 알린다.
 // 시계·난수·타이머·소켓을 직접 쓰지 않는다. 모두 포트로 받는다.
 import type { CredentialFiles, CredentialRefPolicy } from "../accounts/credential-ref.ts";
 import { type CredentialSendGate, type CredentialSendLedger, type CredentialSendNote, type CredentialSendServer, createCredentialSender } from "../dispatch/credential-send.ts";
@@ -100,9 +103,10 @@ export function createIssuance(ports: IssuancePorts): Issuance {
     record({ kind: "shutdown", step: "issuance_closed" });
     try {
       await ports.server.close();
-    } catch (error) {
+    } catch {
       record({ kind: "shutdown", step: "server_close_failed" });
-      throw error;
+      // 포트의 오류 원문(메시지·cause)은 무엇이 실렸는지 모르므로 호출자에게 건네지 않는다. 이름만 돌려준다.
+      throw new Error("server_close_failed");
     }
     record({ kind: "shutdown", step: "server_closed" });
   };
@@ -111,7 +115,14 @@ export function createIssuance(ports: IssuancePorts): Issuance {
     issuanceOpen,
     credentials,
     shutdown(): Promise<void> {
-      if (closing === null) closing = close();
+      if (closing !== null) return closing;
+      // 닫기를 시작하기 전에 공유할 약속을 게시한다. closeIssuance 안(같은 호출 스택)에서 shutdown()이 다시 불려도 이 약속을 받는다.
+      // close()는 여기서 동기로 시작하므로 깃발도 이 호출 안에서 선다.
+      let settle!: { resolve: () => void; reject: (error: unknown) => void };
+      closing = new Promise<void>((resolve, reject) => {
+        settle = { resolve, reject };
+      });
+      close().then(settle.resolve, settle.reject);
       return closing;
     },
   };

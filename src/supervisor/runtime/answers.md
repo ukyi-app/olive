@@ -26,7 +26,7 @@
 | `occupancy`(`full`) | 그 실행기의 줄 끝에 인사로 넣고 맡기지 않음을 세운다 |
 | `occupancy`(`partial`) | 버린다. 같은 상태 보고가 `forward`로도 오므로 그쪽에서 한 번만 센다 |
 | `forward`(`status_report`) | 받은 때 등록돼 있던 같은 요청 ID의 항목을 답에 묶어 낸 쪽 실행기의 줄 끝에 넣는다. 그때 등록부를 읽지 못하면 묶을 항목 없이(`null`) 넣는다 |
-| `forward`(그 밖: 영수증·보고·결과 보고) | 곧바로 `handleForward`. 장부가 받은 결과(`ack`·`applied_without_ack`)면 기록하기 전에 같은 `forward`와 그 결과를 `credentials.onReceipt`에 넘긴다(무엇에 보낼지는 송신기가 고른다). 결과가 `ack`일 때만 초안을 봉해 `writeAck(forward.connection, …)` |
+| `forward`(그 밖: 영수증·보고·결과 보고) | 곧바로 `handleForward`. 장부가 받아들인 결과(`ack`·`applied_without_ack`. `delivery`가 `new`든 `duplicate`든)면 기록하기 전에 같은 `forward`와 그 결과를 `credentials.onReceipt`에 넘긴다. 같은 본문의 재전송이면 그만큼 다시 넘긴다. 무엇에 보낼지와 계정 읽기·값 틀 송신을 (연결, 실행)마다 각각 최대 1회로 막는 것은 송신기가 한다. 결과가 `ack`일 때만 초안을 봉해 `writeAck(forward.connection, …)` |
 | `candidate` | 순서기의 `noteCandidate(작업자 실행기 이름)` |
 | `withdrawn` | 그 연결을 정리할 목록에 적고, `credentials.forgetConnection(연결)`을 부른 뒤 등록부의 그 연결 항목을 끝낸다. 지금 처리기에 넘긴 답이 쓰는 항목과, 철회 전에 받아 줄에 선 그 연결의 답마다 그 답이 대조될 수 있는 항목 하나씩(받은 차례로 앞 항목부터. 처리기와 같은 비교: 받는 쪽이 낸 쪽이고 물은 실행 집합과 답한 실행 집합이 같다)만 남긴다. 남긴 항목이 있거나 정리 중 등록부가 던지면 그 연결은 목록에 남고, 그 연결의 답을 처리할 때마다, 어느 실행기든 줄 처리(`drain`)가 끝날 때마다, `pump()`마다 같은 기준으로 다시 정리한다 |
 
@@ -68,7 +68,7 @@
 | C37 | 같은 복원기 게시 함수 | `restorer()`를 부를 때마다 읽고 쥐지 않는다(인사의 접수, ack의 정지 세대) | (조립 조건) | `server.md`·`sink.md`·`hello-answers.md` |
 | C43 | 등록부의 구현: 서버와 수명을 같이, 철회된 연결의 항목을 끝냄, `remove`는 없는 항목에 던지지 않음 | `query-book.ts` 전체. 실은 횟수만큼 항목이 있고 `settle`은 항목 하나. 답은 받은 때 있던 항목에만 대조(`answers.ts:314`, `:514`), 맞지 않은 답은 항목을 끝내지 않음(`:462`). 처리 중인 답의 항목은 철회가 남은 답에 주지 않고(`:449`, `:324`), 철회 때는 줄에 선 답이 대조될 수 있는 항목만 남기며(`couldMatch` `:158`, `:342`), 철회된 연결에서 답이 쓰지 않은 항목은 그 연결의 마지막 답을 처리한 뒤 끝냄(`:478`) | 조회 등록부 4개, 받은 때의 등록 2개, 철회와 등록 정리 9개 | `sink.ts`의 `QueryBook`, `sink.md`, `server.md` "서버를 새로 시작하면 연결 번호가 1부터다" |
 | C44 | `deliver`는 던지지 않는다. `forward`는 `handleForward`로, `occupancy(full)`은 `passHelloAnswer`로 | `deliver`의 `try`(`:577`), `drain`의 `catch` | "deliver는 던지지 않고" | `server.md` "`deliver`는 던지지 않는다" |
-| C50 | `handleForward`의 결과 뒤에 같은 `forward`와 결과를 그대로 `onReceipt`에 | 장부가 받은 결과(`ack`·`applied_without_ack`)만, 기록 전에(`:277`~`:283`). 조립은 `issuance.md` | `issuance.test.ts` "자격 값 잇기" 다섯, 루프백 | `dispatch/credential-send.md` "뒤 조각이 지켜야 할 것" |
+| C50 | `handleForward`의 결과 뒤에 같은 `forward`와 결과를 그대로 `onReceipt`에 | 장부가 받아들인 결과(`ack`·`applied_without_ack`)마다, 기록 전에(`:277`~`:283`). 조립은 `issuance.md` | `issuance.test.ts` "자격 값 잇기" 다섯, 루프백 | `dispatch/credential-send.md` "뒤 조각이 지켜야 할 것" |
 | C54 | `withdrawn`·닫힘에 `forgetConnection` | `withdrawn` 갈래에서 등록부 정리보다 먼저(`:533`~`:540`). 서버가 연결을 닫을 때도 인사를 마친 연결이면 `withdrawn`이 온다(`transport/connections.ts`의 `leave`) | "연결 철회마다", 루프백 | `dispatch/credential-send.md` |
 | C45 | 밀린 사본이 사는 동안 연결 번호가 유효 | 줄과 등록부는 `wire`(그 서버 위의 내보내기 포트)에 묶여 그 서버의 연결 번호로만 묻는다. 서버를 새로 만들면 새로 만든다(아래) | (조립 조건) | `receipts.md` "연결 번호는 밀린 사본이 살아 있는 동안 유효해야 한다" |
 | C46 | 결과 포트를 늘 넘기고, 처리기를 부르는 흐름에 `await` 없음 | `results`는 필수 칸. 파일에 `await`·`async`가 없다 | 정적(C46) | `receipts.md` "결과 포트를 늘 넘긴다" |

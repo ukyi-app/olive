@@ -272,8 +272,8 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       { forward, now, stopGeneration: stopGeneration(), pendingQueries: [], links: ports.wire.answers, backlog: [] },
       { ledger: ports.ledger, random: ports.random, results: ports.results },
     );
-    // 기록보다 먼저 넘긴다: 송신기는 결과의 칸을 부른 그 자리에서 읽으므로 기록기가 결과를 고쳐도 보낼 대상이 바뀌지 않는다.
-    // 무엇에 보낼지(task_start의 접수, (연결, 실행)마다 한 번)는 송신기가 고른다. 장부가 받지 않은 영수증은 넘기지 않는다.
+    // 기록보다 먼저 넘긴다: 송신기는 결과의 칸을 부른 그 자리에서 읽으므로 기록기가 결과를 고쳐도 보낼 대상이 바뀌지 않는다. 장부가 받아들인
+    // 영수증(new·duplicate)마다 넘기고, 계정 읽기·값 틀 송신을 (연결, 실행)마다 각각 최대 1회로 막는 것은 송신기다. 받지 않은 영수증은 넘기지 않는다.
     if (outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") {
       try {
         ports.credentials?.onReceipt(forward, outcome);

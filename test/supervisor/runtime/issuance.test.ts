@@ -1,5 +1,6 @@
 // 발급 문과 종료 차례(issuance.ts). 답 줄(answers.ts)·내보내기 포트(sink.ts)·자격 값 보내기(credential-send.ts)·순서기(cycle.ts)는 실제 것이고,
-// 연결 서버·장부·계정 파일은 가짜다. 가짜 서버는 실제 서버의 쓰기 차례(인정 → lastCheck → 인정 재확인 → finalCheck → 넘김)를 따른다.
+// 연결 서버·장부·계정 파일은 가짜다. 가짜 서버는 실제 서버의 쓰기 차례(인정 → lastCheck → 인정 재확인 → finalCheck → 넘김)를 따르되,
+// 인정은 주체의 연결 번호만 본다. 복원기 게시 객체의 재확인은 실제 서버를 쓰는 루프백과 서버 시험이 입증한다.
 // 자격 값의 표본은 이 파일이 지어낸 바이트이고, 새는지는 불리언으로만 단언한다(실패 진단에 표본이 실리지 않게).
 import { describe, expect, test } from "bun:test";
 import { createHash, generateKeyPairSync } from "node:crypto";
@@ -21,13 +22,53 @@ const SAMPLE = "QX8V-LK2M-WP7R-ZN3T-HD4F";
 const sampleBytes = () => new TextEncoder().encode(SAMPLE);
 const DIGEST = createHash("sha256").update(sampleBytes()).digest("hex");
 const allZero = (bytes: Uint8Array) => bytes.every((b) => b === 0);
-// 바이트 그릇은 숫자 배열로 펴서 본다.
+// 바이트 그릇(뷰와 원시 ArrayBuffer)은 숫자 배열로, 오류는 이름과 메시지로 펴서 본다. JSON.stringify는 Error를 {}로 만든다.
 const SAMPLE_NUMBERS = Array.from(sampleBytes()).join(",");
 const leaks = (value: unknown): boolean => {
   const text =
-    JSON.stringify(value, (_key, v: unknown) => (ArrayBuffer.isView(v) ? Array.from(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) : v)) ?? "";
-  return text.includes(SAMPLE) || text.includes(SAMPLE_NUMBERS) || text.includes(Buffer.from(SAMPLE).toString("base64"));
+    JSON.stringify(value, (_key, v: unknown) =>
+      ArrayBuffer.isView(v)
+        ? Array.from(new Uint8Array(v.buffer, v.byteOffset, v.byteLength))
+        : v instanceof ArrayBuffer
+          ? Array.from(new Uint8Array(v))
+          : v instanceof Error
+            ? { name: v.name, message: v.message, cause: v.cause }
+            : v,
+    ) ?? "";
+  return (
+    text.includes(SAMPLE) ||
+    text.includes(Buffer.from(SAMPLE).toString("hex")) ||
+    text.includes(Buffer.from(SAMPLE).toString("base64")) ||
+    text.includes(SAMPLE_NUMBERS)
+  );
 };
+
+// 관측에서 뽑은 이름 목록의 단언. 원래 문자열끼리 견준 결과는 불리언으로 보고, 실패 진단에는 ":"로 나눈 조각이 모두 허용된
+// 이름(또는 연결 번호)인 항목만 그대로 싣는다. 관측에 표본이 섞이는 회귀가 생겨도 실패 메시지가 표본을 다시 찍지 않는다.
+const NAMES = new Set([
+  "ack",
+  "status_query",
+  "sent",
+  "no_connection",
+  "issuance_closed",
+  "server_closed",
+  "server_close_failed",
+  "written",
+  "already_sent",
+  "blocked",
+  "not_written",
+  "intake_closed",
+  "not_recognized",
+  "envelope",
+  "credential",
+  "server.close",
+  "life:end",
+]);
+const shown = (list: readonly string[]) => list.map((item) => (NAMES.has(item) || item.split(":").every((part) => part === "" || /^\d+$/.test(part) || NAMES.has(part)) ? item : "<not_allowed>"));
+function expectNames(actual: readonly string[], wanted: readonly string[]): void {
+  const equal = actual.length === wanted.length && actual.every((item, i) => item === wanted[i]);
+  expect({ names: shown(actual), equal }).toEqual({ names: shown(wanted), equal: true });
+}
 
 const NOW = 1_800_000_000_000;
 const GEN = 3;
@@ -99,6 +140,8 @@ function fakeServer() {
       if (closes > 0 || recognized.get(principal) !== connection) return { kind: "not_written", reason: "not_recognized" };
       const refusal = options.lastCheck();
       if (refusal !== null) return { kind: "not_written", reason: "refused", refusal };
+      // 실제 서버처럼 lastCheck 뒤에 인정을 다시 본다. lastCheck 안에서 인정이 바뀌면 넘기지 않는다.
+      if (closes > 0 || recognized.get(principal) !== connection) return { kind: "not_written", reason: "not_recognized" };
       const late = options.finalCheck?.() ?? null;
       if (late !== null) return { kind: "not_written", reason: "refused", refusal: late };
       const decoded = createMixedFrameDecoder().push(frame);
@@ -255,27 +298,34 @@ describe("자격 값 잇기(C50·C54)", () => {
     const h = harness();
     h.lines.deliver(accepted(1));
     await flush();
-    expect(h.received).toEqual(["ack"]);
+    expectNames(h.received, ["ack"]);
     expect(h.credentialFrames()).toBe(1);
-    expect(h.fake.written.map((w) => `${w.connection}:${w.kind}:${w.action ?? ""}`)).toEqual(["1:envelope:ack", "1:credential:"]);
-    expect(h.attempts()).toEqual(["written"]);
+    expectNames(
+      h.fake.written.map((w) => `${w.connection}:${w.kind}:${w.action ?? ""}`),
+      ["1:envelope:ack", "1:credential:"],
+    );
+    expectNames(h.attempts(), ["written"]);
     expect(h.disk.lent.length).toBe(1);
     expect(allZero(h.disk.lent[0]!)).toBe(true);
     expect(leaks(h.issuanceNotes)).toBe(false);
     expect(leaks(h.answerNotes)).toBe(false);
   });
 
-  test("같은 연결에서 같은 접수 영수증이 두 번 와도 계정 파일 읽기와 값 틀은 한 번이다(두 번째는 already_sent)", async () => {
+  test("같은 연결에서 같은 본문의 접수 영수증이 두 번 오면(장부는 new, duplicate) onReceipt는 두 번이지만 계정 파일 읽기와 값 틀은 한 번이다", async () => {
     const h = harness();
+    // 실행기의 재전송처럼 같은 입력을 그대로 다시 넣는다(instruction_request_id도 같다).
     const id = uuid();
-    h.lines.deliver(accepted(1, id));
+    const item = accepted(1, id);
+    h.lines.deliver(item);
     h.receiptAnswers.push({ ok: true, delivery: "duplicate", ack: id });
-    h.lines.deliver(accepted(1, id));
+    h.lines.deliver(item);
     await flush();
-    expect(h.received).toEqual(["ack", "ack"]);
+    expect(h.receipts.length).toBe(2);
+    expectNames(h.received, ["ack", "ack"]);
     expect(h.credentialFrames()).toBe(1);
     expect(h.disk.lent.length).toBe(1);
-    expect(h.attempts()).toEqual(["already_sent", "written"]);
+    expectNames(h.attempts(), ["already_sent", "written"]);
+    expectNames(h.acks(), ["sent", "sent"]);
   });
 
   test("장부가 거절했거나 적지 못한 영수증은 송신기에 넘기지 않는다: 시도 0, 읽기 0, 값 틀 0", async () => {
@@ -286,8 +336,8 @@ describe("자격 값 잇기(C50·C54)", () => {
     h.lines.deliver(accepted(1));
     await flush();
     expect(h.receipts.length).toBe(2);
-    expect(h.received).toEqual([]);
-    expect(h.attempts()).toEqual([]);
+    expectNames(h.received, []);
+    expectNames(h.attempts(), []);
     expect(h.disk.lent.length).toBe(0);
     expect(h.credentialFrames()).toBe(0);
     expect(h.fake.written).toEqual([]);
@@ -297,7 +347,7 @@ describe("자격 값 잇기(C50·C54)", () => {
     const h = harness();
     h.lines.deliver(accepted(1, uuid(), "run_renew"));
     await flush();
-    expect(h.acks()).toEqual(["sent"]);
+    expectNames(h.acks(), ["sent"]);
     expect(h.credentialFrames()).toBe(0);
     expect(h.disk.lent.length).toBe(0);
   });
@@ -313,7 +363,7 @@ describe("자격 값 잇기(C50·C54)", () => {
     h.receiptAnswers.push({ ok: true, delivery: "duplicate", ack: id });
     h.lines.deliver(accepted(1, id));
     await flush();
-    expect(h.attempts()).toEqual(["written", "written"]);
+    expectNames(h.attempts(), ["written", "written"]);
   });
 });
 
@@ -335,9 +385,12 @@ describe("발급 닫기와 종료 차례(C36)", () => {
     expect(h.fake.written).toEqual([]);
     expect(h.credentialFrames()).toBe(0);
     expect(h.disk.lent.length).toBe(0);
-    expect(h.acks()).toEqual(["no_connection"]);
-    expect(h.attempts()).toEqual(["blocked:intake_closed"]);
-    expect(h.sinkNotes.flatMap((n) => (n.kind === "not_sent" ? [`${n.action}:${n.reason}`] : []))).toEqual(["ack:issuance_closed", "status_query:issuance_closed"]);
+    expectNames(h.acks(), ["no_connection"]);
+    expectNames(h.attempts(), ["blocked:intake_closed"]);
+    expectNames(
+      h.sinkNotes.flatMap((n) => (n.kind === "not_sent" ? [`${n.action}:${n.reason}`] : [])),
+      ["ack:issuance_closed", "status_query:issuance_closed"],
+    );
   });
 
   test("계정 파일을 읽는 동안 깃발이 서면 lastCheck가 막는다: 값 틀 0, 값은 그 자리에서 0", async () => {
@@ -351,13 +404,13 @@ describe("발급 닫기와 종료 차례(C36)", () => {
     };
     h.lines.deliver(accepted(1));
     await flush();
-    expect(h.attempts()).toEqual([]);
+    expectNames(h.attempts(), []);
     // 서버는 닫지 않는다: 서버의 not_recognized가 아니라 lastCheck가 막는 것을 본다.
     void h.cycle.closeIssuance();
     release();
     await flush();
     expect(h.credentialFrames()).toBe(0);
-    expect(h.attempts()).toEqual(["not_written:intake_closed"]);
+    expectNames(h.attempts(), ["not_written:intake_closed"]);
     expect(allZero(h.disk.lent[0]!)).toBe(true);
   });
 
@@ -376,31 +429,83 @@ describe("발급 닫기와 종료 차례(C36)", () => {
     const done = h.issuance.shutdown();
     await flush();
     expect(h.issuance.issuanceOpen()).toBe(false);
-    expect(h.fake.calls).toEqual([]);
+    expectNames(h.fake.calls, []);
     // 박자가 진행 중인 동안 온 영수증의 ack·자격 값도 깃발을 본다.
     h.lines.deliver(accepted(1));
     await flush();
     expect(h.fake.written).toEqual([]);
-    expect(h.fake.calls).toEqual([]);
+    expectNames(h.fake.calls, []);
     hold.resolve();
     const report: BeatReport = await beat;
     await done;
-    expect(h.fake.calls).toEqual(["life:end", "server.close"]);
+    expectNames(h.fake.calls, ["life:end", "server.close"]);
     expect(report.kind === "ran" && report.resend.kind === "skipped" && report.resend.reason).toBe("issuance_closed");
-    expect(h.issuanceNotes.flatMap((n) => (n.kind === "shutdown" ? [n.step] : []))).toEqual(["issuance_closed", "server_closed"]);
+    expectNames(
+      h.issuanceNotes.flatMap((n) => (n.kind === "shutdown" ? [n.step] : [])),
+      ["issuance_closed", "server_closed"],
+    );
     // 두 번 불러도 닫기는 한 번이다.
     await h.issuance.shutdown();
     expect(h.fake.closes()).toBe(1);
   });
 
-  test("서버 닫기가 거절되면 shutdown도 같은 거절로 끝나고 기록을 남긴다", async () => {
+  test("서버 닫기가 거절되면 shutdown은 고정된 이름의 오류로 끝나고 포트의 오류 원문은 cause에도 싣지 않는다", async () => {
     const h = harness();
-    const failure = new Error("tls close");
+    // 닫기 포트의 오류 메시지에 표본이 섞여도 shutdown의 호출자에게 건너가지 않아야 한다.
+    const failure = new Error(`tls close near ${SAMPLE}`);
     (h.fake.server as { close: () => Promise<void> }).close = async () => {
       throw failure;
     };
-    await expect(h.issuance.shutdown()).rejects.toBe(failure);
-    expect(h.issuanceNotes.flatMap((n) => (n.kind === "shutdown" ? [n.step] : []))).toEqual(["issuance_closed", "server_close_failed"]);
+    const settled = await h.issuance.shutdown().then(
+      () => ({ rejected: false, error: null as unknown }),
+      (error: unknown) => ({ rejected: true, error }),
+    );
+    const error = settled.error;
+    expect(settled.rejected).toBe(true);
+    expect(error instanceof Error).toBe(true);
+    expect(error !== failure).toBe(true);
+    expect(error instanceof Error && error.message === "server_close_failed").toBe(true);
+    expect(error instanceof Error && error.cause === undefined && !("cause" in error)).toBe(true);
+    expect(leaks(error)).toBe(false);
+    expect(error instanceof Error && leaks(error.stack ?? "")).toBe(false);
+    expect(leaks(h.issuanceNotes)).toBe(false);
+    expectNames(
+      h.issuanceNotes.flatMap((n) => (n.kind === "shutdown" ? [n.step] : [])),
+      ["issuance_closed", "server_close_failed"],
+    );
+    // 같은 약속이라 다시 불러도 같은 고정 오류이고 닫기는 한 번이다.
+    const again = await h.issuance.shutdown().then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(again === error).toBe(true);
+  });
+
+  test("닫기 포트 안에서 shutdown()을 동기로 다시 불러도 같은 약속이고 server.close는 한 번이다", async () => {
+    const h = harness();
+    const closeIssuance = h.cycle.closeIssuance.bind(h.cycle);
+    let nested: Promise<void> | null = null;
+    let openWhenNested: boolean | null = null;
+    (h.cycle as { closeIssuance: () => Promise<void> }).closeIssuance = () => {
+      const wait = closeIssuance();
+      if (nested === null) {
+        openWhenNested = h.issuance.issuanceOpen();
+        nested = h.issuance.shutdown();
+      }
+      return wait;
+    };
+    const outer = h.issuance.shutdown();
+    // 첫 호출이 돌아온 그 자리에서 깃발은 이미 서 있다(다음 마이크로태스크로 미루지 않는다).
+    expect(h.issuance.issuanceOpen()).toBe(false);
+    expect(openWhenNested === false).toBe(true);
+    await Promise.all([outer, nested]);
+    expect(nested === outer).toBe(true);
+    expect(h.fake.closes()).toBe(1);
+    expectNames(h.fake.calls, ["server.close"]);
+    expectNames(
+      h.issuanceNotes.flatMap((n) => (n.kind === "shutdown" ? [n.step] : [])),
+      ["issuance_closed", "server_closed"],
+    );
   });
 
   test("깃발을 읽다 던지면 닫힌 것으로 본다(내보내기 포트와 자격 값 모두)", async () => {
@@ -413,8 +518,70 @@ describe("발급 닫기와 종료 차례(C36)", () => {
     await flush();
     expect(h.fake.written).toEqual([]);
     expect(h.disk.lent.length).toBe(0);
-    expect(h.attempts()).toEqual(["blocked:intake_closed"]);
-    expect(h.acks()).toEqual(["no_connection"]);
+    expectNames(h.attempts(), ["blocked:intake_closed"]);
+    expectNames(h.acks(), ["no_connection"]);
+  });
+});
+
+describe("시험의 진단", () => {
+  test("유출 판정은 문자열·hex·base64·바이트 뷰·숫자 배열·원시 ArrayBuffer·Error 메시지 꼴을 모두 잡는다", () => {
+    const bytes = sampleBytes();
+    const carriers: unknown[] = [
+      SAMPLE,
+      Buffer.from(SAMPLE).toString("hex"),
+      Buffer.from(SAMPLE).toString("base64"),
+      bytes,
+      Array.from(bytes),
+      Buffer.from(bytes),
+      sampleBytes().buffer,
+      new Error(`near ${SAMPLE}`),
+      new Error("wrapped", { cause: new Error(SAMPLE) }),
+    ];
+    for (const carrier of carriers) expect(leaks({ nested: [{ carrier }] })).toBe(true);
+    expect(leaks({ kind: "attempt", connection: 1, runId: RUN, outcome: "written", reason: null })).toBe(false);
+  });
+
+  test("관측 이름 단언이 실패해도 실패 메시지에 표본이 없다(허용된 이름만 진단에 오른다)", () => {
+    const h = harness();
+    h.issuanceNotes.push({ kind: "credential", note: { kind: "attempt", connection: 1, runId: RUN, outcome: "written", reason: SAMPLE } as never });
+    const failures: unknown[] = [];
+    try {
+      expectNames(h.attempts(), ["written"]);
+    } catch (error) {
+      failures.push(error);
+    }
+    const note = h.issuanceNotes[0]!.kind === "credential" ? h.issuanceNotes[0]!.note : null;
+    const line = note !== null && note.kind === "attempt" ? `1:${note.outcome}:${note.reason ?? ""}` : "";
+    try {
+      expectNames([line], ["1:written:"]);
+    } catch (error) {
+      failures.push(error);
+    }
+    expect(failures.length).toBe(2);
+    expect(failures.every((error) => error instanceof Error)).toBe(true);
+    expect(failures.some((error) => leaks(error))).toBe(false);
+  });
+
+  test("가짜 서버도 lastCheck 뒤에 인정을 다시 본다: 계정 파일 읽기 뒤 lastCheck 안에서 인정이 바뀌면 값 틀 0", async () => {
+    const h = harness();
+    let readDone = false;
+    const read = h.disk.files.read.bind(h.disk.files);
+    (h.disk.files as { read: CredentialFiles["read"] }).read = async (location, maxBytes) => {
+      const answer = await read(location, maxBytes);
+      readDone = true;
+      return answer;
+    };
+    // 깃발 읽기는 송신기 lastCheck 안에서 불린다. 읽기가 끝난 뒤의 첫 깃발 읽기에서 같은 실행기를 연결 2로 옮긴다.
+    const open = h.cycle.issuanceOpen.bind(h.cycle);
+    (h.cycle as { issuanceOpen: () => boolean }).issuanceOpen = () => {
+      if (readDone) h.fake.recognized.set(R1, 2);
+      return open();
+    };
+    h.lines.deliver(accepted(1));
+    await flush();
+    expect(h.credentialFrames()).toBe(0);
+    expectNames(h.attempts(), ["not_written:not_recognized"]);
+    expect(allZero(h.disk.lent[0]!)).toBe(true);
   });
 });
 
