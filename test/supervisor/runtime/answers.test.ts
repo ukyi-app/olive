@@ -71,11 +71,13 @@ type Call = { kind: "full" | "partial"; sender: string; states: string; answered
 
 // sightings: 관측만 적는 연산(recordAnswerSightings)의 답. 기본은 적지 못함(ledger_unwritable)이다: 인정이 끝난 연결의 안다는 답을 적지
 // 못했을 때의 동작(상태 보고는 밀린 사본으로 쥐고 인사는 오염으로 남긴다)을 그대로 본다. 적히는 경우는 시험마다 "saved"로 고른다.
+// sightAnswers에 넣은 값이 있으면 그 값을 먼저 차례로 돌려준다(Error면 던진다).
 function harness(options: { settled?: boolean; intake?: boolean; sightings?: "saved" | "unwritable" } = {}) {
   const table = new FakeTable();
   const calls: Call[] = [];
   const sights: Call[] = [];
   const answers: unknown[] = [];
+  const sightAnswers: unknown[] = [];
   const receipts: unknown[] = [];
   const receiptAnswers: unknown[] = [];
   const acks: { connection: number; envelope: Envelope }[] = [];
@@ -99,6 +101,11 @@ function harness(options: { settled?: boolean; intake?: boolean; sightings?: "sa
     },
     recordAnswerSightings(input, from) {
       sights.push({ kind: input.coverage as Call["kind"], sender: from.sender, states: input.runs.map((r) => r.state).join(","), answeredAt: input.answeredAt });
+      if (sightAnswers.length > 0) {
+        const next = sightAnswers.shift();
+        if (next instanceof Error) throw next;
+        return next as ReturnType<Ledger["recordAnswerSightings"]>;
+      }
       if (options.sightings === "saved") return { ok: true };
       const unsavedSightings = input.runs.filter((r) => r.state !== "not_known").map((r) => ({ runId: r.run_id, runGeneration: r.run_generation as number }));
       return { ok: false, reason: "ledger_unwritable", unsavedSightings };
@@ -142,7 +149,7 @@ function harness(options: { settled?: boolean; intake?: boolean; sightings?: "sa
     queries.add(query);
     return query;
   };
-  return { table, calls, sights, answers, receipts, receiptAnswers, acks, notes, candidates, state, ports, lines, queries, ask };
+  return { table, calls, sights, answers, sightAnswers, receipts, receiptAnswers, acks, notes, candidates, state, ports, lines, queries, ask };
 }
 
 describe("차례(C18·C19·C16)", () => {
@@ -264,6 +271,39 @@ describe("소비하는 때의 연결 대조와 밀린 목록(C21·C20·C23)", ()
     expect(h.lines.withheld.executors()).toEqual({ known: true, value: [] });
     expect(h.lines.takeRequery()).toEqual([RUN]);
     expect(h.queries.pending()).toEqual([]);
+  });
+
+  test("인정이 끝난 연결의 안다는 답은 관측 쓰기가 던지면(ledger_failed) 밀린 사본으로 쥐고 뒤 답을 막는다", () => {
+    const h = harness({ sightings: "saved" });
+    h.table.greet(1, R1, []);
+    const q1 = h.ask(1, R1, [RUN]);
+    h.table.greet(2, R1, [], NOW + 2);
+    h.sightAnswers.push(new Error("disk"));
+    h.lines.deliver(statusForward(1, R1, q1.requestId, [run(RUN, "running")], NOW + 1));
+    const status = h.notes.filter((n) => n.kind === "status");
+    expect(status.map((n) => n.kind === "status" && n.outcome.outcome === "status_not_current" && n.outcome.sighting)).toEqual([{ sighting: "ledger_failed", failure: "threw" }]);
+    expect(h.sights).toEqual([{ kind: "partial", sender: R1, states: "running", answeredAt: NOW + 1 }]);
+    expect(h.lines.backlog(R1).map((c) => [c.connection, c.answeredAt])).toEqual([[1, NOW + 1]]);
+    expect(h.calls).toEqual([]);
+  });
+
+  test("앞 밀린 사본이 남아 부르지 않은(skipped·backlog_first) 인정이 끝난 연결의 안다는 답은 그 사본 뒤에 쥔다", () => {
+    const h = harness({ sightings: "saved" });
+    h.table.greet(1, R1, []);
+    const q1 = h.ask(1, R1, [RUN]);
+    const q2 = h.ask(1, R1, [RUN]);
+    h.answers.push(new Error("disk"));
+    h.lines.deliver(statusForward(1, R1, q1.requestId, [run(RUN, "running")], NOW + 1));
+    expect(h.lines.backlog(R1).map((c) => [c.connection, c.answeredAt])).toEqual([[1, NOW + 1]]);
+    h.table.greet(2, R1, [], NOW + 3);
+    h.lines.deliver(statusForward(1, R1, q2.requestId, [run(RUN, "stopping")], NOW + 2));
+    const last = h.notes.filter((n) => n.kind === "status").at(-1);
+    expect(last?.kind === "status" && last.outcome.outcome === "status_not_current" && last.outcome.sighting).toEqual({ sighting: "skipped", why: "backlog_first" });
+    expect(h.sights).toEqual([]);
+    expect(h.lines.backlog(R1).map((c) => [c.connection, c.answeredAt])).toEqual([
+      [1, NOW + 1],
+      [1, NOW + 2],
+    ]);
   });
 
   test("not_known만 실은 옛 연결의 답은 밀린 목록에 남기지 않는다", () => {

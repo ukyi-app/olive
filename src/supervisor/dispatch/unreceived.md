@@ -8,7 +8,7 @@ D-90의 감독 쪽 판단이다. 실행기가 받은 적 없는 작업자 실행
 
 - **조립이 실제 증거를 잇는다.** 조립(`runtime/boot.ts`)이 순서기의 `unreceived`에 이 박자를 묶고, 증거와 맡기지 않을 실행기에 같은 답 줄의 `evidence`·`withheld`(`runtime/answers.md` "D-90 증거")를, 답 줄에는 프로세스에 하나인 증거 장부를 넘긴다. 그래서 시한 뒤에 반영된 전체 인사가 그 실행을 싣지 않고 아래 조건이 모두 맞으면 장부를 부른다. 조립 시험(`test/supervisor/runtime/boot-evidence.test.ts`)이 실제 답 줄·실제 박자 다섯·실제 장부로 정상 입력 1회 닫힘과, 오염(장부가 받지 않은 영수증)·대기(저장되지 않은 상태 보고의 밀린 사본)·번호 변경(증거를 읽은 뒤 새 인사)·연결 바뀜(새 연결이 밀어냄)마다 0회를 본다.
 - **지금 운영에서는 닫을 후보가 생기지 않는다.** 현관(O08)이 없어 복원 5단계의 접수가 열리지 않고 배정 정책이 닫힌 값이라 시작 지시가 적히지 않는다(`runtime/boot.md`).
-- 새 인사를 부르는 길(A6e)과, 버린 답의 양성 관측을 장부에 적는 연산(`recordAnswerSightings`)을 답 줄에서 부르는 일(A6d)도 없다. 둘 다 생겨도 이 박자의 판단은 바뀌지 않고 후보가 늘 뿐이다(아래 "뒤 조각이 지켜야 할 것").
+- 새 인사를 부르는 길(A6e)은 없다. 답 줄은 인정이 끝난 연결의 양성 관측을 장부에 적는다(`recordAnswerSightings`, A6d, `runtime/answers.md`). 둘 다 이 박자의 판단을 바꾸지 않고 후보를 늘릴 뿐이다: 관측이 적힌 답은 오염이 아니고, 그 실행은 장부가 `run_sighted`로 거절한다(아래 "뒤 조각이 지켜야 할 것").
 
 ## 공개 면
 
@@ -174,7 +174,7 @@ UnreceivedOutcome =
 - **같은 객체:** `ledger`는 순서기·다른 박자와 같은 장부 객체, `confirm`의 연결 판단은 내보내기 포트의 `answers`, `withheld`는 답 줄의 것, `intake`는 연결 판단의 맞춤에 쓴 복원기, `observationsSettled`는 답 줄에 넘긴 그 신호, `now`는 순서기가 넘긴 값을 그대로. 장부를 다시 열면 박자 함수 본문에서 지금의 객체로 위임한다(이 박자는 포트를 박자 처음에 한 번만 꺼낸다).
 - **새 인사를 부르는 길(A6e):** 시한 뒤의 전체 인사가 없는 실행기에만, 그 실행기에 임대를 믿는 실행이 없을 때 연결을 닫는다. 이 박자에 갈래를 더해도 `confirm`을 장부 호출 전의 마지막 증거 호출로 두고, 그 뒤에는 읽기만 하는 박자 유효 문 하나만 둔다.
 - **박자 유효 문(조립):** `beatValid`는 읽기만 한다. 답 줄(대기 답·변경 번호), 증거, 연결, 장부를 바꾸거나 넘기거나 닫지 않는다. `confirm` 뒤에 불리므로, 이 함수 안의 변화는 이 박자가 잡지 못하고 앞서 확인한 증거로 장부를 닫는다. 조립(`runtime/boot.ts`의 `effectsOpen`)은 장부 건강·허가·단조 시각만 읽고, `test/supervisor/runtime/boot-effects.test.ts` "읽기만 한다"가 그 호출 동안 증거 포트·답 줄·서버 호출 0과 장부 쓰기 0을 본다. 이 박자의 정적 시험은 `beatStillValid`와 `invoke`의 본문을 글자 그대로 견준다.
-- **관측만 적는 장부 연산의 호출(A6d):** 장부 연산(`recordAnswerSightings`)은 있고 답 줄이 부르는 자리가 없다. 버려진 답의 양성 관측이 적힌 경우에만 오염을 풀 수 있다. 적기에 실패한 답은 오염으로 남긴다. 장부의 `run_sightings`가 늘면 `closeUnreceivedRun`이 `run_sighted`로 거절한다(이 박자는 `refused`로 싣는다).
+- **관측만 적는 장부 연산의 호출(A6d):** 영수증 처리기와 인사 처리기가 인정이 끝난 연결의 "안다"는 답에 장부 연산(`recordAnswerSightings`)을 부른다(`receipts.md`·`hello-answers.md`). 관측이 적힌 답만 오염에서 빠진다. 적지 못한 답은 상태 보고면 밀린 사본(대기), 인사면 오염으로 남는다(`runtime/answers.md`). 장부의 `run_sightings`가 늘면 `closeUnreceivedRun`이 `run_sighted`로 거절한다(이 박자는 `refused`로 싣는다).
 - **조립(N5):** 순서기의 `unreceived`에 위 포트를 묶은 `unreceivedTick`을 넘긴다(`runtime/boot.ts`의 `beats.unreceived`, 위 "지금 닫히는 범위"). 보고의 `unreceived`(`closed`, `ledger_failed`, `halted`)는 박자 기록(`beat`의 `unreceivedOutcomes`·`unreceivedHalted`)에 싣고, 관리자 통로(M1a)가 그 기록을 읽는다.
 
 ## 남는 한계

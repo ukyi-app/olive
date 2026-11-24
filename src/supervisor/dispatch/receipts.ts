@@ -662,15 +662,15 @@ function readSightingAnswer(answer: unknown): SightingOutcome {
 export function recordSighting(answer: SightingAnswer, ledger: Pick<ReceiptLedger, "recordAnswerSightings">, links: AnswerLinks, now: number): SightingOutcome {
   if (!answer.runs.some(isPositive)) return skipped("no_positive");
   if (!isTime(now)) return skipped("now_malformed");
-  let record: unknown;
+  // 수신자를 문 앞에서 묶어 둔다: 문 뒤에는 묶은 함수 하나를 부를 뿐 속성을 읽지 않는다. 묶기도 함수의 bind를 읽어 부르므로 던질 수 있다.
+  let call: (input: AnswerSightingsInput, from: { sender: string }) => unknown;
   try {
-    record = ledger.recordAnswerSightings;
+    const record: unknown = ledger.recordAnswerSightings;
+    if (typeof record !== "function") return { sighting: "ledger_failed", failure: "threw" };
+    call = (record as (input: AnswerSightingsInput, from: { sender: string }) => unknown).bind(ledger);
   } catch {
     return { sighting: "ledger_failed", failure: "threw" };
   }
-  if (typeof record !== "function") return { sighting: "ledger_failed", failure: "threw" };
-  // 수신자를 문 앞에서 묶어 둔다: 문 뒤에는 묶은 함수 하나를 부를 뿐 속성을 읽지 않는다.
-  const call = (record as (input: AnswerSightingsInput, from: { sender: string }) => unknown).bind(ledger);
   // 장부에는 사본의 사본을 넘긴다(장부가 받은 배열을 고쳐도 쥔 사본은 그대로다).
   const input: AnswerSightingsInput = { coverage: answer.coverage, runs: copyRuns(answer.runs), answeredAt: answer.answeredAt, now };
   const from = { sender: answer.sender };

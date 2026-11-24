@@ -404,6 +404,29 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
     expect(spy.calls).toHaveLength(2);
   });
 
+  test("닫힌 연결의 밀린 사본은 관측 쓰기가 던지거나 답의 꼴이 틀리면(ledger_failed) 놓지 않고 그대로 돌려준다", () => {
+    const runId = id();
+    const a: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 };
+    const b: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "stopping")], answeredAt: NOW + 20 };
+    const closed: AnswerLinks = { current: () => false };
+    for (const [answer, failure] of [
+      [new Error("disk"), "threw"],
+      [{ ok: "yes" }, "malformed_answer"],
+    ] as const) {
+      const spy = answerSpy([], [answer]);
+      const outcome = replayBacklog({ backlog: [a, b], now: NOW + 700_000, links: closed }, { ledger: spy.ledger });
+      expect(outcome).toEqual({
+        outcome: "backlog_settled",
+        settled: [
+          { settled: "not_current", answer: a, link: "not_current", sighting: { sighting: "ledger_failed", failure } },
+          { settled: "held", answer: b },
+        ],
+        backlog: [a, b],
+      });
+      expect([spy.calls, spy.sights.length]).toEqual([[], 1]);
+    }
+  });
+
   test("밀린 '안다'는 답 → 새 '모른다'는 답의 순서로 실제 장부에 닿고, 관측이 남는다", async () => {
     const { ledger, fault, generation, state, runId } = realLedger();
     const order: string[] = [];
@@ -616,6 +639,36 @@ describe("인정이 끝난 연결의 답: 관측만 적기(recordSighting)", () 
       expect(JSON.stringify(outcome)).not.toContain("DIAGNOSTIC_CANARY");
       expect(spy.calls).toEqual([]);
     }
+  });
+
+  test("연산을 장부에 묶다 던져도(bind 접근자) 예외 없이 ledger_failed·threw이고 연결 확인·호출은 0회다", async () => {
+    const runId = id();
+    const pending = query([runId]);
+    const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "running")], NOW + 55);
+    const spy = answerSpy();
+    let invoked = 0;
+    const record = () => {
+      invoked += 1;
+      return { ok: true };
+    };
+    Object.defineProperty(record, "bind", {
+      get(): never {
+        throw new Error("DIAGNOSTIC_CANARY");
+      },
+    });
+    const ledger = { ...spy.ledger, recordAnswerSightings: record } as unknown as ReceiptLedger;
+    let checks = 0;
+    const links: AnswerLinks = {
+      current: () => {
+        checks += 1;
+        return false;
+      },
+    };
+    const outcome = handleForward(input(v, [pending], { links }), { ledger, random });
+    expect(outcome).toMatchObject({ outcome: "status_not_current", sighting: { sighting: "ledger_failed", failure: "threw" } });
+    expect(JSON.stringify(outcome)).not.toContain("DIAGNOSTIC_CANARY");
+    // 갈래를 고를 때의 확인 1회뿐이다: 묶기에서 멈추므로 부르기 직전 확인과 호출에 닿지 않는다.
+    expect([checks, invoked, spy.calls]).toEqual([1, 0, []]);
   });
 
   test("대조되지 않은 답(인정 안 된 연결·다른 연결에 낸 조회)은 관측도 적지 않는다", async () => {
