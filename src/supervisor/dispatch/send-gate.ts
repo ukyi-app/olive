@@ -4,7 +4,7 @@
 // 장부의 D-90 자동 닫기는 "표식이 없는 실행은 한 번도 실리지 않았다"에 기댄다. 표식 없이 시작이 한 번이라도 실리면 실행기가 받은
 // 실행을 감독이 받은 적 없음으로 닫아 작업 자리를 풀고 일이 겹친다. 그래서 표식이 거절·던짐·꼴이 틀린 답이면 싣지 않는다.
 // 시작인지는 부르는 쪽의 말이 아니라 봉투의 동작으로 가른다. 시계·난수를 직접 부르지 않는다.
-import type { Envelope } from "../../contract/v1/index.ts";
+import { canonicalJson, type Envelope } from "../../contract/v1/index.ts";
 import { REFUSALS as LEDGER_REFUSALS, type Refusal as LedgerRefusal } from "../../ledger/index.ts";
 import type { InstructionSink, StartMarker } from "./ports.ts";
 
@@ -53,35 +53,35 @@ export type GateResult<S> =
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isRefusal = (value: unknown): value is LedgerRefusal => (LEDGER_REFUSALS as readonly unknown[]).includes(value);
 
-// 봉투에서 읽은 것. 시작인가와, 시작이면 표식에 쓸 실행·요청 ID(읽지 못하면 null).
+// 봉투에서 읽은 것. 시작인가, 시작이면 표식에 쓸 실행·요청 ID(읽지 못하면 null), 그리고 포트에 넘길 데이터 사본(만들지 못하면 null).
+// 사본이 null이면 늘 시작·ID null이라, 포트에 닿기 전에 표식 없이 돌아간다.
 interface EnvelopeView {
   readonly starting: boolean;
   readonly ids: { readonly runId: string; readonly requestId: string } | null;
+  readonly copy: Envelope | null;
 }
 
-// 봉투의 칸을 진입 때 한 번씩 읽는다: 머리(header) → 동작, 시작이면 머리의 요청 ID → 본문(body) → 실행 ID. 같은 칸을 두 번 읽으면
-// 접근자의 시간이 두 번 들고(첫 유효 문이 늦어진다) 두 읽기가 다른 값을 낼 수 있다. 머리나 동작을 읽지 못하면 시작으로 친다(표식 없이
-// 실을 수 있는 쪽으로 틀리지 않는다). 시작인데 두 ID를 읽지 못하면 ids가 null이다(envelope_unreadable).
+// 진입 때 봉투를 정규 직렬화로 한 번 읽어 그 글을 다시 푼 데이터 사본을 만들고, 동작·ID 판정과 포트 호출 모두 이 사본만 쓴다.
+// 원래 봉투는 이 뒤로 다시 읽지 않는다. 받은 봉투를 포트에 그대로 넘기면 포트(내보내기 포트는 직렬화부터 한다)가 머리·본문의
+// 접근자를 유효 문 뒤에 다시 돌리고, 읽을 때마다 값이 바뀌는 접근자면 표식에 적은 ID와 실제로 실리는 ID가 갈린다.
+// 정규 직렬화는 칸마다 한 번 읽고, 포트도 같은 직렬화를 하므로 여기서 읽지 못한 봉투는 포트도 싣지 못한다.
+// 사본을 만들지 못하거나 머리·동작이 없으면 시작으로 친다(표식 없이 실을 수 있는 쪽으로 틀리지 않는다). 시작인데 두 ID를 읽지
+// 못하면 ids가 null이다(envelope_unreadable).
 function readEnvelope(envelope: Envelope): EnvelopeView {
-  let header: unknown;
-  let action: unknown;
+  let copy: unknown;
   try {
-    header = envelope.header;
-    action = (header as { readonly action?: unknown }).action;
+    copy = JSON.parse(canonicalJson(envelope));
   } catch {
-    return { starting: true, ids: null };
+    return { starting: true, ids: null, copy: null };
   }
-  if (action !== "task_start") return { starting: false, ids: null };
-  let requestId: unknown;
-  let runId: unknown;
-  try {
-    requestId = (header as { readonly request_id?: unknown }).request_id;
-    const body: unknown = envelope.body;
-    runId = isObject(body) ? body.run_id : undefined;
-  } catch {
-    return { starting: true, ids: null };
-  }
-  return { starting: true, ids: typeof runId === "string" && typeof requestId === "string" ? { runId, requestId } : null };
+  const header = isObject(copy) ? copy.header : undefined;
+  if (!isObject(copy) || !isObject(header)) return { starting: true, ids: null, copy: null };
+  const sent = copy as unknown as Envelope;
+  if (header.action !== "task_start") return { starting: false, ids: null, copy: sent };
+  const requestId = header.request_id;
+  const body = copy.body;
+  const runId = isObject(body) ? body.run_id : undefined;
+  return { starting: true, ids: typeof runId === "string" && typeof requestId === "string" ? { runId, requestId } : null, copy: sent };
 }
 
 // 쥔 함수와 그 수신자(칸을 읽은 그 객체). 진입 때 만든다.
@@ -233,7 +233,7 @@ function verdictOf<S>(check: Check<S>, stops: Held | null): GateResult<S> | null
 }
 
 // 봉투 하나를 holder.sink에 싣는다. 시작이 아니면 표식 없이 싣는다(start는 보지 않는다).
-// 진입 때 입력 객체의 칸을 모두 한 번씩 읽어 지역 값에 쥔다: 봉투의 머리·동작(시작이면 요청 ID·본문·실행 ID), holder의 sink·beatValid,
+// 진입 때 입력 객체의 칸을 모두 한 번씩 읽어 지역 값에 쥔다: 봉투의 데이터 사본(readEnvelope, 칸마다 한 번), holder의 sink·beatValid,
 // 포트의 send, (시작) start의 시각·마지막 확인·거절 판별·표식 포트와 그 메서드, (시작이 아님) plain의 확인·거절 판별. 유효 문 뒤에는
 // 쥔 함수·값만 쓴다. 칸이 접근자면 유효 문 뒤에 읽는 순간 그 안에서 흐른 시간을
 // 유효 문도 마지막 확인도 보지 못한다(start.lastCheck 접근자에 1ms면 박자 만료 정각에 포트가 불린다).
@@ -299,12 +299,16 @@ export async function sendInstruction<S = never>(
     const refused = markVerdict(marking);
     if (refused !== null) return { kind: "unmarked", markReason: refused };
   }
+  // 사본이 없으면 시작으로 읽혀 위에서 이미 돌아갔다. 타입을 좁히려고 문 앞에서 한 번 더 본다.
+  const sent = view.copy;
+  if (sent === null) return { kind: "unmarked", markReason: "envelope_unreadable" };
   if (!gate()) return { kind: "beat_closed" };
   const verdict = verdictOf(check, stops);
   if (verdict !== null) return verdict;
   try {
     // 마지막 판정 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
-    return { kind: "answered", answer: await Reflect.apply(send, target, [envelope]) };
+    // 넘기는 것은 진입 때 만든 데이터 사본이다(표식의 ID를 읽은 그 사본).
+    return { kind: "answered", answer: await Reflect.apply(send, target, [sent]) };
   } catch {
     return { kind: "threw" };
   }

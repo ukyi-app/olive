@@ -109,7 +109,7 @@ evidence.confirm(executorId, connection, version, stopGeneration) →
 | 상태 보고(`forward` `status_report`) | `take`(머리의 낸 쪽·동작) | `take`의 등록부 읽기(`askedAt`) | 그 읽기 전(`hold`), 줄에 넣은 뒤 줄의 답 | `handleForward`의 `status_matched`에서 그 사본의 `settled`가 `"applied"`일 때. 빈 밀린 사본은 보존할 양성 사본이 없다는 뜻일 뿐 저장 확인이 아니다(`not_known`만 실은 보고의 저장 실패도 사본 없이 `status_matched`다) | 줄에 남음·처리 중·밀린 사본(대기), 맞지 않음·꼴 거절은 양성일 수 있으면 오염, 던짐은 고장 |
 | 접수·시작·정지·정리·세션 영수증, 세션·훅 보고 | `take`(머리의 낸 쪽) | `passReceipt`의 시계 | 시계 전(`hold`) | `handleForward`의 `ack`·`applied_without_ack` | 그 밖의 결과(`ledger_failed`·`ledger_refused`·`rejected`)와 던짐 모두 그 주체 오염(`finally`). 던짐은 고장도 |
 | 결과 보고(`report_result`) | `take`(머리의 낸 쪽) | `passReceipt`의 시계(그 뒤 장부 읽기, 보관소) | 시계 전(`hold`) | `handleForward`의 `ack`·`applied_without_ack` | `result_unknown`·`result_refused`·그 밖과 던짐 모두 그 주체 오염 |
-| 밀린 사본 다시 넘기기 | 줄(`pumpLine`·`replay`) | `replayBacklog`의 장부·연결 확인 | 이미 줄에 있음(대기) | 각 사본의 `settled`가 `"applied"`일 때(`backlog_settled`의 남은 사본이 비는 것은 붙들 양성 사본이 없다는 뜻) | 사본이 줄에 남음(대기). 처리기는 양성 사본을 버리지 않는다 |
+| 밀린 사본 다시 넘기기 | 줄(`pumpLine`·`replay`) | `pumpLine`의 복원 대기 조회(`settled()`, 대기 중이면 여기서 돌아간다). 통과하면 빈 입력 줄의 시계(`readNow`). 재전달 처리기(`replayBacklog`) 안에서는 그 뒤에 장부·연결 확인 | 이미 줄에 있음(대기) | 각 사본의 `settled`가 `"applied"`일 때(`backlog_settled`의 남은 사본이 비는 것은 붙들 양성 사본이 없다는 뜻) | 사본이 줄에 남음(대기). 처리기는 양성 사본을 버리지 않는다 |
 | 철회(`withdrawn`) | `take`(출력의 `principal`) | 송신기의 `forgetConnection`, 등록부 정리 | 그 앞(`changed`) | 해당 없음(장부를 쓰지 않는다) | 등록부 정리가 던지면 고장 |
 
 주체를 읽지 못한 영수증(머리의 낸 쪽이 글자가 아님)은 받는 중으로 세울 주체가 없다. 장부가 받았다는 결과가 아니면 모든 실행기를 오염으로 둔다(진짜 서버의 `forward`는 늘 낸 쪽을 싣는다).
