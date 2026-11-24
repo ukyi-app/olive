@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { AGENT_SOURCE } from "../src/main/agent-install.ts";
+import { ROLE_AGENT_EXIT } from "../src/main/role-agent.ts";
 import { readText } from "./files.ts";
 
 type Stage = { base: string; name?: string; lines: string[] };
@@ -28,9 +30,10 @@ function stage(all: Stage[], name: string): Stage {
   return found!;
 }
 
-test("dockerfile: 단계는 deps, runtime-files, image-check, test, 이름 없는 최종 단계 순서다", async () => {
+test("dockerfile: 단계는 deps, agent-build, runtime-files, image-check, test, 이름 없는 최종 단계 순서다", async () => {
   expect((await stages()).map((s) => s.name ?? "(final)")).toEqual([
     "deps",
+    "agent-build",
     "runtime-files",
     "image-check",
     "test",
@@ -49,6 +52,35 @@ test("dockerfile: image-check가 최종 파일 내용에서 Bun 버전, hc 없�
   expect(check).toContain('test "$(env -i /rootfs/usr/local/bin/bun --version)" = "$(cat /app/.bun-version)"');
   expect(check).toContain('test -z "$(find /rootfs -name hc -print -quit)"');
   expect(check).toContain("test ! -e /rootfs/etc/claude-code");
+});
+
+// 대리는 glibc 대상 하나로만 만든다(D-107). musl 대상은 빌드 중 런타임을 내려받고 dumpable.ts의 libc.so.6이 musl에 없다.
+// autoload를 끄지 않으면 컴파일 파일이 실행 폴더(역할 컨테이너의 작업 폴더)의 .env·bunfig.toml을 prepare 전에 읽는다.
+test("dockerfile: agent-build는 deps 위에서 src/main/role-agent.ts를 glibc 대상(bun-linux-x64)으로, autoload를 끄고 컴파일한다", async () => {
+  const build = stage(await stages(), "agent-build");
+  expect(build.base).toBe("deps");
+  // 줄 잇기(`\`) 앞의 공백이 남으므로 공백을 하나로 모아 견준다.
+  expect(build.lines.map((line) => line.replace(/\s+/g, " "))).toEqual([
+    "COPY src ./src",
+    "RUN bun build --compile --target=bun-linux-x64 --no-compile-autoload-dotenv --no-compile-autoload-bunfig src/main/role-agent.ts --outfile /out/olive-agent",
+  ]);
+  expect(build.lines.join("\n")).not.toContain("musl");
+  // 다른 판의 bun을 받아 쓰는 길(교차 컴파일)을 열지 않는다.
+  expect(build.lines.join("\n")).not.toContain("--compile-executable-path");
+});
+
+test("dockerfile: runtime-files가 대리를 설치 진입점의 원본 경로로 받고, image-check가 그 파일의 꼴·내장 판·81 종료를 본다", async () => {
+  const all = await stages();
+  expect(stage(all, "runtime-files").lines).toContain(`COPY --from=agent-build /out/olive-agent ${AGENT_SOURCE}`);
+  const check = stage(all, "image-check").lines.join("\n");
+  const agent = `/rootfs${AGENT_SOURCE}`;
+  expect(check).toContain(`test -f ${agent} && test ! -L ${agent} && test -x ${agent}`);
+  expect(check).toContain(`test "$(env -i BUN_BE_BUN=1 ${agent} --version)" = "$(cat /app/.bun-version)"`);
+  expect(check).toContain(`{ env -i ${agent}; test "$?" -eq ${ROLE_AGENT_EXIT.config}; }`);
+  // 검사가 모두 && 한 줄로 이어져 결과 파일 만들기 앞에 있다(하나라도 실패하면 test 단계가 돌지 않는다).
+  const run = stage(all, "image-check").lines.find((line) => line.startsWith("RUN "))!;
+  expect(run.indexOf(`{ env -i ${agent}; test`)).toBeLessThan(run.indexOf("&& touch /image-check.ok"));
+  expect(run.indexOf(`{ env -i ${agent}; test`)).toBeGreaterThan(0);
 });
 
 test("dockerfile: test 단계가 image-check를 기다리고 타입 검사와 시험을 돌린다", async () => {

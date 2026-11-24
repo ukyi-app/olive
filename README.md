@@ -18,21 +18,24 @@
 - **하나의 이미지, 역할은 명령으로:** 감독과 작업자 실행기가 같은 이미지를 쓴다. 파드는 `command`로 역할을 고른다.
   - 감독: `["bun", "src/main/supervisor.ts"]`
   - 작업자 실행기(제어 컨테이너): `["bun", "src/main/executor.ts"]`
-  - 역할 컨테이너의 대리(PID 1): `src/main/role-agent.ts`. 역할 컨테이너는 다른 이미지이고 대리를 init이 놓는다(D-103). 그 실행 파일의 꼴은 아직 정하지 않았다.
+  - 대리 설치(작업자 실행기 파드의 init 컨테이너): `["bun", "src/main/agent-install.ts"]`. 이미지의 `/opt/olive/olive-agent`를 공유 볼륨의 `/opt/olive-agent/olive-agent`에 놓는다(아래 "대리 설치").
+  - 역할 컨테이너의 대리(PID 1): `/opt/olive-agent/olive-agent`(`src/main/role-agent.ts`를 컴파일한 파일). 역할 컨테이너는 다른 이미지(glibc 계열)이고 대리를 init이 놓는다(D-103·D-107).
   - 기본 명령(`src/main/no-role.ts`)은 역할을 고르라고 찍고 64로 끝난다. 이미지의 `ENTRYPOINT`는 비어 있어 `command`가 그대로 돈다.
-- **종료 코드:** 64는 역할을 고르지 않음, 69는 아직 구현되지 않음(감독). 실행기의 81~89와 대리의 75~82는 아래 "작업자 실행기 진입점".
+- **종료 코드:** 64는 역할을 고르지 않음, 69는 아직 구현되지 않음(감독). 실행기의 81~89, 대리의 75~82, 대리 설치의 90~93은 아래 "작업자 실행기 진입점".
 - **사용자와 파일시스템:** 비root uid·gid 65532. 루트 파일시스템은 읽기 전용 전제이고 쓰기는 `/tmp`만 된다(파드가 emptyDir를 붙인다).
 - **포트:** 이미지에 듣는 포트를 적지 않는다(`EXPOSE`·`PORT` 없음). 실행기는 TCP 포트를 듣지 않는다. 듣는 곳은 역할 컨테이너의 대리가 붙는 경로 유닉스 소켓 하나(`src/executor/agent-listener.ts`, D-102)뿐이고 abstract 소켓도 쓰지 않는다.
 - **들이지 않는 것:** hc 실행 파일, `/etc/claude-code`(관리 설정), 모델 CLI. 앞의 둘은 빌드가 확인한다.
+- **들이는 것: 대리 실행 파일 하나, glibc(D-107).** `/opt/olive/olive-agent`는 `src/main/role-agent.ts`를 `bun build --compile --target=bun-linux-x64`로 Bun 런타임째 묶은 파일이다(약 104MiB, 이미지가 그만큼 커진다). glibc 동적 링크(`/lib64/ld-linux-x86-64.so.2`)라 Alpine 같은 musl 이미지에서는 돌지 않는다. 실행 폴더의 `.env`·`bunfig.toml`을 읽지 않게 컴파일한다(대리는 역할 컨테이너의 작업 폴더에서 prepare 전에 뜬다). 이 이미지 안에서는 돌리지 않는다.
 - **기반 이미지:** `oven/bun:<버전>-slim`(설치·시험 단계)과 `oven/bun:<버전>-distroless`(최종 단계, 셸 없음). 둘 다 digest로 고정한다.
 - **amd64 단일 빌드:** `app-build`가 `--platform linux/amd64`로 부른다.
 
 ### 빌드가 확인하는 것
 
-Dockerfile 단계는 `deps` → `runtime-files` → `image-check` → `test` → 최종 단계다.
+Dockerfile 단계는 `deps` → `agent-build` → `runtime-files` → `image-check` → `test` → 최종 단계다.
 
 - `deps`: 기반 이미지(slim)의 `bun --version`이 `.bun-version`과 같다.
-- `image-check`: 최종 이미지의 파일 내용(`runtime-files`)을 셸이 있는 단계에 복사해 본다. distroless 안의 bun이 `.bun-version`과 같고, 이름이 `hc`인 파일이 하나도 없고, `/etc/claude-code`가 없다. 최종 단계는 셸이 없어 `RUN`을 쓸 수 없기 때문이다.
+- `agent-build`: `deps`의 bun으로 대리를 컴파일한다. 빌드 호스트와 같은 대상이라 내려받기가 없다.
+- `image-check`: 최종 이미지의 파일 내용(`runtime-files`)을 셸이 있는 단계에 복사해 본다. distroless 안의 bun이 `.bun-version`과 같고, 이름이 `hc`인 파일이 하나도 없고, `/etc/claude-code`가 없다. 대리는 심링크 아닌 실행 파일이고, `BUN_BE_BUN=1 … --version`으로 찍은 내장 bun 판이 `.bun-version`과 같고, 환경 없이 띄우면 81로 끝난다(이 단계는 glibc라 실제로 뜬다). 최종 단계는 셸이 없어 `RUN`을 쓸 수 없기 때문이다.
 - `test`: `image-check`의 결과 파일을 받아 오므로 그 검사 뒤에만 돈다. 타입 검사(`bun run check`)와 시험(`bun run test`, 아래 "시험")을 돌린다. 공용 빌드가 PR과 main push에서 `--target test`로 이 단계를 돌린다.
 
 ## 버전 고정
@@ -55,7 +58,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 두 진입점뿐이다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 대리를 glibc 대상으로 컴파일해 image-check가 본다(`dockerfile`), 대리 설치가 복사·sha256 대조·모드 0555·덮어쓰기를 하고 실패마다 정한 코드로 끝난다(`agent-install`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 두 진입점뿐이다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -99,6 +102,7 @@ src/main/
 ├── supervisor.ts   # 감독 진입점(자리)
 ├── executor.ts     # 작업자 실행기(제어 컨테이너) 진입점: 환경 → 조립(src/executor/runtime.ts)
 ├── role-agent.ts   # 역할 컨테이너의 대리 진입점: 환경 → prepare → 제어 소켓에 붙음
+├── agent-install.ts # init 컨테이너의 대리 설치: 이미지의 대리 → 공유 볼륨(환경을 읽지 않는다)
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
@@ -193,6 +197,18 @@ v1을 바꾸지 않고 실행기가 정한 동작이다. 감독 작업은 이것
 
 대리(`role-agent.ts`): 환경이 없거나 절대 경로가 아니면 **81**. `RoleAgent.prepare`(non-dumpable 78, PID 1 79, 정리 코어 기록 80)가 소켓보다 먼저다. 제어가 아직 듣지 않으면 0.5초마다 다시 붙고 60초 안에 못 붙으면 **82**. 붙으면 `hello`. 붙은 뒤 소켓이 닫히면 `linkClosed()`로 실행을 멈추고 75로 끝난다(76·77은 `src/agent/agent.md`).
 
+### 대리 설치
+
+init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역할 컨테이너보다 먼저 돈다. 환경을 읽지 않고 두 고정 경로만 쓴다: 원본 `/opt/olive/olive-agent`(이미지 안), 대상 `/opt/olive-agent/olive-agent`(공유 볼륨). 이 이미지는 distroless라 셸·`cp`가 없어 복사를 bun으로 한다.
+
+1. 원본이 심링크 아닌 일반 파일이고 읽힌다. 아니면 **90**(그 digest에 대리가 없다).
+2. 대상 폴더가 있는 폴더다. 아니면 **91**(볼륨이 그 경로에 붙지 않았다).
+3. 원본의 sha256을 구하고 같은 폴더의 임시 이름(`.olive-agent.tmp`, 앞선 실행이 남긴 것은 먼저 지운다)에 복사한다. 실패하면 **92**.
+4. 임시 파일의 sha256·길이가 원본과 다르면 **93**.
+5. 모드 `0555`로 바꾸고 대상 이름으로 rename한다(이미 있으면 덮어쓴다. 같은 폴더라 원자적이다). 실패하면 **92**.
+
+실패하면 임시 파일을 지우고 그 코드로 끝나 파드가 역할 컨테이너를 띄우지 않는다. 성공하면 대상 경로·sha256·바이트 수를 한 줄 찍고 0. 복사와 해시는 1MiB 조각으로 읽어 파일 크기만큼 메모리를 쓰지 않는다.
+
 같은 응답 상한(15초, `limits.STOP_GRACE_MS + 5초`) 하나를 worker의 `exitWaitMs`와 원격의 `replyWaitMs`에 넘기고, 원격의 `runtime.now`에는 worker의 상한 타이머(전역 `setTimeout`)와 시간 기준이 같은 `performance.now`를 넘긴다. worker·link·저장소·TLS의 시계는 벽시계다. 대리의 `runtime.now`도 벽시계다(`start`의 기한·임대 끝과 바로 견준다).
 
 운영 숫자는 `executor.ts`의 임시값이다: hello 상한 30초, tick 1초, 멈춤 상한 10초, 다시 붙기 1초에서 30초까지 2배씩(흔들림 20%), 받아 둘 양 1MiB. 실측 뒤 바꾼다.
@@ -220,7 +236,8 @@ v1을 바꾸지 않고 실행기가 정한 동작이다. 감독 작업은 이것
 
 ### 뒤 조각이 지켜야 할 것
 
-- **차트 분할(H-split):** 컨테이너 둘, `shareProcessNamespace` 없음, 역할 uid ≠ 제어 uid. 링크 폴더(emptyDir)는 제어에 쓰기, 역할에 읽기 전용이고 두 컨테이너의 `OLIVE_AGENT_SOCKET`이 그 안의 같은 경로다. 소켓 파일은 `0606`이다: D-103으로 역할 컨테이너가 제어의 그룹에 들지 않아 기타 권한으로 붙는다. 공유 보조 그룹을 쓰기로 바꾸면 `executor.ts`의 값을 `0660`으로 좁힌다. init이 이 이미지의 대리를 역할 컨테이너에 놓는다(D-103, 실행 파일의 꼴 미정). 환경 이름은 위 표에 맞춘다. 키·TLS·저장소 볼륨은 제어에만, 역할 컨테이너에 exec·프로브를 두지 않는다.
+- **차트 분할(H-split):** 컨테이너 둘, `shareProcessNamespace` 없음, 역할 uid ≠ 제어 uid. 링크 폴더(emptyDir)는 제어에 쓰기, 역할에 읽기 전용이고 두 컨테이너의 `OLIVE_AGENT_SOCKET`이 그 안의 같은 경로다. 소켓 파일은 `0606`이다: D-103으로 역할 컨테이너가 제어의 그룹에 들지 않아 기타 권한으로 붙는다. 공유 보조 그룹을 쓰기로 바꾸면 `executor.ts`의 값을 `0660`으로 좁힌다. 환경 이름은 위 표에 맞춘다. 키·TLS·저장소 볼륨은 제어에만, 역할 컨테이너에 exec·프로브를 두지 않는다.
+- **대리 설치(H-split, D-103·D-107):** init 컨테이너는 이 이미지(제어와 같은 digest)로 `["bun", "src/main/agent-install.ts"]`를 돌린다. emptyDir `agent-bin`을 init에는 쓰기로, 역할 컨테이너에는 읽기 전용으로 둘 다 `/opt/olive-agent`에 붙이고, 역할 컨테이너의 `command`는 `["/opt/olive-agent/olive-agent"]`다. 제어 컨테이너에는 붙이지 않는다. emptyDir은 디스크 매체로 둔다(`medium: Memory`면 약 104MiB가 메모리 상한에 든다). 역할 이미지는 glibc 계열(데비안·우분투·distroless)이어야 한다. 역할 컨테이너 환경에 `BUN_BE_BUN`을 두지 않는다(대리 대신 bun으로 돈다). 켤 때 넣는 올리브 digest에 이 파일이 있어야 init이 성공한다(없으면 90).
 - **서명 키(PR-B, H-split 뒤):** `OLIVE_SIGNING_KEY_FILE`이 가리키는 Ed25519 PEM을 제어 컨테이너에만 붙인다. 이 진입점은 키를 파일로 읽는다(TLS 키와 같은 Secret 마운트). 위 "공개 저장소"의 "환경변수로만"과 다른 꼴이라 차트 PR에서 함께 정한다.
 - **감독 공개 키·인스턴스 이름·정책 revision·역할 프로필:** 공개 키는 신뢰 ConfigMap의 `supervisor-signing.pub`를 읽는다(차트 값이 비면 파일이 없어 82). 인스턴스 이름과 정책 revision의 출처, 역할 프로필의 자리(O11·O12)는 정하지 않았다.
 - **회복 길(D-104, 이 진입점에 없음):** 실행 중 링크가 끊기면 지금은 원격이 잠기고 그 실행은 슬롯을 쥔 `unknown_running`으로 남는다(프로세스는 끝나지 않는다). D-104의 정한 코드로 끝나 파드 전체를 다시 띄우고 init의 새 세대 표식을 본 뒤 `inheritedUnverified: false`로 넘기는 길은 뒤 조각이다. 그 전에는 물려받은 실행이 있는 기동마다 원격이 잠겨 새 실행을 띄우지 않는다.
