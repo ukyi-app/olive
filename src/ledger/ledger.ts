@@ -175,10 +175,14 @@ export interface Run {
   stopReceiptId: string | null;
   cleanedReceiptId: string | null;
   resultDigest: string | null;
-  // listRuns만 not_started 줄에 싣는다: 관리자가 실패로 닫은 줄(operator_closures)인가. 스케줄러의 예산 상한이 읽는다
-  // (src/supervisor/scheduler/queue.ts의 budgetBar: false인 not_started 줄만 상한에서 빼고, 칸이 없으면 상한으로 센다).
+  // listRuns만 not_started 줄에 싣는다: 관리자가 실패로 닫은 줄(operator_closures)인가. 스케줄러의 예산 판단이 예약과 맞춰 본다
+  // (src/supervisor/scheduler/queue.ts의 budgetBar: false가 아닌 not_started 줄의 예약이 0이면 모름으로 보류한다).
   // 다른 읽기와 다른 상태의 줄에는 이 칸이 없다.
   closedByOperator?: boolean;
+  // listRuns만 작업자 줄에 싣는다: 이 실행이 같은 요청의 예산에서 잡고 있는 양(ledger.md "요청 예산의 예약").
+  // 시작 지시가 없거나 D-90으로 닫혔으면 0, 그 밖은 시작 지시에 고정된 예산 전부(시작 뒤 감액·관리자 닫기와 무관), 모르면 null.
+  // 세션 줄과 다른 읽기에는 이 칸이 없다.
+  reservedBudget?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -2812,10 +2816,27 @@ export class Ledger {
 
   listRuns(): Read<Run[]> {
     return this.#read(() =>
-      (this.#db.query("SELECT * FROM runs ORDER BY queue_seq").all() as RunRow[]).map((row) =>
-        row.state === "not_started" ? { ...toRun(row), closedByOperator: this.#operatorClosed(row.run_id) } : toRun(row),
-      ),
+      (this.#db.query("SELECT * FROM runs ORDER BY queue_seq").all() as RunRow[]).map((row) => {
+        const run: Run = row.state === "not_started" ? { ...toRun(row), closedByOperator: this.#operatorClosed(row.run_id) } : toRun(row);
+        return row.kind === "worker" ? { ...run, reservedBudget: this.#reservedBudget(row.run_id) } : run;
+      }),
     );
+  }
+
+  // 작업자 실행이 그 요청의 예산에서 잡고 있는 양(ledger.md "요청 예산의 예약"). 장부가 아는 사실(시작 지시, D-90 근거)로만 정하고
+  // runs.budget_left는 읽지 않는다: 시작 뒤 감액은 계측이 아직 없어 돌려주지 않고(D-77), 대기 중 감액은 시작 지시에 이미 고정돼 있다.
+  #reservedBudget(runId: string): number | null {
+    const starts = this.#db
+      .query(`SELECT action, ${this.#rebuildColumns ? "budget_left" : "NULL AS budget_left"} FROM instructions WHERE run_id = ? AND action IN ('task_start', 'session_start')`)
+      .all(runId) as { action: string; budget_left: number | null }[];
+    if (starts.length === 0) return 0;
+    // startRun은 한 번만 시작 지시를 적고 시작한 줄은 대기로 돌아가지 않는다. 둘 이상이거나 작업자 줄에 세션 시작이 있으면 어느 예산인지 정하지 않는다.
+    const [start] = starts;
+    if (starts.length > 1 || start?.action !== "task_start") return null;
+    // D-90은 실행기가 받은 적 없고 감액도 없는 실행만 닫으므로(budget_reduced) 쓴 예산이 없다. 관리자 닫기는 이미 돌았을 수 있어 여기서 빼지 않는다(D-94).
+    if (this.#closures && this.#db.query("SELECT 1 AS x FROM unreceived_closures WHERE run_id = ?").get(runId) !== null) return 0;
+    // 판 4 전에 적힌 시작 지시에는 고정 예산이 없다. 지금 잔액으로 메우지 않는다.
+    return start.budget_left === null ? null : safe(start.budget_left, "instructions.budget_left");
   }
 
   // 실행의 지시 이력 시각. 없는 실행이면 null이다. 장부를 바꾸지 않는다.
