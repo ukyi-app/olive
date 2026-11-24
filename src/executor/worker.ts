@@ -798,6 +798,43 @@ export class WorkerExecutor {
     await Promise.all(this.store.runs().map((record) => this.reconcile(record)));
   }
 
+  // 파드 전체 재시작을 확인한 기동(D-104)이 연결 전에, recover보다 먼저 부른다. 그 실행들을 첫 종료·재정리와 같은 한 자리(reclaim →
+  // confirmStopped)로 다시 끝내고 센다. 종료 영수증은 그 계수가 0일 때만 나고, 장부가 설명하지 못하는 실행은 세기만 한다.
+  // recover와 따로 두는 까닭: recover는 unknown_running을 다시 세지 않고(검증된 취소가 다시 센다) 요청 밖의 실행까지 대조한다.
+  // 남은 수는 생성자에 받은 cleanup이 답한다. 조립이 이 호출 동안만 그 자리를 재시작의 증거로 바꿔 넣는다(runtime.ts).
+  async reclaimRestarted(runIds: readonly string[]): Promise<void> {
+    if (this.store.ledgerHeld()) return;
+    await Promise.all(
+      runIds.map((runId) => {
+        const record = this.store.run(runId);
+        return record === undefined ? undefined : this.reclaim(runId, this.restartedExit(runId, record));
+      }),
+    );
+  }
+
+  // 재시작으로 원래 출력은 사라졌다. 결과 보고는 종료 영수증과 같은 전이에서만 나므로, 저장된 결과 보고가 없는 completed를 그대로 맺으면
+  // 감독 장부는 오지 않을 결과를 checking에서 기다리며 자리를 쥔다(확정 기록이 거절된다). 그래서 새 종료 영수증은 failed로 맺는다.
+  // 이미 저장된 종료 영수증은 confirmStopped가 같은 ID로 다시 쓰므로 이 값이 닿지 않는다.
+  private restartedExit(runId: string, record: RunRecord): ExitKind {
+    const exit = record.exit ?? "failed";
+    if (exit !== "completed") return exit;
+    return this.store.validEvents(runId).some((entry) => entry.action === "report_result") ? exit : "failed";
+  }
+
+  // 회복 대조가 요청을 지우기 전에 부른다. 종료 영수증은 파일에 있는데 실행 기록이 그 사건을 따라오지 못한 실행(앞선 기동의 실행 기록 쓰기 실패)을
+  // recover와 같은 대조로 그 사건에 맞춰 적는다. 그 영수증이 이미 남은 0의 증거라 다시 세지 않는다. 장부가 설명하지 못하는 실행은 건드리지 않는다.
+  async settleRestarted(runIds: readonly string[]): Promise<void> {
+    if (this.store.ledgerHeld()) return;
+    await Promise.all(
+      runIds.map((runId) => {
+        const record = this.store.run(runId);
+        if (record === undefined || this.store.suspectRun(runId)) return undefined;
+        if (!this.store.validEvents(runId).some((entry) => entry.action === "receipt_stopped")) return undefined;
+        return this.reconcile(record);
+      }),
+    );
+  }
+
   // 끝을 맺지 못한 모든 상태를 같은 방식으로 대조한다: 유효한 사건이 있으면 그 사건으로 최종 상태와 마지막 영수증을 맺고(같은 ID, 같은 본문),
   // 없으면 남은 수를 센다. 다시 띄우지 않는다(결과가 없어도 새 실행으로 바꾸지 않는다).
   // 시작 영수증이 없어도 띄우지 않았다는 증거는 아니므로, 종료만 확인된 실행은 not_started가 아니라 failed_stopped로 맺는다.
@@ -814,6 +851,10 @@ export class WorkerExecutor {
       if (record.state !== "finalized") patch.state = "finalized";
     } else if (has("receipt_stopped") && (unfinished || record.state === "unknown_running")) {
       patch.state = has("report_result") ? "ready_result" : "failed_stopped";
+      // 종료 값도 그 영수증을 따른다. 재시작 회복은 completed를 failed로 바꿔 영수증을 내므로(restartedExit) 그 기동이 실행 기록을 못 적었으면
+      // 파일의 기록은 아직 completed다. 상태만 맞추면 실행 기록과 감독이 받은 영수증이 다른 종료 사유를 말한다.
+      const exit = entries.findLast((entry) => entry.action === "receipt_stopped")!.body.exit as ExitKind;
+      if (exit !== record.exit) patch.exit = exit;
     }
     const latest = entries.findLast((entry) => entry.action !== "report_result")?.id ?? null;
     if (latest !== record.last_receipt_id) patch.last_receipt_id = latest;

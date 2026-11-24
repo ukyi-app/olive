@@ -69,6 +69,8 @@ function contents(): Map<string, string> {
 }
 
 const TIMING: ExecutorSettings["timing"] = { replyWaitMs: 5_000, helloWaitMs: 1_000, helloPollMs: 50, tickMs: 1_000, stopWaitMs: 2_000, settleWaitMs: 1_500 };
+// 세대 표식 경로. 회복 요청이 있는 기동만 읽는다(contents()에는 없어 읽으면 ENOENT다).
+const GENERATION = "/olive/generation/marker";
 
 function settings(over: Partial<ExecutorSettings> = {}): ExecutorSettings {
   return {
@@ -78,6 +80,7 @@ function settings(over: Partial<ExecutorSettings> = {}): ExecutorSettings {
     supervisor: { address: "127.0.0.1", port: 9, serverName: SUPERVISOR_DNS, uri: SUPERVISOR_URI },
     storeDir: scratch(),
     agentSocket: "/olive/link/agent.sock",
+    generationMarker: GENERATION,
     files: FILES,
     timing: TIMING,
     reconnect: { initialDelayMs: 100, maxDelayMs: 400, multiplier: 2, jitterRatio: 0 },

@@ -1,20 +1,38 @@
-// 작업자 실행기 파드의 init 컨테이너가 부르는 대리 설치 진입점(D-103). 이미지의 대리 실행 파일을 공유 볼륨에 놓는다.
-// 이 이미지는 distroless라 셸·cp가 없어 복사를 bun으로 한다. 환경을 읽지 않는다: 두 경로는 아래 상수이고 차트가 그 경로에 볼륨을 붙인다.
+// 작업자 실행기 파드의 init 컨테이너가 부르는 대리 설치 진입점(D-103). 이미지의 대리 실행 파일을 공유 볼륨에 놓고,
+// 제어 전용 폴더에 새 세대 표식을 쓴다(D-104, 아래 writeGeneration).
+// 이 이미지는 distroless라 셸·cp가 없어 복사를 bun으로 한다. 환경을 읽지 않는다: 경로는 아래 상수이고 차트가 그 경로에 볼륨을 붙인다.
 //
 // 차례: 원본 확인과 sha256 → 대상 폴더 확인 → 같은 폴더의 임시 이름에 복사 → 임시 파일 sha256 대조 → 모드 0555 → rename.
 // - rename은 같은 폴더 안이라 원자적이다. 역할 컨테이너는 이전 파일이나 새 파일 하나만 본다(이미 있으면 덮어쓴다).
 // - 실패하면 정해진 0 아닌 코드로 끝난다. 0으로 끝나면 파드가 역할 컨테이너를 띄우므로 대조 전의 파일은 대상 이름에 두지 않는다.
 //   임시 파일은 쓰기 단계의 실패에서만 지우려 한다. 그 전에 멈추거나 지우지 못해 남은 것은 다음 init이 복사 전에 지운다.
 // - 복사는 copyFileSync에 맡기고, 해시는 1MiB씩 읽는다. 대리는 약 100MiB라 통째로 읽으면 init의 메모리 상한을 그만큼 올려야 한다.
-import { createHash } from "node:crypto";
-import { chmodSync, closeSync, constants, copyFileSync, lstatSync, openSync, readSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  copyFileSync,
+  fchmodSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 // 이미지 안의 원본(Dockerfile의 runtime-files)과 공유 볼륨 위의 대상(차트의 init·역할 컨테이너가 같은 경로로 붙인다).
 export const AGENT_SOURCE = "/opt/olive/olive-agent";
 export const AGENT_TARGET = "/opt/olive-agent/olive-agent";
+// 세대 표식(D-104). 제어 전용 emptyDir 위의 파일이다: init은 쓰기로, 제어는 읽기로 같은 경로에 붙이고 역할 컨테이너에는 붙이지 않는다.
+// 제어 진입점(src/main/executor.ts)이 이 상수를 그대로 읽는다.
+export const GENERATION_TARGET = "/opt/olive-generation/marker";
 
-// 64·69(placeholder.ts), 75~82(대리), 81~89(실행기)와 겹치지 않는다.
+// 64·69(placeholder.ts), 75~82(대리), 81~89·94(실행기)와 겹치지 않는다.
 export const AGENT_INSTALL_EXIT = {
   // 원본이 없거나 일반 파일이 아니거나 읽지 못했다(그 이미지에 대리가 없다).
   source: 90,
@@ -24,9 +42,15 @@ export const AGENT_INSTALL_EXIT = {
   write: 92,
   // 복사한 파일의 sha256이 원본과 다르다.
   mismatch: 93,
+  // 세대 표식의 폴더가 없거나 폴더가 아니다(제어 전용 볼륨이 init에 붙지 않았다).
+  generation_dir: 95,
+  // 세대 표식의 임시 파일 쓰기·fsync·rename에 실패했다.
+  generation_write: 96,
 } as const;
 
-export type AgentInstallFailure = keyof typeof AGENT_INSTALL_EXIT;
+export type AgentInstallFailure = Exclude<keyof typeof AGENT_INSTALL_EXIT, GenerationFailure>;
+export type GenerationFailure = "generation_dir" | "generation_write";
+export type GenerationResult = { readonly ok: true; readonly marker: string } | { readonly ok: false; readonly reason: GenerationFailure };
 export type AgentInstallResult =
   | { readonly ok: true; readonly sha256: string; readonly bytes: number }
   | { readonly ok: false; readonly reason: AgentInstallFailure };
@@ -121,6 +145,51 @@ function discard(path: string): void {
   } catch {}
 }
 
+// 새 세대 표식을 쓴다: 32바이트 난수의 소문자 16진수 64자, 줄바꿈 없음(실행기의 GENERATION_MARKER 꼴). init이 돌 때마다 새 값이다.
+// 차례: 폴더 확인 → 같은 폴더의 고정 임시 이름(남은 것은 먼저 지움)을 배타 생성 → 쓰기·fsync → rename → 폴더 fsync.
+// - rename은 같은 폴더 안이라 원자적이다. 제어는 이전 값이나 새 값 하나만 읽는다(반쯤 쓴 값을 읽지 않는다).
+// - 이 값이 바뀌었다는 것이 "init이 다시 돌았다 = kubelet이 파드의 모든 컨테이너를 끝냈다"의 증거다. 같은 값을 다시 쓰면 그 증거가
+//   사라지므로 난수는 주입받되 언제나 새로 뽑는다(제품은 crypto.randomBytes).
+// - 실패하면 0이 아닌 코드로 끝나 파드가 컨테이너를 띄우지 않는다. 대상 이름에는 다 쓴 값만 rename으로 들어간다.
+export function writeGeneration(target: string, random: (bytes: number) => Uint8Array): GenerationResult {
+  const dir = dirname(target);
+  try {
+    if (!statSync(dir).isDirectory()) return { ok: false, reason: "generation_dir" };
+  } catch {
+    return { ok: false, reason: "generation_dir" };
+  }
+  const temp = join(dir, `.${basename(target)}.tmp`);
+  try {
+    const bytes = random(32);
+    const marker = Buffer.from(bytes).toString("hex");
+    if (bytes.length !== 32 || !/^[0-9a-f]{64}$/.test(marker)) return { ok: false, reason: "generation_write" };
+    removeIfPresent(temp);
+    // 읽기 전용 모드로 만든다. 제어는 읽기만 하고, 다시 쓰는 것은 다음 init의 rename이라 모드와 무관하다.
+    // openSync의 모드는 umask를 지나므로 init의 umask에 따라 0400 등이 된다. 제어가 다른 uid여도 읽도록 fchmod로 0444를 정한다.
+    const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o444);
+    try {
+      fchmodSync(fd, 0o444);
+      const data = Buffer.from(marker, "ascii");
+      let offset = 0;
+      while (offset < data.length) offset += writeSync(fd, data, offset, data.length - offset);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temp, target);
+    const dirFd = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY);
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
+    return { ok: true, marker };
+  } catch {
+    discard(temp);
+    return { ok: false, reason: "generation_write" };
+  }
+}
+
 function main(): never {
   const result = installAgent({ source: AGENT_SOURCE, target: AGENT_TARGET });
   if (!result.ok) {
@@ -128,6 +197,12 @@ function main(): never {
     process.exit(AGENT_INSTALL_EXIT[result.reason]);
   }
   console.error(`olive agent-install: ${AGENT_TARGET} sha256 ${result.sha256} ${result.bytes}바이트`);
+  const generation = writeGeneration(GENERATION_TARGET, randomBytes);
+  if (!generation.ok) {
+    console.error(`olive agent-install: ${generation.reason} 단계에서 멈췄다(${GENERATION_TARGET})`);
+    process.exit(AGENT_INSTALL_EXIT[generation.reason]);
+  }
+  console.error(`olive agent-install: 세대 표식 ${GENERATION_TARGET}를 새로 썼다`);
   process.exit(0);
 }
 
