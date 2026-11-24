@@ -49,7 +49,10 @@ test("dockerfile: deps 단계가 기반 이미지의 bun과 .bun-version을 대�
 test("dockerfile: image-check가 최종 파일 내용에서 Bun 버전, hc 없음, /etc/claude-code 없음을 확인한다", async () => {
   const check = stage(await stages(), "image-check").lines.join("\n");
   expect(check).toContain("COPY --from=runtime-files / /rootfs/");
-  expect(check).toContain('test "$(env -i /rootfs/usr/local/bin/bun --version)" = "$(cat /app/.bun-version)"');
+  expect(check).toContain('expected="$(cat /app/.bun-version)" && test -n "$expected"');
+  expect(check).toContain(
+    'runtime_version="$(env -i /rootfs/usr/local/bin/bun --version)" && test "$runtime_version" = "$expected"',
+  );
   expect(check).toContain('test -z "$(find /rootfs -name hc -print -quit)"');
   expect(check).toContain("test ! -e /rootfs/etc/claude-code");
 });
@@ -75,12 +78,46 @@ test("dockerfile: runtime-files가 대리를 설치 진입점의 원본 경로�
   const check = stage(all, "image-check").lines.join("\n");
   const agent = `/rootfs${AGENT_SOURCE}`;
   expect(check).toContain(`test -f ${agent} && test ! -L ${agent} && test -x ${agent}`);
-  expect(check).toContain(`test "$(env -i BUN_BE_BUN=1 ${agent} --version)" = "$(cat /app/.bun-version)"`);
+  expect(check).toContain(
+    `agent_version="$(env -i BUN_BE_BUN=1 ${agent} --version)" && test "$agent_version" = "$expected"`,
+  );
   expect(check).toContain(`{ env -i ${agent}; test "$?" -eq ${ROLE_AGENT_EXIT.config}; }`);
   // 검사가 모두 && 한 줄로 이어져 결과 파일 만들기 앞에 있다(하나라도 실패하면 test 단계가 돌지 않는다).
   const run = stage(all, "image-check").lines.find((line) => line.startsWith("RUN "))!;
   expect(run.indexOf(`{ env -i ${agent}; test`)).toBeLessThan(run.indexOf("&& touch /image-check.ok"));
   expect(run.indexOf(`{ env -i ${agent}; test`)).toBeGreaterThan(0);
+});
+
+// 위 시험은 각 검사가 있는지만 본다. 검사 사이가 ;나 ||로 끊기면 앞 검사의 실패가 결과 파일 만들기를 막지 못하므로,
+// image-check의 RUN 하나를 && 로 쪼갠 조각 전체를 차례대로 고정한다. 결과 파일 만들기는 마지막 조각 하나뿐이다.
+test("dockerfile: image-check의 모든 검사가 한 RUN에서 && 로만 이어져 결과 파일 만들기의 전제다", async () => {
+  const check = stage(await stages(), "image-check").lines;
+  const runs = check.filter((line) => line.startsWith("RUN "));
+  expect(runs).toHaveLength(1);
+  const agent = `/rootfs${AGENT_SOURCE}`;
+  expect(
+    runs[0]!
+      .slice("RUN ".length)
+      .replace(/\s+/g, " ")
+      .split(" && "),
+  ).toEqual([
+    'expected="$(cat /app/.bun-version)"',
+    'test -n "$expected"',
+    "test -f /rootfs/usr/local/bin/bun",
+    "test ! -L /rootfs/usr/local/bin/bun",
+    'runtime_version="$(env -i /rootfs/usr/local/bin/bun --version)"',
+    'test "$runtime_version" = "$expected"',
+    'test -z "$(find /rootfs -name hc -print -quit)"',
+    "test ! -e /rootfs/etc/claude-code",
+    "test ! -L /rootfs/etc/claude-code",
+    `test -f ${agent}`,
+    `test ! -L ${agent}`,
+    `test -x ${agent}`,
+    `agent_version="$(env -i BUN_BE_BUN=1 ${agent} --version)"`,
+    'test "$agent_version" = "$expected"',
+    `{ env -i ${agent}; test "$?" -eq ${ROLE_AGENT_EXIT.config}; }`,
+    "touch /image-check.ok",
+  ]);
 });
 
 test("dockerfile: test 단계가 image-check를 기다리고 타입 검사와 시험을 돌린다", async () => {

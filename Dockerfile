@@ -2,10 +2,12 @@
 # - amd64 단일 빌드. app-build가 --platform linux/amd64로 부른다. 아키텍처별 파일을 받아야 하면
 #   ARG TARGETARCH를 기본값 없이 선언한다. 기본값이 있으면 그것이 플랫폼 인자를 이긴다.
 # - test 단계가 있어야 한다. app-build가 --target test로 시험을 돌린다. 공용 빌드는 마지막 단계를 이미지로 낸다.
-# - 비root uid 65532. 루트 파일시스템은 읽기 전용이고 쓰기는 /tmp만 된다. 듣는 포트를 이미지에 적지 않는다.
+# - 비root uid 65532. 루트 파일시스템은 읽기 전용이고, 쓰기는 파드가 컨테이너마다 붙인 마운트에서만 된다: 모든 컨테이너의 /tmp,
+#   init 컨테이너의 /opt/olive-agent(emptyDir agent-bin, 대리 설치 대상). 듣는 포트를 이미지에 적지 않는다.
 # - hc 실행 파일과 /etc/claude-code가 없다(D-37). 모델 CLI를 넣지 않는다.
 # - 들이는 실행 파일은 대리 하나다: /opt/olive/olive-agent(src/main/role-agent.ts를 컴파일한 glibc 동적 링크 파일, D-107).
 #   이 이미지에서는 돌지 않고, init 컨테이너가 bun src/main/agent-install.ts로 공유 볼륨에 놓아 역할 컨테이너(glibc 계열)가 돌린다(D-103).
+#   BUN_OPTIONS·BUN_BE_BUN·BUN_JSC_*·LD_PRELOAD는 대리 코드보다 먼저 읽히고 컴파일 플래그로 끌 수 없다. 역할 컨테이너 환경이 막는다(README "뒤 조각").
 # 기반 이미지는 digest로 고정하고 Renovate가 올린다. 두 FROM, .bun-version, @types/bun은 같은 Bun 버전이다.
 
 # 셸이 있는 slim 단계. 고정 파일과 기반 이미지 안의 실제 Bun 버전이 다르면 여기서 멈춘다.
@@ -42,12 +44,16 @@ COPY --from=agent-build /out/olive-agent /opt/olive/olive-agent
 #   이 단계는 glibc라 실제로 뜨므로, 환경 없이 띄우면 대리 진입점의 "환경 없음" 81로 끝나는지 본다(묶음이 진입점을 타는지).
 FROM deps AS image-check
 COPY --from=runtime-files / /rootfs/
-RUN test -f /rootfs/usr/local/bin/bun && test ! -L /rootfs/usr/local/bin/bun \
-  && test "$(env -i /rootfs/usr/local/bin/bun --version)" = "$(cat /app/.bun-version)" \
+# - 판은 대입 한 줄로 받아 그 명령의 성공과 값 비교를 따로 && 로 잇는다. test "$(명령)" = "…"는 명령이 실패해도
+#   찍은 문자열만 맞으면 통과한다(비교의 종료 코드만 남는다). 기대값이 비면 두 빈 문자열이 같아지므로 비지 않은지도 본다.
+# - 모든 검사는 한 RUN의 && 사슬이다. 하나라도 ;로 끊기면 앞 검사의 실패가 결과 파일 만들기를 막지 못한다.
+RUN expected="$(cat /app/.bun-version)" && test -n "$expected" \
+  && test -f /rootfs/usr/local/bin/bun && test ! -L /rootfs/usr/local/bin/bun \
+  && runtime_version="$(env -i /rootfs/usr/local/bin/bun --version)" && test "$runtime_version" = "$expected" \
   && test -z "$(find /rootfs -name hc -print -quit)" \
   && test ! -e /rootfs/etc/claude-code && test ! -L /rootfs/etc/claude-code \
   && test -f /rootfs/opt/olive/olive-agent && test ! -L /rootfs/opt/olive/olive-agent && test -x /rootfs/opt/olive/olive-agent \
-  && test "$(env -i BUN_BE_BUN=1 /rootfs/opt/olive/olive-agent --version)" = "$(cat /app/.bun-version)" \
+  && agent_version="$(env -i BUN_BE_BUN=1 /rootfs/opt/olive/olive-agent --version)" && test "$agent_version" = "$expected" \
   && { env -i /rootfs/opt/olive/olive-agent; test "$?" -eq 81; } \
   && touch /image-check.ok
 

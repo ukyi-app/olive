@@ -1,10 +1,11 @@
 // 작업자 실행기 파드의 init 컨테이너가 부르는 대리 설치 진입점(D-103). 이미지의 대리 실행 파일을 공유 볼륨에 놓는다.
 // 이 이미지는 distroless라 셸·cp가 없어 복사를 bun으로 한다. 환경을 읽지 않는다: 두 경로는 아래 상수이고 차트가 그 경로에 볼륨을 붙인다.
 //
-// 차례: 원본 확인 → 대상 폴더 확인 → 원본 sha256 → 같은 폴더의 임시 이름에 복사 → 임시 파일 sha256 대조 → 모드 0555 → rename.
+// 차례: 원본 확인과 sha256 → 대상 폴더 확인 → 같은 폴더의 임시 이름에 복사 → 임시 파일 sha256 대조 → 모드 0555 → rename.
 // - rename은 같은 폴더 안이라 원자적이다. 역할 컨테이너는 이전 파일이나 새 파일 하나만 본다(이미 있으면 덮어쓴다).
-// - 실패하면 임시 파일을 지우고 정해진 0 아닌 코드로 끝난다. 0으로 끝나면 파드가 역할 컨테이너를 띄우므로 반쯤 놓인 파일을 남기지 않는다.
-// - 복사와 해시는 조각으로 읽는다. 대리는 약 100MiB라 통째로 읽으면 init의 메모리 상한을 그만큼 올려야 한다.
+// - 실패하면 정해진 0 아닌 코드로 끝난다. 0으로 끝나면 파드가 역할 컨테이너를 띄우므로 대조 전의 파일은 대상 이름에 두지 않는다.
+//   임시 파일은 쓰기 단계의 실패에서만 지우려 한다. 그 전에 멈추거나 지우지 못해 남은 것은 다음 init이 복사 전에 지운다.
+// - 복사는 copyFileSync에 맡기고, 해시는 1MiB씩 읽는다. 대리는 약 100MiB라 통째로 읽으면 init의 메모리 상한을 그만큼 올려야 한다.
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, constants, copyFileSync, lstatSync, openSync, readSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
