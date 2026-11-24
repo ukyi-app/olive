@@ -1,6 +1,6 @@
 # 박자 순서기 (`cycle.ts`)
 
-감독 순환의 한 박자를 차례대로 부르는 자리다. 한 박자에 연결 서버의 `tick()`과 박자 넷(끊김 `linkLossTick` → 수명 `lifeTick` → 재전송 `resendTick` → 배정·시작 `assignAndStartTick`)을 차례로 부른다. 앞의 넷은 박자마다 많아야 한 번이고, 배정만 `assigned`가 나오면 같은 박자에서 `assignCallsPerBeat`번(상한 8)까지 되풀이한다. 박자 사이의 기억 넷(`watch`, `lastQueries`, `lastResends`, `unsentRenews`)을 쥐었다가 다음 박자에 넘긴다. **박자의 결과를 바꾸거나 다시 해석하지 않는다.** 결과의 정해진 칸을 기억으로 옮기고, 멈췄거나 적혔는지 모르는 결과 뒤에 장부를 다시 읽는 것만 한다.
+감독 순환의 한 박자를 차례대로 부르는 자리다. 한 박자에 연결 서버의 `tick()`과 박자 다섯(끊김 `linkLossTick` → 수명 `lifeTick` → 재전송 `resendTick` → D-90 닫기 `unreceivedTick` → 배정·시작 `assignAndStartTick`)을 차례로 부른다. 앞의 넷은 박자마다 많아야 한 번이고, 배정만 `assigned`가 나오면 같은 박자에서 `assignCallsPerBeat`번(상한 8)까지 되풀이한다. 박자 사이의 기억 넷(`watch`, `lastQueries`, `lastResends`, `unsentRenews`)을 쥐었다가 다음 박자에 넘긴다. **박자의 결과를 바꾸거나 다시 해석하지 않는다.** 결과의 정해진 칸을 기억으로 옮기고, 멈췄거나 적혔는지 모르는 결과 뒤에 장부를 다시 읽는 것만 한다.
 
 박자 함수·서버 tick·장부 읽기·시계 둘·복원 끝 여부는 포트로 받는다. 시계·난수·타이머를 직접 부르지 않는다(시험이 소스를 읽어 지킨다). 박자를 언제 부를지(주기)는 부르는 쪽이 정한다. 이 순서기를 부르는 곳은 아직 없다. 실제 서버·포트·장부를 묶어 넘기는 것은 진입점 조각이다.
 
@@ -33,6 +33,7 @@ CycleBeats = {
   linkLoss(clocks: { clock, monotonic }, policy: LinkLossPolicy, input: LinkLossTickInput): LinkLossTickResult
   life(clock: Clock, input: LifeTickInput): Promise<LifeTickResult>
   resend(clock: Clock, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult>
+  unreceived(now: number): UnreceivedTickResult   // 동기. dispatch/unreceived.md
   assign(now: number): Promise<TickResult>
 }
 
@@ -46,7 +47,7 @@ Cycle = {
 BeatReport =
   | { kind: "skipped", reason: "beat_in_progress" | "issuance_closed" }
   | { kind: "ran", serverTick: "ok" | "threw", clock: "ok" | "regressed" | "unavailable",
-      linkLoss: Step, life: Step, resend: Step, assign: Step[], rereads: Reread[] }
+      linkLoss: Step, life: Step, resend: Step, unreceived: Step, assign: Step[], rereads: Reread[] }
 
 Step = { kind: "returned", result } | { kind: "threw" } | { kind: "skipped", reason: "restore_not_done" | "issuance_closed" | "clock_untrusted" }
 ```
@@ -57,6 +58,7 @@ Step = { kind: "returned", result } | { kind: "threw" } | { kind: "skipped", rea
 linkLoss: (clocks, policy, input) => linkLossTick({ ...linkLossPorts, ...clocks }, policy, input)
 life:     (clock, input) => lifeTick({ ...lifePorts, clock }, lifecyclePolicy, input)
 resend:   (clock, policy, input) => resendTick({ ...resendPorts, clock }, policy, input)
+unreceived: (now) => unreceivedTick(unreceivedPorts, now)
 assign:   (now) => assignAndStartTick(assignPorts, assignPolicy, now)
 ```
 
@@ -69,6 +71,7 @@ assign:   (now) => assignAndStartTick(assignPorts, assignPolicy, now)
 3. **끊김.** 복원이 끝났고 깃발이 서지 않았을 때만.
 4. **수명.** 같은 조건. `unsentRenews`가 비어 있지 않으면 먼저 실행 목록을 읽어 뺄 것을 빼고, 그 읽기 뒤에 조건을 본다.
 5. **재전송.** 같은 조건과 박자 처음의 시계가 `ok`일 때.
+5a. **D-90 닫기(`dispatch/unreceived.md`).** 재전송과 같은 조건. 배정처럼 장부 시계를 다시 읽어 `now`로 넘기고 그 읽기 뒤에 조건을 본다(다시 읽은 값이 `ok`가 아니면 `clock_untrusted`). 동기 박자라 기다리지 않는다. 던지거나 `halted: "threw"`면 실행 목록을 다시 읽고(`rereads`의 `beat: "unreceived"`), 어느 쪽이든 배정은 돈다.
 6. **배정·시작.** 같은 조건. 장부 시계를 다시 읽어 `now`로 넘기고, 그 읽기 뒤에 조건을 본다. 결과에 `assigned`가 있고 멈추지 않았으면 같은 박자에서 다시 부른다(처음 포함 `assignCallsPerBeat`번까지).
 
 박자마다 부르기 직전에 복원 끝 여부와 깃발을 다시 본다. **이 확인이 박자를 부르기 전의 마지막 일이다.** 그 앞의 포트 읽기(수명 앞의 실행 목록, 배정 앞의 시계)는 먼저 끝내고, 복원 조회가 돌아온 뒤에 깃발을 한 번 더 본다. 부르는 함수는 만들 때 꺼내 쥔 것이고 박자의 인자(끊김의 `watch` 사본, 수명·재전송의 기억 목록, 배정의 `now` 숫자)는 확인 전에 만든다. 그래서 확인과 함수 진입 사이에 외부 객체의 속성·접근자·배열 생성자가 돌 틈이 없다. `watch`는 결과를 받을 때와 넘길 때 모두 두 칸만 인덱스로 옮겨 새 일반 배열에 담는다(`map`은 박자가 돌려준 배열 하위 타입의 생성자를 부른다). 인자를 만든 뒤(확인 중 포함) 더해진 candidate는 끊김 결과 `watch`로 바꾼 뒤 다시 더한다. 포트가 그 안에서 `closeIssuance()`를 부르거나 복원을 다시 시작해도 바로 다음 박자가 열리지 않는다. **한 번 막히면 그 박자의 남은 박자도 같은 이유로 막힌다.** 박자 하나가 던지거나 멈춰도 그 박자의 남은 박자는 그대로 돈다(아래 "멈춘 박자").
@@ -79,7 +82,7 @@ assign:   (now) => assignAndStartTick(assignPorts, assignPolicy, now)
 - **끊김 → 수명.** 정해진 차례다(`dispatch/link-loss.md` "뒤 조각이 지킬 것"). 옮긴 실행에는 장부가 갱신을 거절하므로 끊겼다고 판정한 실행기의 실행에 갱신이 적히기 전에 옮긴다. 끊김 박자는 동기라 돌아온 뒤에 수명 박자를 부른다.
 - **수명 → 재전송.** 갱신이 시간에 가장 민감하다. 갱신을 낼 수 있는 구간은 기본값에서 7000ms이고(`dispatch/life-loop.md` "박자를 되풀이해 부른다"), 재전송·배정은 내보내기 포트를 기다리므로 그 뒤에 두면 갱신이 늦어진다.
 - **재전송 → 배정.** 새 일(배정·시작)은 이미 진 일(갱신·종료·재전송)을 내보낸 뒤에 연다. 배정 박자의 시작 판단은 박자 처음의 읽기로 하므로 앞 박자들의 쓰기를 본 뒤가 안전하다. 끝에 두면 배정의 되풀이가 다른 박자를 미루지 않는다.
-- **D-90 닫기 박자의 자리는 재전송 뒤, 배정 앞이다.** 재전송의 `start_expired`를 재료로 쓰고, 닫아 푼 자리를 같은 박자의 배정이 쓸 수 있다. 이 PR에는 그 박자가 없다.
+- **D-90 닫기 박자의 자리는 재전송 뒤, 배정 앞이다.** 닫아 푼 자리를 같은 박자의 배정이 쓸 수 있다. 재전송의 결과(`start_expired`)는 쓰지 않는다: 후보와 시간 경계는 장부 읽기의 시작 지시와 그 발행 시각으로 정하므로 재전송이 던지거나 멈춘 박자에도 판단이 같다.
 
 ## 정한 것
 
@@ -168,7 +171,7 @@ assign:   (now) => assignAndStartTick(assignPorts, assignPolicy, now)
 - **재기동을 걸친 시계 비후퇴는 이 PR 밖이다.** 하한은 메모리에만 있다. 장부의 마지막 기록 시각을 하한으로 읽을지는 정하지 않았다.
 - **답 줄과 연결 잇기(N4a2):** 연결 서버의 `candidate` 사건마다 `noteCandidate(주체 이름)`을 부른다. 수명 결과의 `pendingQueries`를 영수증 처리기에 넘기는 것과 조회 등록부는 그 조각이다(순서기는 넘기지 않는다). `not_rebuildable`·`stop_generation_mismatch` 뒤의 조회도 그 쪽이다.
 - **자격 값과 종료 순서(N4a3):** 내보내기 포트와 자격 값 보내기의 `lastCheck`가 `issuanceOpen()`을 보게 하고, `closeIssuance()`가 돌아온 뒤에 `server.close()`를 부른다. 그 전까지 진행 중이던 박자 함수 안의 발급은 포트가 막지 않는다.
-- **D-90 닫기 박자(A6c):** 재전송 뒤, 배정 앞에 끼운다. `CycleBeats`에 박자 하나를 더하고 같은 막힘(복원·깃발·시계)을 건다. 재전송이 시작을 보류한 박자(`clock_untrusted`)에는 시간 판정도 보류한다.
+- **D-90 닫기 박자의 증거와 진입점:** 박자는 `unreceived`로 끼웠다(위 5a). 진입점은 답 줄·내보내기 포트·복원기와 같은 객체를 그 포트에 묶는다. 증거 포트의 구현과 그 밖의 조건은 `dispatch/unreceived.md` "뒤 조각이 지켜야 할 것"이다.
 - **재전송의 보류 사유가 늘어도 순서기는 바뀌지 않는다.** `resent`와 `delivery: "unknown"`인 `not_sent`만 기억으로 옮기고 다른 갈래는 그대로 보고에 싣는다.
 
 ## 남는 한계

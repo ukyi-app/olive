@@ -126,12 +126,48 @@ test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재�
     "src/supervisor/dispatch/envelopes.ts",
     "src/supervisor/dispatch/resend.ts",
     GATE,
+    // D-90 닫기 박자. 장부 읽기 항목의 action 칸을 견주어 시작 지시만 후보로 고를 뿐 초안을 꾸미거나 싣지 않는다(아래 "D-90 닫기 박자" 시험).
+    UNRECEIVED,
   ]);
   expect(sendSites(src("src/supervisor/dispatch/envelopes.ts"))).toEqual([]);
   // 감독 안에서 봉투에 서명하는 자리는 봉투 모듈과 정지 동기화의 답(stop_sync_reply만 받는 포트)뿐이다.
   const sealing = files.filter((file) => file.startsWith("src/supervisor/") && sealCalls(src(file)) > 0);
   expect(sealing).toEqual(["src/supervisor/dispatch/envelopes.ts", "src/supervisor/transport/connections.ts"]);
   expect(src("src/supervisor/transport/connections.ts")).toContain('seal(input: SealInput<"stop_sync_reply">): Envelope;');
+});
+
+const UNRECEIVED = "src/supervisor/dispatch/unreceived.ts";
+// D-90 닫기 박자가 시작 봉투에 닿을 수 있는 글자. task_start 글자는 항목을 고르는 한 줄에만 있어야 한다: 초안을 손으로 꾸미려면
+// action·recipient를 적는 줄에 그 글자를 더 써야 하므로 여기서 걸린다.
+const unreceivedReach = (source: string): string[] => [
+  ...(startDraftCalls(source) > 0 ? ["startDraft"] : []),
+  ...(sealCalls(source) > 0 || /\bsealDraft\b/.test(source) ? ["seal"] : []),
+  ...sendSites(source),
+  ...(/\bmarkStartDispatch\b/.test(source) ? ["markStartDispatch"] : []),
+  ...(/\bsendInstruction\b|send-gate|envelopes|sink/i.test(source) ? ["send_import"] : []),
+  ...source
+    .split("\n")
+    .filter((line) => /["'`]task_start["'`]/.test(line))
+    .map((line) => line.trim())
+    .filter((line) => line !== 'if (action !== "task_start") return null;'),
+];
+
+test("정적: D-90 닫기 박자는 task_start를 항목 고르기 한 줄에만 쓰고, 시작 봉투를 만들거나 봉하거나 싣거나 표식을 적을 수 없다", () => {
+  expect(unreceivedReach(src(UNRECEIVED))).toEqual([]);
+  expect(startLiterals(src(UNRECEIVED))).toBe(1);
+});
+
+test("대조군: D-90 닫기 박자에 시작 봉투·송신·표식의 글자나 다른 task_start 줄을 넣으면 위 단언이 잡는다", () => {
+  for (const [snippet, expected] of [
+    ["const d = startDraft({ run });", ["startDraft"]],
+    ["const e = sealDraft(d, signer);", ["seal"]],
+    ["await ports.sink.send(e);", ["method_call", "send_import"]],
+    ["ledger.markStartDispatch({ runId, requestId, now });", ["markStartDispatch"]],
+    ['import { sendInstruction } from "./send-gate.ts";', ["send_import"]],
+    ['const body = { action: "task_start", recipient };', ['const body = { action: "task_start", recipient };']],
+  ] as const) {
+    expect([snippet, unreceivedReach(`${src(UNRECEIVED)}\n${snippet}`)]).toEqual([snippet, [...expected]]);
+  }
 });
 
 test("정적: 공유 함수 밖의 송신 자리는 시작 봉투를 만들 수 없는 모듈에 있다", () => {

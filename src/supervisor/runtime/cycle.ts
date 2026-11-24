@@ -1,4 +1,4 @@
-// 감독의 박자 순서기. 한 박자에 연결 서버의 tick과 박자 넷(끊김 → 수명 → 재전송 → 배정·시작)을 정해진 차례로 부르고(배정만
+// 감독의 박자 순서기. 한 박자에 연결 서버의 tick과 박자 다섯(끊김 → 수명 → 재전송 → 받은 적 없는 실행 닫기 → 배정·시작)을 정해진 차례로 부르고(배정만
 // assigned가 나오면 같은 박자에서 정책의 횟수까지 되풀이한다), 박자 사이의 기억(watch, lastQueries, lastResends, unsentRenews)을
 // 쥐었다가 다음 박자에 넘긴다. 박자의 결과를 바꾸거나 다시 해석하지 않는다: 결과의 정해진 칸을 기억으로 옮기고, 멈췄거나 적혔는지
 // 모르는 결과 뒤에 장부를 다시 읽는 것만 한다.
@@ -7,7 +7,7 @@
 //
 // 지키는 것:
 // 1. 박자를 겹쳐 부르지 않는다. 박자가 진행 중이면 beat()는 기다리지 않고 거절한다(박자 안의 포트에서 다시 부른 것도 같다).
-// 2. 복원이 끝나기 전에는 서버 tick만 부르고 박자 넷은 부르지 않는다. 박자를 부르기 직전마다, 그 앞의 포트 읽기를 마친 뒤에 다시 본다.
+// 2. 복원이 끝나기 전에는 서버 tick만 부르고 박자는 부르지 않는다. 박자를 부르기 직전마다, 그 앞의 포트 읽기를 마친 뒤에 다시 본다.
 //    박자 함수는 만들 때 꺼내 쥔 것을 부르고 인자는 확인 전에 만들므로, 그 확인과 함수 진입 사이에 외부 코드가 돌지 않는다.
 //    한 번 막히면 그 박자의 남은 박자도 부르지 않는다(끊김 박자 없이 수명 박자만 도는 박자를 만들지 않는다).
 // 3. 장부 시계는 공유 비후퇴 시계(shared-clock.ts)다. 원천 값이 그 하한(장부·내보내기 포트·서버가 읽은 값 포함)보다 이르면 박자에는
@@ -21,15 +21,18 @@ import type { LifeTickInput, LifeTickResult } from "../dispatch/life-loop.ts";
 import type { LinkLossPolicy, LinkLossTickInput, LinkLossTickResult, MonotonicClock, WatchEntry } from "../dispatch/link-loss.ts";
 import type { Clock } from "../dispatch/ports.ts";
 import { type ResendPolicy, type ResendTickInput, type ResendTickResult, START_LAST_SEAL_MS } from "../dispatch/resend.ts";
+import type { UnreceivedTickResult } from "../dispatch/unreceived.ts";
 import { type ClockReading, isSharedClock, type SharedClock } from "./shared-clock.ts";
 
-// 박자 넷. 조립은 실제 박자 함수에 그 포트·정책을 묶어 넘긴다(예: linkLoss = (c, p, i) => linkLossTick({ ...포트, ...c }, p, i)).
+// 박자 다섯. 조립은 실제 박자 함수에 그 포트·정책을 묶어 넘긴다(예: linkLoss = (c, p, i) => linkLossTick({ ...포트, ...c }, p, i)).
 // 시계와 끊김·재전송의 정책은 이 순서기가 넘기는 것을 그대로 포트에 넣어야 한다: 시계 하한과 정책 검사가 그 값에 걸려 있다.
-// createCycle이 네 함수를 한 번 꺼내 쥐므로 나중에 이 객체의 속성을 바꿔도 따르지 않는다. 지금의 장부·어댑터로 바꾸는 것은 함수 본문 안에서 한다.
+// createCycle이 다섯 함수를 한 번 꺼내 쥐므로 나중에 이 객체의 속성을 바꿔도 따르지 않는다. 지금의 장부·어댑터로 바꾸는 것은 함수 본문 안에서 한다.
 export interface CycleBeats {
   linkLoss(clocks: { readonly clock: Clock; readonly monotonic: MonotonicClock }, policy: LinkLossPolicy, input: LinkLossTickInput): LinkLossTickResult;
   life(clock: Clock, input: LifeTickInput): Promise<LifeTickResult>;
   resend(clock: Clock, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult>;
+  // D-90 닫기(unreceived.ts의 unreceivedTick). 동기다: 증거 읽기·연결 재확인·장부 호출 사이에 기다림이 없어야 한다.
+  unreceived(now: number): UnreceivedTickResult;
   assign(now: number): Promise<AssignTickResult>;
 }
 
@@ -89,7 +92,7 @@ export type Step<R> =
   | { readonly kind: "threw" }
   | { readonly kind: "skipped"; readonly reason: SkipReason };
 
-export type RereadBeat = "link_loss" | "life" | "resend" | "assign";
+export type RereadBeat = "link_loss" | "life" | "resend" | "unreceived" | "assign";
 
 export type Reread =
   // 결과 밖을 대조할 목록. runs는 실행 목록, waiting_requests는 대기 부탁 목록(배정이 던지거나 halted: "threw"일 때만)이다. known은 그 목록을 읽었는지까지다:
@@ -116,11 +119,12 @@ export type BeatReport =
   | {
       readonly kind: "ran";
       readonly serverTick: "ok" | "threw";
-      // 박자 처음에 읽은 장부 시계. ok가 아니면 재전송·배정을 부르지 않았다.
+      // 박자 처음에 읽은 장부 시계. ok가 아니면 재전송·D-90 닫기·배정을 부르지 않았다.
       readonly clock: "ok" | "regressed" | "unavailable";
       readonly linkLoss: Step<LinkLossTickResult>;
       readonly life: Step<LifeTickResult>;
       readonly resend: Step<ResendTickResult>;
+      readonly unreceived: Step<UnreceivedTickResult>;
       // 부른 차례대로. 하나 이상이고, 부르지 않았으면 skipped 하나다.
       readonly assign: readonly Step<AssignTickResult>[];
       readonly rereads: readonly Reread[];
@@ -176,7 +180,7 @@ function takeBeats(beats: CycleBeats): CycleBeats {
     if (typeof fn !== "function") throw new TypeError(`순서기의 beats.${name}는 함수여야 한다`);
     return ((...args: unknown[]) => Reflect.apply(fn, beats, args)) as CycleBeats[K];
   };
-  return Object.freeze({ linkLoss: take("linkLoss"), life: take("life"), resend: take("resend"), assign: take("assign") });
+  return Object.freeze({ linkLoss: take("linkLoss"), life: take("life"), resend: take("resend"), unreceived: take("unreceived"), assign: take("assign") });
 }
 
 export function createCycle(deps: CycleDeps): Cycle {
@@ -421,6 +425,24 @@ export function createCycle(deps: CycleDeps): Cycle {
       else if (resend.result.kind === "ran" && resend.result.halted !== null) rereadRuns("resend", "halted");
     }
 
+    // D-90 닫기. 재전송 뒤에 두어 닫아 푼 자리를 같은 박자의 배정이 쓴다. 막힘과 시계는 배정과 같다: 박자 처음의 시계가 ok일 때만,
+    // 부르기 직전에 장부 시계를 다시 읽어 now로 넘기고 그 읽기 뒤에 막힘을 마지막으로 본다. 동기 박자라 기다리지 않는다.
+    let unreceived: Step<UnreceivedTickResult>;
+    const unreceivedRead = blocked() || start.state !== "ok" ? null : readNow();
+    const unreceivedAt = unreceivedRead !== null && unreceivedRead.state === "ok" ? unreceivedRead.at : null;
+    const unreceivedGate = trusted() ?? (unreceivedAt === null ? "clock_untrusted" : null);
+    if (unreceivedGate !== null || unreceivedAt === null) unreceived = { kind: "skipped", reason: unreceivedGate ?? "clock_untrusted" };
+    else {
+      try {
+        unreceived = { kind: "returned", result: beats.unreceived(unreceivedAt) };
+      } catch {
+        unreceived = { kind: "threw" };
+      }
+      // 장부가 닫았는지 모르는 끝(던짐, 장부 호출이 던지거나 답이 정의 밖이어서 멈춤)만 다시 읽는다. 전역 포트로 멈춘 것은 장부를 부르지 않았다.
+      if (unreceived.kind === "threw") rereadRuns("unreceived", "threw");
+      else if (unreceived.result.kind === "ran" && unreceived.result.halted === "threw") rereadRuns("unreceived", "halted");
+    }
+
     const assign: Step<AssignTickResult>[] = [];
     // 배정이 던지거나 halted: "threw"로 멈추면 결과에 없는 대기 부탁과 실행 전체를 다시 읽는다(assign-loop.md "박자가 멈출 때").
     // halted: "intake_closed"는 되풀이만 멈추고 다시 읽지 않는다. 대기 부탁은 실행 줄이 생기기 전부터 있는 별도 목록이라 실행 목록만으로는
@@ -456,7 +478,7 @@ export function createCycle(deps: CycleDeps): Cycle {
       if (result.halted !== null || !result.requests.some((item) => item.outcome === "assigned")) break;
     }
 
-    return { kind: "ran", serverTick, clock: start.state, linkLoss, life, resend, assign, rereads };
+    return { kind: "ran", serverTick, clock: start.state, linkLoss, life, resend, unreceived, assign, rereads };
   };
 
   const report = (value: BeatReport): BeatReport => {
