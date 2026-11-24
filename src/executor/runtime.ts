@@ -22,6 +22,8 @@
 //   그 기다림은 settleWaitMs에 묶는다. 넘으면 다시 붙지 않고 fatal로 끝낸다.
 // - 기동의 기다림(재료 읽기·저장소 열기·recover)도 하나마다 settleWaitMs에 묶는다. 넘으면 그 단계의 코드로 끝난다(사유 timed_out).
 // - 끝낼 때 소켓 stop()을 기다린 뒤 TLS 클라이언트를 닫는다. stop이 상한(stopWaitMs) 안에 끝나지 않거나 상한을 걸지 못하면 기다리지 않고 닫는다.
+// - 기한이 있는 기다림은 결과를 받아들이는 때의 단조 시각으로 판정한다(untilDeadline, hello는 받은 시각). 기한 정각 이후면 상한 타이머보다
+//   먼저 처리된 결과여도 만료다. 타이머는 깨우는 수단이다.
 import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
 import { encodeControl } from "../agent/link.ts";
 import { type Role, ROLES } from "../contract/v1/index.ts";
@@ -298,28 +300,67 @@ class StepTimeout extends Error {
   }
 }
 
-// 기동의 기다림 하나를 상한(단조 시계의 setTimer)에 묶는다. 상한이 되거나 상한을 걸지 못하면 StepTimeout으로 거절한다.
-// 늦게 끝난 결과는 버린다: 기동이 실패하면 진입점이 프로세스를 끝내므로 그 결과(열린 저장소, 진행 중인 복원)를 쓸 자리가 없다.
-function bounded<T>(work: Promise<T>, ms: number, setTimer: ExecutorDeps["setTimer"]): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+type Waited<T> =
+  | { readonly kind: "done"; readonly value: T }
+  | { readonly kind: "failed"; readonly error: unknown }
+  // 기한 정각 이후에 결과를 받았거나 상한 타이머가 기한에 닿았다.
+  | { readonly kind: "lapsed" }
+  // 상한 타이머를 걸지 못했다(기다리지 않는다).
+  | { readonly kind: "unarmed" }
+  | { readonly kind: "aborted" };
+
+// 기한이 있는 기다림 하나. 기한(limit)은 단조 시계(monoNow)의 절대 시각이다. 판정은 시각이 한다: 결과(성공·거절)를 받아들이는 때
+// monoNow가 기한 정각 이후면 콜백 차례와 상관없이 lapsed다. 타이머는 깨우는 수단이라 정각 전에 불리면 시각을 다시 보고 남은 시간으로
+// 다시 건다(올림, 최소 1ms라 실제 시계에서 끝난다).
+// 함정: 정각에 결과와 상한 타이머가 같은 차례에 서면 이벤트 루프가 고른 쪽이 이긴다. 결과 쪽에서 시각을 보지 않으면 기한이 지난 결과로
+// 다음 단계(기동, 다시 붙기)에 들어간다. 진행 중인 작업 자체는 취소하지 않는다. 늦게 끝난 결과는 버린다.
+function untilDeadline<T>(work: Promise<T>, limit: number, deps: Pick<ExecutorDeps, "monoNow" | "setTimer">, signal?: AbortSignal): Promise<Waited<T>> {
+  return new Promise((resolve) => {
+    let ended = false;
     let cancel: () => void = () => {};
-    const settle = () => {
+    const end = (outcome: Waited<T>) => {
+      if (ended) return;
+      ended = true;
+      resolve(outcome);
       try {
         cancel();
       } catch {
-        // 취소하지 못한 상한 타이머가 늦게 불려도 이미 정해진 약속은 바뀌지 않는다
+        // 취소하지 못한 상한 타이머가 늦게 불려도 이미 정해진 결과는 바뀌지 않는다
+      }
+    };
+    const accept = (outcome: Waited<T>) => end(deps.monoNow() >= limit ? { kind: "lapsed" } : outcome);
+    const arm = () => {
+      try {
+        cancel = deps.setTimer(Math.max(1, Math.ceil(limit - deps.monoNow())), () => (deps.monoNow() >= limit ? end({ kind: "lapsed" }) : arm()));
+      } catch {
+        end({ kind: "unarmed" });
       }
     };
     work.then(
-      (value) => (settle(), resolve(value)),
-      (error: unknown) => (settle(), reject(error)),
+      (value) => accept({ kind: "done", value }),
+      (error: unknown) => accept({ kind: "failed", error }),
     );
-    try {
-      cancel = setTimer(ms, () => reject(new StepTimeout("timed_out")));
-    } catch {
-      reject(new StepTimeout("bound_unavailable"));
-    }
+    if (signal?.aborted) return end({ kind: "aborted" });
+    signal?.addEventListener("abort", () => end({ kind: "aborted" }), { once: true });
+    arm();
   });
+}
+
+// 기동의 기다림 하나. 기한은 단계를 부르기 전에 잰다: 단계의 동기 부분이 쓴 시간도 상한에 든다. 정각 이후에 받은 결과는 성공이든 실패든
+// StepTimeout(timed_out)이다. 상한을 걸지 못하면 bound_unavailable. 늦은 결과(열린 저장소, 진행 중인 복원)는 기동이 실패하면 진입점이
+// 프로세스를 끝내므로 쓸 자리가 없다.
+async function bounded<T>(begin: () => Promise<T>, ms: number, deps: Pick<ExecutorDeps, "monoNow" | "setTimer">): Promise<T> {
+  const limit = deps.monoNow() + ms;
+  let work: Promise<T>;
+  try {
+    work = begin();
+  } catch (error) {
+    work = Promise.reject(error);
+  }
+  const waited = await untilDeadline(work, limit, deps);
+  if (waited.kind === "done") return waited.value;
+  if (waited.kind === "failed") throw waited.error;
+  throw new StepTimeout(waited.kind === "unarmed" ? "bound_unavailable" : "timed_out");
 }
 
 // 오류에서 사유 이름만 꺼낸다. 메시지에는 경로나 값이 들 수 있어 쓰지 않는다.
@@ -406,7 +447,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   step("material");
   let material: Material;
   try {
-    material = await bounded(readMaterial(settings, deps.readText), timing.settleWaitMs, deps.setTimer);
+    material = await bounded(() => readMaterial(settings, deps.readText), timing.settleWaitMs, deps);
   } catch (error) {
     return fail("material", EXECUTOR_EXIT.material, error);
   }
@@ -415,7 +456,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   step("store");
   let store: ExecutorStore;
   try {
-    store = await bounded(deps.openStore(settings.storeDir, deps.wallNow), timing.settleWaitMs, deps.setTimer);
+    store = await bounded(() => deps.openStore(settings.storeDir, deps.wallNow), timing.settleWaitMs, deps);
   } catch (error) {
     return fail("store", EXECUTOR_EXIT.store, error);
   }
@@ -516,7 +557,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
 
   step("recover");
   try {
-    await bounded(worker.recover(), timing.settleWaitMs, deps.setTimer);
+    await bounded(() => worker.recover(), timing.settleWaitMs, deps);
   } catch (error) {
     listener.stop();
     return fail("recover", EXECUTOR_EXIT.recover, error);
@@ -585,16 +626,14 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       }
       deps.log(`실행기를 멈춘다(${reason}), 코드 ${code}`);
       if (socket !== undefined) {
-        const stopping = socket.stop().then(() => true);
-        let stopped: boolean;
+        const stopLimit = deps.monoNow() + timing.stopWaitMs;
+        let stopping: Promise<void>;
         try {
-          let cancelBound: () => void = () => {};
-          const bound = new Promise<boolean>((resolve) => (cancelBound = deps.setTimer(timing.stopWaitMs, () => resolve(false))));
-          stopped = await Promise.race([stopping, bound]);
-          cancelBound();
-        } catch {
-          stopped = false;
+          stopping = socket.stop();
+        } catch (error) {
+          stopping = Promise.reject(error);
         }
+        const stopped = (await untilDeadline(stopping, stopLimit, deps)).kind === "done";
         if (!stopped) deps.log("감독 소켓이 상한 안에 멈추지 않았거나 상한을 걸지 못해 기다리지 않고 닫는다");
       }
       try {
@@ -660,28 +699,14 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 함정: 처리 안의 저장소 쓰기(맞춤 답의 정지 세대 쓰기, 검증의 nonce, 영수증·실행 기록)에는 상한이 없다. 그 쓰기가 돌아오지 않으면
   // 이 기다림도 끝나지 않아, 실행기가 살아 있는 채 다시 붙지도 끝나지도 않는다. 그래서 기다림마다 settleWaitMs를 걸고, 넘으면 다시 붙지
   // 않고 fatal로 끝내 컨테이너 재시작에 맡긴다. 저장소는 쓰기를 차례로 하므로 멈춘 쓰기 뒤에서는 새 연결의 맞춤도 끝나지 않는다.
-  // 소켓의 멈춤(중단 신호)이면 기다리지 않고 거절한다.
-  const settledInFlight = (signal: AbortSignal | undefined, limit: number) =>
-    new Promise<"settled" | "aborted" | "lapsed">((resolve) => {
-      if (signal?.aborted) return resolve("aborted");
-      let cancelBound: () => void = () => {};
-      const end = (how: "settled" | "aborted") => {
-        resolve(how);
-        try {
-          cancelBound();
-        } catch {
-          // 늦게 불린 상한은 이미 정해진 약속을 바꾸지 않는다
-        }
-      };
-      signal?.addEventListener("abort", () => end("aborted"), { once: true });
-      void Promise.all([...inFlight]).then(() => end("settled"));
-      try {
-        cancelBound = deps.setTimer(Math.max(1, Math.ceil(limit - deps.monoNow())), () => resolve("lapsed"));
-      } catch {
-        // 상한을 걸지 못하면 기다리지 않는다(끝나지 않을 수 있는 처리에 다시 붙기를 묶지 않는다)
-        resolve("lapsed");
-      }
-    });
+  // 소켓의 멈춤(중단 신호)이면 기다리지 않고 거절한다. 처리의 끝을 받아들이는 때에도 시각을 본다(untilDeadline): 기한 정각 이후에 끝난
+  // 처리는 상한 타이머보다 먼저 처리돼도 lapsed라, 새 TCP를 열기 전에 fatal이 정해진다. 상한을 걸지 못해도 기다리지 않고 lapsed다
+  // (끝나지 않을 수 있는 처리에 다시 붙기를 묶지 않는다).
+  const settledInFlight = async (signal: AbortSignal | undefined, limit: number): Promise<"settled" | "aborted" | "lapsed"> => {
+    const waited = await untilDeadline(Promise.all([...inFlight]), limit, deps, signal);
+    if (waited.kind === "done") return "settled";
+    return waited.kind === "aborted" ? "aborted" : "lapsed";
+  };
   const gatedClient: Pick<TlsClient, "connect" | "close"> = {
     connect: async (signal) => {
       const limit = deps.monoNow() + timing.settleWaitMs;
