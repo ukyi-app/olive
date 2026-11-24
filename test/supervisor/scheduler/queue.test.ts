@@ -411,6 +411,20 @@ describe("요청 한도(D-105: 요청 전체로 묶음, D-106: 모자라면 보�
     expect(planNext(view([{ ...sessionRow, reservedBudget: LIMIT }, current], inputs), POLICY).candidates.map((x) => x.runId)).toEqual([current.runId]);
   });
 
+  test("시작 지시가 있는 작업자 줄의 예약 0은 장부와 어긋난 읽기라 모름으로 보류하고, 대기·대기에서 닫힌 줄의 0만 믿는다", () => {
+    // 실제 장부에서는 시작 지시와 같은 트랜잭션에 1 이상의 예산이 고정되므로 이런 줄은 포트가 꼴이 틀린 답을 줄 때만 나온다.
+    const current = run({ inputRequestId: "zero", budgetLeft: 10 });
+    const inputs = [inputFor(current, "admin")];
+    for (const state of ["preparing", "running", "stopping", "unknown_running", "checking", "ready_result", "failed_stopped", "cleanup_pending", "finalized"] as const) {
+      const prior = run({ inputRequestId: "zero", state, reservedBudget: 0 });
+      expect(planNext(view([prior, current], inputs), POLICY).held, state).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_unknown" }]);
+    }
+    const waiting = run({ inputRequestId: "zero", reservedBudget: 0 });
+    const closedWaiting = run({ inputRequestId: "zero", state: "not_started", closedByOperator: false, reservedBudget: 0 });
+    expect(planNext(view([closedWaiting, current], inputs), POLICY).candidates.map((x) => x.runId)).toEqual([current.runId]);
+    expect(planNext(view([current, waiting], inputs), POLICY).candidates.map((x) => x.runId)).toEqual([current.runId]);
+  });
+
   test("한도는 입력의 출처마다 따로다", () => {
     const prior = run({ inputRequestId: "org", state: "finalized", reservedBudget: 20_000 });
     const next = run({ inputRequestId: "org", budgetLeft: 50_000 });

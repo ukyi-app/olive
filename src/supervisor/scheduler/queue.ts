@@ -150,12 +150,15 @@ function budgetBar(view: SchedulerView, run: SchedulerRun, limit: number): HoldR
   // 읽지 못한 잔액·예약이 이 0을 가리지 않게 모름보다 먼저 본다.
   if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
   if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
-  // 세션 줄은 예약을 세지 않는다: 세션 시작은 닫혀 있고 세션의 예산은 이 판단 밖이다.
+  // 세션 줄의 예약은 세지 않는다(세션 시작이 닫혀 있다). 대기 세션 자신의 예산은 이 함수가 종류를 가리지 않으므로 같은 요청의
+  // 남은 몫과 비교된다. 세션을 한도에 넣을지는 세션 시작을 열 때 다시 정한다.
   const workers = others.filter((other) => other.kind === "worker");
   if (workers.some((other) => !isBudget(other.reservedBudget))) return "budget_unknown";
-  // 관리자 닫기는 시작 지시가 있어야만 되므로 그 줄의 예약은 시작 예산 전부다(D-94). 그런 줄이나 관리자가 닫았는지 모르는 줄의
+  // 예약 0을 믿는 줄은 시작 지시가 없는 queued와 관리자가 닫지 않았다고 확인된 not_started(대기에서 닫힘, D-90)뿐이다. 그 밖의
+  // 작업자 줄은 시작 지시와 같은 트랜잭션에 1 이상의 예산이 고정되고, 관리자 닫기도 시작 예산 전부를 잡는다(D-94). 그런 줄의
   // 예약이 0이면 장부와 어긋난 읽기라 0으로 믿지 않는다.
-  if (workers.some((other) => other.state === "not_started" && other.closedByOperator !== false && other.reservedBudget === 0)) return "budget_unknown";
+  const zeroTrusted = (other: SchedulerRun): boolean => other.state === "queued" || (other.state === "not_started" && other.closedByOperator === false);
+  if (workers.some((other) => other.reservedBudget === 0 && !zeroTrusted(other))) return "budget_unknown";
   // 예약은 시작한 실행이 잡은 양이고 돌려주지 않는다(D-77). 대기 중인 다른 실행은 시작할 때 이 판단을 따로 지난다.
   const left = limit - workers.reduce((sum, other) => sum + (other.reservedBudget as number), 0);
   if (left <= 0) return "budget_exhausted";
