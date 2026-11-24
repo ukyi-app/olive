@@ -392,11 +392,12 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 **시험 작업 넣기(`test-job`).** 본체 세션(O10) 없이 시험 클러스터에서 실제 연결 위의 "작업 한 바퀴"를 보려고 배정 대기 부탁 한 줄을 넣는다. `bun src/main/admin.ts test-job <owner> <key> <role> <purpose> <sourceRef> <inputDigest>`이고 성공하면 stdout에 `{"schema":"olive-test-job/v1","outcome":"created"|"existing","ref":"<부탁 참조>"}` 한 줄이다.
 
 - **켜기:** 감독 환경 `OLIVE_TEST_JOBS=on`일 때만 받는다. 꺼져 있으면 조립(`boot.ts`의 `const testJob`)이 쓰기 포트를 만들지 않고 처리기는 칸을 보지 않고 늘 `disabled`(1)다. 켜졌는지는 감독 기록 `admin_listening testJobs=…`에 남는다.
-- **효과는 장부 쓰기 하나:** 본체의 `start_worker`가 도구 어댑터로 적는 것과 같은 장부 연산 `recordToolRequest` 한 번이다(같은 표 `tool_requests`, 단계 `waiting_assignment`, 세션 칸은 고정 값 `admin-test-job`, 호출 ID·참조 후보는 감독의 CSPRNG, 기록 시각은 공유 시계의 `peek`). 조립이 그 메서드 하나만 담아 넘기고 관리 통로 폴더에서 장부 멤버를 꺼내는 곳은 그 한 자리다(`test/supervisor/admin/static.test.ts`). 송신은 없다.
+- **효과는 장부 쓰기 하나:** 본체의 `start_worker`가 도구 어댑터로 적는 것과 같은 장부 연산 `recordToolRequest` 한 번이다(같은 표 `tool_requests`, 단계 `waiting_assignment`, 세션 칸은 고정 값 `admin-test-job`, 호출 ID·참조 후보는 감독의 CSPRNG, 기록 시각은 공유 시계의 `peek`). 조립은 그 쓰기 하나와 장부 읽기 둘(`listInputs`·`listWaitingToolRequests`, 아래 "배정될 수 있는가")만 담아 넘기고, 관리 통로 폴더에서 장부 멤버를 꺼내는 곳은 `test-job.ts` 하나다(구조 분해·별칭으로 꺼내는 것도 센다, `test/supervisor/admin/static.test.ts`). 송신은 없다.
 - **도구 경로와의 관계:** 도구 처리기(`scheduler/tools.ts`)와 그 포트(`RunningSupervisor.tools`)를 거치지 않는다. 그래서 처리기가 장부 전에 보는 세션(`liveSession`)·입력 고정(`inputPinned`)·정책(`judge`)은 보지 않는다. 장부의 검사는 그대로 지난다: **소유자(`owner`)는 장부가 이미 접수한 입력(`inputs`의 요청 ID)이어야 한다**(외래 키. 아니면 `invariant_violation`(1)이고 아무것도 적히지 않는다). 이 명령은 소유자 입력을 만들지 않는다. 같은 트랜잭션에서 정지·접수 허가를 다시 본다(쓰기 모드 `start`).
+- **배정될 수 있는가:** 소유자 입력이 취소·만료된 부탁은 배정이 늘 거절하고(`input_cancelled`·`input_expired`) 지우는 관리 명령이 없다. 그래서 쓰기 전에 장부 읽기 `listInputs`로 소유자 입력을 보고, 취소됐거나 만료(공유 시계 `peek`가 만료 시각 정각 이후)면 `owner_inactive`(1)이고 아무것도 적지 않는다. 장부에 없는 소유자는 여기서 거절하지 않고 위의 외래 키가 막는다. 대기 한도는 **배정될 수 있는 대기만** 센다: 상태의 `queued`가 한도에 닿았을 때만 `listWaitingToolRequests`를 읽어 소유자 입력이 취소·만료된 대기 부탁을 뺀다. 그런 막힌 줄은 그대로 남는다(정리는 관리자 닫기, 뒤 조각). **함정:** 이 두 읽기는 `peekStatus`와 달리 실패하면 장부를 고장으로 표시하고 접수 허가를 버린다(쓰기의 실패와 같다). 그래서 켜진 감독에서만 있다.
 - **배정이 보는 출처:** 시험 작업은 출처를 따로 두지 않는다. 배정 박자는 소유자 입력의 `source`를 정책의 `originOf`로 나누고, 나누지 못한 입력의 일은 보류한다. 지금 진입점의 배정 정책은 닫힌 값(`originOf`는 늘 없음, 등록행·계정·계획 없음)이고 현관이 없어 복원 5단계를 마치지 못하므로, 지금 진입점에서 이 명령은 `restore_not_done`(3)이다.
-- **차례(한 동기 구간):** 칸 검사 → 상태 읽기(`status`와 같은 `readStatus`: 복원·살아 있음·정지·접수·대기 수. 장부를 고장으로 표시하지 않는 `peekStatus`) → 대기 한도 → 참조 후보·호출 ID·시각 → 쓰기 함수 꺼내기 → 문 한 번(`gate(limit)`) → 호출 하나. 문은 조립이 만든 함수 하나로, 끝 차례·끝낼 사유·복원 5단계·받아들인 허가·박자 기한을 변수로 보고(`closed` → `not_alive`) 맨 끝에 단조 시각을 읽어 요청 기한을 본다(정각 이후·시각 모름 → `late`). 래치 `look()`를 부르지 않고 장부를 읽지 않는다. 요청 기한은 관리 소켓이 그 연결에 정한 요청 받기 기한(`serverWaitMs`)이다. 함정: 조립 상태와 기한을 두 포트로 나누면 앞 문을 지난 뒤 둘째 읽기 사이에 생긴 끝 차례를 보지 못한다(하네스 훑기가 찾은 틈).
-- **같은 키로 다시 부르기:** `(owner, key)`가 같고 내용이 같은 줄이 있으면 새로 적지 않고 `existing`(0), 내용이 다르면 `conflict`(1)다. 단 대기 한도를 먼저 보므로, 답을 받지 못한(`timeout`·`write_unknown` 등) 부탁이 아직 대기 중이면 다시 부른 요청은 `limit`(1)이다. 새 줄은 생기지 않는다. 그때는 `status`의 `queued`로 본다.
+- **차례(한 동기 구간):** 칸 검사 → 상태 읽기(`status`와 같은 `readStatus`: 복원·살아 있음·정지·접수·대기 수. 장부를 고장으로 표시하지 않는 `peekStatus`) → 시각(`peek`) → 소유자 입력(`listInputs`) → 대기 한도(한도에 닿았을 때만 `listWaitingToolRequests`) → 참조 후보·호출 ID → 쓰기 함수 꺼내기 → 문 한 번(`gate(limit)`) → 호출 하나. 문은 조립이 만든 함수 하나로, 끝 차례·끝낼 사유·복원 5단계·받아들인 허가·박자 기한을 변수로 보고(`closed` → `not_alive`) 맨 끝에 단조 시각을 읽어 요청 기한을 본다(정각 이후·시각 모름 → `late`). 래치 `look()`를 부르지 않고 장부를 읽지 않는다. 요청 기한은 관리 소켓이 그 연결에 정한 요청 받기 기한(`serverWaitMs`)이다. 함정: 조립 상태와 기한을 두 포트로 나누면 앞 문을 지난 뒤 둘째 읽기 사이에 생긴 끝 차례를 보지 못한다(하네스 훑기가 찾은 틈).
+- **같은 키로 다시 부르기:** `(owner, key)`가 같고 내용이 같은 줄이 있으면 새로 적지 않고 `existing`(0), 내용이 다르면 `conflict`(1)다. 단 대기 한도를 먼저 보므로, 답을 받지 못한(`timeout`·`write_unknown` 등) 부탁이 아직 대기 중이고 배정될 수 있으면 다시 부른 요청은 `limit`(1)이다. 새 줄은 생기지 않는다. 그때는 `status`의 `queued`로 본다.
 
 | 칸 | 꼴(장부의 규칙) |
 |---|---|
@@ -418,8 +419,8 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 1 | 감독이 요청을 거절했다 | `busy`, `malformed`, `unknown_command` |
 | 0 | 시험 작업: 새로 적었거나(`created`) 같은 줄이 이미 있다(`existing`). stdout에 시험 작업 한 줄 | 없음 |
 | 3 | 시험 작업: 복원 5단계 전. 장부를 읽지 않는다 | `restore_not_done` |
-| 1 | 시험 작업을 거절했다. 장부에 새로 적힌 것이 없다 | `disabled`(설정 꺼짐), `malformed`(칸 수·꼴), `not_alive`(끝 차례·끝낼 사유·문 닫힘), `stopped`, `intake_closed`, `limit`(대기 한도), `late`(요청 기한 정각 이후), `conflict`, `invariant_violation`(소유자가 접수한 입력이 아님 등), `ledger_refused`(그 밖의 장부 거절) |
-| 1 | 시험 작업: 쓰기를 부르기 전에 멈췄다(적힌 것 없음) | `ledger_unreadable`, `stop_unrecorded`, `clock_unavailable`, `out_of_range`, `read_threw`, `random_unavailable` |
+| 1 | 시험 작업을 거절했다. 장부에 새로 적힌 것이 없다 | `disabled`(설정 꺼짐), `malformed`(칸 수·꼴), `not_alive`(끝 차례·끝낼 사유·문 닫힘), `stopped`, `intake_closed`, `owner_inactive`(소유자 입력이 취소·만료), `limit`(배정될 수 있는 대기 한도), `late`(요청 기한 정각 이후), `conflict`, `invariant_violation`(소유자가 접수한 입력이 아님 등), `ledger_refused`(그 밖의 장부 거절) |
+| 1 | 시험 작업: 쓰기를 부르기 전에 멈췄다(적힌 것 없음) | `ledger_unreadable`(상태 읽기, 또는 `listInputs`·`listWaitingToolRequests` 실패: 이때 장부는 고장으로 표시된다), `stop_unrecorded`, `clock_unavailable`, `out_of_range`, `read_threw`, `random_unavailable` |
 | 1 | 시험 작업: 쓰기를 불렀지만 답이 넘긴 값과 맞지 않거나 던졌다. **적혔는지 모른다** | `write_unknown` |
 | 64 | 인자가 `status` 하나이거나 `test-job`과 값 여섯(빈 값 없음, 요청 한 줄 1,024바이트 이하)이 아니다 | 사용법 |
 
@@ -434,7 +435,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 답 한 줄 | 4,096바이트(CLI가 받는 진입점 출력 상한과 같다) | | | 1(`too_long`) |
 | 동시 관리 연결 | 4 | | 연결을 받는 순간 | `busy`를 답하고 닫음(1) |
 | 시험 작업: 쓰기 | 요청 받기 기한(`serverWaitMs`, 2초) | 연결을 받은 순간 | 쓰기 바로 앞(문 다음) | `late`(1), 적지 않음 |
-| 시험 작업: 대기 | 1(`TEST_JOB_LIMITS.maxQueued`). 상태 한 줄의 `queued`(배정 전 부탁 + 자리를 받기 전 실행, 출처 가리지 않음)가 이 수 이상이면 받지 않는다. 작업 자리는 통틀어 하나다 | | 상태 읽기 | `limit`(1) |
+| 시험 작업: 대기 | 1(`TEST_JOB_LIMITS.maxQueued`). 배정될 수 있는 대기(상태 한 줄의 `queued`: 배정 전 부탁 + 자리를 받기 전 실행, 출처 가리지 않음. 여기서 소유자 입력이 취소·만료된 대기 부탁을 뺀 수)가 이 수 이상이면 받지 않는다. 작업 자리는 통틀어 하나다 | | 상태 읽기, 한도에 닿으면 `listWaitingToolRequests` | `limit`(1) |
 
 **뒤 조각이 지켜야 할 것.**
 

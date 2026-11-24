@@ -14,9 +14,14 @@ const strip = (source: string) =>
 const code = async (file: string) => strip(await readText(file));
 
 const ADMIN_DIR = "src/supervisor/admin/";
-// 관리 통로 폴더가 꺼낼 수 있는 장부 멤버(부르든 꺼내든). 장부 읽기는 조립이 넘긴 view(복원기의 statusView → Ledger.peekStatus) 하나라 없고,
-// 쓰기는 test-job.ts의 recordToolRequest 하나다(조립이 그것 하나만 담아 넘긴다).
-const LEDGER_MEMBERS: Record<string, readonly string[]> = { "test-job.ts": ["recordToolRequest"] };
+// 관리 통로 폴더가 꺼낼 수 있는 장부 멤버(부르든 꺼내든). 상태 읽기는 조립이 넘긴 view(복원기의 statusView → Ledger.peekStatus)라 없다.
+// test-job.ts만 조립이 담아 넘긴 셋을 꺼낸다: 쓰기 recordToolRequest, 소유자 입력과 대기 부탁이 배정될 수 있는지 볼 읽기 둘.
+const LEDGER_MEMBERS: Record<string, readonly string[]> = { "test-job.ts": ["recordToolRequest", "listInputs", "listWaitingToolRequests"] };
+// 장부 포트를 점 접근 밖의 값으로 쓰는 자리. 이것 밖에서 ledger를 값으로 쓰면(구조 분해, 별칭, 인자로 넘기기) 멤버 검사가 그 뒤의 접근을
+// 보지 못한다. test-job.ts는 포트 타입, 쓰기를 꺼내려는 별칭 하나, 쓰기를 부를 때의 this 하나만 둔다.
+const LEDGER_VALUES: Record<string, readonly string[]> = {
+  "test-job.ts": ['readonly ledger: Pick<Ledger, "recordToolRequest" | "listInputs" | "listWaitingToolRequests">;', "const ledger = ports.ledger;", "record.call(ledger, input)"],
+};
 // 폴더 안에서 import할 수 있는 것. 장부는 상태 읽기(status.ts)만, 그것도 공개 면(index.ts)으로만 본다.
 const IMPORTS: Record<string, readonly string[]> = {
   "protocol.ts": [],
@@ -43,6 +48,10 @@ function adminProblems(name: string, source: string): string[] {
   const writes = [...source.matchAll(/\.\s*recordToolRequest\b/g)].length;
   if (writes !== (members.includes("recordToolRequest") ? 1 : 0)) problems.push(`recordToolRequest ${writes}곳`);
   if (/\bledger\s*\[/.test(source)) problems.push("ledger[...]");
+  // 문자열(import 경로 등)을 비우고 허용한 자리를 뺀 뒤, 점 접근·괄호 접근이 아닌 ledger는 모두 값으로 쓴 것이다.
+  let values = source.replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+  for (const allowed of LEDGER_VALUES[name] ?? []) values = values.replace(allowed.replace(/"(?:[^"\\\n]|\\.)*"/g, '""'), "");
+  for (const _ of values.matchAll(/\bledger\b(?!\s*(?:\.\s*[\w$]|\[))/g)) problems.push("ledger 값");
   const effect = EFFECTS.exec(source);
   if (effect !== null) problems.push(`효과 ${effect[0]}`);
   const listens = [...source.matchAll(/\bBun\.listen\b/g)].length;
@@ -50,7 +59,7 @@ function adminProblems(name: string, source: string): string[] {
   return problems;
 }
 
-test("정적: 관리 통로 폴더는 장부를 test-job.ts의 recordToolRequest 하나로만 꺼내고, 연결에 싣거나 도구 처리기의 포트를 쓰는 글이 없으며, 듣는 곳은 listener.ts 하나다", async () => {
+test("정적: 관리 통로 폴더는 장부를 test-job.ts의 recordToolRequest 하나와 읽기 둘로만 꺼내고(구조 분해·별칭으로 꺼내는 것도 센다), 연결에 싣거나 도구 처리기의 포트를 쓰는 글이 없으며, 듣는 곳은 listener.ts 하나다", async () => {
   const files = await list(`${ADMIN_DIR}*.ts`);
   expect(files.map((file) => file.slice(ADMIN_DIR.length))).toEqual(Object.keys(IMPORTS).sort());
   for (const file of files) expect(adminProblems(file.slice(ADMIN_DIR.length), await code(file)), file).toEqual([]);
@@ -69,6 +78,9 @@ test("정적: 관리 통로 폴더는 장부를 test-job.ts의 recordToolRequest
   const job = await code(`${ADMIN_DIR}test-job.ts`);
   expect(adminProblems("test-job.ts", `${job}\nconst w = ports.ledger.admitRun;`)).toEqual(["ledger.admitRun"]);
   expect(adminProblems("test-job.ts", `${job}\nconst again = ports.ledger.recordToolRequest;`)).toEqual(["recordToolRequest 2곳"]);
+  // 대조군: 구조 분해·별칭으로 꺼내면 멤버 이름이 점 뒤에 오지 않아도 잡는다. 허용한 파일도 허용한 자리 밖에서는 잡는다.
+  expect(adminProblems("commands.ts", `${await code(`${ADMIN_DIR}commands.ts`)}\nconst { recordToolRequest: w } = testJob.ledger;`)).toEqual(["ledger 값"]);
+  expect(adminProblems("test-job.ts", `${job}\nconst { ledger: l } = ports;\nl.admitRun(x);`)).toEqual(["ledger 값"]);
 });
 
 // 조립이 관리 통로에 넘기는 묶음(boot.ts의 const admin). 부르는 것은 복원기의 부작용 없는 상태 읽기, 공유 시계의 peek, Object.freeze뿐이다.
@@ -101,10 +113,10 @@ test("정적: 조립이 관리 통로에 넘기는 묶음은 복원기의 상태
   expect(/listWaitingToolRequests/.test(await code("src/supervisor/runtime/tools-adapter.ts"))).toBe(false);
 });
 
-// 조립이 시험 작업 넣기에 넘기는 묶음(boot.ts의 const testJob). 설정이 켜졌을 때만 만들고, 부르는 것은 장부 쓰기 하나(recordToolRequest)와
-// 박자 기한의 판정·단조 시계뿐이다. 문은 조립의 변수만 읽는다(끝낼 사유를 붙잡는 look()·haltReason()·박자 유효 문·장부 읽기를 부르지 않는다).
+// 조립이 시험 작업 넣기에 넘기는 묶음(boot.ts의 const testJob). 설정이 켜졌을 때만 만들고, 부르는 것은 장부 쓰기 하나(recordToolRequest)·
+// 장부 읽기 둘(listInputs·listWaitingToolRequests)과 박자 기한의 판정·단조 시계뿐이다. 문은 조립의 변수만 읽는다(끝낼 사유를 붙잡는 look()·haltReason()·박자 유효 문·장부 읽기를 부르지 않는다).
 const TEST_JOB_HEAD = "  const testJob: TestJobPorts | null =\n    settings.testJobs === true\n";
-const TEST_JOB_BLOCK_CALLS = ["Object.freeze", "Object.freeze", "ledger.recordToolRequest", "if", "if", "pastLimit", "pastLimit"];
+const TEST_JOB_BLOCK_CALLS = ["Object.freeze", "Object.freeze", "ledger.recordToolRequest", "ledger.listInputs", "ledger.listWaitingToolRequests", "if", "if", "pastLimit", "pastLimit"];
 function testJobBlockCalls(boot: string): string[] | null {
   const start = boot.indexOf(TEST_JOB_HEAD);
   if (start < 0 || boot.indexOf(TEST_JOB_HEAD, start + 1) >= 0) return null;

@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { type Ledger, openLedger, type Read, type StatusPeek, type ToolRequestInput } from "../../../src/ledger/index.ts";
+import { type InputEntry, type Ledger, openLedger, type Read, type StatusPeek, type ToolRequestInput, type WaitingToolRequest } from "../../../src/ledger/index.ts";
 import { PURPOSE, RESTORE_KEY } from "../../../src/ledger/ledger.ts";
 import { adminFs } from "../../../src/main/supervisor.ts";
 import { ask, type ClientDeps, commandOf, exitFor, requestOf } from "../../../src/supervisor/admin/client.ts";
@@ -47,6 +47,18 @@ const createdOf = (input: ToolRequestInput, over: Record<string, unknown> = {}) 
   request: { ref: input.ref, owner: input.owner, dedupeKey: input.dedupeKey, role: input.role, purpose: input.purpose, sourceRef: input.sourceRef, inputDigest: input.inputDigest, phase: "waiting_assignment", ...over },
 });
 
+// 장부의 입력 한 줄(기본: 취소되지 않았고 WALL보다 한 시간 뒤에 만료)과 그 입력을 소유자로 한 대기 부탁 한 줄.
+const entryOf = (requestId: string, over: Partial<InputEntry> = {}): InputEntry => ({
+  requestId,
+  seq: 1,
+  source: "admin-dm",
+  receivedAt: WALL,
+  expiresAt: WALL + 3_600_000,
+  cancelled: false,
+  ...over,
+});
+const waitingOf = (input: { cancelled: boolean; expiresAt: number }): WaitingToolRequest => ({ ref: id(), owner: id(), role: "isolated_reader", inputDigest: digest("w"), input });
+
 // 부른 자리를 차례대로 적는 가짜 읽기·쓰기 포트. 쓰기(recordToolRequest)에 넘긴 값을 모은다.
 function fake(
   over: Partial<{
@@ -57,6 +69,8 @@ function fake(
     gate: (limit: number) => unknown;
     write: (input: ToolRequestInput) => unknown;
     bytes: (length: number) => Uint8Array;
+    inputs: () => Read<InputEntry[]>;
+    waiting: () => Read<WaitingToolRequest[]>;
   }> = {},
 ) {
   const calls: string[] = [];
@@ -75,6 +89,8 @@ function fake(
         written.push(input);
         return over.write === undefined ? createdOf(input) : over.write(input);
       }) as Ledger["recordToolRequest"],
+      listInputs: () => (calls.push("listInputs"), (over.inputs ?? (() => known([entryOf(JOB.owner)])))()),
+      listWaitingToolRequests: () => (calls.push("listWaitingToolRequests"), (over.waiting ?? (() => known([])))()),
     },
     gate: ((limit: number) => (calls.push("gate"), limits.push(limit), (over.gate ?? (() => "open"))(limit))) as TestJobPorts["gate"],
     random: { bytes: over.bytes ?? ((length) => new Uint8Array(length).fill((seq += 1))) },
@@ -161,10 +177,10 @@ describe("처리기", () => {
     expect(calls).toEqual([]);
   });
 
-  test("켜짐·정상: 장부 쓰기 정확히 한 번이고, 차례는 상태 읽기 → 시각 → 문(요청 기한을 넘김) → 쓰기다. 넘긴 값은 요청의 칸·고정 세션·새 참조 후보·새 호출 ID·장부 시계", () => {
+  test("켜짐·정상: 장부 쓰기 정확히 한 번이고, 차례는 상태 읽기 → 시각 → 소유자 입력 → 문(요청 기한을 넘김) → 쓰기다. 넘긴 값은 요청의 칸·고정 세션·새 참조 후보·새 호출 ID·장부 시계", () => {
     const f = fake();
     const reply = f.reply();
-    expect(f.calls).toEqual(["progress", "view", "now", "gate", "recordToolRequest"]);
+    expect(f.calls).toEqual(["progress", "view", "now", "listInputs", "gate", "recordToolRequest"]);
     expect(f.limits).toEqual([LIMIT]);
     expect(f.written.length).toBe(1);
     const input = f.written[0]!;
@@ -209,8 +225,6 @@ describe("처리기", () => {
       // 처음부터 허가가 없는 감독: 정지 기록이 정지면 stopped, 아니면 접수 닫힘.
       [{ progress: { restored: true, alive: true, granted: false }, peek: { intakeOpen: false, stop: stopped } }, { kind: "refused", reason: "stopped" }],
       [{ progress: { restored: true, alive: true, granted: false }, peek: { intakeOpen: false } }, { kind: "refused", reason: "intake_closed" }],
-      [{ peek: { waitingRequests: TEST_JOB_LIMITS.maxQueued } }, { kind: "refused", reason: "limit" }],
-      [{ peek: { queuedRuns: TEST_JOB_LIMITS.maxQueued } }, { kind: "refused", reason: "limit" }],
       [{ view: () => ({ known: false, reason: "io" }) }, { kind: "unknown", reason: "ledger_unreadable" }],
     ];
     for (const [over, expected] of cases) {
@@ -218,10 +232,74 @@ describe("처리기", () => {
       expect(f.reply(), JSON.stringify(over)).toEqual(expected);
       expect(f.calls, JSON.stringify(over)).toEqual(["progress", "view"]);
     }
+    // 대기 한도: 상태의 대기 수가 한도에 닿으면 대기 목록을 읽고, 막힌 부탁이 없으면 거절이다.
+    const waitingActive = () => known([waitingOf({ cancelled: false, expiresAt: WALL + 1 })]);
+    for (const over of [{ peek: { waitingRequests: TEST_JOB_LIMITS.maxQueued }, waiting: waitingActive }, { peek: { queuedRuns: TEST_JOB_LIMITS.maxQueued } }] as Parameters<typeof fake>[0][]) {
+      const f = fake(over);
+      expect(f.reply(), JSON.stringify(over?.peek)).toEqual({ kind: "refused", reason: "limit" });
+      expect(f.calls, JSON.stringify(over?.peek)).toEqual(["progress", "view", "now", "listInputs", "listWaitingToolRequests"]);
+    }
     expect(TEST_JOB_LIMITS.maxQueued).toBe(1);
     const busy = fake({ peek: { slotRuns: 1 } });
     expect(busy.reply()).toMatchObject({ kind: "test_job", outcome: "created" });
     expect(busy.written.length).toBe(1);
+  });
+
+  test("소유자 입력이 취소됐거나 만료(장부 시계가 만료 시각 정각 이후)면 owner_inactive이고 쓰지 않는다. 1ms 전이면 쓴다. 장부에 없는 소유자는 장부의 외래 키에 맡긴다", () => {
+    const cases: [InputEntry[], AdminReply | "created"][] = [
+      [[entryOf(JOB.owner, { cancelled: true })], { kind: "refused", reason: "owner_inactive" }],
+      [[entryOf(JOB.owner, { expiresAt: WALL })], { kind: "refused", reason: "owner_inactive" }],
+      [[entryOf(JOB.owner, { expiresAt: WALL - 1 })], { kind: "refused", reason: "owner_inactive" }],
+      [[entryOf(id(), { cancelled: true }), entryOf(JOB.owner, { expiresAt: WALL + 1 })], "created"],
+      [[entryOf(id())], "created"],
+    ];
+    for (const [rows, expected] of cases) {
+      const f = fake({ inputs: () => known(rows) });
+      const reply = f.reply();
+      if (expected === "created") {
+        expect(reply, JSON.stringify(rows)).toMatchObject({ kind: "test_job", outcome: "created" });
+        expect(f.written.length).toBe(1);
+      } else {
+        expect(reply, JSON.stringify(rows)).toEqual(expected);
+        expect(f.calls).toEqual(["progress", "view", "now", "listInputs"]);
+        expect(f.written.length).toBe(0);
+      }
+    }
+    const unreadable = fake({ inputs: () => ({ known: false, reason: "io" }) });
+    expect(unreadable.reply()).toEqual({ kind: "unknown", reason: "ledger_unreadable" });
+    expect(unreadable.written.length).toBe(0);
+  });
+
+  test("대기 한도는 배정될 수 있는 대기만 센다: 소유자 입력이 취소·만료된 대기 부탁은 빼고, 대기 목록을 읽지 못하거나 상태의 수와 어긋나면 쓰지 않는다", () => {
+    const blockedCancelled = waitingOf({ cancelled: true, expiresAt: WALL + 1 });
+    const blockedExpired = waitingOf({ cancelled: false, expiresAt: WALL });
+    const active = waitingOf({ cancelled: false, expiresAt: WALL + 1 });
+    const cases: [Partial<StatusPeek>, () => Read<WaitingToolRequest[]>, AdminReply | "created"][] = [
+      [{ waitingRequests: 1 }, () => known([blockedCancelled]), "created"],
+      [{ waitingRequests: 1 }, () => known([blockedExpired]), "created"],
+      [{ waitingRequests: 2 }, () => known([blockedCancelled, blockedExpired]), "created"],
+      [{ waitingRequests: 2 }, () => known([blockedCancelled, active]), { kind: "refused", reason: "limit" }],
+      // 자리를 받기 전 실행은 막힌 부탁을 빼도 센다.
+      [{ waitingRequests: 1, queuedRuns: 1 }, () => known([blockedCancelled]), { kind: "refused", reason: "limit" }],
+      [{ waitingRequests: 1 }, () => ({ known: false, reason: "io" }), { kind: "unknown", reason: "ledger_unreadable" }],
+      [{ waitingRequests: 1 }, () => known([blockedCancelled, blockedExpired]), { kind: "unknown", reason: "out_of_range" }],
+    ];
+    for (const [peek, waiting, expected] of cases) {
+      const f = fake({ peek, waiting });
+      const reply = f.reply();
+      const label = JSON.stringify([peek, expected]);
+      if (expected === "created") {
+        expect(reply, label).toMatchObject({ kind: "test_job", outcome: "created" });
+        expect(f.calls, label).toEqual(["progress", "view", "now", "listInputs", "listWaitingToolRequests", "gate", "recordToolRequest"]);
+      } else {
+        expect(reply, label).toEqual(expected);
+        expect(f.written.length, label).toBe(0);
+      }
+    }
+    // 대기가 한도 밖이면 대기 목록을 읽지 않는다.
+    const quiet = fake({ waiting: () => ({ known: false, reason: "io" }) });
+    expect(quiet.reply()).toMatchObject({ kind: "test_job", outcome: "created" });
+    expect(quiet.calls).not.toContain("listWaitingToolRequests");
   });
 
   test("문의 답: open이면 쓰고, closed(또는 모르는 값)면 not_alive, late면 late이고 쓰지 않는다. 문이 던지면 read_threw", () => {
@@ -318,8 +396,8 @@ function attemptOf(ledger: Ledger): symbol {
   expect(ledger.grantIntake(RESTORE_KEY, attempt)).toBe(true);
   return attempt;
 }
-const inputOf = (ledger: Ledger, owner: string) =>
-  expect(ledger.enqueueInput({ requestId: owner, source: "admin-dm", sourceRef: { ref: `inbox/${owner}`, expiresAt: NOW + 3_600_000 }, receivedAt: NOW })).toMatchObject({ ok: true });
+const inputOf = (ledger: Ledger, owner: string, expiresAt: number = NOW + 3_600_000) =>
+  expect(ledger.enqueueInput({ requestId: owner, source: "admin-dm", sourceRef: { ref: `inbox/${owner}`, expiresAt }, receivedAt: NOW })).toMatchObject({ ok: true });
 
 describe("실제 장부", () => {
   function realLedger() {
@@ -328,13 +406,14 @@ describe("실제 장부", () => {
     inputOf(ledger, OWNER);
     // 대기 수를 0으로 보이게 할 수 있는 읽기(같은 키 다시 부르기를 한도 없이 보려고).
     let hideWaiting = false;
+    let at = NOW;
     const sources: AdminSources = {
       progress: () => ({ restored: true, alive: true, granted: true }),
       view: (cap) => {
         const read = ledger.peekStatus(cap, attempt);
         return read.known && hideWaiting ? known({ ...read.value, waitingRequests: 0 }) : read;
       },
-      now: () => okAt(NOW),
+      now: () => okAt(at),
     };
     const ports: TestJobPorts = { ledger, gate: () => "open", random: loopbackTime().random };
     const handlers = createAdminHandlers(sources, ports);
@@ -344,7 +423,7 @@ describe("실제 장부", () => {
       if (!read.known) throw new Error("read");
       return read.value.map((row) => row.ref);
     };
-    return { ledger, ask, waiting, hide: () => void (hideWaiting = true) };
+    return { ledger, ask, waiting, hide: () => void (hideWaiting = true), at: (to: number) => void (at = to) };
   }
 
   test("접수한 입력의 소유자면 대기 부탁 한 줄(대기 단계)이고, 같은 키는 대기가 한도면 limit·한도 밖이면 existing, 내용이 다르면 conflict다", () => {
@@ -369,6 +448,38 @@ describe("실제 장부", () => {
     expect(r.ask({ ...JOB, owner: stranger, sourceRef: `inbox/${stranger}` })).toEqual({ kind: "refused", reason: "invariant_violation" });
     expect(r.waiting()).toEqual([]);
     expect(r.ledger.health()).toEqual({ writable: true });
+  });
+
+  test("소유자 입력이 취소·만료됐으면 owner_inactive이고 줄이 없다", () => {
+    const r = realLedger();
+    const late = id();
+    const cancelled = id();
+    inputOf(r.ledger, late, NOW + 10);
+    inputOf(r.ledger, cancelled);
+    expect(r.ledger.cancelInput(cancelled, NOW)).toEqual({ ok: true });
+    expect(r.ask({ ...JOB, owner: cancelled, sourceRef: `inbox/${cancelled}` })).toEqual({ kind: "refused", reason: "owner_inactive" });
+    r.at(NOW + 10);
+    expect(r.ask({ ...JOB, owner: late, sourceRef: `inbox/${late}` })).toEqual({ kind: "refused", reason: "owner_inactive" });
+    expect(r.waiting()).toEqual([]);
+    expect(r.ledger.health()).toEqual({ writable: true });
+  });
+
+  test("배정될 수 없는 대기 부탁(넣은 뒤 소유자 입력이 만료·취소)이 남아도 정상 소유자의 새 부탁은 접수되고, 그 부탁이 대기 중이면 다시 한도다", () => {
+    for (const block of ["expire", "cancel"] as const) {
+      const r = realLedger();
+      const short = id();
+      inputOf(r.ledger, short, NOW + 10);
+      const first = r.ask({ ...JOB, owner: short, sourceRef: `inbox/${short}` });
+      if (first?.kind !== "test_job") throw new Error(JSON.stringify(first));
+      if (block === "expire") r.at(NOW + 10);
+      else expect(r.ledger.cancelInput(short, NOW + 1)).toEqual({ ok: true });
+      const second = r.ask();
+      if (second?.kind !== "test_job") throw new Error(`${block} ${JSON.stringify(second)}`);
+      expect(second.outcome, block).toBe("created");
+      expect(new Set(r.waiting()), block).toEqual(new Set([first.ref, second.ref]));
+      expect(r.ask({ ...JOB, key: "smoke-2" }), block).toEqual({ kind: "refused", reason: "limit" });
+      expect(r.waiting().length, block).toBe(2);
+    }
   });
 
   test("상태 읽기를 지나도 장부는 쓰기 트랜잭션 안에서 정지·접수를 다시 본다: 정지 뒤의 쓰기는 거절이고 줄이 없다", () => {
@@ -458,7 +569,7 @@ describe("실제 조립", () => {
     const sent = { ...sends };
     const reply = jobOf(w, running);
     expect(reply).toMatchObject({ kind: "test_job", outcome: "created" });
-    expect(calls.slice(before)).toEqual(["peekStatus", "recordToolRequest"]);
+    expect(calls.slice(before)).toEqual(["peekStatus", "listInputs", "recordToolRequest"]);
     expect(sends).toEqual(sent);
     expect(queuedOf(running)).toBe(1);
     const waiting = raw().listWaitingToolRequests();
@@ -466,7 +577,7 @@ describe("실제 조립", () => {
     // 한도: 두 번째 부탁은 쓰지 않는다.
     before = calls.length;
     expect(jobOf(w, running, { ...JOB, key: "smoke-2" })).toEqual({ kind: "refused", reason: "limit" });
-    expect(calls.slice(before)).toEqual(["peekStatus"]);
+    expect(calls.slice(before)).toEqual(["peekStatus", "listInputs", "listWaitingToolRequests"]);
     for (let i = 0; i < 3; i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
     expect(w.names()).not.toContain("fatal");
     expect(await running.stop()).toBe(0);
@@ -483,9 +594,10 @@ describe("실제 조립", () => {
     expect(send(now)).toEqual({ kind: "refused", reason: "late" });
     expect(send()).toEqual({ kind: "refused", reason: "late" });
     expect(send(Number.NaN)).toEqual({ kind: "refused", reason: "late" });
-    expect(calls.slice(before)).toEqual(["peekStatus", "peekStatus", "peekStatus"]);
+    const late = ["peekStatus", "listInputs"];
+    expect(calls.slice(before)).toEqual([...late, ...late, ...late]);
     expect(send(now + 1)).toMatchObject({ kind: "test_job", outcome: "created" });
-    expect(calls.slice(before)).toEqual(["peekStatus", "peekStatus", "peekStatus", "peekStatus", "recordToolRequest"]);
+    expect(calls.slice(before)).toEqual([...late, ...late, ...late, "peekStatus", "listInputs", "recordToolRequest"]);
     expect(await running.stop()).toBe(0);
   });
 
@@ -551,7 +663,11 @@ describe("루프백", () => {
     const clock = loopbackTime();
     const written: ToolRequestInput[] = [];
     const ports: TestJobPorts = {
-      ledger: { recordToolRequest: ((input: ToolRequestInput) => (written.push(input), createdOf(input))) as Ledger["recordToolRequest"] },
+      ledger: {
+        recordToolRequest: ((input: ToolRequestInput) => (written.push(input), createdOf(input))) as Ledger["recordToolRequest"],
+        listInputs: () => known([entryOf(JOB.owner)]),
+        listWaitingToolRequests: () => known([]),
+      },
       gate: (limit) => (clock.mono() < limit ? "open" : "late"),
       random: clock.random,
     };

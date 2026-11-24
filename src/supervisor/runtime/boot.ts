@@ -876,12 +876,16 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     now: () => shared.peek(),
   });
   // 시험 작업 넣기의 쓰기 포트. 설정이 켜졌을 때만 만든다: 꺼진 감독에는 관리 통로에서 장부 쓰기에 닿는 길이 없다. 장부 객체를 넘기지 않고
-  // recordToolRequest 하나만 담는다. 문은 조립의 변수·박자 기한·요청 기한만 본다: look()·haltReason()을 부르지 않고(래치를 움직이지 않는다)
+  // 쓰기 recordToolRequest 하나와, 소유자 입력과 대기 부탁이 배정될 수 있는지 볼 읽기 둘(listInputs·listWaitingToolRequests)만 담는다. 문은 조립의 변수·박자 기한·요청 기한만 본다: look()·haltReason()을 부르지 않고(래치를 움직이지 않는다)
   // 장부를 읽지 않는다. 접수 허가·정지는 장부가 쓰기 트랜잭션 안에서 다시 본다(쓰기 모드 start).
   const testJob: TestJobPorts | null =
     settings.testJobs === true
       ? Object.freeze({
-          ledger: Object.freeze({ recordToolRequest: (input: Parameters<Ledger["recordToolRequest"]>[0]) => ledger.recordToolRequest(input) }),
+          ledger: Object.freeze({
+            recordToolRequest: (input: Parameters<Ledger["recordToolRequest"]>[0]) => ledger.recordToolRequest(input),
+            listInputs: () => ledger.listInputs(),
+            listWaitingToolRequests: () => ledger.listWaitingToolRequests(),
+          }),
           gate: (limit: number) => {
             if (stopping || exitCode !== 0 || halted !== null || stage < 5 || !granted) return "closed";
             if (beatLimit !== null && pastLimit(deps, beatLimit)) return "closed";

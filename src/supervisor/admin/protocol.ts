@@ -62,7 +62,7 @@ export interface SupervisorStatus {
 // 나머지는 쓰기를 부르기 전에 멈췄다는 뜻이다(random_unavailable: 참조 후보·호출 ID를 만들지 못했다).
 export const UNKNOWN_REASONS = ["restore_not_done", "ledger_unreadable", "stop_unrecorded", "clock_unavailable", "out_of_range", "read_threw", "random_unavailable", "write_unknown"] as const;
 export type UnknownReason = (typeof UNKNOWN_REASONS)[number];
-// 요청을 처리하지 않은 사유. 어느 사유든 장부에 새로 적힌 것이 없다. disabled부터 뒤 아홉은 시험 작업의 것이다(README "감독 관리 통로").
+// 요청을 처리하지 않은 사유. 어느 사유든 장부에 새로 적힌 것이 없다. disabled부터 뒤 열은 시험 작업의 것이다(README "감독 관리 통로").
 export const REFUSED_REASONS = [
   "malformed",
   "unknown_command",
@@ -71,6 +71,7 @@ export const REFUSED_REASONS = [
   "not_alive",
   "stopped",
   "intake_closed",
+  "owner_inactive",
   "limit",
   "late",
   "conflict",
