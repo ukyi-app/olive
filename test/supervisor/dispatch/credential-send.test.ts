@@ -666,13 +666,47 @@ describe("정적", () => {
     for (const file of files) expect(/credential-send/.test(await readText(file)), file).toBe(false);
   });
 
-  test("src/에서 encodeCredentialFrame을 부르는 파일은 credential-send.ts 하나다", async () => {
+  // 값 틀을 만드는 자리는 둘이다. 감독이 실행기에게 보내는 credential-send.ts, 그리고 실행기의 제어가 같은 값을 역할 컨테이너의 대리에게
+  // 넘기는 remote-agent.ts(D-102: 키와 계정 파일은 제어에만 있고, 값은 대리가 띄울 때 한 번 쓴다). 둘째 자리가 할 수 없는 것은 아래 시험이 본다.
+  test("src/에서 encodeCredentialFrame을 부르는 파일은 credential-send.ts와 executor/remote-agent.ts 둘이다", async () => {
     const users: string[] = [];
     for (const file of await list("src/**/*.ts")) {
       if (file === "src/transport/framing.ts") continue;
       if (/\bencodeCredentialFrame\b/.test(strip(await readText(file)))) users.push(file);
     }
-    expect(users).toEqual(["src/supervisor/dispatch/credential-send.ts"]);
+    expect(users).toEqual(["src/executor/remote-agent.ts", "src/supervisor/dispatch/credential-send.ts"]);
+  });
+
+  // remote-agent.ts의 값 틀이 할 수 없는 것: 계획 밖에서 값을 읽기(계정 파일·장부·감독 모듈), 틀을 두 번 이상 만들기, 쓴 값·틀을 0으로 채우지 않기,
+  // 값을 진단(로그·직렬화·inspect)에 넘기기, 링크 밖으로 쓰기(감독 연결의 writeFrame·송신 포트).
+  const remoteFrameProblems = (source: string): string[] => {
+    const problems: string[] = [];
+    if ((source.match(/\bencodeCredentialFrame\s*\(/g) ?? []).length !== 1) problems.push("틀은 한 곳에서만 만든다");
+    if (!/plan\.env\[name\]/.test(source) || !/utf8\.encode\(credential\)/.test(source)) problems.push("값은 계획의 자격 환경에서만 온다");
+    if (/from\s+"[^"]*(supervisor|ledger|accounts)[^"]*"|node:fs|Bun\.file\b/.test(source)) problems.push("계획 밖에서 값을 읽을 수 있다");
+    for (const fill of ["value.fill(0)", "encoded.frame.fill(0)", "frames.fill(0)"]) if (!source.includes(fill)) problems.push(`0으로 채우지 않는다: ${fill}`);
+    if (/\bconsole\.|JSON\.stringify|\binspect\(|node:util/.test(source)) problems.push("진단으로 나갈 수 있다");
+    if (/\bwriteFrame\b|\.send\s*\(/.test(source)) problems.push("링크 밖으로 쓸 수 있다");
+    return problems;
+  };
+
+  test("executor/remote-agent.ts의 값 틀은 계획의 값 하나로 한 번 만들고, 쓴 뒤 0으로 채우며, 진단·링크 밖으로 나가지 않는다", async () => {
+    const source = strip(await readText("src/executor/remote-agent.ts"));
+    expect(remoteFrameProblems(source)).toEqual([]);
+    // 대조군: 확인이 실제로 잡는다.
+    const broken = source
+      .replace("plan.env[name]", "readAccount(name)")
+      .replace("frames.fill(0);", "")
+      .replace('import { createHash } from "node:crypto";', 'import { createHash } from "node:crypto";\nimport { readFileSync } from "node:fs";')
+      .concat("\nconsole.log(value); encodeCredentialFrame(runId, digest, value); transport.writeFrame(frames);");
+    expect(remoteFrameProblems(broken)).toEqual([
+      "틀은 한 곳에서만 만든다",
+      "값은 계획의 자격 환경에서만 온다",
+      "계획 밖에서 값을 읽을 수 있다",
+      "0으로 채우지 않는다: frames.fill(0)",
+      "진단으로 나갈 수 있다",
+      "링크 밖으로 쓸 수 있다",
+    ]);
   });
 
   test("src/에서 writeFrame을 부르는 파일은 credential-send.ts와 runtime/sink.ts뿐이다", async () => {

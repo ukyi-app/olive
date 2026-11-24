@@ -1,18 +1,50 @@
 // 실행기 시험이 함께 쓰는 도구: 시험 중에 만드는 키, 감독 쪽 봉투, 가짜 연결·정리·폴더·자격, 시계.
 // 키와 자격 값은 시험이 돌 때마다 새로 만든다(저장소에 두지 않는다).
+import { test as bunTest } from "bun:test";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Action, type Bodies, type Envelope, sealEnvelope, type SealInput } from "../../src/contract/v1/index.ts";
+import { type Action, type Bodies, type Envelope, limits, sealEnvelope, type SealInput } from "../../src/contract/v1/index.ts";
 import type { ProcessCleanup } from "../../src/executor/containment.ts";
 import { bunLauncher, type Launcher, type SpawnedChild } from "../../src/executor/launcher.ts";
 import { type Connection, ExecutorLink, type Transport } from "../../src/executor/link.ts";
 import type { CredentialSource, RoleProfile } from "../../src/executor/profile.ts";
+import { RemoteAgent, type RemoteAgentRuntime } from "../../src/executor/remote-agent.ts";
 import { ExecutorStore, type StoreIo } from "../../src/executor/store.ts";
 import { type RunSpace, WorkerExecutor } from "../../src/executor/worker.ts";
+import { FakeAgent, realTimers } from "./fake-agent.ts";
+
+// rig가 작업자에 줄 띄우기·정리 구현. remote-*.test.ts가 같은 시험 파일을 원격 구현(RemoteAgent + 가짜 대리)으로 다시 돌릴 때 켠다.
+// 원격일 때도 시험이 보는 r.launcher·r.cleanup·r.space는 같은 가짜이고, 가짜 대리가 링크 건너편에서 그것을 부른다.
+// remote는 시험이 도는 동안, registeringRemote는 감싸는 파일이 시험 파일을 다시 import하는 동안만 참이다.
+export const implementation = { remote: false, registeringRemote: false };
+
+const EXIT_BEFORE_DRAIN =
+  "가짜 launcher가 stdout을 다 읽기 전에 exited 훅을 부른다. 링크에는 그 말이 없어 원격 구현은 exited 메시지를 받은 때에야 끝을 안다(완료가 아닌 쪽으로 기운다, remote-agent.test.ts가 본다)";
+// 원격 구현으로 다시 돌릴 때 등록하지 않는 시험과 그 까닭. 모두 시험의 가짜 launcher가 링크로 옮길 수 없는 동작을 전제한다.
+export const DIRECT_ONLY: ReadonlyMap<string, string> = new Map([
+  ["R11 제때 끝난 프로그램은 stdout을 읽는 사이 임대 시각이 지나도 completed다(뒤의 정리·계수는 계속한다)", EXIT_BEFORE_DRAIN],
+  ["R11 끝난 프로그램의 임대는 늘지 않는다", EXIT_BEFORE_DRAIN],
+  ["F10 nonce 장애가 이미 정상 종료한 프로그램의 결과를 실패로 바꾸지 않는다", EXIT_BEFORE_DRAIN],
+  [
+    "R16 깊이 상한을 넘는 결과는 고정 실패 결과가 되고 이미 확인한 종료 증거·상태를 뒤집지 않는다",
+    "가짜 launcher가 outputBytes(64KiB)를 넘는 stdout을 그대로 돌려준다. 원격 구현은 그 출력을 받지 않고 잠근다(output_over_limit, remote-agent.test.ts가 본다)",
+  ],
+]);
+// 원격으로 다시 import할 때 등록하지 않은 시험 이름. 감싸는 파일이 이 목록을 대조한다.
+export const unregisteredRemote: string[] = [];
+
+// hardening·evidence 시험이 bun:test의 test 대신 쓴다. 직접 실행에서는 그대로 등록하고, 원격으로 다시 import할 때만 DIRECT_ONLY를 뺀다.
+export function test(name: string, fn: () => void | Promise<void>, timeout?: number): void {
+  if (implementation.registeringRemote && DIRECT_ONLY.has(name)) {
+    unregisteredRemote.push(name);
+    return;
+  }
+  bunTest(name, fn, timeout);
+}
 
 export const FAKE_ROLE = fileURLToPath(new URL("./fake-role.ts", import.meta.url));
 export const T0 = 1_800_000_000_000;
@@ -306,6 +338,8 @@ export interface Rig {
   transport: FakeTransport;
   connection: Connection;
   challenge: string;
+  // 원격 구현일 때만 있다.
+  remote?: RemoteAgent;
 }
 
 export interface RigOptions {
@@ -319,6 +353,9 @@ export interface RigOptions {
   extraEnv?: Record<string, string>;
   exitWaitMs?: number;
   stopWriteWaitMs?: number;
+  // 원격 구현을 쓰고 대리 자리를 시험이 정한다(주지 않으면 implementation.remote일 때 FakeAgent).
+  // runtime을 주면 원격 구현의 타이머·단조 시계를 시험이 정한다(주지 않으면 실제 타이머와 performance.now).
+  remote?: { attach?: (remote: RemoteAgent) => void; inheritedUnverified?: boolean; runtime?: RemoteAgentRuntime };
 }
 
 export async function rig(options: RigOptions = {}): Promise<Rig> {
@@ -330,6 +367,22 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
   const space = new FakeSpace();
   const credentials = new FakeCredentials();
   const launcher = recordingLauncher(cleanup);
+  let parts: { cleanup: ProcessCleanup; space: RunSpace; launcher: Launcher } = { cleanup, space, launcher };
+  let remote: RemoteAgent | undefined;
+  if (implementation.remote || options.remote !== undefined) {
+    // 다시 연 저장소(make({ dir }))는 파드 전체 재시작을 확인한 기동으로 친다. 확인 없는 기동의 잠금은 remote-agent.test.ts가 본다.
+    remote = new RemoteAgent({
+      credentialEnv: "OLIVE_CREDENTIAL",
+      runWindow: (id) => store.run(id),
+      runtime: options.remote?.runtime ?? realTimers,
+      inheritedUnverified: options.remote?.inheritedUnverified ?? false,
+      // worker의 exitWaitMs와 같은 값(worker의 기본값 포함).
+      replyWaitMs: options.exitWaitMs ?? limits.STOP_GRACE_MS + 5_000,
+    });
+    if (options.remote?.attach !== undefined) options.remote.attach(remote);
+    else new FakeAgent(launcher, cleanup, { drainMs: 100, exitWaitMs: options.exitWaitMs }).attach(remote);
+    parts = { cleanup: remote.cleanup, space: remote.space(space), launcher: remote.launcher };
+  }
   const worker = new WorkerExecutor({
     instance: "worker-1",
     profile: fakeProfile(options.mode ?? "complete", cwd, options.extraEnv),
@@ -338,9 +391,7 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
     signingKey: executorKeys.privateKey,
     supervisorKey: supervisorKeys.publicKey,
     credentials,
-    cleanup,
-    space,
-    launcher,
+    ...parts,
     now: clock.now,
     drainMs: 100,
     exitWaitMs: options.exitWaitMs,
@@ -358,7 +409,7 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
   });
   const transport = new FakeTransport();
   const connection = link.open(transport);
-  const r: Rig = { clock, dir, cwd, store, worker, link, cleanup, space, credentials, launcher, transport, connection, challenge: challenges[0]! };
+  const r: Rig = { clock, dir, cwd, store, worker, link, cleanup, space, credentials, launcher, transport, connection, challenge: challenges[0]!, remote };
   const syncTo = options.syncTo === undefined ? 0 : options.syncTo;
   if (syncTo !== null) await sync(r, syncTo);
   return r;
