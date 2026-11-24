@@ -456,8 +456,10 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   if (action === "task_start") {
     // 끊김(markLostFor)이나 복원 3단계(markLost)가 모른다고 옮긴 실행은 되살리지 않고 같은 실행 ID로 조회만 한다(D-92).
     // 처음 봉투를 받지 못한 실행기가 새 연결로 받으면 쓸모없는 실행을 연다. 조회는 수명 박자의 일이다.
-    // 함정: 이 판정은 시한 판정(start_expired) 뒤에 둔다. 발행 + START_LAST_SEAL_MS가 지난 시작은 상태와 무관하게 start_expired로
-    // 끝나야 부르는 쪽이 그 결과를 D-90의 "더 보내지 않음" 재료로 쓴다.
+    // 함정: 이 판정은 시한 판정(start_expired) 뒤에 둔다. 본문을 다시 만들 수 있고 유효한 시각으로 시한 판정에 닿은 시작은
+    // 발행 + START_LAST_SEAL_MS가 지났으면 상태와 무관하게 start_expired로 끝나야 부르는 쪽이 그 결과를 D-90의 "더 보내지 않음"
+    // 재료로 쓴다. 본문을 다시 만들 수 없는 옛 판의 시작은 그 전에 not_rebuildable로 끝나 같은 실행 ID를 조회하고,
+    // 장부의 D-90 자동 닫기도 그 실행을 닫지 않는다(started_before_migration).
     if (item.runState === "unknown_running") return withheld("run_unknown");
     // 같은 실행에 종료가 적혔으면 시작을 다시 내지 않는다. 실행기가 시작을 받은 적이 없다면 열자마자 닫힐 일을 여는 것이고,
     // 받았다면 시작의 재전송은 영수증을 다시 받는 것밖에 없다. 종료는 따로 다시 낸다.
