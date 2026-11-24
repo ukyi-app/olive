@@ -9,7 +9,7 @@ import { AgentListenerRefused, listenForAgent, type UnixHandlers, type UnixListe
 import { RemoteAgent } from "../../src/executor/remote-agent.ts";
 import { FakeLauncher, FakeRuntime, FakeSpace } from "../agent/support.ts";
 import { realTimers } from "./fake-agent.ts";
-import { rig, scratch, start, until } from "./support.ts";
+import { pause, rig, scratch, start, until } from "./support.ts";
 
 const stops: (() => void)[] = [];
 afterEach(() => {
@@ -19,8 +19,80 @@ afterEach(() => {
 const result = new TextEncoder().encode(JSON.stringify({ role: "diagnosis", outcome: "completed", summary: "끝", items: [], refs: [] }));
 
 function newRemote() {
-  return new RemoteAgent({ credentialEnv: "OLIVE_CREDENTIAL", runWindow: () => undefined, runtime: realTimers, inheritedUnverified: false });
+  return new RemoteAgent({ credentialEnv: "OLIVE_CREDENTIAL", runWindow: () => undefined, runtime: realTimers, inheritedUnverified: false, replyWaitMs: 1_000 });
 }
+
+// 실제 경로 소켓에 실제 대리 핵심을 붙인 rig. onCount는 worker가 원격 survivors()를 부를 때마다 먼저 불린다.
+async function realAgent(exitWaitMs: number, hooks: { onCount?: () => void } = {}) {
+  const path = join(scratch("olive-agent-link-"), "agent.sock");
+  const r = await rig({
+    exitWaitMs,
+    remote: {
+      attach: (remote) => {
+        const listening = listenForAgent(remote, { path, mode: 0o600, chmod: chmodSync });
+        stops.push(() => listening.stop());
+        const survivors = remote.cleanup.survivors;
+        remote.cleanup.survivors = () => {
+          hooks.onCount?.();
+          return survivors();
+        };
+      },
+    },
+  });
+  const runtime = new FakeRuntime();
+  runtime.t = r.clock.now();
+  const space = new FakeSpace();
+  const launcher = new FakeLauncher();
+  const agent = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher }))!;
+  const { socket } = await dial(path, (chunk) => agent.receive(chunk), () => agent.linkClosed());
+  agent.attach({
+    write: (bytes) => {
+      if (socket.write(bytes) !== bytes.length) throw new Error("short write");
+    },
+    close: () => socket.end(),
+  });
+  await until(() => r.remote!.state().greeted);
+  return { r, space, launcher };
+}
+
+test("소켓: 실제 대리의 끝내기 응답이 상한을 넘기면 뒤의 계수가 제때 0이어도 receipt_stopped가 나가지 않고 원격은 같은 연결의 ended다", async () => {
+  // 대리의 정리는 제어가 계수를 부를 때(또는 시험이 풀 때)에야 끝난다. 대리는 FIFO대로 terminated → counted를 낸다.
+  let release: () => void = () => {};
+  const { r, space, launcher } = await realAgent(100, { onCount: () => release() });
+  space.terminate = () => {
+    space.terminations++;
+    return new Promise<void>((resolve) => (release = resolve));
+  };
+  const { runId } = await start(r);
+  await until(() => launcher.calls.length === 1);
+  launcher.finish(0, result);
+  await r.worker.idle();
+  release();
+  await until(() => !r.remote!.cleanup.busy());
+  await pause(50);
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+  expect(r.transport.of("receipt_stopped")).toHaveLength(0);
+  expect(r.transport.of("report_result")).toHaveLength(0);
+  expect(r.remote!.state()).toMatchObject({ connected: true, generation: 1, phase: "ended", distrusted: null });
+});
+
+test("소켓: 실제 대리의 최종 계수만 상한을 넘기면 늦은 0이 원격을 idle로 바꾸지 않는다(같은 연결의 ended)", async () => {
+  const { r, space, launcher } = await realAgent(100);
+  let late: (n: number) => void = () => {};
+  let calls = 0;
+  // 첫 계수는 띄우기 전 사전 계수다. 둘째(제어가 보낸 최종 계수)만 쥔다.
+  space.survivors = () => (++calls === 1 ? Promise.resolve(0) : new Promise<number | null>((resolve) => (late = resolve)));
+  const { runId } = await start(r);
+  await until(() => launcher.calls.length === 1);
+  launcher.finish(0, result);
+  await r.worker.idle();
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+  late(0);
+  await pause(100);
+  expect(r.store.run(runId)?.state).toBe("unknown_running");
+  expect(r.transport.of("receipt_stopped")).toHaveLength(0);
+  expect(r.remote!.state()).toMatchObject({ connected: true, generation: 1, phase: "ended", distrusted: null });
+});
 
 // 실제 경로 소켓에 붙는 클라이언트. 받은 바이트를 receive로, 끊김을 closed로 넘긴다.
 async function dial(path: string, receive: (chunk: Uint8Array) => void, closed: () => void) {
@@ -75,7 +147,8 @@ test("소켓: 실제 대리가 경로 소켓으로 붙어 hello → 시작 → �
   const { runId, value } = await start(r);
   await until(() => launcher.calls.length === 1);
   const plan = launcher.calls[0]!.plan;
-  expect(plan.env.OLIVE_CREDENTIAL).toBe(new TextDecoder().decode(value));
+  // 값을 담은 비교는 불리언으로만 단언한다(실패 진단에 자격 표본이 실리지 않게).
+  expect(plan.env.OLIVE_CREDENTIAL === new TextDecoder().decode(value)).toBe(true);
   expect(plan.program).toBe(process.execPath);
   launcher.finish(0, result);
   await r.worker.idle();
@@ -159,4 +232,40 @@ test("소켓: 다 못 쓴 바이트는 사본으로 쥐었다 drain에서 차례
   handlers.data(peer, encodeAgent({ type: "terminated", seq: 2 }));
   expect(await counting).toBe(0);
   await terminating;
+});
+
+test("소켓: drain의 이어 쓰기가 던지면 쥔 사본을 0으로 지우고 연결을 닫아 세션에 끊김을 알린다", async () => {
+  let handlers!: UnixHandlers;
+  const listen: UnixListen = (_path, given): UnixListening => {
+    handlers = given;
+    return { stop: () => {} };
+  };
+  const remote = newRemote();
+  listenForAgent(remote, { path: "/x/agent.sock", mode: 0o600, chmod: () => {}, listen });
+  const held: Uint8Array[] = [];
+  let ended = 0;
+  let writes = 0;
+  const peer: UnixPeer = {
+    write: (bytes) => {
+      held.push(bytes);
+      if (++writes > 1) throw new Error("drain write failed");
+      return 3;
+    },
+    end: () => {
+      ended++;
+    },
+  };
+  handlers.open(peer);
+  handlers.data(peer, encodeAgent({ type: "hello" }));
+  const terminating = remote.cleanup.terminate();
+  handlers.drain(peer);
+  expect(ended).toBe(1);
+  expect(remote.state()).toMatchObject({ connected: false, distrusted: null });
+  expect(await terminating.then(() => "settled", () => "rejected")).toBe("rejected");
+  for (const bytes of held.slice(1)) expect(bytes.every((byte) => byte === 0)).toBe(true);
+});
+
+test("소켓: 실제 bind 함수는 내보내지 않는다(경로·권한 검사를 지나는 listenForAgent만 공개)", async () => {
+  const listener = await import("../../src/executor/agent-listener.ts");
+  expect(Object.keys(listener).sort()).toEqual(["AgentListenerRefused", "listenForAgent"]);
 });

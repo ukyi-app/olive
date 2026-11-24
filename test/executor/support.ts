@@ -7,7 +7,7 @@ import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Action, type Bodies, type Envelope, sealEnvelope, type SealInput } from "../../src/contract/v1/index.ts";
+import { type Action, type Bodies, type Envelope, limits, sealEnvelope, type SealInput } from "../../src/contract/v1/index.ts";
 import type { ProcessCleanup } from "../../src/executor/containment.ts";
 import { bunLauncher, type Launcher, type SpawnedChild } from "../../src/executor/launcher.ts";
 import { type Connection, ExecutorLink, type Transport } from "../../src/executor/link.ts";
@@ -375,6 +375,8 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
       runWindow: (id) => store.run(id),
       runtime: realTimers,
       inheritedUnverified: options.remote?.inheritedUnverified ?? false,
+      // worker의 exitWaitMs와 같은 값(worker의 기본값 포함).
+      replyWaitMs: options.exitWaitMs ?? limits.STOP_GRACE_MS + 5_000,
     });
     if (options.remote?.attach !== undefined) options.remote.attach(remote);
     else new FakeAgent(launcher, cleanup, { drainMs: 100, exitWaitMs: options.exitWaitMs }).attach(remote);

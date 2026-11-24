@@ -31,6 +31,7 @@ export interface UnixListening {
 }
 
 // 경로 유닉스 소켓 하나를 듣는 함수. 시험이 바꿔 넣는 자리이고, 제품은 bunUnixListen이다.
+// 어느 쪽이든 listenForAgent의 경로·권한 검사를 지난 뒤에만 불린다(bunUnixListen은 내보내지 않는다).
 export type UnixListen = (path: string, handlers: UnixHandlers) => UnixListening;
 
 export interface AgentListenerOptions {
@@ -42,7 +43,7 @@ export interface AgentListenerOptions {
   listen?: UnixListen;
 }
 
-export const bunUnixListen: UnixListen = (path, handlers) => {
+const bunUnixListen: UnixListen = (path, handlers) => {
   const listener = Bun.listen<undefined>({
     unix: path,
     socket: {
@@ -143,7 +144,15 @@ export function listenForAgent(agent: RemoteAgent, options: AgentListenerOptions
     },
     drain: (socket) => {
       const peer = peers.get(socket);
-      if (peer?.open && !flush(peer)) shut(peer);
+      if (!peer?.open) return;
+      // 이어 쓰기의 예외도 음수 반환과 같은 끊김이다. 쥔 사본을 지우고 세션에 알린다(실행 중이면 잠금).
+      let flushed = false;
+      try {
+        flushed = flush(peer);
+      } catch {
+        flushed = false;
+      }
+      if (!flushed) shut(peer);
     },
     close: (socket) => {
       const peer = peers.get(socket);

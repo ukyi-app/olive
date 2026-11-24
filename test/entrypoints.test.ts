@@ -36,17 +36,23 @@ test("entrypoints: 이미지 기본 명령(no-role)은 역할을 고르라고 �
 const LISTENER = "src/executor/agent-listener.ts";
 const listening = /\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\.listen\(/;
 // 그 한 파일의 듣기: Bun.listen 하나이고 unix 경로만 넘긴다(hostname·port 없음).
+const ALLOWED_LISTEN = /\bBun\.listen\s*(?:<[^>]*>)?\s*\(\s*\{\s*unix\s*:\s*path\s*,\s*socket\s*:/;
 const unixOnly = (source: string) =>
   [...source.matchAll(/\bBun\.listen\b/g)].length === 1 &&
-  !/\bBun\.(serve|udpSocket)\b|\bcreateServer\b|\.listen\(/.test(source) &&
-  /\bBun\.listen\s*(?:<[^>]*>)?\s*\(\s*\{\s*unix\s*:\s*path\s*,\s*socket\s*:/.test(source) &&
+  ALLOWED_LISTEN.test(source) &&
+  // 허용한 그 호출을 뺀 나머지에서 다른 듣기를 찾는다(허용한 호출의 ".listen("을 이 규칙이 잡지 않게).
+  !/\bBun\.(serve|udpSocket)\b|\bcreateServer\b|\.listen\(/.test(source.replace(ALLOWED_LISTEN, "")) &&
   !/\b(hostname|port)\s*:/.test(source);
 
 test("entrypoints: 경로 유닉스 소켓만 듣는다는 확인이 TCP·두 번 듣기를 잡는다", async () => {
   expect(unixOnly(await Bun.file(join(root, LISTENER)).text())).toBe(true);
-  expect(unixOnly("Bun.listen({ unix: path, socket: {} }); Bun.listen({ unix: path, socket: {} });")).toBe(false);
-  expect(unixOnly('Bun.listen({ hostname: "0.0.0.0", port: 9, socket: {} });')).toBe(false);
-  expect(unixOnly("Bun.listen({ unix: path, port: 9, socket: {} });")).toBe(false);
+  // 정상 대조군(타입 인자 없음)과, 거기서 한 가지씩만 바꾼 음성 대조군.
+  const normal = "Bun.listen({ unix: path, socket: {} });";
+  expect(unixOnly(normal)).toBe(true);
+  expect(unixOnly(`${normal} ${normal}`)).toBe(false);
+  expect(unixOnly('Bun.listen({ hostname: "0.0.0.0", socket: {} });')).toBe(false);
+  expect(unixOnly(`${normal} const tcp = { port: 9 };`)).toBe(false);
+  expect(unixOnly(`${normal} server.listen(9);`)).toBe(false);
 });
 
 test("entrypoints: 실행기에서 닿는 코드에 듣는 API는 agent-listener.ts의 경로 유닉스 소켓 하나뿐이다", async () => {
