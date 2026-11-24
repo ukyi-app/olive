@@ -836,7 +836,7 @@ function realWorld() {
     assignment: { allowed: [], registrations: [], expected: { profile_revision: "profile-1", policy_revision: "policy-1" } },
     accounts: [],
     plans: [],
-    queue: { alertMaxWaitMs: 60_000 },
+    queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 1_000_000, alert: 1_000_000 } },
     originOf: () => "admin",
   } as unknown as AssignLoopPolicy;
   const beats: CycleBeats = {
