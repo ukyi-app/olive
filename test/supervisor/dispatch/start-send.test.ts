@@ -53,7 +53,47 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
     // 실행기 → 감독 연결. 감독 모듈을 import하지 않음을 아래 시험이 본다.
     "src/executor/link.ts": ["method_call", "method_call"],
     "src/executor/worker.ts": ["method_call", "method_call"],
+    // 박자 순서기가 만들 때 쥔 박자 함수를 그 수신자로 부르는 한 자리(함수의 name·length를 읽지 않으려고 bind 대신 쓴다).
+    // 송신 포트를 받거나 시작 봉투를 만들 수 없음을 아래 시험이 본다.
+    "src/supervisor/runtime/cycle.ts": ["reflect"],
   });
+});
+
+// 박자 함수만 부르는 모듈이 시작 봉투를 만들거나(초안·task_start·봉하기) 송신 포트를 받거나 부를(공유 함수·내보내기 포트) 수 있는 글자.
+const CANNOT_SEND: readonly [string, RegExp][] = [
+  ["startDraft", /\bstartDraft\b/],
+  ["task_start", /task_start/],
+  ["seal", /\.seal\s*\(|\bsealEnvelope\b/],
+  ["sendInstruction", /\bsendInstruction\b/],
+  ["sink", /sink/i],
+  ["send-gate", /send-gate/],
+];
+const sendCapable = (source: string) => [
+  ...CANNOT_SEND.filter(([, shape]) => shape.test(source)).map(([name]) => name),
+  ...source
+    .split("\n")
+    .filter((line) => /\bReflect\s*\.\s*apply\b/.test(line))
+    .map((line) => line.trim())
+    .filter((line) => line !== "return ((...args: unknown[]) => Reflect.apply(fn, beats, args)) as CycleBeats[K];"),
+];
+const CYCLE = "src/supervisor/runtime/cycle.ts";
+
+test("정적: 박자 순서기의 Reflect.apply는 쥔 박자 함수를 부르는 한 줄이고, 그 파일은 시작 봉투를 만들거나 송신 포트를 받지 않는다", () => {
+  expect(sendCapable(src(CYCLE))).toEqual([]);
+});
+
+test("대조군: 박자 순서기에 시작 봉투·송신 포트의 글자나 다른 Reflect.apply를 넣으면 위 단언이 잡는다", () => {
+  for (const [snippet, expected] of [
+    ["const d = startDraft({ run });", ["startDraft"]],
+    ['if (kind === "task_start") return;', ["task_start"]],
+    ["const e = ports.signer.seal(d);", ["seal"]],
+    ["await sendInstruction(ports, e);", ["sendInstruction"]],
+    ["readonly sink: InstructionSink;", ["sink"]],
+    ['import { x } from "../dispatch/send-gate.ts";', ["send-gate"]],
+    ["Reflect.apply(send, target, [envelope]);", ["Reflect.apply(send, target, [envelope]);"]],
+  ] as const) {
+    expect([snippet, sendCapable(`${src(CYCLE)}\n${snippet}`)]).toEqual([snippet, [...expected]]);
+  }
 });
 
 test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재전송 박자뿐이고, 둘 다 포트를 직접 부르지 않고 sendInstruction을 한 번 부른다", () => {
