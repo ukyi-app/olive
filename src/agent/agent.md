@@ -20,7 +20,7 @@
 | 제어 → 대리 | `count` | `seq` | 남은 수를 묻는다(`PidSweep.survivors`). 열린 실행이 없어도 받는다 |
 | 대리 → 제어 | `hello` | 없음 | 링크의 첫 말. non-dumpable·PID 1·기준 기록을 마친 뒤에만 보낸다 |
 | 대리 → 제어 | `spawned` | `run_id` | 프로세스가 생겼다 |
-| 대리 → 제어 | `output` | `run_id`, `data`(base64) | stdout 조각(디코딩한 원 바이트 32KiB 이하, 넘으면 보내는 쪽·받는 쪽 모두 `link_bad_message`). 해석하지 않는다 |
+| 대리 → 제어 | `output` | `run_id`, `data`(base64) | stdout 조각(디코딩한 원 바이트 32KiB 이하). 넘는 조각은 양쪽 모두 거절한다: 봉투가 크기 검사를 통과하면 보내는 쪽·받는 쪽 모두 `link_bad_message`, 봉투 자체가 64KiB를 넘으면 받는 쪽은 길이 접두만 보고 `frame_too_large`(보내는 쪽은 `link_bad_message`). 해석하지 않는다 |
 | 대리 → 제어 | `exited` | `run_id`, `code`, `signal`, `overflow`, `stdout_bytes` | 프로그램이 끝났다. `stdout_bytes`는 앞선 `output` 합, 초과면 0 |
 | 대리 → 제어 | `not_spawned` | `run_id`, `reason` | 띄우지 않았다: `aborted`·`cleanup_busy`·`spawn_failed`·`refused`(자격 값이 다른 칸에 있음 등)·`expired`·`space_not_clean` |
 | 대리 → 제어 | `unconfirmed` | `run_id` | 띄웠지만 끝을 확인하지 못했다(`ExitUnconfirmed`) |
@@ -49,7 +49,7 @@
 
 `terminate`·`count`는 열린 실행이 없을 때도 받아 공간 전체를 정리하고 센다. 띄우지 않으므로 여는 쪽 효과는 없다. 받는 까닭:
 
-- `count`: 제어는 `start`를 보내기 전에 멈춘 실행(띄우지 않은 실행)도 세어 0을 확인한 뒤에만 종료 영수증을 낸다(`worker.ts`의 `notStarted` → `confirmStopped`의 `survivors`). 대리에게는 열린 실행이 없다.
+- `count`: 제어는 `start`를 보내기 전에 멈춘 실행(띄우지 않은 실행)도 세어 0을 확인한 뒤에만 종료 영수증을 낸다(`worker.ts`의 `notStarted` → `confirmStopped`의 `survivors`). 대리에게는 열린 실행이 없고, 그 실행의 시작 응답(`spawned`·`not_spawned`)은 영영 오지 않는다. 그래서 그 실행의 근거는 그 실행의 정리 단계에서 새로 보낸 `count`의 답이다(아래 "뒤 조각이 지켜야 할 것").
 - `terminate`: 제어가 상한 안에 `counted`를 받지 못해 실행을 모름으로 둔 뒤 회수(`reclaim`)하면, 늦게 온 0으로 대리 쪽 실행은 이미 닫혔을 수 있다. 거절하면 대리가 끝나 그 회수가 늘 모름이 된다.
 
 이 둘의 답은 공간 전체의 사실이고 어느 실행의 것인지는 말하지 않는다. 어느 요청의 답으로 쓸지는 제어가 정한다(아래 "뒤 조각이 지켜야 할 것").
@@ -61,7 +61,7 @@
 | 원인 | 종료 코드 |
 |---|---|
 | 링크가 끊김(`linkClosed`), 쓰기 실패 | 75 |
-| 열린 실행이 `min(deadline_at, lease_until) + enforceGraceMs`(기본 25초)를 지나도 닫히지 않음. 그 시각이 지난 뒤 `renew`나 0인 계수 완료가 만료 콜백보다 먼저 처리돼도 같다(기존 시각으로 판단, 그 갱신이나 `counted`는 받거나 보내지 않음) | 76 |
+| 열린 실행이 `min(deadline_at, lease_until) + enforceGraceMs`(기본 25초)를 지나도 닫히지 않음. 그 시각이 지난 뒤 `renew`나, 프로그램이 끝난 실행(`run.ended`)을 0으로 닫을 계수 완료가 만료 콜백보다 먼저 처리돼도 같다(기존 시각으로 판단, 그 갱신은 받지 않고 그 최종 0의 `counted`는 보내지 않음). 프로그램이 끝나기 전의 중간 0은 억제하지 않고 그대로 나간 뒤 76으로 닫힐 수 있으므로, 중간 계수로는 종료를 확정할 수 없다 | 76 |
 | 디코더 거절(같거나 작은 `seq` 포함), `attach` 전의 수신, 실행 중의 `start`, 맞지 않는 `renew`, 두 번째 `attach`(그 포트의 닫기가 실패해도) | 77 |
 
 대리는 공간의 PID 1이라 끝나면 커널이 공간의 나머지를 SIGKILL로 끝낸다. 그래서 정리가 멈춰도 상한 뒤에는 공간이 빈다. 끝난 뒤에는 아무 말도 하지 않으므로 제어는 그 실행의 남은 수를 모른다.
@@ -93,7 +93,7 @@
 ## 뒤 조각이 지켜야 할 것
 
 - **제어(O-b)**: 두 번째 연결, 디코더 거절, 늦은 답·없는 요청의 답, 상한 안에 없는 답, 실행 중 끊김을 모두 "모름"(`null`·`unknown_running`)으로 다룬다. 두 번째 연결을 본 역할 컨테이너 세대는 다시 믿지 않는다. **새 `hello`로 끊긴 실행을 닫지 않는다**(새 hello는 그 뒤의 새 실행에만 쓴다. 끊긴 실행의 회복은 파드 재시작 관문이나 관리자 닫기다).
-- **제어(O-b)**: **띄우기가 보류된 동안의 0은 종료 증거가 아니다.** `start`를 보낸 뒤 `spawned`·`not_spawned`가 오기 전에는 대리가 사전 계수를 기다리는 중일 수 있고, 그때의 `count`는 빈 공간의 0을 답하지만 그 뒤 같은 실행이 뜰 수 있다. 시작 응답이 미결일 때 받은 `counted`를 영수증으로 승격하지 않고, 실행·요청·단계가 맞는 최종 계수(시작 응답과 `exited`·`unconfirmed`·`not_spawned` 뒤)만 쓴다. 열린 실행 밖의 `terminated`·`counted`도 공간 전체의 사실일 뿐이므로 같은 규칙으로 고른다.
+- **제어(O-b)**: **띄우기가 보류된 동안의 0은 종료 증거가 아니다.** `start`를 보낸 뒤 `spawned`·`not_spawned`가 오기 전에는 대리가 사전 계수를 기다리는 중일 수 있고, 그때의 `count`는 빈 공간의 0을 답하지만 그 뒤 같은 실행이 뜰 수 있다. 시작 응답이 미결일 때 받은 `counted`를 영수증으로 승격하지 않고, 실행·요청·단계가 맞는 최종 계수만 쓴다. `start`를 보낸 실행은 시작 응답과 `exited`·`unconfirmed`·`not_spawned` 뒤의 종료 단계에서 보낸 계수다. `start`를 보내지 않았고 앞으로도 보내지 않을 실행은 시작 응답을 기다리지 않고, 그 실행의 정리 단계에서 새로 보낸 계수를 쓴다. 열린 실행 밖의 `terminated`·`counted`도 공간 전체의 사실일 뿐이므로 같은 규칙으로 고른다.
 - **제어(O-b)**: 값 틀을 만드는 자리가 하나 는다. `src/`에서 `encodeCredentialFrame`을 부르는 곳을 `credential-send.ts` 하나로 묶은 정적 규칙(`test/supervisor/dispatch/credential-send.test.ts`)을 같은 변경에서 다시 정한다. 링크 쓰기 자리가 `.send(` 꼴이면 송신 자리 목록(`start-send.test.ts`)에도 걸린다.
 - **제어(O-b)**: 듣는 소켓은 경로 유닉스 소켓 하나다(TCP·abstract 금지). 대리 쪽 소켓을 대리가 듣는 반대 방향은 쓰지 않는다(같은 uid의 모델이 바꿔치기할 수 있다).
 - **진입점(O-c)**: `RoleAgent.prepare`를 소켓 연결보다 먼저 부른다. 환경 읽기와 소켓은 진입점에만 두고, 소켓이 닫히거나 오류가 나면 `linkClosed()`를 부른다. `runtime.exit`은 실제로 프로세스를 끝내야 한다.

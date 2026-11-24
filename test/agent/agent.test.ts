@@ -65,7 +65,8 @@ test("대리 정상 길: start → spawned·output·exited, 끝내기 → termin
   const plan = launcher.calls[0]!.plan;
   // 계획은 start와 자격 값으로만 만든다. 자격 값은 credential_env 하나에만 있다.
   // 실패 진단에 값이 실리지 않게 자격 칸은 불리언으로, 나머지는 값을 뺀 꼴로 비교한다.
-  const { OLIVE_CREDENTIAL: credential, ...env } = plan.env;
+  // launcher는 { ...plan.env }를 자식에게 넘긴다. 상속·비열거 속성의 자격 칸은 거기서 빠지므로 같은 꼴을 만든 뒤 나눈다.
+  const { OLIVE_CREDENTIAL: credential, ...env } = { ...plan.env };
   expect(credential === SECRET).toBe(true);
   // 다른 칸에 값이 섞였으면 아래 diff에 실리기 전에 여기서 멈춘다.
   expect(JSON.stringify({ ...plan, env }).includes(SECRET)).toBe(false);

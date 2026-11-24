@@ -8,7 +8,7 @@
 // 자격 값은 JSON을 지나지 않는다. 시작(start) 바로 뒤의 값 틀로만 오고, 디코딩한 값은 CredentialValue에 싸여
 // JSON.stringify·console.log·오류 메시지에 바이트가 실리지 않는다. 거절 사유는 언제나 이름뿐이다.
 // 가림의 보장은 CredentialValue와 LinkError까지다. 계약을 어긴 제어가 같은 바이트를 start의 다른 칸(argv·env 등)에 넣으면
-// 디코딩한 start 전체에는 그 바이트가 있다(대리는 그런 start를 띄우지 않는다). 그래서 받은 start 전체를 직렬화·inspect·로그에
+// 디코딩한 start 전체에는 그 바이트가 있다(program·cwd·argv·다른 환경 값에 있으면 대리는 띄우지 않지만, 실행 ID 같은 다른 칸은 대조하지 않는다). 그래서 받은 start 전체를 직렬화·inspect·로그에
 // 넘기지 않는다. 칸 전부와 대조하지 않는 까닭: 실행 ID·지문·수 칸은 짧은 값과 우연히 겹칠 수 있어 "전체에 없음"을 약속할 수 없다.
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
