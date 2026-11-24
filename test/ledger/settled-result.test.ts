@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import type { Ledger } from "../../src/ledger/index.ts";
 import { digest, id, must, NOW, open, startedWorker, tempPath } from "./helpers.ts";
@@ -70,6 +71,39 @@ describe("settledResult: 결과 보고가 저장 자리와 함께 반영됐고 d
     // 판정 뒤 같은 결과의 다른 보고는 적자마자 마친다.
     report(ledger, s, RESULT, NOW + 4);
     expect(ledger.settledResult(s.runId)).toEqual({ known: true, value: { runId: s.runId, resultDigest: RESULT, storedRef: first.storedRef, storedAt: NOW + 2 } });
+  });
+
+  // 지금의 공개 쓰기로는 판정된 실행에 같은 digest의 미반영 보고가 생기지 않는다(판정이 모두 닫고, 판정 뒤 보고는 적자마자 반영). 그래서
+  // applied_at 조건은 방어 조건이고, 그 상태를 장부 파일에 직접 넣어 고정한다. 반영 표시만 다른 대조 줄이 값을 내야 넣은 줄의 꼴이 맞다.
+  test("판정된 실행이라도 반영되지 않은 같은 digest의 보고만 있으면 null이다", () => {
+    const path = tempPath();
+    const ledger = open(path);
+    const s = checking(ledger);
+    must(ledger.markResult({ runId: s.runId, resultDigest: RESULT, now: NOW + 3 }));
+    ledger.close();
+
+    const insert = (appliedAt: number | null) => {
+      const raw = new Database(path);
+      try {
+        raw.run("PRAGMA foreign_keys = ON");
+        raw
+          .query("INSERT INTO deliveries (id, action, run_id, body_digest, stored_ref, result_digest, received_at, applied_at) VALUES (?, 'report_result', ?, ?, ?, ?, ?, ?)")
+          .run(id(), s.runId, digest(`report:${id()}`), "results/raw", RESULT, NOW + 4, appliedAt);
+      } finally {
+        raw.close();
+      }
+    };
+
+    insert(null);
+    const unapplied = open(path);
+    expect(unapplied.getRun(s.runId)).toMatchObject({ known: true, value: { state: "ready_result", resultDigest: RESULT } });
+    expect(unapplied.settledResult(s.runId)).toEqual({ known: true, value: null });
+    unapplied.close();
+
+    insert(NOW + 5);
+    const applied = open(path);
+    expect(applied.settledResult(s.runId)).toEqual({ known: true, value: { runId: s.runId, resultDigest: RESULT, storedRef: "results/raw", storedAt: NOW + 4 } });
+    applied.close();
   });
 
   test("장부를 바꾸지 않고, 닫힌 장부에서는 모름이다", () => {

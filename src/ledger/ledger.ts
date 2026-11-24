@@ -526,8 +526,9 @@ export interface PendingReport {
   signal?: ReportSignal;
 }
 
-// 확정(result_finalize)에 싣는 결과 보관. settledResult만 낸다. storedAt은 그 결과 보고를 장부에 적은 시각이다: 감독은 결과를 저장한
-// 뒤에만 보고를 적으므로(recordReport) 저장을 마친 시각 이후의 첫 장부 시각이다.
+// 확정(result_finalize)에 싣는 결과 보관. settledResult만 낸다. storedAt은 그 보고의 deliveries.received_at, 곧 결과 보고 처리기가
+// 보관소와 장부에 함께 넘긴 시각이다. 첫 전달이면 보관소 머리의 storedAt과 같고, 장부가 거절·모름으로 답해 같은 보고가 다시 오면
+// 보관소의 값보다 늦다. "저장을 마친 뒤의 시각"으로 기대해 계산하지 않는다.
 export interface SettledResult {
   runId: string;
   resultDigest: string;
