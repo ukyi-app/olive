@@ -974,7 +974,13 @@ function realWorld() {
     // 증거 포트의 구현(답 줄)이 아직 없는 조립과 같다: 모든 실행기가 모름이라 장부를 부르지 않는다.
     unreceived: (now) =>
       unreceivedTick(
-        { ledger, evidence: { read: () => ({ known: false }) }, links: wire.answers, withheld: { executors: () => ({ known: true, value: [] }) }, intake, observationsSettled: () => true },
+        {
+          ledger,
+          evidence: { read: () => ({ known: false }), confirm: () => "link_not_current" },
+          withheld: { executors: () => ({ known: true, value: [] }) },
+          intake,
+          observationsSettled: () => true,
+        },
         now,
       ),
     assign: (now) => assignAndStartTick(assignPorts, assignPolicy, now),

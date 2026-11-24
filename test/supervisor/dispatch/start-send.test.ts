@@ -119,7 +119,7 @@ test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재�
     expect([file, sendSites(src(file))]).toEqual([file, []]);
     expect([file, [...src(file).matchAll(/\bsendInstruction\s*\(/g)].length]).toEqual([file, 1]);
   }
-  // task_start를 문자열로 쓰는 모듈(초안을 손으로 꾸밀 수 있는 자리)도 정한 넷뿐이다. 초안 모듈 자체는 포트를 부르지 않는다.
+  // task_start를 문자열로 쓰는 모듈(초안을 손으로 꾸밀 수 있는 자리)도 정한 다섯뿐이다. 초안 모듈 자체는 포트를 부르지 않는다.
   // credential-send.ts는 받은 영수증의 instruction 칸을 견주기만 하고 초안을 꾸미지 않는다(이 시험 첫머리의 단언).
   expect(files.filter((file) => startLiterals(src(file)) > 0 && !file.startsWith("src/contract/") && !file.startsWith("src/ledger/") && !file.startsWith("src/executor/"))).toEqual([
     "src/supervisor/dispatch/credential-send.ts",

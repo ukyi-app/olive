@@ -51,8 +51,16 @@ function world(path = tempPath()) {
   const ledger = ready(open(path));
   const calls: UnreceivedClosureInput[] = [];
   const state = {
-    evidence: (_executorId: string): UnreceivedEvidenceRead => ({ known: true, tainted: false, pending: false, lastFull: full() }),
+    evidence: (_executorId: string): UnreceivedEvidenceRead => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full() }),
     current: (connection: number, executorId: string): boolean => connection === CONN && executorId === WORKER_EXECUTOR,
+    // 가짜 답 줄의 변경 번호. 증거를 읽은 뒤 늘면 confirm이 evidence_changed를 낸다.
+    version: 0,
+    // 증거 포트의 confirm. 계약의 차례대로 연결 → 정지 세대 → 변경 번호를 본다.
+    confirm: (executorId: string, connection: number, version: number, generation: number): unknown => {
+      if (!state.current(connection, executorId)) return "link_not_current";
+      if (state.generation() !== generation) return "stop_generation";
+      return version === state.version ? "current" : "evidence_changed";
+    },
     withheld: (): unknown => ({ known: true, value: [] }),
     generation: (): unknown => 0,
     settled: (): unknown => true,
@@ -80,8 +88,10 @@ function world(path = tempPath()) {
         return ledger.closeUnreceivedRun(input, from);
       },
     },
-    evidence: { read: (executorId: string) => state.evidence(executorId) },
-    links: { current: (connection: number, executorId: string) => state.current(connection, executorId) },
+    evidence: {
+      read: (executorId: string) => state.evidence(executorId),
+      confirm: (executorId: string, connection: number, version: number, generation: number) => state.confirm(executorId, connection, version, generation),
+    },
     withheld: { executors: () => state.withheld() },
     intake: { stopGeneration: () => state.generation() },
     observationsSettled: () => state.settled(),
@@ -106,7 +116,7 @@ describe("모름 표", () => {
   test("#1 서명 시각 = 발행 + 29,999면 장부를 부르지 않는다(장부도 같은 경계에서 answer_too_early)", () => {
     const w = world();
     const live = started(w.ledger);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ answeredAt: NOW + 29_999 }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ answeredAt: NOW + 29_999 }) });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "answer_too_early")]);
     expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
     // 미리 거르는 값이 장부의 경계와 같다: 장부에 직접 넘겨도 같은 값에서 거절한다.
@@ -132,7 +142,7 @@ describe("모름 표", () => {
   test("#3 연결의 인사가 시작 발행보다 이르고 연결이 계속 살면 닫지 않는다(새 인사가 와야 한다)", () => {
     const w = world();
     const live = started(w.ledger);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ answeredAt: NOW - 5_000, receivedAt: NOW + 60_000 }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ answeredAt: NOW - 5_000, receivedAt: NOW + 60_000 }) });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "answer_too_early")]);
     expect(ran(w.tick(NOW + 120_000)).runs).toEqual([skipped(live, "answer_too_early")]);
     expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
@@ -189,7 +199,7 @@ describe("모름 표", () => {
         (w: ReturnType<typeof world>) => {
           w.state.evidence = () => {
             w.state.current = () => false;
-            return { known: true, tainted: false, pending: false, lastFull: full() };
+            return { known: true, tainted: false, pending: false, version: 0, lastFull: full() };
           };
         },
       ],
@@ -247,7 +257,7 @@ describe("모름 표", () => {
   test("#8 그 실행기의 앞선 인사·상태 보고가 버려졌으면(tainted) 0회다", () => {
     const w = world();
     const live = started(w.ledger);
-    w.state.evidence = () => ({ known: true, tainted: true, pending: false, lastFull: full() });
+    w.state.evidence = () => ({ known: true, tainted: true, pending: false, version: 0, lastFull: full() });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "tainted")]);
     expect(w.calls.length).toBe(0);
   });
@@ -255,7 +265,7 @@ describe("모름 표", () => {
   test("#9 그 실행기 줄에 held 인사·retry·밀린 사본이 남았으면(pending) 0회다", () => {
     const w = world();
     const live = started(w.ledger);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: true, lastFull: full() });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: true, version: 0, lastFull: full() });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "pending")]);
     expect(w.calls.length).toBe(0);
   });
@@ -264,7 +274,7 @@ describe("모름 표", () => {
     const w = world();
     const live = started(w.ledger);
     // 새 서버의 첫 인사가 빈 전체 목록이어도 버린 사본이 있었으면 오염이다.
-    w.state.evidence = () => ({ known: true, tainted: true, pending: false, lastFull: full({ connection: CONN }) });
+    w.state.evidence = () => ({ known: true, tainted: true, pending: false, version: 0, lastFull: full({ connection: CONN }) });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "tainted")]);
     expect(w.calls.length).toBe(0);
   });
@@ -312,9 +322,9 @@ describe("모름 표", () => {
   test("#13 인사가 맞춘 세대가 지금 세대와 다르거나, 지금 세대를 모르거나, 복원기와 장부의 세대가 다르면 0회다", () => {
     const w = world();
     const live = started(w.ledger);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ stopGeneration: 1 }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ stopGeneration: 1 }) });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "stop_generation")]);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full() });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full() });
     for (const value of [null, undefined, -1, 0.5]) {
       w.state.generation = () => value;
       expect([value, w.tick()]).toEqual([value, { kind: "not_run", reason: "stop_generation_unknown" }]);
@@ -333,7 +343,7 @@ describe("모름 표", () => {
     const w = world();
     const live = started(w.ledger);
     const runs = [{ run_id: live.runId, run_generation: 1, state: "preparing", last_receipt_id: null }] as unknown as UnreceivedFull["runs"];
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ runs }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ runs }) });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "run_in_answer")]);
     expect(w.calls.length).toBe(0);
   });
@@ -347,24 +357,26 @@ describe("모름 표", () => {
       },
       () => ({ known: false }),
       () => null,
-      () => ({ known: true, pending: false, lastFull: full() }),
-      () => ({ known: true, tainted: "no", pending: false, lastFull: full() }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), runs: "none" } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), runs: [null] } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), answeredAt: 0 } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), answeredAt: null } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), receivedAt: Number.NaN } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), connection: -1 } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: { ...full(), principal: undefined } }),
-      () => ({ known: true, tainted: false, pending: false, lastFull: "full" }),
+      () => ({ known: true, pending: false, version: 0, lastFull: full() }),
+      () => ({ known: true, tainted: "no", pending: false, version: 0, lastFull: full() }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), runs: "none" } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), runs: [null] } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), answeredAt: 0 } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), answeredAt: null } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), receivedAt: Number.NaN } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), connection: -1 } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: { ...full(), principal: undefined } }),
+      () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: "full" }),
+      () => ({ known: true, tainted: false, pending: false, lastFull: full() }),
+      () => ({ known: true, tainted: false, pending: false, version: -1, lastFull: full() }),
     ];
     for (const [index, read] of broken.entries()) {
       w.state.evidence = read as () => UnreceivedEvidenceRead;
       expect([index, ran(w.tick()).runs]).toEqual([index, [skipped(live, "evidence_unknown")]]);
     }
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: null });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: null });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "no_full")]);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ principal: OTHER_EXECUTOR }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ principal: OTHER_EXECUTOR }) });
     expect(ran(w.tick()).runs).toEqual([skipped(live, "principal_mismatch")]);
     for (const answer of [{ known: false, reason: "unwritable" }, { known: true, value: { stopGeneration: 0 } }, { known: true, value: { stopGeneration: 0.5, instructions: [] } }, null]) {
       w.state.unanswered = () => answer;
@@ -437,7 +449,7 @@ describe("모름 표", () => {
   test("#18 받은 시각은 서명 시각 대신 쓰지 않는다: 받은 시각이 늦어도 서명 시각이 이르면 0회다", () => {
     const w = world();
     const live = started(w.ledger);
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ answeredAt: NOW + 29_999, receivedAt: NOW + 90_000 }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ answeredAt: NOW + 29_999, receivedAt: NOW + 90_000 }) });
     expect(ran(w.tick(NOW + 90_010)).runs).toEqual([skipped(live, "answer_too_early")]);
     expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
   });
@@ -460,7 +472,7 @@ describe("판단의 테두리", () => {
     w.state.before = [other];
     const live = started(w.ledger);
     w.state.evidence = (executorId) =>
-      executorId === OTHER_EXECUTOR ? { known: false } : { known: true, tainted: false, pending: false, lastFull: full() };
+      executorId === OTHER_EXECUTOR ? { known: false } : { known: true, tainted: false, pending: false, version: 0, lastFull: full() };
     expect(ran(w.tick()).runs.map((item) => [item.outcome, "runId" in item ? item.runId : null])).toEqual([
       ["skipped", other.runId],
       ["closed", live.runId],
@@ -472,7 +484,7 @@ describe("판단의 테두리", () => {
     const w = world();
     const live = started(w.ledger);
     const runs: { run_id: string }[] = [];
-    w.state.evidence = () => ({ known: true, tainted: false, pending: false, lastFull: full({ runs: runs as unknown as UnreceivedFull["runs"] }) });
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ runs: runs as unknown as UnreceivedFull["runs"] }) });
     w.state.current = () => {
       runs.push({ run_id: "late" });
       return true;
@@ -497,6 +509,223 @@ describe("판단의 테두리", () => {
   });
 });
 
+// 박자가 쓰는 시계로 순서기를 한 번 돌리고, 같은 박자의 배정이 본 작업자 자리를 함께 돌려준다.
+async function beatWithAssign(w: ReturnType<typeof world>) {
+  const shared = createSharedClock({ now: () => AT });
+  let freeAtAssign: boolean | null = null;
+  const cycle = createCycle({
+    beats: {
+      linkLoss: () => ({ kind: "ran", executors: [], watch: [], halted: null, haltedAt: null }),
+      life: async () => ({ kind: "ran", runs: [], pendingQueries: [], halted: null, haltedAt: null }),
+      resend: async () => ({ kind: "ran", instructions: [], halted: null, haltedAt: null }),
+      unreceived: (now) => unreceivedTick(w.ports, now),
+      assign: async () => {
+        const slot = w.ledger.slotFree("worker");
+        freeAtAssign = slot.known ? slot.value : null;
+        return { kind: "ran", starts: [], requests: [], halted: null, haltedAt: null };
+      },
+    },
+    serverTick: () => {},
+    ledgerClock: shared,
+    monotonic: { now: () => 1 },
+    restoreDone: () => true,
+    ledger: w.ledger,
+    policy: { judgeMs: 30_000, resendEveryMs: 5_000, assignCallsPerBeat: 1 },
+  });
+  const report = await cycle.beat();
+  if (report.kind !== "ran" || report.unreceived.kind !== "returned") throw new Error(`박자가 돌지 않았다: ${JSON.stringify(report)}`);
+  return { runs: ran(report.unreceived.result).runs, freeAtAssign: freeAtAssign as boolean | null };
+}
+
+describe("마지막 확인 뒤의 외부 코드", () => {
+  // 가짜 답 줄에 같은 실행기의 양성 상태 보고가 들어온다: 변경 번호가 늘고 넘기지 않은 답이 남는다.
+  function line(w: ReturnType<typeof world>) {
+    const queue = { submitted: false };
+    w.state.evidence = () => ({ known: true, tainted: false, pending: queue.submitted, version: w.state.version, lastFull: full() });
+    return () => {
+      queue.submitted = true;
+      w.state.version += 1;
+    };
+  }
+
+  test("증거를 읽기 전·후에 같은 실행기 줄에 들어온 양성 답은 둘 다 닫지 않고, 같은 박자의 배정은 자리가 찬 것을 본다", async () => {
+    const before = world();
+    const beforeRun = started(before.ledger);
+    line(before)();
+    const early = await beatWithAssign(before);
+    expect([early.runs, early.freeAtAssign, before.calls.length, before.stateOf(beforeRun.runId)]).toEqual([[skipped(beforeRun, "pending")], false, 0, "preparing"]);
+    // 증거를 읽은 뒤 항목의 전역 포트 재조회(정지 세대·맡기지 않을 실행기·복원 대기) 안에서 들어온다.
+    for (const port of ["generation", "withheld", "settled"] as const) {
+      const w = world();
+      const live = started(w.ledger);
+      const submit = line(w);
+      const original = w.state[port];
+      let reads = 0;
+      w.state[port] = () => {
+        reads += 1;
+        // 둘째 읽기가 증거를 읽은 뒤의 항목 재조회다.
+        if (reads === 2) submit();
+        return original();
+      };
+      const late = await beatWithAssign(w);
+      expect([port, late.runs, late.freeAtAssign, w.calls.length, w.stateOf(live.runId)]).toEqual([port, [skipped(live, "evidence_changed")], false, 0, "preparing"]);
+    }
+  });
+
+  test("맡기지 않을 실행기 조회 안에서 정지 세대가 바뀌면 confirm이 잡아 0회다(장부는 정지 세대를 보지 않는다)", () => {
+    const w = world();
+    const live = started(w.ledger);
+    let reads = 0;
+    let generation = 0;
+    w.state.generation = () => generation;
+    w.state.withheld = () => {
+      reads += 1;
+      if (reads === 2) generation = 1;
+      return { known: true, value: [] };
+    };
+    expect(ran(w.tick()).runs).toEqual([skipped(live, "stop_generation")]);
+    expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
+  });
+
+  test("포트·장부 객체의 속성은 박자 처음에 한 번씩만 읽고, confirm과 장부 호출 사이에는 아무 속성도 읽지 않는다", () => {
+    const names = ["ports.ledger", "ledger.unansweredInstructions", "ledger.closeUnreceivedRun", "ports.evidence", "evidence.read", "evidence.confirm", "ports.withheld", "withheld.executors", "ports.intake", "intake.stopGeneration", "ports.observationsSettled"] as const;
+    type Name = (typeof names)[number];
+    const arrange = (revoke: (name: Name, trace: readonly string[]) => boolean) => {
+      const w = world();
+      const live = started(w.ledger);
+      const trace: string[] = [];
+      const inner = w.ports as unknown as Record<string, Record<string, unknown>>;
+      const getter = (name: Name, value: unknown) => () => {
+        if (revoke(name, trace)) w.state.current = () => false;
+        trace.push(`get ${name}`);
+        return value;
+      };
+      const wrap = (owner: Record<string, unknown>, prefix: string) => {
+        const out = {};
+        for (const [key, value] of Object.entries(owner)) {
+          const name = `${prefix}.${key}` as Name;
+          const fn = typeof value === "function" && key === "confirm" ? (...args: unknown[]) => (trace.push("confirm"), (value as (...a: unknown[]) => unknown)(...args)) : value;
+          const fnClose = key === "closeUnreceivedRun" ? (...args: unknown[]) => (trace.push("close"), (fn as (...a: unknown[]) => unknown)(...args)) : fn;
+          Object.defineProperty(out, key, { get: getter(name, fnClose), enumerable: true });
+        }
+        return out;
+      };
+      const ports = {};
+      for (const key of ["ledger", "evidence", "withheld", "intake"]) Object.defineProperty(ports, key, { get: getter(`ports.${key}` as Name, wrap(inner[key] as Record<string, unknown>, key)) });
+      Object.defineProperty(ports, "observationsSettled", { get: getter("ports.observationsSettled", inner.observationsSettled) });
+      return { w, live, trace, result: ran(unreceivedTick(ports as unknown as UnreceivedPorts, AT)) };
+    };
+    // 철회 없음: 속성마다 한 번, 모두 confirm보다 앞이다.
+    const plain = arrange(() => false);
+    expect(plain.result.runs.map((item) => item.outcome)).toEqual(["closed"]);
+    expect(plain.trace.slice(plain.trace.indexOf("confirm"))).toEqual(["confirm", "close"]);
+    expect(names.map((name) => plain.trace.filter((entry) => entry === `get ${name}`).length)).toEqual(names.map(() => 1));
+    // 리뷰의 입력: 확인 뒤에 읽히면 철회하는 접근자. 확인 뒤에 읽히지 않으므로 철회도 없다.
+    const afterCheck = arrange((_name, trace) => trace.includes("confirm"));
+    expect([afterCheck.result.runs.map((item) => item.outcome), afterCheck.trace.at(-1)]).toEqual([["closed"], "close"]);
+    // 어느 접근자 안에서 철회해도 장부는 0회다.
+    for (const name of names) {
+      const revoked = arrange((current) => current === name);
+      expect([name, revoked.result.runs, revoked.w.calls.length, revoked.w.stateOf(revoked.live.runId)]).toEqual([name, [skipped(revoked.live, "link_not_current")], 0, "preparing"]);
+    }
+  });
+});
+
+describe("포트와 응답의 꼴", () => {
+  test("전체 목록의 원소가 계약의 실행 상태 항목이 아니면 그 항목만 evidence_unknown이고 다른 실행기의 닫기는 간다", () => {
+    const valid = { run_id: id(), state: "running", run_generation: 1, last_receipt_id: null };
+    const broken: unknown[][] = [
+      [{ run_id: id() }],
+      [{ ...valid, extra: 1 }],
+      [{ ...valid, state: "made_up" }],
+      [{ ...valid, run_generation: 0 }],
+      [{ ...valid, last_receipt_id: "r" }],
+      [{ ...valid, state: "not_known" }],
+      [{ ...valid, state: "not_known", run_generation: null, last_receipt_id: id() }],
+      [valid, valid],
+      Array.from({ length: 9 }, () => ({ ...valid, run_id: id() })),
+      // 빈 자리도 꼴이 틀린 항목이다(장부의 answerRuns와 같다).
+      [, valid],
+    ];
+    for (const [index, runs] of broken.entries()) {
+      const w = world();
+      const other = ghost(OTHER_EXECUTOR);
+      w.state.before = [other];
+      const live = started(w.ledger);
+      w.state.evidence = (executorId) =>
+        executorId === OTHER_EXECUTOR
+          ? { known: true, tainted: false, pending: false, version: 0, lastFull: full({ principal: OTHER_EXECUTOR, runs: runs as unknown as UnreceivedFull["runs"] }) }
+          : { known: true, tainted: false, pending: false, version: 0, lastFull: full() };
+      const result = ran(w.tick());
+      expect([index, result.runs.map((item) => [item.outcome, "reason" in item ? item.reason : null]), result.halted]).toEqual([
+        index,
+        [
+          ["skipped", "evidence_unknown"],
+          ["closed", null],
+        ],
+        null,
+      ]);
+      expect([index, w.calls.map((call) => call.runId)]).toEqual([index, [live.runId]]);
+    }
+    // 대조군: 꼴이 맞는 목록은 장부에 그대로 간다(not_known 포함).
+    const w = world();
+    const live = started(w.ledger);
+    const known = [valid, { run_id: id(), state: "not_known", run_generation: null, last_receipt_id: null }];
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ runs: known as unknown as UnreceivedFull["runs"] }) });
+    expect(ran(w.tick()).runs.map((item) => item.outcome)).toEqual(["closed"]);
+    expect([w.calls[0]?.runs, w.stateOf(live.runId)] as unknown[]).toEqual([known, "not_started"]);
+  });
+
+  test("포트 속성을 꺼내다 던지면 그 포트를 불러 던진 것과 같다: 증거는 항목마다 evidence_unknown, 전역 포트는 그 이유로 not_run", () => {
+    const throwing = (w: ReturnType<typeof world>, key: string) => {
+      const ports = { ...(w.ports as unknown as Record<string, unknown>) };
+      Object.defineProperty(ports, key, {
+        get() {
+          throw new Error("접근자");
+        },
+      });
+      return unreceivedTick(ports as unknown as UnreceivedPorts, AT);
+    };
+    const w = world();
+    const other = ghost(OTHER_EXECUTOR);
+    w.state.before = [other];
+    const live = started(w.ledger);
+    expect(ran(throwing(w, "evidence")).runs).toEqual([skipped({ requestId: other.requestId, runId: other.runId }, "evidence_unknown", OTHER_EXECUTOR), skipped(live, "evidence_unknown")]);
+    for (const [key, reason] of [
+      ["ledger", "read_unknown"],
+      ["intake", "stop_generation_unknown"],
+      ["withheld", "withheld_unknown"],
+      ["observationsSettled", "observations_unsettled"],
+    ] as const) {
+      expect([key, throwing(w, key)]).toEqual([key, { kind: "not_run", reason }]);
+    }
+    // 증거 포트에 confirm이 없거나 장부 포트에 닫기가 없으면 꺼내지 못한 것이다.
+    const ports = w.ports as unknown as Record<string, unknown>;
+    expect(ran(unreceivedTick({ ...ports, evidence: { read: () => full() } } as unknown as UnreceivedPorts, AT)).runs.map((item) => "reason" in item && item.reason)).toEqual(["evidence_unknown", "evidence_unknown"]);
+    expect(unreceivedTick({ ...ports, ledger: { unansweredInstructions: () => w.ledger.unansweredInstructions() } } as unknown as UnreceivedPorts, AT)).toEqual({ kind: "not_run", reason: "read_unknown" });
+    expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
+  });
+
+  test("confirm이 던지거나 정의 밖의 값을 내면 link_not_current로 0회다", () => {
+    for (const answer of [() => true, () => "ok", () => undefined, () => ({ toString: () => "current" })]) {
+      const w = world();
+      const live = started(w.ledger);
+      w.state.confirm = answer;
+      expect(ran(w.tick()).runs).toEqual([skipped(live, "link_not_current")]);
+      expect(w.calls.length).toBe(0);
+    }
+  });
+
+  test("닫기의 성공에서 보는 칸은 실행 ID와 상태 둘이다(closed는 장부 포트가 그렇게 답했다는 뜻이다)", () => {
+    const w = world();
+    const live = started(w.ledger);
+    w.state.closeAnswer = () => ({ ok: true, run: { runId: live.runId, state: "not_started" } });
+    expect(ran(w.tick()).runs.map((item) => item.outcome)).toEqual(["closed"]);
+    // 장부 대역이 적지 않았으므로 실제 장부는 그대로다. 이 박자는 그것을 가르지 않는다(unreceived.md "정한 것").
+    expect([w.calls.length, w.stateOf(live.runId)]).toEqual([1, "preparing"]);
+  });
+});
+
 describe("정적", () => {
   const code = async (path: string) =>
     (await readText(path))
@@ -504,24 +733,54 @@ describe("정적", () => {
       .filter((line) => !line.trimStart().startsWith("//"))
       .join("\n");
   const FILE = "src/supervisor/dispatch/unreceived.ts";
+  const CONFIRM = "const confirmed = confirmLast(";
+  const CALL = "answer = apply(close, receiver, closing);";
+  // confirm 호출문 다음 줄부터 장부 호출까지.
+  const afterConfirm = (source: string) => {
+    const from = source.indexOf("\n", source.indexOf(CONFIRM));
+    return source.slice(from, source.indexOf(CALL, from) + CALL.length);
+  };
 
-  test("기다리지 않고, 시계·난수·타이머·환경·파일을 직접 쓰지 않으며, 장부에는 닫기 하나만 쓴다", async () => {
+  test("기다리지 않고, 시계·난수·타이머·환경·파일을 직접 쓰지 않는다", async () => {
     const source = await code(FILE);
     for (const banned of [/\bawait\b/, /\basync\b/, /\.then\s*\(/, /\bDate\b/, /\bperformance\b/, /\bMath\.random\b/, /\bsetTimeout\b/, /\bsetInterval\b/, /\bprocess\b/, /\bBun\b/, /["']node:/, /["']bun:/]) {
       expect([String(banned), banned.test(source)]).toEqual([String(banned), false]);
     }
-    const ledgerCalls = [...source.matchAll(/ledger\.(\w+)\s*\(/g)].map((match) => match[1]).sort();
-    expect(ledgerCalls).toEqual(["closeUnreceivedRun", "unansweredInstructions"]);
   });
 
-  test("연결 재확인은 장부 호출 직전의 마지막 포트 호출이다(그 사이에 ports.를 부르지 않는다)", async () => {
+  test("포트 객체의 속성은 hold에서 한 번씩만 읽고, 장부에서는 읽기와 닫기 둘만 꺼낸다", async () => {
     const source = await code(FILE);
-    const check = source.indexOf("linkCurrent(ports.links, full.connection, item.executorId)");
-    const call = source.indexOf("ports.ledger.closeUnreceivedRun(");
-    expect([check > 0, call > check]).toEqual([true, true]);
-    expect(source.slice(check + "linkCurrent(ports.links".length, call).includes("ports.")).toBe(false);
-    // 대조군: 사이에 포트를 부르면 잡는다.
-    const broken = source.replace("let answer: unknown;", "ports.evidence.read(item.executorId);\n  let answer: unknown;");
-    expect(broken.slice(broken.indexOf("linkCurrent(ports.links") + "linkCurrent(ports.links".length, broken.indexOf("ports.ledger.closeUnreceivedRun(")).includes("ports.")).toBe(true);
+    const start = source.indexOf("function hold(");
+    const end = source.indexOf("\n}\n", start);
+    const reads = [...source.matchAll(/\b(ports|ledger)\.(\w+)/g)];
+    expect(reads.map((match) => `${match[1]}.${match[2]}`).sort()).toEqual([
+      "ledger.closeUnreceivedRun",
+      "ledger.unansweredInstructions",
+      "ports.evidence",
+      "ports.intake",
+      "ports.ledger",
+      "ports.observationsSettled",
+      "ports.withheld",
+    ]);
+    expect(reads.every((match) => (match.index ?? -1) > start && (match.index ?? -1) < end)).toBe(true);
+    // 대조군: 판단 안에서 포트를 다시 읽으면 잡는다.
+    const broken = source.replace(CALL, "answer = apply(ledger.closeUnreceivedRun as Fn, receiver, closing);");
+    expect([...broken.matchAll(/\bledger\.closeUnreceivedRun\b/g)].length).toBe(2);
+  });
+
+  test("confirm이 장부 호출 전의 마지막 외부 호출이고, 그 뒤로는 속성을 읽지 않고 꺼내 둔 함수와 미리 만든 인자만 쓴다", async () => {
+    const source = await code(FILE);
+    expect([source.indexOf(CONFIRM) > 0, source.indexOf(CALL) > source.indexOf(CONFIRM)]).toEqual([true, true]);
+    const between = afterConfirm(source);
+    expect([/[.[]/.test(between), [...between.matchAll(/(\w+)\s*\(/g)].map((match) => match[1])]).toEqual([false, ["if", "skip", "apply"]]);
+    // confirmLast는 돌아온 뒤 원시값 비교만 한다.
+    const body = source.slice(source.indexOf("function confirmLast("), source.indexOf("\n}\n", source.indexOf("function confirmLast(")));
+    expect(/[.[]/.test(body.slice(body.indexOf("apply(") + "apply(".length).split("\n").slice(1).join("\n"))).toBe(false);
+    // 대조군: 사이에서 속성을 읽거나 포트를 부르면 잡는다.
+    for (const injected of ["const late = held.close;", "invoke(held.settled, []);"]) {
+      const skipLine = 'if (confirmed !== "current") return skip(confirmed);';
+      const broken = afterConfirm(source.replace(skipLine, `${skipLine}\n  ${injected}`));
+      expect([injected, /[.[]/.test(broken) || [...broken.matchAll(/(\w+)\s*\(/g)].length !== 3]).toEqual([injected, true]);
+    }
   });
 });

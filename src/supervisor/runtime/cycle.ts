@@ -31,7 +31,7 @@ export interface CycleBeats {
   linkLoss(clocks: { readonly clock: Clock; readonly monotonic: MonotonicClock }, policy: LinkLossPolicy, input: LinkLossTickInput): LinkLossTickResult;
   life(clock: Clock, input: LifeTickInput): Promise<LifeTickResult>;
   resend(clock: Clock, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult>;
-  // D-90 닫기(unreceived.ts의 unreceivedTick). 동기다: 증거 읽기·연결 재확인·장부 호출 사이에 기다림이 없어야 한다.
+  // D-90 닫기(unreceived.ts의 unreceivedTick). 동기다: 증거 읽기·마지막 확인·장부 호출 사이에 기다림이 없어야 한다.
   unreceived(now: number): UnreceivedTickResult;
   assign(now: number): Promise<AssignTickResult>;
 }
