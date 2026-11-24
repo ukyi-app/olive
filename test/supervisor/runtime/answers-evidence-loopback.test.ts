@@ -2,7 +2,7 @@
 // 서버의 deliver → 답 줄 → 인사 처리기 → 장부, 박자의 포트는 같은 답 줄의 evidence·withheld와 서버·내보내기 포트에 넘긴 그 복원기다.
 // 실행기 쪽은 tls-client.ts와 봉투만 받는 디코더로 흉내 내고 봉투는 계약 v1로 실제 서명한다. 기다리는 것은 소켓·서버의 사건뿐이다.
 import { afterEach, expect, test } from "bun:test";
-import { generateKeyPairSync, type KeyObject } from "node:crypto";
+import { generateKeyPairSync, type KeyObject, X509Certificate } from "node:crypto";
 import { type Envelope, limits, rawPublicKey, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import type { UnreceivedClosureInput } from "../../../src/ledger/index.ts";
 import { type UnreceivedPorts, type UnreceivedTickResult, unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
@@ -65,9 +65,11 @@ function events<T>() {
 
 test("루프백: 시한 뒤 실행기가 빈 full로 인사하면 증거 포트가 그 인사를 내고 박자가 실제 장부로 한 번 닫는다. 인사 전에는 no_full로 0회다", async () => {
   // 시작 발행(t0) 뒤 30,000ms를 시험 시계로 옮긴다. 서버·장부·실행기가 같은 값을 읽는다.
-  let now = Date.now();
-  const t0 = now;
+  // 인증서 기간은 TLS 라이브러리가 프로세스 시계로 보므로 도우미(makePki)가 실제 시각을 기준으로 만든다. 시험 시계의 시작은 그
+  // 기준에서 얻는다(발급 기관의 notBefore가 기준 - 1시간, 초 단위로 내림). 이 파일은 벽시계를 직접 읽지 않는다.
   const pki = makePki();
+  let now = Date.parse(new X509Certificate(pki.ca.pem).validFrom) + 3_600_000;
+  const t0 = now;
   const sup = keys();
   const k1 = keys();
   const material = (leaf: { pem: string; keyPem: string }) => ({ certificatePem: leaf.pem, privateKeyPem: leaf.keyPem, trustBundlePem: pki.ca.pem });

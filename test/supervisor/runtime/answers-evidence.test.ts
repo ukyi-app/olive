@@ -6,7 +6,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import type { UnreceivedClosureInput } from "../../../src/ledger/index.ts";
 import type { HelloConnectionTable } from "../../../src/supervisor/dispatch/hello-answers.ts";
-import type { ReceiptLedger } from "../../../src/supervisor/dispatch/receipts.ts";
+import type { ReceiptLedger, SentQuery } from "../../../src/supervisor/dispatch/receipts.ts";
 import {
   type UnreceivedOutcome,
   type UnreceivedPorts,
@@ -14,10 +14,18 @@ import {
   type UnreceivedTickResult,
   unreceivedTick,
 } from "../../../src/supervisor/dispatch/unreceived.ts";
-import { type AnswerEvidenceBook, type AnswerLinePorts, type AnswerLines, createAnswerEvidenceBook, createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
+import {
+  type AnswerEvidenceBook,
+  type AnswerLinePorts,
+  type AnswerLines,
+  type AnswerNote,
+  createAnswerEvidenceBook,
+  createAnswerLines,
+} from "../../../src/supervisor/runtime/answers.ts";
 import { createQueryBook } from "../../../src/supervisor/runtime/query-book.ts";
+import { createFileResultBackend, nodeFilePort } from "../../../src/supervisor/scheduler/result-store-file.ts";
 import type { Delivered } from "../../../src/supervisor/transport/server.ts";
-import { id, must, NOW, open, ready, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
+import { id, must, NOW, open, ready, tempDir, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 const R1 = WORKER_EXECUTOR;
 const R2 = "executor/diagnosis/1/store-b";
@@ -65,12 +73,18 @@ class FakeTable {
 }
 
 // 장부 하나와 그 위의 답 줄 하나, 그 답 줄을 묶은 박자. 시작 지시까지 적고(발행 = NOW) 송신 표식을 남긴 작업자 실행 하나를 둔다.
-function world(options: { book?: AnswerEvidenceBook } = {}) {
+// results면 실행에 소유자(입력 요청)를 두고 실제 파일 결과 보관소를 넘긴다(결과 보고는 소유자가 없으면 보관소에 닿지 않는다).
+function world(options: { book?: AnswerEvidenceBook; results?: boolean } = {}) {
   // 답 저장의 실패는 장부 포트에서 던져 낸다. 실제 장부의 쓰기 실패는 장부를 고장(broken)으로 두어 닫기(start 모드)까지 거절하므로
-  // 증거 포트가 막았는지 가를 수 없다.
-  const fault = { failAnswers: 0 };
+  // 증거 포트가 막았는지 가를 수 없다. 영수증의 실패는 장부에 닿기 전의 것(답 줄의 시계, 결과 보관소의 디렉터리 fsync)만 낸다.
+  const fault = { failAnswers: 0, failClock: 0, failDirSync: 0 };
   const real = ready(open(tempPath()));
-  const runId = must(real.admitRun(worker())).run.runId;
+  let owner: string | undefined;
+  if (options.results === true) {
+    owner = id();
+    must(real.enqueueInput({ requestId: owner, source: "test", sourceRef: { ref: `inputs/${id()}`, expiresAt: NOW + 600_000 }, receivedAt: NOW }));
+  }
+  const runId = must(real.admitRun(worker(owner === undefined ? {} : { inputRequestId: owner }))).run.runId;
   const requestId = id();
   must(real.startRun({ runId, requestId, stopGeneration: 0, now: NOW }));
   must(real.markStartDispatch({ runId, requestId, now: NOW }));
@@ -85,7 +99,30 @@ function world(options: { book?: AnswerEvidenceBook } = {}) {
     onRead: null as (() => void) | null,
     // 답 줄의 confirm이 연결을 물을 때.
     onCurrent: null as (() => void) | null,
+    // 답 줄의 기록기(observe) 안.
+    onNote: null as ((note: AnswerNote) => void) | null,
   };
+  const notes: AnswerNote[] = [];
+  const acks: number[] = [];
+  let backend: AnswerLinePorts["results"]["backend"] = {} as never;
+  if (options.results === true) {
+    const made = createFileResultBackend({
+      dir: tempDir(),
+      maxRecordBytes: 20 * 1024,
+      files: {
+        ...nodeFilePort,
+        fsync(fd) {
+          if (fault.failDirSync > 0 && nodeFilePort.fstat(fd).kind === "directory") {
+            fault.failDirSync -= 1;
+            throw new Error("EIO");
+          }
+          nodeFilePort.fsync(fd);
+        },
+      },
+    });
+    if (made.status !== "ok") throw new Error("결과 보관소를 만들지 못했다");
+    backend = made.backend;
+  }
   const answerCalls: string[] = [];
   const ledger: ReceiptLedger = {
     applyReceipt: (input, from) => real.applyReceipt(input, from),
@@ -107,10 +144,18 @@ function world(options: { book?: AnswerEvidenceBook } = {}) {
     table: () => table.view(),
     restorer: () => published,
     ledger,
-    results: { backend: {} as never, ledger: real },
+    results: { backend, ledger: real },
     random: { bytes: (length) => crypto.getRandomValues(new Uint8Array(length)) },
     signer: { seal: (input) => sealEnvelope(input, supervisorKey) },
-    clock: { now: () => clock.now },
+    clock: {
+      now: () => {
+        if (fault.failClock > 0) {
+          fault.failClock -= 1;
+          throw new Error("시계 실패");
+        }
+        return clock.now;
+      },
+    },
     wire: {
       answers: {
         current: (connection, executorId) => {
@@ -118,11 +163,18 @@ function world(options: { book?: AnswerEvidenceBook } = {}) {
           return table.recognized(executorId) === connection;
         },
       },
-      writeAck: () => "sent",
+      writeAck: (connection) => {
+        acks.push(connection);
+        return "sent";
+      },
     },
     queries,
     cycle: { noteCandidate: () => {} },
     observationsSettled: () => gate.settled,
+    observe: (note) => {
+      notes.push(note);
+      hooks.onNote?.(note);
+    },
     ...(options.book === undefined ? {} : { evidenceBook: options.book }),
   };
   const lines: AnswerLines = createAnswerLines(ports);
@@ -179,10 +231,25 @@ function world(options: { book?: AnswerEvidenceBook } = {}) {
     queries.add(query);
     lines.deliver({ kind: "forward", connection, verified: verified(R1, { in_reply_to: query.requestId, runs }, SIGNED + 1) });
   };
+  // 연결 판단이 서명을 검증한 뒤 낸 영수증·결과 보고(같은 실행·세대).
+  const receipt = (connection: number, action: "receipt_accepted" | "receipt_started" | "report_result"): void => {
+    const body =
+      action === "report_result"
+        ? { report_id: id(), run_id: runId, result: { role: "diagnosis", outcome: "completed", summary: "ok", items: [], refs: [] } }
+        : action === "receipt_accepted"
+          ? { receipt_id: id(), run_id: runId, instruction: "task_start", instruction_request_id: requestId }
+          : { receipt_id: id(), run_id: runId, instruction_request_id: requestId, started_at: PASSED };
+    const header = { sender: R1, action, run_generation: runOf().runGeneration, stop_generation: 0, body_digest: "e".repeat(64), issued_at: PASSED };
+    lines.deliver({ kind: "forward", connection, verified: { ok: true, action, header, body } as never });
+  };
   const live = { requestId, runId, executorId: R1 };
   return {
     real,
     lines,
+    queries,
+    notes,
+    acks,
+    receipt,
     table,
     gate,
     hooks,
@@ -251,7 +318,9 @@ describe("박자 + 실제 답 줄", () => {
     expect(w.runOf().state).not.toBe("not_started");
   });
 
-  test("옛 연결의 양성 인사가 not_current로 버려지고 새 연결의 빈 인사가 반영되면 오염이라 닫지 않는다. 버린 인사가 비었으면 닫는다(대조군)", () => {
+  test("버린 옛 인사가 양성일 수 있으면(not_known 밖의 항목) 오염이라 닫지 않는다. 확인된 빈 목록이면 잃는 양성 관측이 없어 오염이 아니고 닫는다(대조군)", () => {
+    // 오염은 버린 답이 양성 관측을 실었을 수 있을 때만이다(answers.ts의 mayBePositive). 빈 목록·전부 not_known인 목록을 버려도
+    // 장부가 모르는 "안다"는 관측이 생기지 않는다.
     for (const oldRuns of ["positive", "empty"] as const) {
       const w = world();
       w.gate.settled = false;
@@ -320,6 +389,182 @@ describe("박자가 증거를 읽은 뒤의 외부 코드(#66 리뷰의 재현 �
     expect(w.closeCalls.length).toBe(0);
     // 다음 박자는 대기를 본다.
     expect(ran(w.tick()).runs).toEqual([skippedOutcome(w, "pending")]);
+  });
+});
+
+describe("실행기 입력이 장부에 닿기 전의 구간(첫 외부 호출보다 먼저 서는 흔적)", () => {
+  const slot = (w: ReturnType<typeof world>) => w.real.slotFree("worker");
+  const receiptResult = (w: ReturnType<typeof world>): string => {
+    const found = w.notes.findLast((note) => note.kind === "receipt");
+    if (found?.kind !== "receipt") return "none";
+    const outcome = found.outcome as { outcome: string; reason?: string; at?: string };
+    return [outcome.outcome, outcome.at ?? outcome.reason].filter(Boolean).join("/");
+  };
+
+  test("검증한 시작 영수증·결과 보고가 장부 저장 전에 실패하면(시계가 한 번 던짐, 결과 보관의 디렉터리 fsync 실패) 그 주체를 오염으로 남겨 다음 빈 full 뒤에도 닫지 않는다", () => {
+    for (const failure of ["clock", "store"] as const) {
+      const w = world({ results: true });
+      // 시한 전 인사. 영수증은 장부에 닿지 못하고, 다음 연결의 빈 full이 시한 뒤에 반영된다.
+      w.hello(1, [], NOW + 2);
+      const before = w.lines.evidence.read(R1);
+      if (!before.known) throw new Error("모름");
+      if (failure === "clock") {
+        w.fault.failClock = 1;
+        w.receipt(1, "receipt_started");
+      } else {
+        w.fault.failDirSync = 1;
+        w.receipt(1, "report_result");
+      }
+      expect([failure, receiptResult(w), w.acks.length]).toEqual([failure, failure === "clock" ? "rejected/input_malformed" : "result_unknown/store", 0]);
+      const after = w.lines.evidence.read(R1);
+      expect([failure, after]).toMatchObject([failure, { known: true, tainted: true, pending: false }]);
+      expect(after.known && after.version > before.version).toBe(true);
+      w.table.greet(2, R1, [], SIGNED);
+      w.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+      w.hello(2, []);
+      expect([failure, ran(w.tick()).runs]).toEqual([failure, [skippedOutcome(w, "tainted")]]);
+      expect([failure, w.closeCalls.length, w.runOf().state, slot(w)]).toEqual([failure, 0, "preparing", { known: true, value: false }]);
+    }
+  });
+
+  test("증거를 읽은 뒤 전역 조회 안에서 결과 보고를 받고 그 보관이 실패하면 닫지 않는다. 다음 박자는 오염을 본다", () => {
+    const w = world({ results: true });
+    w.hello(1, []);
+    w.hooks.onPort = (name, call) => {
+      if (name !== "settled" || call !== 2) return;
+      w.fault.failDirSync = 1;
+      w.receipt(1, "report_result");
+    };
+    expect(ran(w.tick()).runs).toEqual([skippedOutcome(w, "evidence_changed")]);
+    expect(receiptResult(w)).toBe("result_unknown/store");
+    w.hooks.onPort = null;
+    expect(ran(w.tick()).runs).toEqual([skippedOutcome(w, "tainted")]);
+    expect([w.closeCalls.length, w.runOf().state, slot(w)]).toEqual([0, "preparing", { known: true, value: false }]);
+  });
+
+  test("처리기 안(장부 쓰기 직전)에서 박자가 돌면 받는 중인 영수증은 대기다. 장부가 받으면 오염 없이 거둔다", () => {
+    const w = world({ results: true });
+    w.hello(1, []);
+    let inner: UnreceivedTickResult | null = null;
+    let inside: unknown = null;
+    const ledger = w.ports.ledger as { applyReceipt: ReceiptLedger["applyReceipt"] };
+    const apply = ledger.applyReceipt;
+    ledger.applyReceipt = (input, from) => {
+      inside = w.lines.evidence.read(R1);
+      inner = w.tick();
+      return apply(input, from);
+    };
+    w.receipt(1, "receipt_accepted");
+    expect(inside).toMatchObject({ known: true, pending: true, tainted: false });
+    expect(ran(inner as unknown as UnreceivedTickResult).runs).toEqual([skippedOutcome(w, "pending")]);
+    expect([receiptResult(w), w.acks.length, w.lines.evidence.read(R1)]).toMatchObject(["ack", 1, { pending: false, tainted: false }]);
+    expect([w.closeCalls.length, slot(w)]).toEqual([0, { known: true, value: false }]);
+  });
+
+  test("장부가 받은 영수증·결과 보고는 오염을 남기지 않는다(대조군): 받은 뒤의 빈 full은 후보 없음, 증거를 읽은 뒤 받으면 번호가 바뀌어 evidence_changed", () => {
+    for (const action of ["receipt_accepted", "receipt_started", "report_result"] as const) {
+      const pre = world({ results: true });
+      pre.hello(1, [], NOW + 2);
+      pre.receipt(1, action);
+      expect([action, receiptResult(pre), pre.lines.evidence.read(R1)]).toMatchObject([action, "ack", { tainted: false, pending: false }]);
+      pre.table.greet(2, R1, [], SIGNED);
+      pre.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+      pre.hello(2, []);
+      expect([action, ran(pre.tick()).runs, pre.closeCalls.length, slot(pre)]).toEqual([action, [], 0, { known: true, value: false }]);
+
+      const late = world({ results: true });
+      late.hello(1, []);
+      late.hooks.onPort = (name, call) => {
+        if (name === "settled" && call === 2) late.receipt(1, action);
+      };
+      expect([action, ran(late.tick()).runs]).toEqual([action, [skippedOutcome(late, "evidence_changed")]]);
+      expect([action, receiptResult(late), late.lines.evidence.read(R1)]).toMatchObject([action, "ack", { tainted: false, pending: false }]);
+      expect([action, late.closeCalls.length, slot(late)]).toEqual([action, 0, { known: true, value: false }]);
+    }
+  });
+
+  test("처리기가 던져도(결과 포트를 읽다 던짐) 그 영수증은 닫기 근거가 되지 않는다: 줄은 고장으로 모름이고 같은 장부의 새 답 줄에서 오염이다", () => {
+    const book = createAnswerEvidenceBook();
+    const w = world({ book, results: true });
+    w.hello(1, []);
+    const results = w.ports.results as { backend: unknown };
+    const real = results.backend;
+    Object.defineProperty(results, "backend", {
+      configurable: true,
+      get() {
+        throw new Error("결과 포트 실패");
+      },
+    });
+    w.receipt(1, "report_result");
+    Object.defineProperty(results, "backend", { configurable: true, writable: true, value: real });
+    expect(w.lines.evidence.read(R1)).toEqual({ known: false });
+    const next = createAnswerLines({ ...w.ports, evidenceBook: book });
+    expect(next.evidence.read(R1)).toMatchObject({ known: true, tainted: true, pending: false });
+    expect([w.closeCalls.length, slot(w)]).toEqual([0, { known: true, value: false }]);
+  });
+
+  test("상태 보고를 받아 첫 등록부 조회 안에서 박자가 돌면 그 보고는 아직 줄에 없어도 대기라 닫지 않는다", () => {
+    const w = world();
+    w.hello(1, []);
+    const queries = w.queries as { pending: () => readonly SentQuery[] };
+    const pending = queries.pending;
+    let inner: UnreceivedTickResult | null = null;
+    let inside: unknown = null;
+    queries.pending = () => {
+      queries.pending = pending;
+      const rows = pending.call(w.queries);
+      inside = w.lines.evidence.read(R1);
+      inner = w.tick();
+      return rows;
+    };
+    w.status(1, w.running());
+    expect(inside).toMatchObject({ known: true, pending: true });
+    expect(ran(inner as unknown as UnreceivedTickResult).runs).toEqual([skippedOutcome(w, "pending")]);
+    // 보고는 그 뒤 실제 장부에 적혔다.
+    expect(w.real.hasRunSighting(w.live.runId)).toEqual({ known: true, value: true });
+    expect([w.closeCalls.length, w.runOf().state, slot(w)]).toEqual([0, "preparing", { known: true, value: false }]);
+  });
+
+  test("양성 full의 저장이 실패하면 기록기를 부르기 전에 retry와 번호가 선다: 기록기 안의 증거가 그 뒤의 증거와 같다", () => {
+    const w = world();
+    w.hello(1, []);
+    let atLedger: unknown = null;
+    let atNote: unknown = null;
+    w.hooks.beforeAnswer = () => {
+      atLedger = w.lines.evidence.read(R1);
+    };
+    w.hooks.onNote = (note) => {
+      if (note.kind === "hello" && note.outcome.kind === "ledger_failed") atNote = w.lines.evidence.read(R1);
+    };
+    w.fault.failAnswers = 1;
+    w.hello(2, w.running());
+    const after = w.lines.evidence.read(R1);
+    expect(atLedger).toMatchObject({ known: true, pending: true });
+    expect(atNote).toMatchObject({ known: true, pending: true });
+    expect((atNote as { version: number }).version).toBeGreaterThan((atLedger as { version: number }).version);
+    expect(after).toEqual(atNote as never);
+  });
+
+  test("변경 번호가 안전 정수 상한에 닿으면 그 장부는 사는 동안 모름이다: 닫지 않고, confirm은 current를 내지 않고, 같은 장부의 새 답 줄도 모름이다", () => {
+    const book = createAnswerEvidenceBook({ firstVersion: Number.MAX_SAFE_INTEGER - 8 });
+    const w = world({ book });
+    w.hello(1, []);
+    const seen: number[] = [];
+    for (;;) {
+      const read = w.lines.evidence.read(R1);
+      if (!read.known) break;
+      seen.push(read.version);
+      if (seen.length > 20) throw new Error("상한에 닿지 않는다");
+      // 철회는 그 주체의 번호를 하나 올린다(연결 99는 쓰지 않는 번호).
+      w.lines.deliver({ kind: "withdrawn", connection: 99, principal: R1 });
+    }
+    expect(seen.at(-1)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(seen.every((value, i) => Number.isSafeInteger(value) && (i === 0 || value > seen[i - 1]!))).toBe(true);
+    expect(w.lines.evidence.confirm(R1, 1, Number.MAX_SAFE_INTEGER, 0)).toBe("evidence_changed");
+    expect(ran(w.tick()).runs).toEqual([skippedOutcome(w, "evidence_unknown")]);
+    expect(w.closeCalls.length).toBe(0);
+    expect(createAnswerLines({ ...w.ports, evidenceBook: book }).evidence.read(R1)).toEqual({ known: false });
+    expect(() => createAnswerEvidenceBook({ firstVersion: -1 })).toThrow(RangeError);
   });
 });
 

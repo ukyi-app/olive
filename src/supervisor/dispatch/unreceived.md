@@ -6,9 +6,8 @@ D-90의 감독 쪽 판단이다. 실행기가 받은 적 없는 작업자 실행
 
 ## 병합해도 동작이 0인 까닭
 
-- **증거 포트의 구현이 없다.** 답 줄이 실행기마다 마지막 반영 인사의 전체 목록·연결·주체·세대·시각과 오염을 내는 일은 뒤 조각이다. 그 전까지 조립은 증거를 `{ known: false }`로 줄 수밖에 없고, 그러면 모든 후보가 `evidence_unknown`이다.
-- **순서기를 부르는 진입점이 없다**(`cycle.md`). 이 박자도 불리지 않는다.
-- 새 인사를 부르는 길과 관측만 적는 장부 연산·그 호출도 없다. 셋 다 생겨도 이 박자의 판단은 바뀌지 않고 후보가 늘 뿐이다(아래 "뒤 조각이 지켜야 할 것").
+- **순서기를 부르는 진입점이 없다**(`cycle.md`). 이 박자도 불리지 않는다. 증거 포트는 답 줄이 `lines.evidence`로 낸다(`runtime/answers.md` "D-90 증거"). 그것을 이 박자에 묶는 조립도 진입점(N5)의 일이다.
+- 새 인사를 부르는 길(A6e)과, 버린 답의 양성 관측을 장부에 적는 연산(`recordAnswerSightings`)을 답 줄에서 부르는 일(A6d)도 없다. 둘 다 생겨도 이 박자의 판단은 바뀌지 않고 후보가 늘 뿐이다(아래 "뒤 조각이 지켜야 할 것").
 
 ## 공개 면
 
@@ -17,7 +16,7 @@ unreceivedTick(ports: UnreceivedPorts, now: number): UnreceivedTickResult   // �
 
 UnreceivedPorts = {
   ledger: { unansweredInstructions, closeUnreceivedRun }   // 성공에서 보는 칸은 run.runId·run.state 둘
-  evidence: {                            // 답 줄이 낸다(뒤 조각). 동기
+  evidence: {                            // 답 줄의 lines.evidence(runtime/answers.ts). 동기
     read(executorId): UnreceivedEvidenceRead
     confirm(executorId, connection, version, stopGeneration):
       "current" | "link_not_current" | "evidence_changed" | "stop_generation"   // 장부 호출 전의 마지막 외부 호출
@@ -109,7 +108,7 @@ UnreceivedOutcome =
 | E1 | 그 연결의 검증된 전체 인사만 근거. 부분 답·받은 시각은 근거가 아니다 | 증거 포트의 꼴(`lastFull` 하나, 서명 시각 칸), 시간 판정은 `answeredAt`만(`:499`). 근거가 그 출력이라는 것은 포트 구현이 지킨다(뒤 조각) | #2, #18 |
 | E2 | 닫는 판단은 장부만 | 장부 포트는 읽기와 `closeUnreceivedRun` 둘(`:31`), 미리 거르기는 장부보다 더 막기만 한다. 장부가 다시 보는 것은 장부가 소유하는 조건(목록·서명 시각·저장된 관측·송신 열기 등)이고, 연결의 현재성·줄의 대기·오염·정지 세대는 장부의 입력에 없어 이 박자가 `confirm`으로 막는다 | 정적 "장부에서는 읽기와 닫기 둘만", #16(실제 장부의 `sent_by_other_open`) |
 | E3 | 시각을 원래 전체 목록·연결·주체·세대에 묶음 | `UnreceivedFull` 한 묶음을 한 번 읽어 새 객체로 옮김(`:402`), 장부에는 그 사본을 넘김 | #2, "연결 재확인이 증거 목록을 고쳐도" |
-| E4 | 앞선 인사·답이 버려진 실행기의 실행은 뺌 | `tainted`(`:492`), 읽은 뒤의 버림은 `confirm`의 `evidence_changed` | #8 |
+| E4 | 양성 관측을 실었을 수 있는 앞선 인사·답이 버려진 실행기의 실행은 뺌(빈 목록·전부 `not_known`인 답의 버림은 잃는 관측이 없어 빼지 않음) | `tainted`(`:492`), 읽은 뒤의 버림은 `confirm`의 `evidence_changed`. 버린 답의 내용으로 오염을 가르는 것은 포트다(아래 "오염 규칙") | #8 |
 | E5 | 옛 연결 `retry`의 성공을 지금 연결의 부재 증명으로 쓰지 않음 | 증거의 연결 번호를 `confirm`이 지금 인정된 연결과 견줌(`:508`) | #7 |
 | E6 | 더 새 양성 답이 대기 중인 실행은 뺌 | 읽을 때의 `pending`(`:493`), 옮기는 도중 들어온 답은 번호의 다시 읽기(`:429`, 지금 번호를 내는 포트)나 `confirm`의 지금 번호 비교(읽은 때의 번호를 내는 포트), 읽은 뒤에 들어온 답은 `confirm`의 `evidence_changed`(`:508`) | #9, "증거를 읽기 전·후에", "칸 접근자 안에서 양성 답이" |
 | E7 | 복원이 붙든 관측을 먼저 저장 | `observationsSettled`를 박자 처음과 항목마다, 전역 포트 중 마지막에(`:275`, `:484`) | #12 |
@@ -135,7 +134,7 @@ UnreceivedOutcome =
 | 5 | 장부 직전 `confirm`이 연결 아님·던짐, 증거·맡기지 않을 실행기 포트 안에서 철회 | 0 | `link_not_current` |
 | 6 | 앞 실행의 닫기 쓰기 도중 철회 | 앞 1, 다음 0 | `closed`, `link_not_current` |
 | 7 | 증거의 연결 ≠ 지금 연결 | 0 | `link_not_current` |
-| 8 | 앞선 인사·상태 보고가 버려짐 | 0 | `tainted` |
+| 8 | 양성일 수 있는 앞선 인사·상태 보고가 버려짐(포트가 `tainted`로 냄) | 0 | `tainted` |
 | 9 | `held` 인사·`retry`·밀린 사본이 남음 | 0 | `pending` |
 | 10 | 서버를 새로 만들어 밀린 사본을 버림 | 0 | `tainted`(이 모듈이 보는 칸은 #8과 같다) |
 | 11 | `withheld`에 그 실행기 / `known: false`·이름 아님·던짐 | 0 | `withheld` / `not_run`/`withheld_unknown` |
@@ -165,12 +164,12 @@ UnreceivedOutcome =
 ## 뒤 조각이 지켜야 할 것
 
 - **증거 포트(답 줄):** 실행기마다 마지막 `applied` 인사 하나의 원래 `occupancy`(full) 출력 그대로 연결 번호·주체·맞춘 세대·전체 목록·서명 시각을 묶어 내고, `receivedAt`은 그 인사를 넘긴 때의 장부 시계로 낸다. 부분 답·`occupancy(source)`·받은 시각을 서명 시각 자리에 넣지 않는다. `held`·실패·`not_current`·`refused`는 `lastFull`을 바꾸지 않는다. 옛 연결 `retry`의 성공도 `lastFull`의 연결을 그 옛 번호로 둔다(그러면 재확인이 막는다).
-- **오염 규칙:** 그 실행기의 인사·상태 보고·밀린 사본이 반영되지 않고 버려지면(`not_current`, 서버를 새로 만들며 버린 사본, 내용을 모르는 버림) 그 프로세스·그 장부 열기 동안 `tainted: true`. 답 줄이 고장 나면(`faulted`) `known: false`. 줄에 넘기지 않은 답이 있으면 `pending: true`. 동기로 읽힌다.
+- **오염 규칙:** 그 실행기의 인사·상태 보고·밀린 사본 중 **양성 관측("안다")을 실었을 수 있는 것**이 반영되지 않고 버려지면 그 프로세스·그 장부 열기 동안 `tainted: true`. 양성일 수 있는 것은 목록에 `not_known` 밖의 항목이 있거나 목록을 읽지 못한 답, 서버를 새로 만들며 버린 줄의 답(내용을 보지 않는다), 내용을 모르는 버림이다. **확인된 빈 목록과 전부 `not_known`인 목록의 버림은 오염이 아니다**: 장부가 모르는 "안다"는 관측이 생기지 않으므로 닫기의 근거(그 뒤 반영된 인사)를 흐리지 않는다. 실행기에서 온 영수증·보고·결과 보고는 장부가 받았다는 결과가 아니면(거절·모름·던짐) 그 실행기를 오염으로 둔다(장부의 전달 행이 없으므로 장부의 재검사가 보지 못한다). 답 줄이 고장 나면(`faulted`) `known: false`. 줄에 넘기지 않은 답이나 받는 중인 입력이 있으면 `pending: true`. 동기로 읽힌다.
 - **`read`는 한 시점의 값:** `version`·`tainted`·`pending`·`lastFull`(그 안의 칸과 목록 포함)을 그 실행기 줄의 같은 시점에서 함께 낸다. 데이터 칸만 가진 객체로 내고, `read` 안이나 칸을 읽는 접근자에서 줄을 바꾸지 않는다. 이 박자는 번호를 먼저 읽고 다 옮긴 뒤 다시 읽어 그 사이의 변화만 잡는다. `read` 안에서나 번호 칸의 접근자 자체에서 칸을 다른 시점에 담으면(대기는 변화 전, 번호는 변화 뒤) 가를 수 없다.
-- **변경 번호(`version`)와 `confirm`:** 변경 번호는 실행기마다 그 프로세스 동안 감소하거나 재사용하지 않는 음이 아닌 안전 정수이고(서버를 새로 만들어도 이어 간다), 그 실행기에 대해 다음 변화가 일어날 때마다 증가한다: 답을 줄에 받음(`held`·`retry`·밀린 사본 포함), 줄의 답을 장부에 넘김, 답을 버림(오염), 줄의 고장, `lastFull`이 바뀜, 그 실행기가 맡기지 않을 실행기에 들거나 남. `confirm(executorId, connection, version, stopGeneration)`은 이 차례로 본다: 내보내기 포트의 `answers.current(connection, executorId)`가 참이 아니면 `link_not_current` → 이 박자의 `intake`와 같은 복원기의 `stopGeneration()`이 넘긴 값이 아니면 `stop_generation` → 그 실행기의 지금 변경 번호가 `version`이 아니면 `evidence_changed` → 아니면 `current`. 변경 번호 비교는 앞의 외부 호출(`answers.current`, 복원기)이 모두 돌아온 뒤 마지막에 한다. `confirm`과 그 안에서 부르는 것은 읽기만 한다(줄을 넘기거나 버리거나 장부를 쓰지 않는다). 고장 난 줄이면 `current`를 내지 않는다.
+- **변경 번호(`version`)와 `confirm`:** 변경 번호는 실행기마다 그 프로세스 동안 감소하거나 재사용하지 않는 음이 아닌 안전 정수이고(서버를 새로 만들어도 이어 간다), 그 실행기에 대해 다음 변화가 일어날 때마다 증가한다: 답을 줄에 받음(`held`·`retry`·밀린 사본 포함), 실행기의 입력(상태 보고·영수증·보고)을 받기 시작함과 그 처리가 끝남, 줄의 답을 장부에 넘김, 답을 버림(오염), 줄의 고장, `lastFull`이 바뀜, 그 실행기가 맡기지 않을 실행기에 들거나 남. 번호가 안전 정수의 상한에 닿아 더 올릴 수 없으면 포트는 그 장부가 사는 동안 `known: false`를 내고 `confirm`은 `current`를 내지 않는다. `confirm(executorId, connection, version, stopGeneration)`은 이 차례로 본다: 내보내기 포트의 `answers.current(connection, executorId)`가 참이 아니면 `link_not_current` → 이 박자의 `intake`와 같은 복원기의 `stopGeneration()`이 넘긴 값이 아니면 `stop_generation` → 그 실행기의 지금 변경 번호가 `version`이 아니면 `evidence_changed` → 아니면 `current`. 변경 번호 비교는 앞의 외부 호출(`answers.current`, 복원기)이 모두 돌아온 뒤 마지막에 한다. `confirm`과 그 안에서 부르는 것은 읽기만 한다(줄을 넘기거나 버리거나 장부를 쓰지 않는다). 고장 난 줄이면 `current`를 내지 않는다.
 - **같은 객체:** `ledger`는 순서기·다른 박자와 같은 장부 객체, `confirm`의 연결 판단은 내보내기 포트의 `answers`, `withheld`는 답 줄의 것, `intake`는 연결 판단의 맞춤에 쓴 복원기, `observationsSettled`는 답 줄에 넘긴 그 신호, `now`는 순서기가 넘긴 값을 그대로. 장부를 다시 열면 박자 함수 본문에서 지금의 객체로 위임한다(이 박자는 포트를 박자 처음에 한 번만 꺼낸다).
 - **새 인사를 부르는 길(A6e):** 시한 뒤의 전체 인사가 없는 실행기에만, 그 실행기에 임대를 믿는 실행이 없을 때 연결을 닫는다. 이 박자에 갈래를 더해도 `confirm`을 장부 호출 직전의 마지막 외부 호출로 둔다.
-- **관측만 적는 장부 연산과 그 호출(L5d+A6d):** 버려진 답의 양성 관측이 적힌 경우에만 오염을 풀 수 있다. 적기에 실패한 답은 오염으로 남긴다. 장부의 `run_sightings`가 늘면 `closeUnreceivedRun`이 `run_sighted`로 거절한다(이 박자는 `refused`로 싣는다).
+- **관측만 적는 장부 연산의 호출(A6d):** 장부 연산(`recordAnswerSightings`)은 있고 답 줄이 부르는 자리가 없다. 버려진 답의 양성 관측이 적힌 경우에만 오염을 풀 수 있다. 적기에 실패한 답은 오염으로 남긴다. 장부의 `run_sightings`가 늘면 `closeUnreceivedRun`이 `run_sighted`로 거절한다(이 박자는 `refused`로 싣는다).
 - **진입점(N5):** 순서기의 `unreceived`에 위 포트를 묶은 `unreceivedTick`을 넘긴다. 보고의 `unreceived`(`closed`, `ledger_failed`, `halted`)를 관리자 기록으로 잇는 것도 진입점이 정한다.
 
 ## 남는 한계

@@ -21,6 +21,7 @@
 // 6. 줄이 쥐는 밀린 사본은 동결한 독립 값이다. 기록기에 넘긴 결과나 backlog()로 내보낸 값을 고쳐도 다시 넘길 내용은 그대로다.
 // 7. D-90 닫기 박자의 증거(evidence)는 줄의 한 시점을 데이터 칸만으로 낸다. 줄의 칸(답·retry·밀린 사본·처리 중·맡기지 않음)이나
 //    마지막 반영 인사·오염이 바뀌는 자리마다 그 실행기의 변경 번호를 올리고, 그 일에 외부 코드를 부르지 않는다(answers.md "D-90 증거").
+//    실행기에서 온 입력은 주체를 안 직후, 첫 외부 호출보다 먼저 대기로 세운다. 영수증·보고는 장부 저장이 확인되지 않으면 오염으로 남긴다.
 // 시계·난수·소켓·타이머를 직접 쓰지 않는다. 시계·난수·서명·장부·복원기·연결 표는 포트로 받는다.
 import { type Envelope, executorName, type RunStatus } from "../../contract/v1/index.ts";
 import type { Restorer } from "../../ledger/index.ts";
@@ -100,6 +101,8 @@ interface BookState {
   floor: number;
   // 답 줄이 고장 난 적이 있다. 무엇을 잃었는지 모르므로 이 장부의 모든 실행기가 오염이다.
   allTainted: boolean;
+  // 번호가 안전 정수의 상한에 닿았다. 그 뒤로는 바뀐 것을 번호로 가르지 못하므로 이 장부가 사는 동안 증거는 모름이다.
+  exhausted: boolean;
   readonly entries: Map<string, EvidenceEntry>;
   // 지금 이 장부에 증거를 내는 답 줄(마지막에 만든 것)과, 그 줄이 쥔 답이 있는 실행기를 세는 함수.
   owner: object | null;
@@ -108,15 +111,30 @@ interface BookState {
 
 const books = new WeakMap<AnswerEvidenceBook, BookState>();
 
-const newBookState = (): BookState => ({ counter: 0, floor: 0, allTainted: false, entries: new Map(), owner: null, pendingOf: null });
+const newBookState = (first = 0): BookState => ({ counter: first, floor: first, allTainted: false, exhausted: false, entries: new Map(), owner: null, pendingOf: null });
 
-export function createAnswerEvidenceBook(): AnswerEvidenceBook {
+export interface AnswerEvidenceBookOptions {
+  // 번호의 시작값(0 이상 안전 정수). 기본 0. 상한 근처의 동작을 시험으로 보려고 둔다.
+  readonly firstVersion?: number;
+}
+
+export function createAnswerEvidenceBook(options: AnswerEvidenceBookOptions = {}): AnswerEvidenceBook {
+  const first = options.firstVersion ?? 0;
+  if (!Number.isSafeInteger(first) || first < 0) throw new RangeError("firstVersion은 0 이상 안전 정수여야 한다");
   const book: AnswerEvidenceBook = Object.freeze({ kind: "answer_evidence_book" });
-  books.set(book, newBookState());
+  books.set(book, newBookState(first));
   return book;
 }
 
 const versionOf = (state: BookState, executorId: string): number => Math.max(state.entries.get(executorId)?.version ?? 0, state.floor);
+
+// 번호를 하나 올린 값. 상한(Number.MAX_SAFE_INTEGER)을 넘길 수 없으면 올리지 않고 장부를 모름으로 둔다: 상한 위에서는 1을 더해도
+// 같은 값이 나와 읽은 뒤의 변화를 confirm이 놓친다.
+function bump(state: BookState): number {
+  if (state.counter >= Number.MAX_SAFE_INTEGER) state.exhausted = true;
+  else state.counter += 1;
+  return state.counter;
+}
 
 function entryOf(state: BookState, executorId: string): EvidenceEntry {
   let entry = state.entries.get(executorId);
@@ -317,30 +335,48 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
   // 만들지 않은 표지를 받으면 장부가 없다(null): 증거는 늘 모름이다. 이어 갈 번호와 오염을 모르는 채 새로 세지 않는다.
   const book: BookState | null = ports.evidenceBook === undefined ? newBookState() : (books.get(ports.evidenceBook) ?? null);
   const self = {};
+  // 받아서 줄에 넣거나 처리기에 넘기는 중인 실행기의 입력(상태 보고는 줄에 넣을 때까지, 영수증·보고는 처리기가 돌아올 때까지)의
+  // 주체와 그 수. 그 사이의 외부 호출(등록부, 시계, 처리기·장부·보관소) 안에서 증거를 읽으면 그 입력은 줄에도 장부에도 없으므로 대기로 낸다.
+  const receiving = new Map<string, number>();
   // 줄에서 넘기지 않은 답(줄의 답, retry, 밀린 사본, 처리 중)이 있는가.
   const holding = (line: Line): boolean => line.items.length > 0 || line.retry !== null || line.backlog.length > 0 || line.inflight > 0;
+  // 그 실행기에 아직 반영하지 않은 입력이 있는가(줄이 쥔 답, 받는 중인 입력).
+  const pendingFor = (executorId: string): boolean => {
+    const line = lines.get(executorId);
+    return (line !== undefined && holding(line)) || receiving.has(executorId);
+  };
   if (book !== null) {
     // 앞 답 줄(서버를 새로 만들기 전)이 쥔 답은 새 줄로 옮기지 않으므로 반영되지 않고 버린 것이다. 앞 서버의 연결 번호는 새 서버에서
     // 다시 쓰이므로 마지막 반영 인사도 모두 지운다(옛 번호가 새 연결과 같은 번호로 확인되지 않게).
     if (book.owner !== null && book.pendingOf !== null) {
       for (const executorId of book.pendingOf()) entryOf(book, executorId).tainted = true;
       for (const entry of book.entries.values()) entry.lastFull = null;
-      book.counter += 1;
-      book.floor = book.counter;
+      book.floor = bump(book);
     }
     book.owner = self;
-    book.pendingOf = () => [...lines].filter(([, line]) => holding(line)).map(([name]) => name);
+    book.pendingOf = () => [...new Set([...lines.keys(), ...receiving.keys()])].filter(pendingFor);
   }
   const owns = (): boolean => book !== null && book.owner === self;
 
-  // 그 실행기의 증거가 바뀌었다(줄의 칸, 마지막 반영 인사, 오염). 번호를 올린다. 외부 코드를 부르지 않는다.
+  // 그 실행기의 증거가 바뀌었다(줄의 칸, 받는 중인 입력, 마지막 반영 인사, 오염). 번호를 올린다. 외부 코드를 부르지 않는다.
   // 바뀐 뒤의 답 줄이 아니면(앞 서버의 줄이 아직 불림) 그 변화는 지금 증거에 들지 않으므로 오염으로 남긴다.
   const changed = (executorId: string): void => {
     if (book === null) return;
     const entry = entryOf(book, executorId);
     if (!owns()) entry.tainted = true;
-    book.counter += 1;
-    entry.version = book.counter;
+    entry.version = bump(book);
+  };
+
+  // 실행기의 입력을 받기 시작했다. 주체를 안 직후, 그 입력의 첫 외부 호출보다 먼저 부른다.
+  const hold = (executorId: string): void => {
+    receiving.set(executorId, (receiving.get(executorId) ?? 0) + 1);
+    changed(executorId);
+  };
+  // 받는 중 표시를 거둔다. 번호는 부르는 쪽이 올린다(그 입력이 남긴 것을 먼저 적은 뒤).
+  const unhold = (executorId: string): void => {
+    const left = (receiving.get(executorId) ?? 1) - 1;
+    if (left > 0) receiving.set(executorId, left);
+    else receiving.delete(executorId);
   };
 
   // 답을 반영하지 않고 버렸다. 양성 관측을 실었을 수 있으면 그 실행기를 오염으로 둔다.
@@ -364,8 +400,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     faulted = true;
     if (book === null) return;
     book.allTainted = true;
-    book.counter += 1;
-    book.floor = book.counter;
+    book.floor = bump(book);
   };
 
   // 실패한 인사의 원본 retry → 그 인사를 처음 넘길 때 옮긴 묶음. retry가 반영되면 이 묶음이 마지막 반영 인사다(옛 연결 번호 그대로).
@@ -441,12 +476,33 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
   };
 
   // 영수증·보고·결과 보고. 실행기가 ack를 받을 때까지 다시 보내므로 답 줄에 세우지 않는다(막힌 줄 뒤에 두면 종료 영수증이 무기한 막힌다).
-  const passReceipt = (forward: Extract<Delivered, { kind: "forward" }>): void => {
-    const now = readNow() ?? Number.NaN;
-    const outcome = handleForward(
-      { forward, now, stopGeneration: stopGeneration(), pendingQueries: [], links: ports.wire.answers, backlog: [] },
-      { ledger: ports.ledger, random: ports.random, results: ports.results },
-    );
+  // sender는 머리의 낸 쪽이다(연결 판단이 그 연결의 주체와 같을 때만 forward를 낸다). 읽지 못했으면 null.
+  const passReceipt = (forward: Extract<Delivered, { kind: "forward" }>, sender: string | null): void => {
+    // 첫 외부 호출(시계) 전에 처리 중으로 세운다. 장부에 닿기 전에 실패하면(시계·보관소가 던짐, 장부 실패) 그 영수증은 장부의 전달 행에도
+    // 줄에도 없어, 다시 오기 전의 빈 full 하나로 그 실행이 닫힌다. 그래서 장부가 받았다는 결과(ack·applied_without_ack)가 아니면
+    // 그 주체를 오염으로 남긴다(거절·모름·던짐 모두). 오염과 해제는 처리기가 돌아오거나 던진 그 자리에서, 송신기·기록기보다 먼저 한다.
+    if (sender !== null) hold(sender);
+    let saved = false;
+    let now = Number.NaN;
+    let outcome: ReceiptOutcome;
+    try {
+      now = readNow() ?? Number.NaN;
+      outcome = handleForward(
+        { forward, now, stopGeneration: stopGeneration(), pendingQueries: [], links: ports.wire.answers, backlog: [] },
+        { ledger: ports.ledger, random: ports.random, results: ports.results },
+      );
+      saved = outcome.outcome === "ack" || outcome.outcome === "applied_without_ack";
+    } finally {
+      if (sender !== null) {
+        unhold(sender);
+        if (!saved && book !== null) entryOf(book, sender).tainted = true;
+        changed(sender);
+      } else if (!saved && book !== null) {
+        // 누구의 영수증인지 모르므로 모든 실행기를 오염으로 둔다(진짜 서버의 forward는 늘 낸 쪽을 싣는다).
+        book.allTainted = true;
+        book.floor = bump(book);
+      }
+    }
     // 기록보다 먼저 넘긴다: 송신기는 결과의 칸을 부른 그 자리에서 읽으므로 기록기가 결과를 고쳐도 보낼 대상이 바뀌지 않는다. 장부가 받아들인
     // 영수증(new·duplicate)마다 넘기고, 계정 읽기·값 틀 송신을 (연결, 실행)마다 각각 최대 1회로 막는 것은 송신기다. 받지 않은 영수증은 넘기지 않는다.
     if (outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") {
@@ -553,21 +609,23 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
   };
 
   // full은 그 인사를 넘기기 직전에 원래 출력에서 옮긴 묶음(retry면 처음 넘길 때 옮긴 것), runs는 그 인사의 목록 사본(읽지 못했으면
-  // null)이다. 증거를 먼저 옮기고 기록한다.
+  // null)이다. 증거와 줄의 상태(retry·맡기지 않음)를 먼저 옮기고 기록한다: 기록기 안에서 읽은 증거나 서버 교체 때의 pendingOf가
+  // 줄에서 뺀 인사를 대기로 보지 못하면, 같은 번호에서 대기가 참→거짓→참으로 바뀐다.
   const takeHello = (executorId: string, line: Line, outcome: HelloAnswerOutcome, full: StoredFull | null, runs: readonly RunStatus[] | null, now: number): void => {
     if (outcome.kind === "applied") appliedFull(executorId, outcome, full, now);
     else if ((outcome.kind === "ledger_unsaved" || outcome.kind === "ledger_failed") && outcome.retry !== null) retryFulls.set(outcome.retry, full);
     // held는 이 함수에 오지 않는다. 나머지(not_current, refused, retry 없는 input_rejected)는 그 인사를 반영하지 않고 버린 것이다.
     else discarded(executorId, runs);
-    note({ kind: "hello", executor: executorId, outcome });
-    if (outcome.kind === "applied") {
-      for (const loss of outcome.deferred) requery.add(loss.runId);
-      release(executorId, line, outcome.connection);
-    } else if (outcome.kind === "ledger_unsaved" || outcome.kind === "ledger_failed") {
+    if (outcome.kind === "ledger_unsaved" || outcome.kind === "ledger_failed") {
       // input_rejected(retry 없음)는 다시 넘겨도 같으므로 버리고 맡기지 않음을 그대로 둔다.
       line.retry = outcome.retry;
       line.withhold = true;
       changed(executorId);
+    }
+    note({ kind: "hello", executor: executorId, outcome });
+    if (outcome.kind === "applied") {
+      for (const loss of outcome.deferred) requery.add(loss.runId);
+      release(executorId, line, outcome.connection);
     }
   };
 
@@ -763,10 +821,17 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         const header = isRecord(verified) ? verified.header : undefined;
         const sender = isRecord(header) ? header.sender : undefined;
         if (isRecord(verified) && verified.action === "status_report" && isText(sender)) {
+          // 첫 외부 호출(등록부 읽기) 전에 받는 중으로 세우고 줄에 넣을 때까지 둔다. 그 읽기 안에서 박자가 돌면 이 답은 아직 줄에 없다.
           // 답을 줄에 넣은 뒤에 기록한다. 기록기가 그 안에서 pump()를 부르면 빈 줄은 지워지므로, 넣기 전에 기록하면 답이 지워진 줄에 들어가
           // 넘겨지지도 다시 묻지도 않는다.
-          const asked = askedAt(output);
-          lineOf(sender).items.push({ kind: "status", forward: output, asked });
+          hold(sender);
+          let asked: readonly SentQuery[] | null;
+          try {
+            asked = askedAt(output);
+            lineOf(sender).items.push({ kind: "status", forward: output, asked });
+          } finally {
+            unhold(sender);
+          }
           changed(sender);
           if (asked === null) {
             // 뜻밖의 예외라 줄의 상태를 다 안다고 하지 않는다.
@@ -775,7 +840,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
           }
           return sender;
         }
-        passReceipt(output);
+        passReceipt(output, isText(sender) ? sender : null);
         return null;
       }
     }
@@ -818,16 +883,15 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     },
     evidence: {
       // 한 시점의 값: 외부 코드를 부르지 않고 이 객체가 쥔 줄과 장부만 읽어 데이터 칸만 가진 새 객체로 낸다(목록도 새 배열·새 원소).
-      // 고장 난 줄, 바뀐 뒤의 답 줄이 아님(앞 서버의 줄), 장부 없음은 모름이다.
+      // 고장 난 줄, 번호가 상한에 닿은 장부, 바뀐 뒤의 답 줄이 아님(앞 서버의 줄), 장부 없음은 모름이다.
       read(executorId: string): UnreceivedEvidenceRead {
-        if (book === null || faulted || !owns() || typeof executorId !== "string") return { known: false };
+        if (book === null || faulted || book.exhausted || !owns() || typeof executorId !== "string") return { known: false };
         const entry = book.entries.get(executorId);
-        const line = lines.get(executorId);
         const full = entry?.lastFull ?? null;
         return {
           known: true,
           tainted: book.allTainted || entry?.tainted === true,
-          pending: line !== undefined && holding(line),
+          pending: pendingFor(executorId),
           version: versionOf(book, executorId),
           lastFull:
             full === null
@@ -859,7 +923,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
           generation = null;
         }
         if (generation !== stopGeneration) return "stop_generation";
-        if (book === null || faulted || !owns() || versionOf(book, executorId) !== version) return "evidence_changed";
+        if (book === null || faulted || book.exhausted || !owns() || versionOf(book, executorId) !== version) return "evidence_changed";
         return "current";
       },
     },
