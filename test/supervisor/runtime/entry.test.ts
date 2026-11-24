@@ -2,7 +2,7 @@
 // 등록표 설정을 그대로 옮긴다. 진입점을 실제로 띄워 91로 끝나는 것은 test/entrypoints.test.ts가 본다.
 import { expect, test } from "bun:test";
 import { limits } from "../../../src/contract/v1/index.ts";
-import { SUPERVISOR_ENV, settingsFromEnv } from "../../../src/main/supervisor.ts";
+import { SUPERVISOR_ENV, SUPERVISOR_OPTIONAL_ENV, settingsFromEnv } from "../../../src/main/supervisor.ts";
 import { readText } from "../../files.ts";
 
 const FULL: Record<(typeof SUPERVISOR_ENV)[number], string> = {
@@ -70,9 +70,19 @@ test("꼴이 틀리면 그 이름으로 invalid다(포트 범위, 상대 경로,
   }
 });
 
-test("README의 감독 환경 표는 진입점이 읽는 이름과 같은 차례다", async () => {
+test("OLIVE_TEST_JOBS: 없음·빈 값·off는 꺼짐, on은 켬, 그 밖의 값은 그 이름으로 invalid다. 필수 이름의 없음이 먼저다", () => {
+  const testJobs = (value?: string) => {
+    const parsed = settingsFromEnv(value === undefined ? FULL : { ...FULL, OLIVE_TEST_JOBS: value });
+    return parsed.ok ? parsed.settings.testJobs : parsed;
+  };
+  expect([testJobs(), testJobs(""), testJobs("off"), testJobs("on")]).toEqual([false, false, false, true]);
+  for (const bad of ["ON", "true", "1", "yes", " on", "on "]) expect(testJobs(bad), bad).toEqual({ ok: false, name: "OLIVE_TEST_JOBS", problem: "invalid" });
+  expect(settingsFromEnv({ ...FULL, OLIVE_SUPERVISOR_PORT: "", OLIVE_TEST_JOBS: "x" })).toEqual({ ok: false, name: "OLIVE_SUPERVISOR_PORT", problem: "missing" });
+});
+
+test("README의 감독 환경 표는 진입점이 읽는 이름(필수, 그 뒤 선택)과 같은 차례다", async () => {
   const readme = await readText("README.md");
   const section = readme.slice(readme.indexOf("## 감독 진입점"), readme.indexOf("## 공개 저장소"));
   const names = [...section.matchAll(/^\| `(OLIVE_[A-Z_]+)` \|/gm)].map((m) => m[1]);
-  expect(names).toEqual([...SUPERVISOR_ENV]);
+  expect(names).toEqual([...SUPERVISOR_ENV, ...SUPERVISOR_OPTIONAL_ENV]);
 });

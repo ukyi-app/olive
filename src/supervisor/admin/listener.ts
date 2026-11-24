@@ -1,6 +1,7 @@
 // 감독의 두 번째 듣기: 관리 통로의 경로 유닉스 소켓 하나(D-60·D-101). 감독의 다른 듣기는 실행기를 받는 TLS 서버(transport/tls-server.ts)뿐이다.
 // TCP·abstract 소켓은 듣지 않는다. 경로는 "/"로 시작해야 하고 NUL을 담지 못한다(abstract 이름은 NUL로 시작한다).
 // 연결 하나 = 요청 한 줄 → 답 한 줄 → 닫기. 요청의 뜻은 answer(commands.ts의 answerLine)가 정하고 여기는 바이트·기한·상한·연결 수명까지다.
+// answer에는 요청 받기의 기한도 넘긴다: 효과를 내는 명령(test-job)은 그 기한 정각 전에만 쓴다(답 쓰기 기한과 합쳐 진입점의 기한보다 짧다).
 //
 // 함정:
 // - 소켓 파일은 bind 때 umask로 권한이 정해지고 chmod는 그 뒤다. 그 틈에 다른 uid가 붙지 못하게 진입점은 umask가 그룹·기타의 쓰기를
@@ -46,8 +47,8 @@ export interface AdminListenerOptions {
   fs: AdminFs;
   monoNow: () => number;
   setTimer: (ms: number, fire: () => void) => () => void;
-  // 요청 한 줄(줄바꿈 뺀 것) → 답 한 줄(줄바꿈 포함).
-  answer: (line: string) => string;
+  // 요청 한 줄(줄바꿈 뺀 것)과 그 연결의 요청 받기 기한(단조 시각) → 답 한 줄(줄바꿈 포함).
+  answer: (line: string, limit: number) => string;
   listen?: AdminUnixListen;
   // 정상 밖으로 끝난 연결의 갈래. 요청·답의 글은 싣지 않는다.
   note?: (note: AdminConnectionNote) => void;
@@ -234,7 +235,7 @@ export function listenAdmin(options: AdminListenerOptions): AdminListening {
     }
     let text: string;
     try {
-      text = options.answer(line);
+      text = options.answer(line, connection.limit);
     } catch {
       note("answer_threw");
       return shut(connection);

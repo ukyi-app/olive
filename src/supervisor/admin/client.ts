@@ -2,7 +2,19 @@
 // 소켓 API는 진입점이 connect 포트로 넘긴다. 듣지 않는다. 장부·박자·연결 서버를 import하지 않는다(protocol.ts만 쓴다).
 // 기한은 붙기 전에 정한 절대 기한 하나이고(ADMIN_LIMITS.clientWaitMs), 연결 성공·답 한 줄·끊김·연결 실패를 받는 순간의
 // 단조 시각으로 판정한다. 타이머가 늦게 와도 정각 이후에 받은 연결에는 요청을 쓰지 않고, 정각 이후에 받은 답은 쓰지 않는다.
-import { ADMIN_COMMANDS, ADMIN_LIMITS, ADMIN_SOCKET_PATH, type AdminCommand, type AdminReply, encodeRequest, parseReply, statusLine } from "./protocol.ts";
+import {
+  ADMIN_LIMITS,
+  ADMIN_SOCKET_PATH,
+  type AdminCall,
+  type AdminCommand,
+  type AdminReply,
+  encodeRequest,
+  parseReply,
+  statusLine,
+  TEST_JOB_FIELDS,
+  type TestJobRequest,
+  testJobLine,
+} from "./protocol.ts";
 
 export interface ClientSocket {
   write(bytes: Uint8Array): number;
@@ -38,7 +50,7 @@ function unreachable(error: unknown): AskOutcome {
   return { kind: "unreachable", reason: "connect_failed" };
 }
 
-export function ask(command: AdminCommand, deps: ClientDeps, path: string = ADMIN_SOCKET_PATH): Promise<AskOutcome> {
+export function ask(command: AdminCommand | AdminCall, deps: ClientDeps, path: string = ADMIN_SOCKET_PATH): Promise<AskOutcome> {
   return new Promise((resolve) => {
     let ended = false;
     let cancel: () => void = () => {};
@@ -164,22 +176,46 @@ export interface EntryResult {
 
 const PREFIX = "olive admin";
 
-export const USAGE: EntryResult = { code: ADMIN_EXIT.usage, stdout: "", stderr: `${PREFIX}: 사용법: bun src/main/admin.ts <${ADMIN_COMMANDS.join("|")}>\n` };
+export const USAGE: EntryResult = {
+  code: ADMIN_EXIT.usage,
+  stdout: "",
+  stderr: `${PREFIX}: 사용법: bun src/main/admin.ts status | test-job ${TEST_JOB_FIELDS.map((field) => `<${field}>`).join(" ")}\n`,
+};
 
-// argv(실행 파일·진입점 뒤)에서 명령 하나. 명령이 아니거나 인자가 더 있으면 null이다.
-export function commandOf(argv: readonly string[]): AdminCommand | null {
-  if (argv.length !== 1) return null;
-  const word = argv[0];
-  return (ADMIN_COMMANDS as readonly (string | undefined)[]).includes(word) ? (word as AdminCommand) : null;
+const BYTES = new TextEncoder();
+
+// argv(실행 파일·진입점 뒤)에서 요청 하나. status는 인자가 없고, test-job은 TEST_JOB_FIELDS 차례의 값 여섯이다. 수가 다르거나,
+// 빈 값이 있거나, 요청 한 줄이 감독의 상한(requestMaxBytes)을 넘으면 null이다(넘는 줄은 감독이 답하지 않고 닫는다). 값의 꼴은 감독이 본다.
+export function requestOf(argv: readonly string[]): AdminCall | null {
+  const [word, ...rest] = argv;
+  if (word === "status") return rest.length === 0 ? { command: "status" } : null;
+  if (word !== "test-job" || rest.length !== TEST_JOB_FIELDS.length || rest.some((value) => value === "")) return null;
+  const job = Object.fromEntries(TEST_JOB_FIELDS.map((field, index) => [field, rest[index]!])) as TestJobRequest;
+  const call: AdminCall = { command: "test-job", job };
+  return BYTES.encode(encodeRequest(call)).length > ADMIN_LIMITS.requestMaxBytes ? null : call;
 }
 
-export function exitFor(outcome: AskOutcome): EntryResult {
+// 인자 없는 명령 하나(status). 인자가 필요한 명령·틀린 argv는 null이다.
+export function commandOf(argv: readonly string[]): AdminCommand | null {
+  const call = requestOf(argv);
+  return call?.command === "status" ? "status" : null;
+}
+
+// 명령마다 받을 수 있는 답이 다르다: status는 상태, test-job은 시험 작업. 다른 명령의 답이 오면 꼴이 틀린 답이다.
+export function exitFor(outcome: AskOutcome, command: AdminCommand = "status"): EntryResult {
+  const subject = command === "status" ? "상태" : "시험 작업";
   const fail = (code: number, message: string): EntryResult => ({ code, stdout: "", stderr: `${PREFIX}: ${message}\n` });
-  if (outcome.kind === "unreachable") return fail(ADMIN_EXIT.failed, `상태 모름: 감독에 닿지 못했다(${outcome.reason})`);
-  if (outcome.kind === "failed") return fail(ADMIN_EXIT.failed, `상태 모름: 감독의 답을 받지 못했다(${outcome.reason})`);
+  if (outcome.kind === "unreachable") return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독에 닿지 못했다(${outcome.reason})`);
+  if (outcome.kind === "failed") return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(${outcome.reason})`);
   const reply = outcome.reply;
-  if (reply.kind === "status") return { code: ADMIN_EXIT.ok, stdout: `${statusLine(reply.status)}\n`, stderr: "" };
+  if (reply.kind === "status" || reply.kind === "test_job") {
+    if (command === "status" && reply.kind === "status") return { code: ADMIN_EXIT.ok, stdout: `${statusLine(reply.status)}\n`, stderr: "" };
+    if (command === "test-job" && reply.kind === "test_job") return { code: ADMIN_EXIT.ok, stdout: `${testJobLine(reply)}\n`, stderr: "" };
+    return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(malformed)`);
+  }
   if (reply.kind === "refused") return fail(ADMIN_EXIT.failed, `감독이 요청을 거절했다(${reply.reason})`);
-  if (reply.reason === "restore_not_done") return fail(ADMIN_EXIT.waiting, "상태 모름: 감독이 복원을 마치지 않았다(restore_not_done)");
-  return fail(ADMIN_EXIT.failed, `상태 모름: 감독이 상태를 읽지 못했다(${reply.reason})`);
+  if (reply.reason === "restore_not_done") return fail(ADMIN_EXIT.waiting, `${subject} 모름: 감독이 복원을 마치지 않았다(restore_not_done)`);
+  // 시험 작업의 write_unknown만 장부에 적혔을 수 있다(다시 부르는 법은 README "감독 관리 통로").
+  if (reply.reason === "write_unknown") return fail(ADMIN_EXIT.failed, `${subject} 모름: 장부에 적혔는지 모른다(write_unknown)`);
+  return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독이 상태를 읽지 못했다(${reply.reason})`);
 }
