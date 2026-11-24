@@ -838,6 +838,39 @@ describe("허가 읽기 한 번의 예외와 치명 사유(접수 문의 한 번
       });
     }
   });
+
+  test("명시적 정지 중 서버 닫기가 실패해 96을 처음 정해도 먼저 붙잡은 사유를 fatal.reason에 적고 닫기 실패의 진단은 남긴다", async () => {
+    for (const closeFails of [false, true]) {
+      const w = world();
+      const commits = countCommits(w);
+      const run = await running(w);
+      await untilStep(w, 5);
+      const restorer = w.captured.restorer!.value;
+      const read = restorer.intakeOpen.bind(restorer);
+      let thrown = 0;
+      restorer.intakeOpen = () => {
+        if (thrown === 0) {
+          thrown += 1;
+          throw new Error("허가 읽기 실패");
+        }
+        return read();
+      };
+      // 박자 밖에서 발급 문을 읽어 사유를 붙잡는다. 그 뒤 명시적 정지(why = stop)는 코드를 정하지 않는다.
+      const open = w.captured.issuance!.ports.cycle.issuanceOpen();
+      const before = commits.length;
+      if (closeFails) w.fake.closeWith = () => Promise.reject(new Error("닫기 실패"));
+      const code = await run.stop();
+      expect({ closeFails, open, thrown, code, writes: commits.slice(before), fatal: named(w, "fatal").map((e) => e.fields), shutdown: named(w, "shutdown_incomplete").map((e) => e.fields) }).toEqual({
+        closeFails,
+        open: false,
+        thrown: 1,
+        code: 96,
+        writes: [],
+        fatal: [{ reason: "intake_unreadable" }],
+        shutdown: closeFails ? [{ kind: "failed" }] : [],
+      });
+    }
+  });
 });
 
 describe("D-90 박자 안의 박자 유효 문", () => {

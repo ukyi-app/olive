@@ -704,9 +704,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   // 치명 코드를 처음 정할 때 박자 안의 문이 이미 붙잡은 사유(halted)가 있으면 그것을 사유로 적는다. 그 사유를 붙잡은 박자가 뒤이어
   // 기한을 넘기면 끝 차례는 beat_lapsed로 들어오는데, 그 이름만 적으면 먼저 생긴 원인(허가 읽기 실패 등)이 기록에서 사라진다.
   // 나중에 온 이름은 later 칸에 남긴다. 이 자리는 halted 변수만 읽는다(장부를 다시 읽지 않는다).
+  // fatal은 한 번만 적고, 적었는지는 코드(96)가 아니라 이 깃발로 가른다: 명시적 정지(why = stop)는 여기서 코드를 정하지 않으므로
+  // 서버 닫기 실패가 96을 먼저 정하면, 코드로 가르는 자리는 붙잡은 사유를 적지 않고 지나간다.
+  let fatalLogged = false;
   const markFatal = (why: string) => {
-    if (why !== "stop" && exitCode === 0) {
+    if (why !== "stop" && !fatalLogged) {
       exitCode = SUPERVISOR_EXIT.fatal;
+      fatalLogged = true;
       if (halted !== null && halted !== why) log("fatal", { reason: halted, later: why });
       else log("fatal", { reason: why });
     }
@@ -730,10 +734,12 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
         exitCode = SUPERVISOR_EXIT.fatal;
         log("shutdown_incomplete", { kind: closed.kind });
       }
-      // 장부를 닫기 전에 이미 생긴 고장·허가 폐기를 코드에 반영한다. 멈춤 요청이 먼저 왔어도 0으로 덮지 않는다.
+      // 장부를 닫기 전에 이미 생긴 고장·허가 폐기를 코드에 반영한다. 멈춤 요청이 먼저 왔어도 0으로 덮지 않는다. 위 닫기 실패가
+      // 96을 먼저 정했어도 fatal을 아직 적지 않았으면 그 사유를 적는다(닫기 실패의 진단은 shutdown_incomplete로 따로 남는다).
       const known = haltReason();
-      if (known !== null && exitCode === 0) {
+      if (known !== null && !fatalLogged) {
         exitCode = SUPERVISOR_EXIT.fatal;
+        fatalLogged = true;
         log("fatal", { reason: known });
       }
       if (!closeLedger()) exitCode = SUPERVISOR_EXIT.fatal;

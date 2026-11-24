@@ -8,7 +8,7 @@ import type { Envelope } from "../../contract/v1/index.ts";
 import { REFUSALS as LEDGER_REFUSALS, type Refusal as LedgerRefusal } from "../../ledger/index.ts";
 import type { InstructionSink, StartMarker } from "./ports.ts";
 
-// 표식이 ok가 아니어서 싣지 않은 이유. 장부의 거절 이름, 표식 포트가 던짐(threw), 답이 성공·거절의 꼴이 아님(malformed_answer),
+// 표식이 ok가 아니어서 싣지 않은 이유. 장부의 거절 이름, 표식 포트가 던짐 또는 표식 입력의 칸을 읽다 던짐(threw), 답이 성공·거절의 꼴이 아님(malformed_answer),
 // 시작 봉투인데 표식 입력이 없음(marker_missing), 봉투에서 실행·요청 ID를 읽지 못함(envelope_unreadable).
 export type MarkFailure = LedgerRefusal | "threw" | "malformed_answer" | "marker_missing" | "envelope_unreadable";
 
@@ -17,11 +17,20 @@ export interface StartMark<S> {
   readonly marker: StartMarker;
   // 표식에 적는 시각. 박자가 마지막으로 읽은 시각(장부와 같은 시계)이다.
   readonly at: number;
-  // 표식을 커밋한 뒤 포트를 부르기 직전의 마지막 확인. null이면 싣고, 값이면 싣지 않고 그 값을 돌려준다.
+  // 표식을 커밋한 뒤 포트를 부르기 직전의 마지막 확인. null이면 싣고, 값이면 싣지 않고 그 값을 돌려준다. 이 칸은 sendInstruction
+  // 진입 때 한 번 읽는다(접근자여도 유효 문 앞에서 돈다).
   // 표식은 커밋(fsync)에 시간이 걸리므로 시계로 재는 확인은 표식 뒤에 둔다. 박자 유효 문 바로 뒤에 부르고, 이 확인이 포트 호출 전의
   // 마지막 외부 호출이다: 유효 문 안의 장부 읽기에 쓴 시간을 이 확인의 시계가 잰다.
   // 던지지 않아야 한다: 던지면 포트를 부르지 않은 채 이 함수 밖으로 예외가 나가고, 부르는 쪽은 실렸는지를 가르지 못한다.
   readonly lastCheck?: () => S | null;
+  // 마지막 확인의 답이 부르는 쪽이 낸 거절인지 가른다. 참이면 stopped로 그 값을 돌려주고, 거짓이거나 칸이 없으면 꼴이 틀린 답(check_malformed)이다.
+  readonly stops?: (value: unknown) => value is S;
+}
+
+// 시작이 아닌 봉투의 마지막 확인(지금은 갱신의 여유 판정)과 그 거절을 가르는 함수. 뜻은 StartMark의 같은 이름 칸과 같다.
+export interface PlainCheck<S> {
+  readonly check: () => S | null;
+  readonly stops: (value: unknown) => value is S;
 }
 
 export type GateResult<S> =
@@ -33,8 +42,11 @@ export type GateResult<S> =
   | { readonly kind: "sink_unavailable" }
   // 시작인데 표식이 ok가 아니어서 부르지 않았다.
   | { readonly kind: "unmarked"; readonly markReason: MarkFailure }
-  // 시작의 마지막 확인이 싣지 말라고 했다. 표식이 커밋됐을 수 있다(포트를 얻지 못한 경우는 표식 없이 이 길로 온다).
+  // 마지막 확인(시작은 StartMark.lastCheck, 아니면 plainCheck)이 싣지 말라고 했다. 시작이면 표식이 커밋됐을 수 있다(포트를 얻지 못한
+  // 경우는 표식 없이 이 길로 온다).
   | { readonly kind: "stopped"; readonly value: S }
+  // 마지막 확인이 null도 부르는 쪽의 거절도 아닌 값(undefined, 숫자, 남의 객체 등)을 냈다. 싣지 않았다. 시작이면 표식이 커밋됐을 수 있다.
+  | { readonly kind: "check_malformed" }
   // 박자 유효 문이 닫혀 부르지 않았다. 표식 앞에서 닫혔으면 표식이 없고, 시작의 마지막 판정(표식 뒤)에서 닫혔으면 표식이 커밋됐을 수 있다.
   | { readonly kind: "beat_closed" };
 
@@ -108,29 +120,89 @@ function markVerdict(call: GatedCall): MarkFailure | null {
   return "malformed_answer";
 }
 
-// 박자 유효 문. 칸이 없으면 늘 유효, 던지거나 true가 아니면 닫힘이다(모름을 유효로 읽지 않는다).
-function beatValid(holder: { readonly beatValid?: () => boolean }): boolean {
+// 박자 유효 문을 진입 때 한 번 얻는다. 칸이 없으면 늘 유효, 칸을 읽다 던지거나 함수가 아니면 늘 닫힘이다. 부를 때 던지거나 true가
+// 아니면 닫힘이다(모름을 유효로 읽지 않는다). 수신 객체(holder)는 여기서 bind로 묶는다: 부를 때 holder의 칸을 다시 읽지 않는다.
+function holdBeatValid(holder: { readonly beatValid?: () => boolean }): () => boolean {
+  let valid: () => boolean;
   try {
-    return holder.beatValid === undefined || holder.beatValid() === true;
+    const fn: unknown = holder.beatValid;
+    if (fn === undefined) return () => true;
+    if (typeof fn !== "function") return () => false;
+    valid = (fn as () => boolean).bind(holder);
   } catch {
-    return false;
+    return () => false;
+  }
+  return () => {
+    try {
+      return valid() === true;
+    } catch {
+      return false;
+    }
+  };
+}
+
+// 시작 표식 입력(start)의 칸을 진입 때 한 번 읽어 쥔다. 시각·마지막 확인을 읽다 던지면 null이다(표식도 송신도 하지 않는다).
+// 표식 포트나 그 메서드를 읽다 던지면 mark만 null이고, 표식 차례에서 callAfterGate가 부르지 않은 채 threw로 낸다.
+interface HeldStart<S> {
+  readonly mark: { readonly receiver: unknown; readonly fn: unknown } | null;
+  readonly input: ReturnType<typeof markInput>;
+  readonly lastCheck: (() => S | null) | undefined;
+  readonly stops: ((value: unknown) => value is S) | undefined;
+}
+function holdStart<S>(start: StartMark<S>, envelope: Envelope): HeldStart<S> | null {
+  let at: number;
+  let lastCheck: (() => S | null) | undefined;
+  let stops: ((value: unknown) => value is S) | undefined;
+  try {
+    at = start.at;
+    lastCheck = start.lastCheck;
+    stops = start.stops;
+  } catch {
+    return null;
+  }
+  let mark: HeldStart<S>["mark"] = null;
+  try {
+    const marker = start.marker;
+    mark = { receiver: marker, fn: marker.markStartDispatch };
+  } catch {
+    mark = null;
+  }
+  return { mark, input: markInput(envelope, at), lastCheck, stops };
+}
+
+// 마지막 확인의 답을 가른다. null만 싣기다. 부르는 쪽이 낸 거절(stops가 참)이면 stopped, 그 밖은 꼴이 틀린 답이라 싣지 않는다:
+// "?? null"처럼 모름(undefined 등)을 싣기로 읽으면 확인이 막으려던 송신이 나간다. 확인이 없으면 싣기다. stops가 던지면 꼴 틀림이다.
+// 확인을 부른 뒤 싣는 길에는 stops를 부르지 않는다(답이 null이면 바로 싣는다).
+function verdictOf<S>(check: (() => S | null) | null | undefined, stops: ((value: unknown) => value is S) | null | undefined): GateResult<S> | null {
+  if (check === undefined || check === null) return null;
+  const answer: unknown = check();
+  if (answer === null) return null;
+  try {
+    return stops !== undefined && stops !== null && stops(answer) ? { kind: "stopped", value: answer } : { kind: "check_malformed" };
+  } catch {
+    return { kind: "check_malformed" };
   }
 }
 
-// 봉투 하나를 holder.sink에 싣는다. 시작이 아니면 표식·마지막 확인 없이 싣는다(start는 보지 않는다).
-// 차례: 포트의 수신 객체와 send를 얻는다 → (시작) 표식의 인자·표식 포트·메서드 → 박자 유효 문 → 표식 → 박자 유효 문 → 마지막 확인 → 포트 호출.
-// 시작이 아니면 수신 객체와 send를 얻은 뒤 박자 유효 문 → 포트 호출이다.
-// 박자 유효 문(holder.beatValid, 선택 칸)은 장부 쓰기(표식)와 송신 바로 앞에서 본다. 수신 객체와 send는 그 앞에서 얻는다:
-// 그 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간만큼 유효 문과 마지막 확인이 낡는다.
-// 시작의 송신 앞은 판정 하나다: 유효 문(조립에서는 장부 건강·허가 읽기 뒤 단조 시각) → 마지막 확인(시작 시한의 시계 읽기) → 호출.
-// 유효 문을 마지막 확인 뒤에 두면 그 안의 장부 읽기에 쓴 시간을 시작 시한이 보지 못한다(발행 + 19,001ms에 포트가 불린다).
-// 함정: 마지막 확인의 시계 읽기 자체에 걸린 시간은 박자 기한이 보지 못한다. 두 기한의 시계가 달라(박자는 단조, 시작 시한은 장부 시계)
-// 한 번의 읽기로 둘을 볼 수 없어서, 비용이 큰 장부 읽기를 앞에 두고 시계 읽기 하나를 맨 끝에 둔다.
-// 포트를 얻지 못하면 표식을 적지 않는다. 다만 시작이면 마지막 확인을 먼저 보고(재전송의 결과 차례), 그 확인도 표식 없이 부른다.
+// 봉투 하나를 holder.sink에 싣는다. 시작이 아니면 표식 없이 싣는다(start는 보지 않는다).
+// 진입 때 입력 객체의 칸을 모두 한 번 읽어 지역 값에 쥔다: holder의 sink·beatValid, 포트의 send, (시작) start의 시각·마지막 확인·표식 포트와
+// 그 메서드, 봉투의 실행·요청 ID. 유효 문 뒤에는 쥔 함수·값만 쓴다. 칸이 접근자면 유효 문 뒤에 읽는 순간 그 안에서 흐른 시간을
+// 유효 문도 마지막 확인도 보지 못한다(start.lastCheck 접근자에 1ms면 박자 만료 정각에 포트가 불린다).
+// 차례(시작): 칸 쥐기 → 박자 유효 문 → 표식 → 박자 유효 문 → 마지막 확인 → 포트 호출.
+// 차례(시작이 아님): 칸 쥐기 → 박자 유효 문 → 마지막 확인(plainCheck, 있으면) → 포트 호출.
+// 송신 앞은 판정 하나다: 유효 문(조립에서는 장부 건강·허가 읽기 뒤 단조 시각) → 마지막 확인(시한의 시계 읽기) → 호출.
+// 유효 문을 마지막 확인 뒤에 두면 그 안의 장부 읽기에 쓴 시간을 시한이 보지 못한다(시작은 발행 + 19,001ms, 갱신은 여유 12,999ms에 포트가 불린다).
+// 함정: 마지막 확인의 시계 읽기 자체에 걸린 시간은 박자 기한이 보지 못한다. 두 기한의 시계가 달라(박자는 단조, 시한은 장부 시계)
+// 한 번의 읽기로 둘을 볼 수 없어서, 비용이 큰 장부 읽기를 앞에 두고 시계 읽기 하나를 맨 끝에 둔다. 마지막 확인은 this 없이 부른다.
+// 포트를 얻지 못하면 표식을 적지 않는다. 시작이면 마지막 확인을 먼저 보고(재전송의 결과 차례), 그 확인도 표식 없이 부른다.
+// 시작이 아니면 마지막 확인 없이 sink_unavailable이다.
 export async function sendInstruction<S = never>(
   holder: { readonly sink: InstructionSink; readonly beatValid?: () => boolean },
   envelope: Envelope,
   start: StartMark<S> | null,
+  // 시작이 아닌 봉투의 마지막 확인. 유효 문 바로 뒤, 포트 호출 바로 앞에 부른다. null이면 싣고, stops가 알아보는 값이면 stopped,
+  // 그 밖이면 check_malformed다. 던지지 않아야 한다(StartMark.lastCheck와 같다). 시작 봉투에는 쓰지 않는다. 두 칸은 진입 때 읽는다.
+  plain: PlainCheck<S> | null = null,
 ): Promise<GateResult<S>> {
   const starting = isStart(envelope);
   if (starting && start === null) return { kind: "unmarked", markReason: "marker_missing" };
@@ -142,24 +214,40 @@ export async function sendInstruction<S = never>(
   } catch {
     send = undefined;
   }
-  if (typeof send !== "function") {
-    const stop = starting ? (start?.lastCheck?.() ?? null) : null;
-    return stop !== null ? { kind: "stopped", value: stop } : { kind: "sink_unavailable" };
+  const gate = holdBeatValid(holder);
+  const held = starting && start !== null ? holdStart(start, envelope) : null;
+  if (starting && held === null) return { kind: "unmarked", markReason: "threw" };
+  let check: (() => S | null) | undefined;
+  let stops: ((value: unknown) => value is S) | undefined;
+  if (starting) {
+    check = held?.lastCheck;
+    stops = held?.stops;
+  } else if (plain !== null) {
+    try {
+      check = plain.check;
+      stops = plain.stops;
+    } catch {
+      return { kind: "check_malformed" };
+    }
   }
-  if (starting && start !== null) {
-    const input = markInput(envelope, start.at);
+  if (typeof send !== "function") {
+    const early = starting ? verdictOf(check, stops) : null;
+    return early !== null ? early : { kind: "sink_unavailable" };
+  }
+  if (held !== null) {
+    const { mark, input } = held;
     if (input === null) return { kind: "unmarked", markReason: "envelope_unreadable" };
-    // 표식: 표식 포트와 그 메서드를 얻고 → 박자 유효 문 → 호출. 메서드를 유효 문 뒤에 읽으면 그 접근자 안에서 흐른 시간을 보지 못한다.
-    const marking = callAfterGate(() => { const marker = start.marker; return { receiver: marker, fn: marker.markStartDispatch, args: [input] }; }, () => beatValid(holder));
+    // 표식: 쥔 표식 포트·메서드 → 박자 유효 문 → 호출. 메서드를 읽지 못했으면(mark가 null) 부르지 않은 채 threw다.
+    const marking = callAfterGate(() => ({ receiver: mark?.receiver, fn: mark?.fn, args: [input] }), gate);
     if (marking.kind === "closed") return { kind: "beat_closed" };
     const refused = markVerdict(marking);
     if (refused !== null) return { kind: "unmarked", markReason: refused };
-    if (!beatValid(holder)) return { kind: "beat_closed" };
-    const stop = start.lastCheck?.() ?? null;
-    if (stop !== null) return { kind: "stopped", value: stop };
-  } else if (!beatValid(holder)) return { kind: "beat_closed" };
+  }
+  if (!gate()) return { kind: "beat_closed" };
+  const verdict = verdictOf(check, stops);
+  if (verdict !== null) return verdict;
   try {
-    // 마지막 판정(시작이 아니면 박자 유효 문) 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
+    // 마지막 판정 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
     return { kind: "answered", answer: await Reflect.apply(send, target, [envelope]) };
   } catch {
     return { kind: "threw" };

@@ -846,6 +846,34 @@ describe("쓰기 직전의 확인: 연결, 최신 읽기, 칸의 꼴, 싣지 못
     expect(w.sent.map((e) => e.header.action)).toEqual(["status_query", "status_query"]);
   });
 
+  test("갱신의 마지막 여유 판정은 박자 유효 문 뒤에 장부 시계를 한 번 읽는다: 유효 문이 1ms를 쓰면 여유 12,999ms로 싣지 않고, 0ms면 13,000ms로 싣는다", async () => {
+    for (const cost of [0, 1]) {
+      const w = world();
+      const s = started(w);
+      accept(w, s);
+      // 판단·기록 17000, 앞 임대 끝 30000. 장부에 갱신을 적은 뒤의 유효 문(송신 앞) 안에서만 cost가 흐른다.
+      w.setClock(NOW + 17_000);
+      const gates: number[] = [];
+      const ports: LifeLoopPorts = {
+        ...w.ports,
+        beatValid: () => {
+          if (w.log.includes("recordRenewInstruction")) w.setClock(NOW + 17_000 + cost);
+          gates.push(w.ports.clock.now() - NOW);
+          return true;
+        },
+      };
+      const outcome = only(await lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] }), s.runId);
+      expect({ cost, outcome: outcome.outcome, reason: "reason" in outcome ? outcome.reason : null, gates, sends: w.log.filter((step) => step === "send").length, sent: w.sent.length }).toEqual({
+        cost,
+        outcome: cost === 0 ? "renew_sent" : "renew_recorded_not_sent",
+        reason: cost === 0 ? null : "renew_margin_lost",
+        gates: [17_000, 17_000 + cost],
+        sends: cost === 0 ? 1 : 0,
+        sent: cost === 0 ? 1 : 0,
+      });
+    }
+  });
+
   test("요청 ID를 먼저 만들고, 마지막 시계 읽기와 장부 호출 사이에 다른 포트를 부르지 않는다", async () => {
     const w = world();
     const s = started(w);

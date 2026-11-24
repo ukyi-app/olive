@@ -87,7 +87,7 @@ type Head = { readonly requestId: string; readonly runId: string; readonly actio
 // read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸(머리 칸과 본문을 다시 만들 칸)이 처음 읽은 것과 다르다.
 // beat_closed: 공유 함수 안에서 본 박자 유효 문이 닫혀 싣지 않았다. 표식 앞의 문이면 표식이 없고, 시작의 표식 뒤 마지막 판정의 문이면
 // 표식이 남는다.
-export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown" | "beat_closed";
+export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown" | "beat_closed" | "check_malformed";
 
 export type ResendOutcome =
   // 같은 요청을 새 봉투에 담아 실었다(sent는 받았다는 뜻이 아니다). sealedAt은 봉할 때 읽은 시각이다.
@@ -555,6 +555,10 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
       return withheld("clock_unavailable");
     }
   }
+  // 마지막 확인이 낸 거절만 공유 함수가 그 결과로 돌려준다(stops). 그 밖의 값은 꼴이 틀린 답(check_malformed)이라 싣지 않는다.
+  const refusals = new WeakSet<object>();
+  const refuse = (outcome: ResendOutcome): ResendOutcome => (refusals.add(outcome), outcome);
+  const stops = (value: unknown): value is ResendOutcome => typeof value === "object" && value !== null && refusals.has(value);
   const lastCheck = (): ResendOutcome | null => {
     let checked: number | null = null;
     try {
@@ -563,14 +567,15 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
     } catch {
       checked = null;
     }
-    if (checked === null) return withheld("clock_unavailable");
+    if (checked === null) return refuse(withheld("clock_unavailable"));
     ctx.floor = checked;
-    return checked > item.issuedAt + START_LAST_SEAL_MS ? expired() : null;
+    return checked > item.issuedAt + START_LAST_SEAL_MS ? refuse(expired()) : null;
   };
   // 시작의 표식은 장부 쓰기다. 박자 유효 문(ctx.ports.beatValid)은 공유 함수가 포트의 수신 객체와 send를 얻은 뒤, 표식과 송신
   // 바로 앞에서 본다(send-gate.ts의 차례). 여기서 먼저 보면 그 접근자 안에서 흐른 시간을 보지 못한다.
-  const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck } : null);
+  const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck, stops } : null);
   if (gate.kind === "stopped") return gate.value;
+  if (gate.kind === "check_malformed") return withheld("check_malformed");
   if (gate.kind === "beat_closed") return withheld("beat_closed");
   if (gate.kind === "sink_unavailable") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };
   if (gate.kind === "unmarked") return { ...head, outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId, sealedAt: sealAt, markReason: gate.markReason };

@@ -265,15 +265,31 @@ const MARK_CALL = /\bmarkStartDispatch\s*\(/;
 const markingFiles = (sources: ReadonlyMap<string, string>) =>
   [...sources].filter(([file, source]) => !file.startsWith("src/ledger/") && (MARK_READ.test(source) || MARK_CALL.test(source))).map(([file]) => file);
 
-test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례는 표식 → 마지막 확인 → 포트 호출이다", () => {
+test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례는 입력의 칸 쥐기 → 표식 → 마지막 확인 → 포트 호출이다", () => {
   expect(markingFiles(sources)).toEqual([GATE]);
   const gate = src(GATE);
   const body = gate.slice(gate.indexOf("export async function sendInstruction"));
   const at = (needle: string) => body.indexOf(needle);
-  expect([at("send = (target as InstructionSink).send"), at("const marking = callAfterGate("), at("start.lastCheck?.()"), at("Reflect.apply(")].every((index) => index >= 0)).toBe(true);
-  expect(at("send = (target as InstructionSink).send")).toBeLessThan(at("const marking = callAfterGate("));
-  expect(at("const marking = callAfterGate(")).toBeLessThan(at("start.lastCheck?.()"));
-  expect(at("start.lastCheck?.()")).toBeLessThan(at("Reflect.apply("));
+  const order = [
+    "send = (target as InstructionSink).send",
+    "const gate = holdBeatValid(holder)",
+    "holdStart(start, envelope)",
+    "const marking = callAfterGate(",
+    "if (!gate()) return",
+    "const verdict = verdictOf(check, stops)",
+    "await Reflect.apply(",
+  ];
+  expect(order.map((needle) => [needle, at(needle) >= 0])).toEqual(order.map((needle) => [needle, true]));
+  for (let index = 1; index < order.length; index++) expect([order[index], at(order[index - 1] as string) < at(order[index] as string)]).toEqual([order[index], true]);
+  // 입력 객체(holder·포트·start·봉투)의 칸은 진입 때 한 번만 읽는다. 첫 유효 문(표식의 callAfterGate) 뒤 본문에는 그 칸 읽기가 없다:
+  // 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간을 유효 문도 마지막 확인도 보지 못한다. start의 칸은 holdStart, 유효 문은 holdBeatValid가 읽는다.
+  expect(body.slice(at("const marking = callAfterGate(")).match(/\b(?:holder|start|target|envelope|marker)\s*(?:\?\.|\.)\s*[\w$]+/g) ?? []).toEqual([]);
+  expect(body.match(/\bstart\s*(?:\?\.|\.)\s*[\w$]+/g) ?? []).toEqual([]);
+  expect(body.match(/\bholder\s*(?:\?\.|\.)\s*[\w$]+/g) ?? []).toEqual(["holder.sink"]);
+  const helpers = gate.slice(gate.indexOf("function holdBeatValid("), gate.indexOf("export async function sendInstruction"));
+  for (const read of ["const fn: unknown = holder.beatValid;", "at = start.at;", "lastCheck = start.lastCheck;", "stops = start.stops;", "const marker = start.marker;", "mark = { receiver: marker, fn: marker.markStartDispatch };"]) {
+    expect([read, helpers.includes(read)]).toEqual([read, true]);
+  }
   // 표식과 포트 호출 사이에 기다림이 없다(첫 await가 포트 호출이다). 뒤에 줄바꿈이 오는 await도 낱말로 찾는다.
   // .then( 콜백으로 포트 호출을 미루는 것처럼 await 낱말이 없는 양보는 보지 못한다(send-gate.md "정적 시험").
   expect(body.search(/\bawait\b/)).toBe(at("await Reflect.apply("));
@@ -298,7 +314,7 @@ const GATED_LINES = [
   "src/supervisor/dispatch/life-loop.ts: import { callAfterGate } from \"./send-gate.ts\";",
   "src/supervisor/dispatch/link-loss.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markLostFor, args: [lostInput] }; }, () => beatValid(ports));",
   "src/supervisor/dispatch/link-loss.ts: import { callAfterGate } from \"./send-gate.ts\";",
-  "src/supervisor/dispatch/send-gate.ts: const marking = callAfterGate(() => { const marker = start.marker; return { receiver: marker, fn: marker.markStartDispatch, args: [input] }; }, () => beatValid(holder));"
+  "src/supervisor/dispatch/send-gate.ts: const marking = callAfterGate(() => ({ receiver: mark?.receiver, fn: mark?.fn, args: [input] }), gate);"
 ];
 const gatedLines = (sources: ReadonlyMap<string, string>) =>
   [...sources]
