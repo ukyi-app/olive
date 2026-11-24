@@ -2575,7 +2575,7 @@ export class Ledger {
   // 재시작 복원 2단계가 받은 실행기의 답 가운데 지정 실행기·같은 세대·not_known 밖의 것을 같은 표에 적는다. 복원의 판정은 바꾸지 않는다.
   // 포트가 답 봉투의 시각을 싣지 않아 answered_at은 비워 둔다. received_at은 관측마다 복원기가 처음 받은 시각이다.
   recordRunSightings(key: symbol, observations: readonly RunSightingObservation[]): { ok: true } | Refused {
-    if (key !== RESTORE_KEY) throw new TypeError("복원 밖의 양성 관측은 applyExecutorAnswer로 적는다");
+    if (key !== RESTORE_KEY) throw new TypeError("recordRunSightings는 복원 전용 열쇠가 필요하다");
     const checked = observations.map((seen) => ({ ...seen, receivedAt: time(seen.receivedAt, "receivedAt") }));
     return this.#write("run_sighting", "continue", () => {
       for (const seen of checked) this.#sight(seen.executorId, seen.status, seen.coverage, null, seen.receivedAt);

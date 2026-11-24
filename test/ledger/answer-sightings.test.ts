@@ -143,10 +143,13 @@ test("지정 실행기·같은 세대만: 다른 실행기·다른 세대·not_k
   expect(sightAnswer(ledger, [status(ghost, "running", 4)], WORKER_EXECUTOR, { coverage: "full" })).toEqual({ ok: true });
   expect(ledger.getRun(ghost)).toEqual({ known: true, value: null });
   expect(ledger.hasRunSighting(ghost)).toEqual({ known: true, value: null });
-  // 다른 세대·장부 밖 항목이 섞여도 답 전체가 거절되지 않는다.
-  const mixed = [status(ghost, "running", 4), status(id(), "not_known"), status(live.runId, "running")];
+  // 다른 세대·장부 밖 항목이 섞여도 답 전체가 거절되지 않는다. 장부에 있는 실행의 다른 세대는 실행 줄이 있어 부재로 걸러지지 않으므로
+  // 세대 대조로만 건너뛴다. 그 항목을 맞는 항목 앞에 두어 뒤 항목까지 처리하는지 본다.
+  const waiting = must(ledger.admitRun(worker())).run.runId;
+  const mixed = [status(waiting, "running", 2), status(ghost, "running", 4), status(id(), "not_known"), status(live.runId, "running")];
   expect(sightAnswer(ledger, mixed, WORKER_EXECUTOR, { coverage: "full" })).toEqual({ ok: true });
   expect(sighted(ledger, live.runId)).toBe(true);
+  expect(sighted(ledger, waiting)).toBe(false);
   ledger.close();
   expect(rawRows(path, "SELECT run_id, executor_id, run_generation, coverage FROM run_sightings")).toEqual([{ run_id: live.runId, executor_id: WORKER_EXECUTOR, run_generation: 1, coverage: "full" }]);
 });
