@@ -798,6 +798,20 @@ export class WorkerExecutor {
     await Promise.all(this.store.runs().map((record) => this.reconcile(record)));
   }
 
+  // 파드 전체 재시작을 확인한 기동(D-104)이 연결 전에, recover보다 먼저 부른다. 그 실행들을 첫 종료·재정리와 같은 한 자리(reclaim →
+  // confirmStopped)로 다시 끝내고 센다. 종료 영수증은 그 계수가 0일 때만 나고, 장부가 설명하지 못하는 실행은 세기만 한다.
+  // recover와 따로 두는 까닭: recover는 unknown_running을 다시 세지 않고(검증된 취소가 다시 센다) 요청 밖의 실행까지 대조한다.
+  // 남은 수는 생성자에 받은 cleanup이 답한다. 조립이 이 호출 동안만 그 자리를 재시작의 증거로 바꿔 넣는다(runtime.ts).
+  async reclaimRestarted(runIds: readonly string[]): Promise<void> {
+    if (this.store.ledgerHeld()) return;
+    await Promise.all(
+      runIds.map((runId) => {
+        const record = this.store.run(runId);
+        return record === undefined ? undefined : this.reclaim(runId, record.exit ?? "failed");
+      }),
+    );
+  }
+
   // 끝을 맺지 못한 모든 상태를 같은 방식으로 대조한다: 유효한 사건이 있으면 그 사건으로 최종 상태와 마지막 영수증을 맺고(같은 ID, 같은 본문),
   // 없으면 남은 수를 센다. 다시 띄우지 않는다(결과가 없어도 새 실행으로 바꾸지 않는다).
   // 시작 영수증이 없어도 띄우지 않았다는 증거는 아니므로, 종료만 확인된 실행은 not_started가 아니라 failed_stopped로 맺는다.

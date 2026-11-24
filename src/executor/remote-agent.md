@@ -16,6 +16,7 @@ const remote = new RemoteAgent({
   runtime: { setTimer, now },                   // 주입 타이머(renew 맞춤, 응답 기한, 중단 뒤 끝 기다리기)와 단조 시계(응답 기한의 판정)
   inheritedUnverified,                          // 아래 "뒤 조각"
   replyWaitMs: exitWaitMs,                      // worker에 넘기는 exitWaitMs와 같은 값
+  onDistrust,                                   // 처음 잠기는 순간 한 번(처음부터 잠근 객체는 부르지 않는다). 조립의 회복 시작
 });
 listenForAgent(remote, { path, mode, chmod });
 new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, space: remote.space(innerSpace) });
@@ -83,7 +84,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 7. **0 아닌 수, 모름:** 대리의 답 그대로(`n`, `null`). 실행은 `ended`로 남아 다음 계수를 받는다.
 8. **확인 없이 물려받은 실행:** `inheritedUnverified: true`면 처음부터 잠금(`inherited_unverified`). 그 실행을 지금 붙은 대리의 0으로 닫지 않는다.
 
-**잠금은 풀리지 않는다.** 잠긴 뒤의 연결은 바로 닫고, 새 `hello`를 받지 않고, 띄우지 않는다. 제어는 새 대리의 `hello`와 옛 공간에 남은 프로세스가 연 연결을 말로 가를 수 없다. 쉬는 동안(`idle`) 끊긴 링크는 잠그지 않는다: 그때는 마지막 실행이 0으로 닫혀 공간에 대리 말고 아무것도 없었고, 새 연결의 `hello`는 그 뒤의 새 실행에만 쓰인다.
+**잠금은 풀리지 않는다.** 처음 잠기는 순간(띄우기 실패와 연결 닫기를 마친 뒤) `onDistrust(사유)`를 한 번 부른다. 받는 처리 안에서 불리므로 받은 쪽은 원격을 다시 부르지 않고 마이크로태스크로 미룬다. 잠긴 뒤의 연결은 바로 닫고, 새 `hello`를 받지 않고, 띄우지 않는다. 제어는 새 대리의 `hello`와 옛 공간에 남은 프로세스가 연 연결을 말로 가를 수 없다. 쉬는 동안(`idle`) 끊긴 링크는 잠그지 않는다: 그때는 마지막 실행이 0으로 닫혀 공간에 대리 말고 아무것도 없었고, 새 연결의 `hello`는 그 뒤의 새 실행에만 쓰인다.
 
 ## 보장
 
@@ -98,7 +99,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 ## 남는 위험
 
 - **0은 역할 컨테이너의 대리가 센다.** 제어는 그 0을 독립으로 확인하지 못한다. 대리 쪽 보호(PID 1의 신호 보호, non-dumpable)를 깨는 커널·대리 버그가 있으면 거짓 0이 이 구현을 지나간다(대리 쪽 `src/agent/agent.md` "남는 위험").
-- **잠금은 회복 길이 없다.** 이 PR에서 잠긴 실행기는 재시작 전까지 0을 말하지 않고 새 실행을 띄우지 않는다. 잠금 뒤의 실행은 `unknown_running`으로 슬롯을 쥔다.
+- **잠금 뒤의 회복은 조립과 차트에 기댄다.** 이 객체는 잠긴 뒤 0을 말하지 않고 새 실행을 띄우지 않는다. 조립(`runtime.ts`)이 감독에 붙은 뒤의 첫 잠금을 받아 회복 요청을 적고 94로 끝나며, 차트의 재시작 규칙과 init의 새 세대 표식이 있어야 그 실행이 남은 0으로 닫힌다(README "회복"). 그 전까지 그 실행은 `unknown_running`으로 슬롯을 쥔다.
 - **끝의 시각이 늦다.** 링크에는 "끝났다, stdout은 아직"이라는 말이 없어 제어는 `exited`를 받은 때 끝을 안다. 그 사이 기한·임대가 지나면 0으로 끝난 프로그램도 `completed`가 아니다(완료가 아닌 쪽).
 - **쉬는 동안의 링크 끊김은 잠그지 않는다.** 그 사이 역할 컨테이너에 다른 프로세스가 들어와(exec 등, 배포 규칙 위반) 먼저 연결하면 그것을 대리로 받는다. 띄우기 전 사전 계수와 두 번째 연결 잠금이 일부를 잡지만 막지 못하는 경우가 있다.
 - **역할 컨테이너 안의 무엇이든 소켓에 붙을 수 있다.** 붙으려면 소켓 파일의 쓰기 권한만 있으면 되고 폴더의 읽기 전용과 무관하다. 대리가 붙어 있는 동안 두 번째 연결은 잠금으로 끝난다(실패 쪽 닫힘이지만 그 뒤 회복이 필요하다).
@@ -110,7 +111,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 - **진입점(`src/executor/runtime.ts`, `src/main/executor.ts`):** 대리의 `hello`를 기다린 뒤에 감독에 연결한다(상한 안에 없으면 연결 전에 86으로 끝난다). hello는 받은 때(단조 시계)와 연결 세대로 판정하고, `recover` 사이에 세대가 바뀌면 남은 상한 안에서 새 세대의 hello를 다시 기다린다. 기동 대조(`WorkerExecutor` 생성자의 `auditRuns`)를 지난 장부에 기동 전부터 끝을 맺지 못한 실행(`preparing`·`running`·`stopping`·`checking`·`unknown_running`)이 있거나 장부가 보류됐으면, 그 공간이 사라졌다는 따로 된 확인이 아직 없으므로 `inheritedUnverified: true`로 만든다(그때는 원격이 어떤 `hello`도 받지 않으므로 기다리지 않고 감독에 붙는다). 소켓 경로·권한·umask, 지난 소켓 파일의 처리, 실제 타이머는 `src/main/executor.ts`가 정한다. **같은 밀리초 상한은 양쪽에 넘긴다:** `replyWaitMs`와 worker의 `exitWaitMs`는 설정 한 곳(`ExecutorTiming.replyWaitMs`)의 같은 값이다(다르게 조립하면 worker가 포기한 정리의 늦은 계수를 여기서 받아 두 판단이 갈라진다). **단조 시계는 `RemoteAgent`의 `runtime.now`에만 넘긴다:** worker에는 단조 시계 인자가 없고(`WorkerOptions.now`는 벽시계), worker의 응답 상한은 전역 `setTimeout`이 잰다. 그래서 `runtime.now`는 그 타이머와 시간 기준이 같은 단조 시계(`performance.now`)이고 `runtime.setTimer`도 `setTimeout`이다(벽시계를 넘기면 시각이 뛸 때 기한 판정이 worker와 갈라진다). 환경 읽기는 진입점에만 둔다.
 - **차트(H-split):** 역할 컨테이너는 자기 PID 공간을 가진다(`shareProcessNamespace` 없음). 링크 폴더는 제어에 쓰기, 역할에 읽기 전용. 키·TLS·저장소 볼륨은 제어 컨테이너에만. 역할 컨테이너에 exec·프로브를 두지 않는다. 역할 uid ≠ 제어 uid.
-- **회복(D-104, 이 PR에 없음):** 실행 중 링크가 끊긴 실행, 잠금 뒤의 실행은 파드 전체 재시작과 init의 새 세대 표식으로 스스로 정리하고, 안 되면 관리자 닫기로 간다. 그 확인이 생기면 기동 때 `inheritedUnverified: false`로 넘긴다. 새 `hello`만으로 그 실행을 닫지 않는다.
+- **회복(D-104):** 실행 중 링크가 끊긴 실행, 잠금 뒤의 실행은 파드 전체 재시작과 init의 새 세대 표식으로 닫는다(README "회복"). 조립은 그 실행을 이 객체의 계수가 아니라 재시작의 증거로 닫고(원격을 만들기 전, 대리 소켓을 열기 전), 닫은 뒤의 장부로 `inheritedUnverified`를 정한다. 새 `hello`만으로 그 실행을 닫지 않는다. 차트의 재시작 규칙·제어 전용 볼륨은 H-split 뒤의 homelab PR이다.
 - 값 틀을 만드는 자리는 `credential-send.ts`와 이 파일 둘이다(`test/supervisor/dispatch/credential-send.test.ts`). 세 번째를 더하지 않는다.
 
 ## 시험

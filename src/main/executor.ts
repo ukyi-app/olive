@@ -12,6 +12,7 @@ import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, isRole, REVISI
 import { ExecutorStore } from "../executor/store.ts";
 import { createTlsClient } from "../transport/tls-client.ts";
 import { parseIdentityUri } from "../transport/tls-policy.ts";
+import { GENERATION_TARGET } from "./agent-install.ts";
 
 // 읽는 환경. 출처와 없을 때의 동작은 README "작업자 실행기 진입점"의 표와 같아야 한다.
 export const EXECUTOR_ENV = [
@@ -101,6 +102,8 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       supervisor: { address: addr[1]!, port, serverName: value("OLIVE_SUPERVISOR_SERVER_NAME"), uri: value("OLIVE_SUPERVISOR_URI") },
       storeDir: value("OLIVE_STORE_DIR"),
       agentSocket: value("OLIVE_AGENT_SOCKET"),
+      // 환경이 아니라 init과 같은 상수다. 두 컨테이너가 다른 경로를 보면 표식이 늘 "모름"이 되어 회복이 닫지 못한다.
+      generationMarker: GENERATION_TARGET,
       files: {
         profile: value("OLIVE_PROFILE_FILE"),
         signingKey: value("OLIVE_SIGNING_KEY_FILE"),

@@ -6,13 +6,19 @@
 //   OLIVE_REQUIRE_BWRAP=1이면 쓸 수 없을 때 실패한다.
 import { expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { PidSweep } from "../../src/executor/containment-core.ts";
 import { checkRecordOptions, ContainmentUnavailable, PidSpace, procFsReader, type Signal } from "../../src/executor/containment.ts";
+import { EXECUTOR_EXIT } from "../../src/executor/runtime.ts";
+import { ExecutorStore } from "../../src/executor/store.ts";
+import { GENERATION_TARGET } from "../../src/main/agent-install.ts";
+import { makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
 import { FakeProc, type FakeProcess, SELF } from "./fake-proc.ts";
+import { executorKeys, onDiskEvents, onDiskRun, supervisorKeys, T0 } from "./support.ts";
 
 const space = (proc: FakeProc) => PidSweep.establish({ self: SELF, reader: proc, kill: proc.kill }, { graceMs: 20, killMs: 40, pollMs: 1 });
 async function recorded(extra: Record<number, FakeProcess>, proc = new FakeProc()) {
@@ -450,4 +456,86 @@ if (problem !== null) {
     expect(result.stdout).toMatch(/^environ=[1-9]\d*\nroot=[1-9]\d*\n$/);
     expect(result.survivors).toBe(0);
   });
+
+  // 회복(D-104)의 제어 진입점을 실제 프로세스로 띄운다. 세대 표식의 고정 경로(/opt 아래)는 bwrap이 이 사례의 폴더를 붙인 것이다.
+  // 이 진입점은 신호를 보내지 않는다(정리는 원격이다). 끝내는 것은 시험이 띄운 bwrap 자식 하나뿐이고 --die-with-parent가 안을 거둔다.
+  test("실제 프로세스 회복: 제어 진입점은 세대 표식이 요청 때와 같으면 닫지 않고 94로 끝나고, 표식이 바뀐 뒤 다시 띄우면 요청의 실행을 남은 0으로 닫고 요청을 지운다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "olive-restart-"));
+    const pki = makePki();
+    const leaf = pki.executor();
+    for (const sub of ["store", "tls", "trust", "link", "generation"]) mkdirSync(join(root, sub));
+    const pem = (key: { export(options: { type: "pkcs8" | "spki"; format: "pem" }): string | Buffer }, type: "pkcs8" | "spki") => String(key.export({ type, format: "pem" }));
+    writeFileSync(join(root, "profile.json"), JSON.stringify({ role: "diagnosis", revision: "profile-r1", program: "/usr/bin/true", argv: [], cwd: "/tmp", env: {}, credentialEnv: "OLIVE_CREDENTIAL" }));
+    writeFileSync(join(root, "signing.pem"), pem(executorKeys.privateKey, "pkcs8"));
+    writeFileSync(join(root, "trust", "supervisor-signing.pub"), pem(supervisorKeys.publicKey, "spki"));
+    writeFileSync(join(root, "trust", "ca-bundle.pem"), pki.ca.pem);
+    writeFileSync(join(root, "tls", "tls.crt"), leaf.pem);
+    writeFileSync(join(root, "tls", "tls.key"), leaf.keyPem);
+    // 끝을 맺지 못한 실행 하나와 그 회복 요청(표식 A).
+    const storeDir = join(root, "store");
+    const seeded = await ExecutorStore.open(storeDir, { now: () => T0 });
+    await seeded.adoptStopGeneration(0);
+    const run = randomUUID();
+    const accepted = randomUUID();
+    const instruction = randomUUID();
+    const window = { start_stop_generation: 0, instruction_request_id: instruction, deadline_at: T0 + 600_000, lease_until: T0 + 30_000, credential_digest: "0".repeat(64) };
+    expect(await seeded.beginRun({ run_id: run, run_generation: 1, state: "preparing", ...window, exit: null, last_receipt_id: null })).toBe(true);
+    const body = { receipt_id: accepted, run_id: run, instruction_request_id: instruction, instruction: "task_start" };
+    expect((await seeded.commit(run, { state: "unknown_running", exit: "failed", last_receipt_id: accepted }, [{ entry: { action: "receipt_accepted", id: accepted, run_id: run, run_generation: 1, acked: false, body } }])).saved).toBe(true);
+    const markerA = "a".repeat(64);
+    await seeded.writeRestartRequest({ marker: markerA, runs: [run] });
+    writeFileSync(join(root, "generation", "marker"), markerA);
+
+    const entry = fileURLToPath(new URL("../../src/main/executor.ts", import.meta.url));
+    const command = wrap(process.execPath, entry);
+    command.splice(command.indexOf("--"), 0, "--tmpfs", "/opt", "--bind", join(root, "generation"), GENERATION_TARGET.slice(0, GENERATION_TARGET.lastIndexOf("/")));
+    const env = {
+      PATH: process.env.PATH ?? "",
+      OLIVE_ROLE: "diagnosis",
+      OLIVE_INSTANCE: "worker-1",
+      OLIVE_POLICY_REVISION: "policy-r1",
+      OLIVE_SUPERVISOR_ADDR: "127.0.0.1:9",
+      OLIVE_SUPERVISOR_SERVER_NAME: SUPERVISOR_DNS,
+      OLIVE_SUPERVISOR_URI: SUPERVISOR_URI,
+      OLIVE_STORE_DIR: storeDir,
+      OLIVE_TLS_DIR: join(root, "tls"),
+      OLIVE_TRUST_DIR: join(root, "trust"),
+      OLIVE_SIGNING_KEY_FILE: join(root, "signing.pem"),
+      OLIVE_PROFILE_FILE: join(root, "profile.json"),
+      OLIVE_AGENT_SOCKET: join(root, "link", "agent.sock"),
+    };
+
+    // 1. 표식이 같다(제어만 다시 떴다): 94, 닫지 않음, 요청은 남는다. 대리 소켓을 열기 전에 끝난다.
+    const same = spawnSync(command[0]!, command.slice(1), { encoding: "utf8", env, timeout: 20_000 });
+    expect(same.status, same.stderr).toBe(EXECUTOR_EXIT.restart_all);
+    expect(same.stderr).toContain("기동 단계 restart_check에서 멈췄다(generation_unchanged)");
+    expect(onDiskRun(storeDir, run).state).toBe("unknown_running");
+    expect(onDiskEvents(storeDir, run).filter((event) => event.action === "receipt_stopped")).toEqual([]);
+    expect(existsSync(join(storeDir, "restart-request.json"))).toBe(true);
+    expect(existsSync(join(root, "link", "agent.sock"))).toBe(false);
+
+    // 2. init이 새 표식을 썼다(파드 전체 재시작): 닫고 요청을 지운 뒤 대리를 기다린다. 그 뒤는 이 사례 밖이라 자식을 끝낸다.
+    writeFileSync(join(root, "generation", "marker"), "b".repeat(64));
+    const child = spawn(command[0]!, command.slice(1), { env, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr!.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    try {
+      const limit = Date.now() + 15_000;
+      while (Date.now() < limit && (existsSync(join(storeDir, "restart-request.json")) || !existsSync(join(root, "link", "agent.sock")))) {
+        if (child.exitCode !== null || child.signalCode !== null) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(existsSync(join(storeDir, "restart-request.json")), stderr).toBe(false);
+      expect(onDiskRun(storeDir, run).state).toBe("failed_stopped");
+      expect(onDiskEvents(storeDir, run).filter((event) => event.action === "receipt_stopped").map((event) => event.body.remaining_processes)).toEqual([0]);
+      expect(stderr).toContain("요청의 실행 1/1개를 남은 0으로 닫았다");
+      // 닫은 뒤에야 대리 소켓을 열었다(감독 연결은 대리 hello 뒤라 아직 없다).
+      expect(existsSync(join(root, "link", "agent.sock"))).toBe(true);
+      expect(child.exitCode).toBeNull();
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    }
+  }, 40_000);
 }
