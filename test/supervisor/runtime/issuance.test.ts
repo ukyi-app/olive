@@ -219,6 +219,9 @@ function harness(options: { life?: () => Promise<void> } = {}) {
       throw new Error("recordReport를 부르면 안 된다");
     },
     applyExecutorAnswer: () => ({ ok: true, moved: [], deferred: [], outsideLedger: [] }) as never,
+    recordAnswerSightings: () => {
+      throw new Error("recordAnswerSightings를 부르면 안 된다");
+    },
   };
   const row = runRow();
   const restorer = () => ({ stopGeneration: () => GEN, intakeOpen: () => true });

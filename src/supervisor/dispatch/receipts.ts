@@ -12,12 +12,15 @@
 //    장부를 부를 때마다 그 직전에 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 보고, 맞을 때만 applyExecutorAnswer에
 //    partial로 넘긴다. sender·runs·answeredAt은 검증된 봉투의 값이다.
 //    그 실행기의 밀린 답(저장되지 않은 앞 답)이 있으면 받은 순서대로 먼저 넘기고, 앞 답이 저장되지 않으면 뒤 답은 넘기지 않는다.
+//    인정이 끝난 연결의 "안다"는 답은 applyExecutorAnswer에 넘기지 않고, 부르기 직전에 연결을 다시 본 뒤 관측만 적는다(recordSighting).
+//    적혔을 때만 그 사본을 놓는다.
 // 4. 결과 보고(report_result)는 보관 → 장부 → ack 순서이고 세 걸음이 한 동기 흐름이다(await·이벤트 루프의 양보·지연 콜백의 예약이 없다. 넘긴 콜백은 그 자리에서 동기로 부른다).
 //    보관소가 참조를 낸 뒤에만 장부에 적고, 장부가 받은 뒤에만 ack한다. 장부의 읽기로 먼저 걸러 보관소에 닿지 않는 것은 정해진
 //    목록뿐이다(resultGate): 장부가 모르는 실행, 지정 실행기·세대가 다른 보고, 세션·queued·시작 지시가 없던 not_started 실행,
 //    소유자가 없는 실행, 장부 읽기가 약속 밖의 값을 준 경우. 그 밖에 장부가 끝내 받지 않는 보고(판정이 끝난 실행의 맞지 않는 결과 등)는
 //    본문부터 보관된다.
 import {
+  type AnswerSightingsInput,
   type DeferredLoss,
   type Delivery,
   type EnvelopeFrom,
@@ -39,7 +42,8 @@ import { ackDraft, type Draft, type RefusalReason as DraftRefusalReason } from "
 import type { Random } from "./ports.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 시험은 가짜로도 돌린다.
-export type ReceiptLedger = Pick<Ledger, "applyReceipt" | "recordReport" | "applyExecutorAnswer">;
+// recordAnswerSightings는 인정이 끝난 연결의 "안다"는 답에만 부른다(recordSighting). 임대·상태·자리를 바꾸지 않는 연산이다.
+export type ReceiptLedger = Pick<Ledger, "applyReceipt" | "recordReport" | "applyExecutorAnswer" | "recordAnswerSightings">;
 
 // 답이 온 연결이 지금도 그 실행기의 인정된 연결인가. 이 모듈은 연결 표를 들여다보지 않고 이 포트에만 묻는다.
 // 조립은 부르는 순간에 쥔 연결 표와 지금의 복원기로 답한다(receipts.md "옛 연결의 답"). 동기여야 한다: 이 답과 장부 호출 사이에
@@ -64,6 +68,30 @@ export interface ExecutorAnswerCopy {
   readonly answeredAt: number | null;
 }
 
+// 관측만 적는 연산(recordAnswerSightings)에 넘기지 않은 까닭. no_positive: 안다는 항목이 없다(붙들 관측이 없다).
+// now_malformed: 장부 시각이 꼴에 맞지 않는다. link_current: 부르기 직전에 본 연결이 지금 인정된 연결이다(그 답은 applyExecutorAnswer의 몫).
+// link_unknown: 연결이 인정됐는지 모른다. backlog_first: 그 실행기의 앞 밀린 사본이 남아 있다(받은 차례로 적으려고 이 답은 목록 끝에 선다).
+// output_mismatch: 인사 출력의 낸 쪽·서명 시각·목록이 그 연결의 인사와 다르다(연결 판단이 인정한 값이라고 믿을 수 없다).
+export const SIGHTING_SKIPS = ["no_positive", "now_malformed", "link_current", "link_unknown", "backlog_first", "output_mismatch"] as const;
+export type SightingSkip = (typeof SIGHTING_SKIPS)[number];
+
+// 인정이 끝난 연결의 "안다"는 답을 관측만 적는 연산에 넘긴 결과. saved만 장부에 적혔다는 뜻이고, 그때만 부르는 쪽이 그 답의 사본을 놓는다.
+// unsaved는 장부의 거절(reason·unsavedSightings 그대로), ledger_failed는 던짐이나 꼴이 틀린 답(적었는지 모른다)이다.
+export type SightingOutcome =
+  | { readonly sighting: "saved" }
+  | { readonly sighting: "unsaved"; readonly reason: LedgerRefusal; readonly unsavedSightings: readonly { readonly runId: string; readonly runGeneration: number }[] }
+  | { readonly sighting: "ledger_failed"; readonly failure: "threw" | "malformed_answer" }
+  | { readonly sighting: "skipped"; readonly why: SightingSkip };
+
+// 관측만 적을 답. 상태 보고의 사본(partial)과 인사(full) 모두 검증된 봉투의 값 그대로다(coverage도 바꾸지 않는다).
+export interface SightingAnswer {
+  readonly sender: string;
+  readonly connection: number;
+  readonly coverage: "full" | "partial";
+  readonly runs: readonly RunStatus[];
+  readonly answeredAt: number | null;
+}
+
 // 답 하나를 장부에 넘긴 결과. 장부의 답을 지우거나 합치지 않는다.
 export type AnswerSettlement =
   // 장부가 반영했다. moved: 임대를 거두고 unknown_running으로 옮긴 실행, deferred: not_known을 받고도 옮기지 않은 실행(같은 ID를
@@ -84,8 +112,9 @@ export type AnswerSettlement =
     }
   // 장부가 던졌거나 답이 꼴에 맞지 않는다. 적었는지 모른다.
   | { readonly settled: "ledger_failed"; readonly answer: ExecutorAnswerCopy; readonly failure: "threw" | "malformed_answer" }
-  // 넘기기 직전에 본 그 답의 연결이 지금 인정된 연결이 아니거나(not_current) 그것을 모른다(unknown). 장부를 부르지 않았다.
-  | { readonly settled: "not_current"; readonly answer: ExecutorAnswerCopy; readonly link: "not_current" | "unknown" }
+  // 넘기기 직전에 본 그 답의 연결이 지금 인정된 연결이 아니거나(not_current) 그것을 모른다(unknown). applyExecutorAnswer를 부르지 않았다.
+  // sighting은 관측만 적는 연산의 결과다(not_current일 때만 부른다). saved가 아니고 안다는 항목이 있으면 그 사본은 backlog에 남는다.
+  | { readonly settled: "not_current"; readonly answer: ExecutorAnswerCopy; readonly link: "not_current" | "unknown"; readonly sighting: SightingOutcome }
   // 앞의 밀린 답이 저장되지 않아 넘기지 않았다(받은 순서를 지킨다).
   | { readonly settled: "held"; readonly answer: ExecutorAnswerCopy };
 
@@ -238,7 +267,8 @@ export type ReceiptOutcome =
       readonly settled: readonly AnswerSettlement[];
       readonly backlog: readonly ExecutorAnswerCopy[];
     }
-  // 기다리는 조회의 답이지만 그 연결이 지금 인정된 연결이 아니거나(not_current) 그것을 모른다(unknown). 장부에 넘기지 않았다.
+  // 기다리는 조회의 답이지만 그 연결이 지금 인정된 연결이 아니거나(not_current) 그것을 모른다(unknown). applyExecutorAnswer에 넘기지 않았다.
+  // sighting은 관측만 적는 연산의 결과다. saved면 부르는 쪽은 이 답의 사본을 쥐지 않는다.
   | {
       readonly outcome: "status_not_current";
       readonly queryRequestId: string;
@@ -246,6 +276,7 @@ export type ReceiptOutcome =
       readonly connection: number;
       readonly link: "not_current" | "unknown";
       readonly answer: ExecutorAnswerCopy;
+      readonly sighting: SightingOutcome;
     }
   | { readonly outcome: "status_unmatched"; readonly reason: StatusUnmatchedReason }
   // 결과 보고를 장부에 넘기지 않았다(확정된 이유). ack가 없다.
@@ -595,6 +626,65 @@ const isDeferred = (item: unknown): boolean =>
   (LEDGER_RUN_STATES as readonly unknown[]).includes(item.state) &&
   DEFERRED_WHY.includes(item.why);
 
+const skipped = (why: SightingSkip): SightingOutcome => ({ sighting: "skipped", why });
+
+// recordAnswerSightings의 답이 약속한 꼴인가. 칸마다 한 번만 읽는다. 칸을 읽다 던지는 값도 꼴이 틀린 답이다(적었는지 모른다).
+function readSightingAnswer(answer: unknown): SightingOutcome {
+  const malformed: SightingOutcome = { sighting: "ledger_failed", failure: "malformed_answer" };
+  try {
+    if (!isRecord(answer)) return malformed;
+    const ok = answer.ok;
+    if (ok === true) return { sighting: "saved" };
+    if (ok !== false) return malformed;
+    const reason = answer.reason;
+    if (!(LEDGER_REFUSALS as readonly unknown[]).includes(reason)) return malformed;
+    const unsaved = answer.unsavedSightings;
+    if (!Array.isArray(unsaved)) return malformed;
+    const pairs: { runId: string; runGeneration: number }[] = [];
+    for (const item of unsaved as unknown[]) {
+      if (!isRecord(item)) return malformed;
+      const runId = item.runId;
+      const runGeneration = item.runGeneration;
+      if (!isText(runId) || !Number.isSafeInteger(runGeneration)) return malformed;
+      pairs.push({ runId, runGeneration: runGeneration as number });
+    }
+    return { sighting: "unsaved", reason: reason as LedgerRefusal, unsavedSightings: pairs };
+  } catch {
+    return malformed;
+  }
+}
+
+// 인정이 끝난 연결의 "안다"는 답에서 양성 관측만 장부에 적는다(recordAnswerSightings). 임대·상태·자리는 바꾸지 않는다.
+// 부르는 쪽은 그 답의 연결이 인정된 연결이 아니라고 본(not_current) 뒤에만 부른다. 장부는 연결을 보지 않고 sender를 믿으므로,
+// 연산을 얻고 입력을 만든 뒤 부르기 직전에 연결을 한 번 더 보고 그 사이에 외부 코드를 두지 않는다. 연결이 지금 인정된 연결이면
+// (그 답은 applyExecutorAnswer의 몫) 또는 모르면 부르지 않는다. 장부는 (실행, 실행기, 세대)의 첫 관측만 적으므로 다시 불러도 해가 없다.
+// 함정: 이 연산의 성공을 닫기의 근거로 쓰지 않는다. 목록에 없는 실행을 보지 않는다(ledger.md "관측만 적는 연산을 부르는 쪽").
+export function recordSighting(answer: SightingAnswer, ledger: Pick<ReceiptLedger, "recordAnswerSightings">, links: AnswerLinks, now: number): SightingOutcome {
+  if (!answer.runs.some(isPositive)) return skipped("no_positive");
+  if (!isTime(now)) return skipped("now_malformed");
+  // 수신자를 문 앞에서 묶어 둔다: 문 뒤에는 묶은 함수 하나를 부를 뿐 속성을 읽지 않는다. 묶기도 함수의 bind를 읽어 부르므로 던질 수 있다.
+  let call: (input: AnswerSightingsInput, from: { sender: string }) => unknown;
+  try {
+    const record: unknown = ledger.recordAnswerSightings;
+    if (typeof record !== "function") return { sighting: "ledger_failed", failure: "threw" };
+    call = (record as (input: AnswerSightingsInput, from: { sender: string }) => unknown).bind(ledger);
+  } catch {
+    return { sighting: "ledger_failed", failure: "threw" };
+  }
+  // 장부에는 사본의 사본을 넘긴다(장부가 받은 배열을 고쳐도 쥔 사본은 그대로다).
+  const input: AnswerSightingsInput = { coverage: answer.coverage, runs: copyRuns(answer.runs), answeredAt: answer.answeredAt, now };
+  const from = { sender: answer.sender };
+  const link = linkVerdict(links, answer.connection, answer.sender);
+  if (link !== "not_current") return skipped(link === "current" ? "link_current" : "link_unknown");
+  let raw: unknown;
+  try {
+    raw = call(input, from);
+  } catch {
+    return { sighting: "ledger_failed", failure: "threw" };
+  }
+  return readSightingAnswer(raw);
+}
+
 // 장부의 applyExecutorAnswer 답이 약속한 꼴인가. 칸을 읽다 던지는 값도 꼴이 틀린 답이다.
 function readExecutorAnswer(answer: unknown, copy: ExecutorAnswerCopy): AnswerSettlement | null {
   try {
@@ -636,7 +726,7 @@ function passAnswer(copy: ExecutorAnswerCopy, ledger: Pick<ReceiptLedger, "apply
 // 넘기지 않고 backlog로 돌려준다: 다시 넘길 때 그 답이 뒤 답보다 먼저여야 "안다고 한 적이 있다"가 뒤 답에 묻히지 않는다.
 // not_known만 실은 답의 실패는 붙들 관측이 없어 backlog에 넣지 않는다(부르는 쪽은 그 실행을 다시 조회한다).
 // 다시 넘기는 것은 같은 값이라 겹쳐도 해가 없다: 장부는 첫 관측만 적고, 이미 옮긴 실행은 다시 옮기지 않는다.
-function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<ReceiptLedger, "applyExecutorAnswer">, links: AnswerLinks, now: number) {
+function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<ReceiptLedger, "applyExecutorAnswer" | "recordAnswerSightings">, links: AnswerLinks, now: number) {
   const settled: AnswerSettlement[] = [];
   const backlog: ExecutorAnswerCopy[] = [];
   for (const copy of queue) {
@@ -649,10 +739,11 @@ function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<Receip
     // 그 연결의 인정을 끝낼 수 있다(await가 없어도 바뀐다). 인정이 끝난 연결의 답은 임대를 바꾸지 못한다.
     const link = linkVerdict(links, copy.connection, copy.sender);
     if (link !== "current") {
-      settled.push({ settled: "not_current", answer: copy, link });
-      // 임대를 건드리지 않고 관측만 적는 운영 중 장부 연산이 없어 "안다"는 항목은 이 사본으로만 남는다. 버리지 않으므로
-      // 그 실행기의 뒤 답은 이 사본 뒤에 막힌다(막힌 동안 임대를 거두지 못한다: 닫는 쪽이다).
-      if (copy.runs.some(isPositive)) backlog.push(copy);
+      // 인정이 끝난 연결의 답은 임대를 바꾸지 못한다. 안다는 항목은 관측만 적는 연산으로 남기고, 적혔을 때만 사본을 놓아 뒤 답을 푼다.
+      // 적지 못했거나 연결을 모르면 버리지 않는다: 그 사본 뒤에 뒤 답이 막힌다(막힌 동안 임대를 거두지 못한다: 닫는 쪽이다).
+      const sighting = link === "not_current" ? recordSighting(copy, ledger, links, now) : skipped("link_unknown");
+      settled.push({ settled: "not_current", answer: copy, link, sighting });
+      if (copy.runs.some(isPositive) && sighting.sighting !== "saved") backlog.push(copy);
       continue;
     }
     const result = passAnswer(copy, ledger, now);
@@ -660,6 +751,15 @@ function settleInOrder(queue: readonly ExecutorAnswerCopy[], ledger: Pick<Receip
     if (result.settled !== "applied" && copy.runs.some(isPositive)) backlog.push(copy);
   }
   return { settled, backlog };
+}
+
+// 인정이 끝난 연결의 조회 답(status_not_current)을 관측만 적는다. 그 실행기의 밀린 사본이 남아 있으면 부르지 않는다: 부르는 쪽이 이 답을
+// 목록 끝에 두고 앞 사본 다음 차례에 적는다(받은 차례). 밀린 목록을 읽지 못하면 남은 것으로 본다.
+function notCurrentSighting(input: ForwardInput, answer: ExecutorAnswerCopy, link: "not_current" | "unknown", ledger: ReceiptLedger): SightingOutcome {
+  if (link !== "not_current") return skipped("link_unknown");
+  if (!answer.runs.some(isPositive)) return skipped("no_positive");
+  if (!Array.isArray(input.backlog) || input.backlog.length !== 0) return skipped("backlog_first");
+  return recordSighting(answer, ledger, input.links, input.now);
 }
 
 function handleStatus(input: ForwardInput, sender: string, issuedAt: unknown, body: Record<string, unknown>, ledger: ReceiptLedger): ReceiptOutcome {
@@ -671,7 +771,7 @@ function handleStatus(input: ForwardInput, sender: string, issuedAt: unknown, bo
   // 연결 판단이 forward를 낸 뒤 그 연결이 밀려났거나 닫혔으면 그 답은 지금 실행의 임대를 바꾸지 못한다. 여기서 먼저 보고(밀린 답도
   // 넘기지 않는다), 넘기는 루프가 장부 호출마다 다시 본다.
   const link = linkVerdict(input.links, connection, sender);
-  if (link !== "current") return { outcome: "status_not_current", ...base, link, answer };
+  if (link !== "current") return { outcome: "status_not_current", ...base, link, answer, sighting: notCurrentSighting(input, answer, link, ledger) };
   if (!isTime(input.now)) return reject("input_malformed", "now");
   const backlog = readBacklog(input.backlog, sender);
   if (backlog === null) return reject("input_malformed", "backlog");
@@ -681,7 +781,7 @@ function handleStatus(input: ForwardInput, sender: string, issuedAt: unknown, bo
 
 // 새 답 없이 한 실행기의 밀린 답을 받은 순서대로 다시 넘긴다. 처리는 handleForward의 status_report와 같다(사본마다 그 답이 온
 // 연결을 장부 호출 직전에 links에 묻는다). 입력을 바꾸지 않는다.
-export function replayBacklog(input: BacklogInput, ports: { readonly ledger: Pick<ReceiptLedger, "applyExecutorAnswer"> }): BacklogOutcome {
+export function replayBacklog(input: BacklogInput, ports: { readonly ledger: Pick<ReceiptLedger, "applyExecutorAnswer" | "recordAnswerSightings"> }): BacklogOutcome {
   if (!isRecord(input) || !Array.isArray(input.backlog)) return { outcome: "rejected", reason: "input_malformed", field: "backlog" };
   if (input.backlog.length === 0) return { outcome: "backlog_settled", settled: [], backlog: [] };
   const first: unknown = input.backlog[0];

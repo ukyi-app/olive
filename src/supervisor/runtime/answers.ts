@@ -19,6 +19,8 @@
 //    반영한 뒤 연결 확인이 한 번 실패하면 반영한 연결 번호를 쥐고 다음 처리에서 해제 조건만 다시 본다(인사를 다시 넘기지 않는다).
 //    뜻밖의 예외로 줄의 상태를 모르게 되면 집합을 known: false로 낸다(빈 목록으로 대신하지 않는다).
 // 6. 줄이 쥐는 밀린 사본은 동결한 독립 값이다. 기록기에 넘긴 결과나 backlog()로 내보낸 값을 고쳐도 다시 넘길 내용은 그대로다.
+//    인정이 끝난 연결의 "안다"는 답은 처리기가 관측만 적는다. 적힌 답만 놓고(사본을 쥐지 않고 오염으로 세지 않는다), 적지 못한 답은
+//    상태 보고면 밀린 사본으로 쥐고 인사면 오염으로 남긴다.
 // 7. D-90 닫기 박자의 증거(evidence)는 줄의 한 시점을 데이터 칸만으로 낸다. 줄의 칸(답·retry·밀린 사본·처리 중·맡기지 않음)이나
 //    마지막 반영 인사·오염이 바뀌는 자리마다 그 실행기의 변경 번호를 올리고, 그 일에 외부 코드를 부르지 않는다(answers.md "D-90 증거").
 //    실행기에서 온 입력은 주체를 안 직후, 첫 외부 호출보다 먼저 대기로 세운다. 영수증·보고는 장부 저장이 확인되지 않으면 오염으로 남긴다.
@@ -617,7 +619,9 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
   const takeHello = (executorId: string, line: Line, outcome: HelloAnswerOutcome, full: StoredFull | null, runs: readonly RunStatus[] | null, now: number): void => {
     if (outcome.kind === "applied") appliedFull(executorId, outcome, full, now);
     else if ((outcome.kind === "ledger_unsaved" || outcome.kind === "ledger_failed") && outcome.retry !== null) retryFulls.set(outcome.retry, full);
-    // held는 이 함수에 오지 않는다. 나머지(not_current, refused, retry 없는 input_rejected)는 그 인사를 반영하지 않고 버린 것이다.
+    // 인정이 끝난 연결의 인사라 반영하지 않았지만 그 안다는 항목은 장부의 관측으로 적혔다. 잃은 양성 관측이 없으므로 오염이 아니다.
+    else if (outcome.kind === "not_current" && outcome.sighting.sighting === "saved") changed(executorId);
+    // held는 이 함수에 오지 않는다. 나머지(관측을 적지 못한 not_current, refused, retry 없는 input_rejected)는 그 인사를 버린 것이다.
     else discarded(executorId, runs);
     if (outcome.kind === "ledger_unsaved" || outcome.kind === "ledger_failed") {
       // input_rejected(retry 없음)는 다시 넘겨도 같으므로 버리고 맡기지 않음을 그대로 둔다.
@@ -687,7 +691,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         // 남아 있어 그 안에서 읽은 증거는 대기다.
         const runs = outputRuns(head.output);
         const full = fullOf(head.output, runs, table);
-        const outcome = passHelloAnswer({ output: head.output, table, now }, { ledger: ports.ledger, intake });
+        const outcome = passHelloAnswer({ output: head.output, table, now }, { ledger: ports.ledger, intake, links: ports.wire.answers });
         if (outcome.kind === "held") {
           line.withhold = true;
           changed(executorId);
@@ -732,8 +736,9 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         line.backlog = keepCopies(outcome.backlog);
       } else if (outcome.outcome === "status_not_current") {
         markRequery(outcome.answer.runs);
-        // "안다"는 항목이 있으면 버리지 않고 그 실행기의 밀린 목록 끝에 둔다(receipts.md "뒤 조각이 지킬 것").
-        if (outcome.answer.runs.some(isPositive)) line.backlog = Object.freeze([...line.backlog, keepCopy(outcome.answer)]);
+        // 관측만 적는 연산에 적힌 답은 쥐지 않는다(뒤 답을 막지 않는다). 적지 못했거나 앞 사본 때문에 부르지 않은 "안다"는 답은 버리지 않고
+        // 그 실행기의 밀린 목록 끝에 둔다(receipts.md "뒤 조각이 지킬 것"). 차례가 오면 밀린 사본 다시 넘기기가 다시 적어 본다.
+        if (outcome.answer.runs.some(isPositive) && outcome.sighting.sighting !== "saved") line.backlog = Object.freeze([...line.backlog, keepCopy(outcome.answer)]);
       }
       // 대조한 답(matched·not_current)은 양성이면 반영됐거나 밀린 목록에 남는다. 그 밖의 결과(맞지 않음·꼴 거절)는 답을 버린 것이다.
       if (matched) changed(executorId);

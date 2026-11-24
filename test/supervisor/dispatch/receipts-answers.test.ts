@@ -59,9 +59,11 @@ function input(v: Verified, pending: SentQuery[], extra: Partial<ForwardInput> =
   return { forward: { verified: v, connection: 7 }, now: NOW + 500_000, stopGeneration: 0, pendingQueries: pending, links: current, backlog: [], ...extra };
 }
 
-// applyExecutorAnswer만 받는 장부. 넘긴 값을 적고 정한 답을 돌려준다. 영수증·보고 연산은 부르면 실패한다.
-function answerSpy(answers: unknown[] = []) {
+// applyExecutorAnswer·recordAnswerSightings만 받는 장부. 넘긴 값을 적고 정한 답을 돌려준다(관측만 적기는 sightAnswers가 비면 성공).
+// 영수증·보고 연산은 부르면 실패한다.
+function answerSpy(answers: unknown[] = [], sightAnswers: unknown[] = []) {
   const calls: { input: ExecutorAnswerInput; from: { sender: string } }[] = [];
+  const sights: { input: ExecutorAnswerInput; from: { sender: string } }[] = [];
   const ledger: ReceiptLedger = {
     applyReceipt: () => {
       throw new Error("applyReceipt를 부르면 안 된다");
@@ -75,8 +77,14 @@ function answerSpy(answers: unknown[] = []) {
       if (next instanceof Error) throw next;
       return next as ReturnType<Ledger["applyExecutorAnswer"]>;
     },
+    recordAnswerSightings(input, from) {
+      sights.push({ input: structuredClone(input), from: { ...from } });
+      const next = sightAnswers.length > 0 ? sightAnswers.shift() : { ok: true };
+      if (next instanceof Error) throw next;
+      return next as ReturnType<Ledger["recordAnswerSightings"]>;
+    },
   };
-  return { ledger, calls };
+  return { ledger, calls, sights };
 }
 
 function matched(outcome: ReceiptOutcome) {
@@ -84,13 +92,15 @@ function matched(outcome: ReceiptOutcome) {
   return outcome;
 }
 
-// 실제 장부(임시 파일)에 작업자 실행 하나를 preparing까지 올린다. 시작 지시의 발행 시각은 NOW, 세대 1. commit을 실패시킬 수 있다.
+// 실제 장부(임시 파일)에 작업자 실행 하나를 preparing까지 올린다. 시작 지시의 발행 시각은 NOW, 세대 1. commit을 실패시킬 수 있다
+// (failCommit은 applyExecutorAnswer, failSighting은 recordAnswerSightings의 commit).
 function realLedger() {
-  const fault = { failCommit: false };
+  const fault = { failCommit: false, failSighting: false };
   const ledger = open(tempPath(), {
     faults: {
       at(point) {
         if (fault.failCommit && point === "executor_answer:before_commit") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
+        if (fault.failSighting && point === "answer_sighting:before_commit") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
       },
     },
   });
@@ -104,6 +114,7 @@ function realLedger() {
 }
 
 // 실제 장부를 감싸 applyExecutorAnswer에 넘긴 runs의 상태만 순서대로 적는다. after는 장부의 답을 본 뒤 부른다.
+// 관측만 적는 연산은 "sighting:" 머리를 붙여 같은 차례에 적는다.
 function recordingLedger(ledger: Ledger, order: string[], after: (answer: ReturnType<Ledger["applyExecutorAnswer"]>) => void = () => {}): ReceiptLedger {
   return {
     applyReceipt: (i, f) => ledger.applyReceipt(i, f),
@@ -113,6 +124,10 @@ function recordingLedger(ledger: Ledger, order: string[], after: (answer: Return
       const answer = ledger.applyExecutorAnswer(i, f);
       after(answer);
       return answer;
+    },
+    recordAnswerSightings(i, f) {
+      order.push(`sighting:${i.runs.map((r) => r.state).join(",")}`);
+      return ledger.recordAnswerSightings(i, f);
     },
   };
 }
@@ -179,7 +194,7 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
     expect(state(runId)).toBe("preparing");
   });
 
-  test("답이 온 연결이 지금 인정된 연결이 아니거나 그것을 모르면 장부에 넘기지 않는다(옛 연결의 답)", async () => {
+  test("답이 온 연결이 지금 인정된 연결이 아니면 applyExecutorAnswer에 넘기지 않고 부르기 직전에 연결을 다시 본 뒤 관측만 적는다. 연결을 모르면 아무것도 적지 않는다(옛 연결의 답)", async () => {
     const runId = id();
     const pending = query([runId]);
     const runs = [status(runId, "finalized")];
@@ -194,8 +209,14 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
         return false;
       },
     };
-    expect(handleForward(input(v, [pending], { links: stale }), { ledger: spy.ledger, random })).toEqual({ ...base, link: "not_current" });
-    expect(asked).toEqual([[7, WORKER_EXECUTOR]]);
+    expect(handleForward(input(v, [pending], { links: stale }), { ledger: spy.ledger, random })).toEqual({ ...base, link: "not_current", sighting: { sighting: "saved" } });
+    // 갈래를 고를 때 한 번, 관측만 적는 연산을 부르기 직전에 한 번.
+    expect(asked).toEqual([
+      [7, WORKER_EXECUTOR],
+      [7, WORKER_EXECUTOR],
+    ]);
+    // 검증된 봉투의 값 그대로(coverage partial, 서명 시각), now는 장부 시계.
+    expect(spy.sights).toEqual([{ input: { coverage: "partial", runs, answeredAt: NOW + 40_000, now: NOW + 500_000 }, from: { sender: WORKER_EXECUTOR } }]);
     const unknowns: unknown[] = [
       {
         current: () => {
@@ -205,7 +226,10 @@ describe("보장 1: 대조된 답만, 검증된 봉투의 값으로 넘긴다", 
       { current: () => "yes" },
       undefined,
     ];
-    for (const links of unknowns) expect(handleForward(input(v, [pending], { links: links as AnswerLinks }), { ledger: spy.ledger, random })).toEqual({ ...base, link: "unknown" });
+    for (const links of unknowns) {
+      expect(handleForward(input(v, [pending], { links: links as AnswerLinks }), { ledger: spy.ledger, random })).toEqual({ ...base, link: "unknown", sighting: { sighting: "skipped", why: "link_unknown" } });
+    }
+    expect(spy.sights).toHaveLength(1);
     const noConnection = { ...input(v, [pending]), forward: { verified: v } } as unknown as ForwardInput;
     expect(handleForward(noConnection, { ledger: spy.ledger, random })).toEqual({ outcome: "rejected", reason: "input_malformed", field: "forward.connection" });
     expect(spy.calls).toEqual([]);
@@ -380,6 +404,29 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
     expect(spy.calls).toHaveLength(2);
   });
 
+  test("닫힌 연결의 밀린 사본은 관측 쓰기가 던지거나 답의 꼴이 틀리면(ledger_failed) 놓지 않고 그대로 돌려준다", () => {
+    const runId = id();
+    const a: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 };
+    const b: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "stopping")], answeredAt: NOW + 20 };
+    const closed: AnswerLinks = { current: () => false };
+    for (const [answer, failure] of [
+      [new Error("disk"), "threw"],
+      [{ ok: "yes" }, "malformed_answer"],
+    ] as const) {
+      const spy = answerSpy([], [answer]);
+      const outcome = replayBacklog({ backlog: [a, b], now: NOW + 700_000, links: closed }, { ledger: spy.ledger });
+      expect(outcome).toEqual({
+        outcome: "backlog_settled",
+        settled: [
+          { settled: "not_current", answer: a, link: "not_current", sighting: { sighting: "ledger_failed", failure } },
+          { settled: "held", answer: b },
+        ],
+        backlog: [a, b],
+      });
+      expect([spy.calls, spy.sights.length]).toEqual([[], 1]);
+    }
+  });
+
   test("밀린 '안다'는 답 → 새 '모른다'는 답의 순서로 실제 장부에 닿고, 관측이 남는다", async () => {
     const { ledger, fault, generation, state, runId } = realLedger();
     const order: string[] = [];
@@ -390,6 +437,9 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
       applyExecutorAnswer(i, f) {
         order.push(i.runs.map((r) => r.state).join(","));
         return ledger.applyExecutorAnswer(i, f);
+      },
+      recordAnswerSightings: () => {
+        throw new Error("인정된 연결의 답이 관측만 적는 연산을 불렀다");
       },
     };
     const first = query([runId]);
@@ -428,7 +478,7 @@ describe("보장 3: 저장에 실패한 답은 같은 값으로 먼저 다시 �
 describe("밀린 답도 장부 호출마다 그 직전에 연결을 본다", () => {
   const linksOf = (open: Set<number>): AnswerLinks => ({ current: (connection, executorId) => open.has(connection) && executorId === WORKER_EXECUTOR });
 
-  test("닫힌 연결의 밀린 답을 다시 넘기면 장부를 부르지 않고 사본을 그대로 남긴다(실제 장부)", async () => {
+  test("닫힌 연결의 밀린 답을 다시 넘기면 applyExecutorAnswer를 부르지 않고 관측만 적는다: 적지 못하거나 연결을 모르면 사본을 그대로 남기고, 적히면 사본을 놓는다(실제 장부)", async () => {
     const { ledger, fault, generation, state, runId } = realLedger();
     const order: string[] = [];
     const recording = recordingLedger(ledger, order);
@@ -440,21 +490,37 @@ describe("밀린 답도 장부 호출마다 그 직전에 연결을 본다", () 
     expect(failed.settled.map((s) => s.settled)).toEqual(["unsaved"]);
     expect(failed.backlog.map((b) => b.connection)).toEqual([7]);
     open.delete(7);
-    const replayed = replayBacklog({ backlog: failed.backlog, now: NOW + 600_000, links: linksOf(open) }, { ledger: recording });
-    expect(replayed).toEqual({ outcome: "backlog_settled", settled: [{ settled: "not_current", answer: failed.backlog[0], link: "not_current" }], backlog: failed.backlog });
-    // 연결 포트가 던져도(모름) 같다.
+    // 관측 쓰기가 실패하면 사본을 그대로 남긴다(관측은 0행이다).
+    fault.failSighting = true;
+    const unsaved = replayBacklog({ backlog: failed.backlog, now: NOW + 600_000, links: linksOf(open) }, { ledger: recording });
+    fault.failSighting = false;
+    const lost = { runId, runGeneration: 1 };
+    expect(unsaved).toEqual({
+      outcome: "backlog_settled",
+      settled: [{ settled: "not_current", answer: failed.backlog[0], link: "not_current", sighting: { sighting: "unsaved", reason: "ledger_unwritable", unsavedSightings: [lost] } }],
+      backlog: failed.backlog,
+    });
+    expect(ledger.hasRunSighting(runId)).toEqual({ known: true, value: false });
+    // 연결 포트가 던져도(모름) 같다. 관측만 적는 연산도 부르지 않는다.
     const throwing: AnswerLinks = {
       current: () => {
         throw new Error("연결 표를 읽지 못함");
       },
     };
     const unknown = replayBacklog({ backlog: failed.backlog, now: NOW + 600_000, links: throwing }, { ledger: recording });
-    expect(unknown.outcome === "backlog_settled" && [unknown.settled.map((s) => s.settled === "not_current" && s.link), unknown.backlog]).toEqual([["unknown"], failed.backlog]);
-    expect(order).toEqual(["finalized"]);
+    expect(unknown.outcome === "backlog_settled" && [unknown.settled.map((s) => s.settled === "not_current" && [s.link, s.sighting]), unknown.backlog]).toEqual([
+      [["unknown", { sighting: "skipped", why: "link_unknown" }]],
+      failed.backlog,
+    ]);
+    // 적히면 사본을 놓는다. 상태·임대는 그대로다.
+    const saved = replayBacklog({ backlog: failed.backlog, now: NOW + 600_001, links: linksOf(open) }, { ledger: recording });
+    expect(saved).toEqual({ outcome: "backlog_settled", settled: [{ settled: "not_current", answer: failed.backlog[0], link: "not_current", sighting: { sighting: "saved" } }], backlog: [] });
+    expect(order).toEqual(["finalized", "sighting:finalized", "sighting:finalized"]);
+    expect(ledger.hasRunSighting(runId)).toEqual({ known: true, value: true });
     expect(state(runId)).toBe("preparing");
   });
 
-  test("앞선 장부 쓰기의 실패로 연결의 인정이 끝나면 같은 루프의 뒤 답은 장부에 닿지 않고 사본이 남는다(실제 장부)", async () => {
+  test("앞선 장부 쓰기의 실패로 연결의 인정이 끝나면 같은 루프의 뒤 답은 applyExecutorAnswer에 닿지 않고 관측만 적혀 사본이 남지 않는다(실제 장부)", async () => {
     const { ledger, fault, generation, state, runId } = realLedger();
     const order: string[] = [];
     const open = new Set([7]);
@@ -470,6 +536,7 @@ describe("밀린 답도 장부 호출마다 그 직전에 연결을 본다", () 
             fault.failCommit = false;
           }
         },
+        recordAnswerSightings: (i: ExecutorAnswerInput, f: { sender: string }) => ledger.recordAnswerSightings(i, f),
       } as unknown as Ledger,
       order,
       (answer) => {
@@ -484,11 +551,134 @@ describe("밀린 답도 장부 호출마다 그 직전에 연결을 본다", () 
     const ended = [status(runId, "finalized")];
     const outcome = matched(handleForward(input(await report(WORKER_EXECUTOR, pending.requestId, ended, NOW + MAX + 10, generation), [pending], { backlog, links: linksOf(open) }), { ledger: recording, random }));
     const last: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: ended, answeredAt: NOW + MAX + 10 };
-    expect(order).toEqual(["running", "not_known"]);
+    expect(order).toEqual(["running", "not_known", "sighting:finalized"]);
     expect(outcome.settled.map((s) => s.settled)).toEqual(["applied", "unsaved", "not_current"]);
-    expect(outcome.backlog).toEqual([last]);
+    expect(outcome.settled[2]).toEqual({ settled: "not_current", answer: last, link: "not_current", sighting: { sighting: "saved" } });
+    expect(outcome.backlog).toEqual([]);
     expect(state(runId)).toBe("preparing");
     expect(ledger.hasRunSighting(runId)).toEqual({ known: true, value: true });
+  });
+});
+
+describe("인정이 끝난 연결의 답: 관측만 적기(recordSighting)", () => {
+  const stale: AnswerLinks = { current: () => false };
+
+  test("앞 밀린 사본이 남아 있으면 이 답은 부르지 않고(backlog_first) 부르는 쪽이 목록 끝에 둔다. 안다는 항목이 없으면 부르지 않는다", async () => {
+    const runId = id();
+    const pending = query([runId]);
+    const spy = answerSpy();
+    const earlier: ExecutorAnswerCopy = { sender: WORKER_EXECUTOR, connection: 7, coverage: "partial", runs: [status(runId, "running")], answeredAt: NOW + 10 };
+    const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "stopping")], NOW + 20);
+    expect(handleForward(input(v, [pending], { links: stale, backlog: [earlier] }), { ledger: spy.ledger, random })).toMatchObject({
+      outcome: "status_not_current",
+      sighting: { sighting: "skipped", why: "backlog_first" },
+    });
+    const unknownBacklog = { ...input(v, [pending], { links: stale }), backlog: "x" } as unknown as ForwardInput;
+    expect(handleForward(unknownBacklog, { ledger: spy.ledger, random })).toMatchObject({ sighting: { sighting: "skipped", why: "backlog_first" } });
+    const quiet = query([runId]);
+    const none = await report(WORKER_EXECUTOR, quiet.requestId, [status(runId, "not_known")], NOW + 30);
+    expect(handleForward(input(none, [quiet], { links: stale }), { ledger: spy.ledger, random })).toMatchObject({ sighting: { sighting: "skipped", why: "no_positive" } });
+    expect([spy.calls, spy.sights]).toEqual([[], []]);
+  });
+
+  test("연산을 얻고 연결을 본 뒤 그 사이 외부 코드 없이 부른다. 부르기 직전의 연결이 인정된 연결이면(그 답은 applyExecutorAnswer의 몫) 부르지 않는다", async () => {
+    const runId = id();
+    const pending = query([runId]);
+    const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "running")], NOW + 40);
+    const log: string[] = [];
+    const answers: boolean[] = [];
+    const links: AnswerLinks = {
+      current() {
+        log.push("link");
+        return answers.shift() ?? false;
+      },
+    };
+    const ledger = {
+      ...answerSpy().ledger,
+      get recordAnswerSightings() {
+        log.push("get");
+        return () => {
+          log.push("call");
+          return { ok: true };
+        };
+      },
+    } as ReceiptLedger;
+    expect(handleForward(input(v, [pending], { links }), { ledger, random })).toMatchObject({ sighting: { sighting: "saved" } });
+    expect(log).toEqual(["link", "get", "link", "call"]);
+    // 갈래를 고를 때는 인정되지 않았는데 부르기 직전에는 인정된 연결이다.
+    log.length = 0;
+    answers.push(false, true);
+    expect(handleForward(input(v, [pending], { links }), { ledger, random })).toMatchObject({ sighting: { sighting: "skipped", why: "link_current" } });
+    expect(log).toEqual(["link", "get", "link"]);
+  });
+
+  test("장부가 던지거나 답의 꼴이 틀리면 ledger_failed, 거절이면 unsaved 그대로이고 사유 밖의 값·원문을 싣지 않는다", async () => {
+    const runId = id();
+    const v = (q: SentQuery) => report(WORKER_EXECUTOR, q.requestId, [status(runId, "running")], NOW + 50);
+    const cases: [unknown, unknown][] = [
+      [new Error("DIAGNOSTIC_CANARY"), { sighting: "ledger_failed", failure: "threw" }],
+      [null, { sighting: "ledger_failed", failure: "malformed_answer" }],
+      [{ ok: "yes" }, { sighting: "ledger_failed", failure: "malformed_answer" }],
+      [{ ok: false, reason: "made_up", unsavedSightings: [] }, { sighting: "ledger_failed", failure: "malformed_answer" }],
+      [{ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId: 7, runGeneration: 1 }] }, { sighting: "ledger_failed", failure: "malformed_answer" }],
+      [
+        {
+          get ok(): never {
+            throw new Error("DIAGNOSTIC_CANARY");
+          },
+        },
+        { sighting: "ledger_failed", failure: "malformed_answer" },
+      ],
+      [{ ok: false, reason: "ledger_unwritable", unsavedSightings: [{ runId, runGeneration: 1 }] }, { sighting: "unsaved", reason: "ledger_unwritable", unsavedSightings: [{ runId, runGeneration: 1 }] }],
+    ];
+    for (const [answer, sighting] of cases) {
+      const pending = query([runId]);
+      const spy = answerSpy([], [answer]);
+      const outcome = handleForward(input(await v(pending), [pending], { links: stale }), { ledger: spy.ledger, random });
+      expect(outcome, JSON.stringify(sighting)).toMatchObject({ outcome: "status_not_current", sighting });
+      expect(JSON.stringify(outcome)).not.toContain("DIAGNOSTIC_CANARY");
+      expect(spy.calls).toEqual([]);
+    }
+  });
+
+  test("연산을 장부에 묶다 던져도(bind 접근자) 예외 없이 ledger_failed·threw이고 연결 확인·호출은 0회다", async () => {
+    const runId = id();
+    const pending = query([runId]);
+    const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "running")], NOW + 55);
+    const spy = answerSpy();
+    let invoked = 0;
+    const record = () => {
+      invoked += 1;
+      return { ok: true };
+    };
+    Object.defineProperty(record, "bind", {
+      get(): never {
+        throw new Error("DIAGNOSTIC_CANARY");
+      },
+    });
+    const ledger = { ...spy.ledger, recordAnswerSightings: record } as unknown as ReceiptLedger;
+    let checks = 0;
+    const links: AnswerLinks = {
+      current: () => {
+        checks += 1;
+        return false;
+      },
+    };
+    const outcome = handleForward(input(v, [pending], { links }), { ledger, random });
+    expect(outcome).toMatchObject({ outcome: "status_not_current", sighting: { sighting: "ledger_failed", failure: "threw" } });
+    expect(JSON.stringify(outcome)).not.toContain("DIAGNOSTIC_CANARY");
+    // 갈래를 고를 때의 확인 1회뿐이다: 묶기에서 멈추므로 부르기 직전 확인과 호출에 닿지 않는다.
+    expect([checks, invoked, spy.calls]).toEqual([1, 0, []]);
+  });
+
+  test("대조되지 않은 답(인정 안 된 연결·다른 연결에 낸 조회)은 관측도 적지 않는다", async () => {
+    const runId = id();
+    const pending = query([runId], WORKER_EXECUTOR, 3);
+    const v = await report(WORKER_EXECUTOR, pending.requestId, [status(runId, "running")], NOW + 60);
+    const spy = answerSpy();
+    expect(handleForward(input(v, [pending], { links: stale }), { ledger: spy.ledger, random })).toEqual({ outcome: "status_unmatched", reason: "other_connection" });
+    expect(handleForward(input(v, [], { links: stale }), { ledger: spy.ledger, random })).toEqual({ outcome: "status_unmatched", reason: "unknown_query" });
+    expect([spy.calls, spy.sights]).toEqual([[], []]);
   });
 });
 

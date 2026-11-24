@@ -69,7 +69,7 @@ function events<T>() {
   };
 }
 
-test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 실제 장부에 적히고, 조회는 연결과 함께 등록·철회되며, 바뀐 연결 뒤에는 옛 연결의 답이 적히지 않는다", async () => {
+test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 실제 장부에 적히고, 조회는 연결과 함께 등록·철회되며, 바뀐 연결 뒤에는 옛 연결의 답이 관측으로만 적히고 새 연결의 인사를 막지 않는다", async () => {
   // 두 상태 보고의 issued_at을 가르려고 한 번 1ms 옮긴다(서버·장부·실행기가 같은 값을 읽는다).
   let now = Date.now();
   const t0 = now;
@@ -106,6 +106,8 @@ test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 
   // 호출 차례는 저장 실패한 호출도 센다. 장부가 행으로 남기는 것은 성공한 쓰기 중 처음 본 양성 관측뿐이다.
   const order: string[] = [];
   const results: string[] = [];
+  // 관측만 적는 연산의 호출(인정이 끝난 연결의 답)과 그 결과. applyExecutorAnswer의 차례(order)와 따로 적는다.
+  const sights: string[] = [];
   const ledger: ReceiptLedger = {
     applyReceipt: (i, f) => real.applyReceipt(i, f),
     recordReport: (i, f) => real.recordReport(i, f),
@@ -113,6 +115,11 @@ test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 
       order.push(`${i.coverage}:${i.runs.map((r) => r.state).join(",")}@${i.answeredAt}`);
       const result = real.applyExecutorAnswer(i, f);
       results.push(result.ok ? "ok" : result.reason);
+      return result;
+    },
+    recordAnswerSightings(i, f) {
+      const result = real.recordAnswerSightings(i, f);
+      sights.push(`${i.coverage}:${i.runs.map((r) => r.state).join(",")}@${i.answeredAt}:${result.ok ? "ok" : result.reason}`);
       return result;
     },
   };
@@ -241,7 +248,7 @@ test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 
   expect(queries.pending().map((q) => q.connection)).toEqual([c1]);
 
   // 3. 복원 관측 대기 중에 첫 연결의 답이 줄에 들어오고, 같은 실행기가 새 연결로 맞추고 인사한다.
-  //    줄이 풀리면 옛 연결의 답은 지금 연결의 답으로 적히지 않고(장부 호출 0) 안다는 사본으로 밀린 목록에 남는다.
+  //    줄이 풀리면 옛 연결의 답은 지금 연결의 답으로 적히지 않고(applyExecutorAnswer 0회) 관측만 적힌 뒤 놓인다. 그 뒤 새 연결의 인사가 반영된다.
   gate.settled = false;
   const q4 = await ask();
   const asked4 = await one.frames.next((e) => e.header.action === "status_query" && e.header.request_id === q4);
@@ -259,11 +266,13 @@ test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 
   gate.settled = true;
   lines.pump();
   await answered.next((kind) => kind === "status_not_current");
-  // 옛 연결의 답은 장부에 닿지 않았다. 그 안다는 사본이 밀린 목록에 남아 있는 동안 새 연결의 인사도 그 뒤에 줄 서고(receipts.md
-  // "밀린 답"), 그 실행기는 맡기지 않을 실행기로 남는다.
-  expect(order.slice(before)).toEqual([]);
-  expect(lines.backlog(R1).map((c) => [c.connection, c.runs[0]?.state])).toEqual([[c1, "running"]]);
-  expect(lines.withheld.executors()).toEqual({ known: true, value: [R1] });
+  // 옛 연결의 답은 applyExecutorAnswer에 닿지 않고 관측만 적혔다(이 실행의 관측은 1에서 이미 있어 새 행은 없다). 사본이 남지 않아
+  // 새 연결의 인사가 막히지 않고 반영되며, 그 실행기는 맡기지 않을 실행기에서 빠진다.
+  await answered.next((kind) => kind === "applied");
+  expect(sights).toEqual([`partial:running@${t0 + 1}:ok`]);
+  expect(order.slice(before)).toEqual([`full:running@${t0 + 1}`]);
+  expect(lines.backlog(R1)).toEqual([]);
+  expect(lines.withheld.executors()).toEqual({ known: true, value: [] });
   expect(queries.pending()).toEqual([]);
   expect(real.getRun(RUN)).toMatchObject({ known: true, value: { state: "preparing" } });
 });

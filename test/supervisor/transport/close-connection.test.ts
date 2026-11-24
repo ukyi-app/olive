@@ -411,6 +411,7 @@ test("루프백: 닫은 연결의 철회가 답 줄·조회 등록부·자격 �
     applyReceipt: (i, f) => real.applyReceipt(i, f),
     recordReport: (i, f) => real.recordReport(i, f),
     applyExecutorAnswer: (i, f) => real.applyExecutorAnswer(i, f),
+    recordAnswerSightings: (i, f) => real.recordAnswerSightings(i, f),
   };
 
   const published = { stopGeneration: () => 0, intakeOpen: () => true };

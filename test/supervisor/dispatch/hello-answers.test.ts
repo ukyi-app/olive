@@ -6,6 +6,7 @@ import { generateKeyPairSync, type KeyObject } from "node:crypto";
 import { type Envelope, limits, type NonceStore, rawPublicKey, type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
 import { type HelloAnswerLedger, type HelloAnswerOutcome, type HelloConnectionTable, type HelloRetry, passHelloAnswer, retryHelloAnswer } from "../../../src/supervisor/dispatch/hello-answers.ts";
+import type { AnswerLinks, SightingOutcome } from "../../../src/supervisor/dispatch/receipts.ts";
 import { Connections, type Output, type ReplyTools } from "../../../src/supervisor/transport/connections.ts";
 import { type ExecutorPeer, type RegistrySettings, RegistryState } from "../../../src/supervisor/transport/registry.ts";
 import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
@@ -83,6 +84,19 @@ class World {
     return step.outputs;
   }
 
+  // 서버의 recognized와 같은 판정: 지금 복원기로 인사까지 끝난 그 주체의 연결이 하나이고 그 번호일 때만 참이다. 부를 때마다 지금 표를 읽는다.
+  links(): AnswerLinks {
+    return {
+      current: (connection, executorId) => {
+        const ids = this.table
+          .candidates(this.stop)
+          .map((candidate) => candidate.connection)
+          .filter((id) => this.table.get(id)?.sync?.principal === executorId);
+        return ids.length === 1 && ids[0] === connection;
+      },
+    };
+  }
+
   // 맞춤 → 답 싣기 → hello. signedAt은 실행기 시계의 서명 시각, at은 감독이 받은 시각이다. hello의 full 출력을 돌려준다.
   async greet(keys: Keys, principal: string, runs: RunStatus[], signedAt: number, at: number): Promise<{ conn: number; output: Output }> {
     const opened = this.table.open(PEER, at);
@@ -97,17 +111,25 @@ class World {
   }
 }
 
-// 장부 호출을 그대로 기록하고 실제 장부에 넘긴다.
+// 장부 호출을 그대로 기록하고 실제 장부에 넘긴다. calls는 applyExecutorAnswer, sights는 recordAnswerSightings의 호출이다.
 function spy(ledger: HelloAnswerLedger) {
   const calls: unknown[][] = [];
+  const sights: unknown[][] = [];
   const port: HelloAnswerLedger = {
     applyExecutorAnswer(input, from) {
       calls.push([structuredClone(input), structuredClone(from)]);
       return ledger.applyExecutorAnswer(input, from);
     },
+    recordAnswerSightings(input, from) {
+      sights.push([structuredClone(input), structuredClone(from)]);
+      return ledger.recordAnswerSightings(input, from);
+    },
   };
-  return { calls, port };
+  return { calls, sights, port };
 }
+
+// 빈 목록·not_known만 실은 인사는 붙들 관측이 없어 관측만 적는 연산도 부르지 않는다.
+const NO_POSITIVE: SightingOutcome = { sighting: "skipped", why: "no_positive" };
 
 function status(runId: string, state: RunStatus["state"], lastReceiptId: string | null = null): RunStatus {
   return state === "not_known" ? { run_id: runId, state, run_generation: null, last_receipt_id: null } : { run_id: runId, state, run_generation: 1, last_receipt_id: lastReceiptId };
@@ -152,7 +174,7 @@ describe("보장 1: 전체 답은 검증된 인사에서만, 서명 시각과 �
     const runs = [status(live.runId, "running")];
     const { conn, output } = await w.greet(K0, WORKER_EXECUTOR, runs, SIGNED, RECEIVED);
     const { calls, port } = spy(ledger);
-    const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop });
+    const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() });
     expect(outcome).toEqual({ kind: "applied", executorId: WORKER_EXECUTOR, connection: conn, answeredAt: SIGNED, moved: [], deferred: [], outsideLedger: [] });
     expect(calls).toEqual([[{ coverage: "full", runs, answeredAt: SIGNED, now: LATER }, { sender: WORKER_EXECUTOR }]]);
     ledger.close();
@@ -168,7 +190,7 @@ describe("보장 1: 전체 답은 검증된 인사에서만, 서명 시각과 �
     const report = await w.receive(conn, envelope(K0, WORKER_EXECUTOR, "status_report", 0, SIGNED + 100, { in_reply_to: uuid(), runs }), RECEIVED + 100);
     const partial = report.find((o) => o.kind === "occupancy")!;
     const { calls, port } = spy(ledger);
-    const ports = { ledger: port, intake: w.stop };
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
     expect(passHelloAnswer({ output: partial, table: w.table, now: LATER }, ports)).toEqual({ kind: "refused", why: "partial" });
     // 인사와 같은 실행 목록에 인사의 서명 시각까지 붙인 partial도 같다.
     expect(passHelloAnswer({ output: { ...partial, issuedAt: SIGNED }, table: w.table, now: LATER }, ports)).toEqual({ kind: "refused", why: "partial" });
@@ -183,7 +205,7 @@ describe("보장 1: 전체 답은 검증된 인사에서만, 서명 시각과 �
     const { output } = await w.greet(K0, WORKER_EXECUTOR, [], SIGNED, RECEIVED);
     const { issuedAt: _, ...unsigned } = output as Extract<Output, { kind: "occupancy" }>;
     const { calls, port } = spy(ledger);
-    const ports = { ledger: port, intake: w.stop };
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
     for (const bad of [unsigned, { ...unsigned, issuedAt: null }, { ...unsigned, issuedAt: -1 }, { ...unsigned, issuedAt: "1" }, { ...unsigned, issuedAt: SIGNED + 0.5 }]) {
       expect(passHelloAnswer({ output: bad, table: w.table, now: LATER }, ports), JSON.stringify(bad)).toEqual({ kind: "refused", why: "signed_time_missing" });
     }
@@ -203,13 +225,13 @@ describe("보장 2: 지금의 인정된 인사만", () => {
     const second = await w.greet(K0, WORKER_EXECUTOR, [], SIGNED + 10, RECEIVED + 10);
     expect(w.table.get(first.conn)!.closed).toBe("superseded");
     const { calls, port } = spy(ledger);
-    const ports = { ledger: port, intake: w.stop };
-    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER }, ports)).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: first.conn, why: "not_greeted" });
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
+    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER }, ports)).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: first.conn, why: "not_greeted", sighting: NO_POSITIVE });
     expect(calls).toEqual([]);
     expect(passHelloAnswer({ output: second.output, table: w.table, now: LATER }, ports).kind).toBe("applied");
     // 닫혀 지운 연결.
     w.step({ kind: "closed", connection: second.conn }, LATER);
-    expect(passHelloAnswer({ output: second.output, table: w.table, now: LATER }, ports)).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: second.conn, why: "no_connection" });
+    expect(passHelloAnswer({ output: second.output, table: w.table, now: LATER }, ports)).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: second.conn, why: "no_connection", sighting: NO_POSITIVE });
     expect(calls).toHaveLength(1);
   });
 
@@ -218,11 +240,11 @@ describe("보장 2: 지금의 인정된 인사만", () => {
     const w = new World(ledger);
     const { conn, output } = await w.greet(K0, WORKER_EXECUTOR, [], SIGNED, RECEIVED);
     const { calls, port } = spy(ledger);
-    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: intake() })).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: conn, why: "other_restore" });
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: intake(), links: w.links() })).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: conn, why: "other_restore", sighting: NO_POSITIVE });
     w.stop.generation = null;
-    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop })).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: conn, why: "other_restore" });
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() })).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: conn, why: "other_restore", sighting: NO_POSITIVE });
     w.stop.generation = 1;
-    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop })).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: conn, why: "stop_generation_changed" });
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() })).toEqual({ kind: "not_current", executorId: WORKER_EXECUTOR, connection: conn, why: "stop_generation_changed", sighting: NO_POSITIVE });
     expect(calls).toEqual([]);
   });
 
@@ -234,7 +256,7 @@ describe("보장 2: 지금의 인정된 인사만", () => {
     const theirs = await w.greet(K1, OTHER, [], SIGNED + 1, RECEIVED + 1);
     const full = mine.output as Extract<Output, { kind: "occupancy" }>;
     const { calls, port } = spy(ledger);
-    const ports = { ledger: port, intake: w.stop };
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
     const cases: [unknown, string][] = [
       [{ ...full, answer: { ...full.answer, executorId: OTHER } }, "other_principal"],
       [{ ...full, answer: { ...full.answer, executorId: SESSION_EXECUTOR } }, "other_principal"],
@@ -254,11 +276,11 @@ describe("보장 2: 지금의 인정된 인사만", () => {
     const w = new World(ledger, intake(false));
     const { conn, output } = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "finalized", id())], SIGNED, RECEIVED);
     const { calls, port } = spy(ledger);
-    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop })).toEqual({ kind: "held", executorId: WORKER_EXECUTOR, connection: conn, withhold: WORKER_EXECUTOR });
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() })).toEqual({ kind: "held", executorId: WORKER_EXECUTOR, connection: conn, withhold: WORKER_EXECUTOR });
     expect(calls).toEqual([]);
     expect(runState(ledger, live.runId)).toBe("running");
     w.stop.open = true;
-    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop }).kind).toBe("applied");
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() }).kind).toBe("applied");
     expect(runState(ledger, live.runId)).toBe("unknown_running");
   });
 
@@ -270,7 +292,7 @@ describe("보장 2: 지금의 인정된 인사만", () => {
     const greeted = { phase: "greeted", sync: { principal: "supervisor", generation: 0 }, greeting: { issued_at: SIGNED, runs } };
     const table = { get: () => greeted, candidates: () => [{ connection: 9 }] } as unknown as HelloConnectionTable;
     const output = { kind: "occupancy", connection: 9, answer: { executorId: "supervisor", coverage: "full", runs }, issuedAt: SIGNED };
-    const outcome = passHelloAnswer({ output, table, now: LATER }, { ledger, intake: source });
+    const outcome = passHelloAnswer({ output, table, now: LATER }, { ledger, intake: source, links: { current: () => true } });
     expect(outcome).toMatchObject({ kind: "ledger_failed", executorId: "supervisor", connection: 9, failure: "input_rejected", retry: null, withhold: "supervisor" });
     expect((outcome as { message: string }).message).toContain("실행을 맡을 수 있는 실행기 주체가 아니다");
     expectNoRetry(outcome);
@@ -289,7 +311,7 @@ describe("보장 3: 장부의 답을 구별해 돌려주고, 실패한 답은 �
       outsideLedger: [{ runId: id(), runGeneration: 3 }],
     };
     const fake = { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger;
-    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: fake, intake: w.stop })).toEqual({
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: fake, intake: w.stop, links: w.links() })).toEqual({
       kind: "applied",
       executorId: WORKER_EXECUTOR,
       connection: conn,
@@ -314,7 +336,7 @@ describe("보장 3: 장부의 답을 구별해 돌려주고, 실패한 답은 �
     const w = new World(ledger);
     const runs = [status(live.runId, "failed_stopped", id())];
     const { conn, output } = await w.greet(K0, WORKER_EXECUTOR, runs, SIGNED, RECEIVED);
-    const failed = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger, intake: w.stop });
+    const failed = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger, intake: w.stop, links: w.links() });
     expect(failed).toMatchObject({
       kind: "ledger_unsaved",
       executorId: WORKER_EXECUTOR,
@@ -363,12 +385,12 @@ describe("보장 3: 장부의 답을 구별해 돌려주고, 실패한 답은 �
         throw new Error("boom");
       },
     } as unknown as HelloAnswerLedger;
-    const thrown = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop });
+    const thrown = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop, links: w.links() });
     expect(thrown).toMatchObject({ kind: "ledger_failed", failure: "threw", message: null, withhold: WORKER_EXECUTOR });
     expect((thrown as { retry: HelloRetry | null }).retry).not.toBeNull();
     for (const answer of [null, { ok: true }, { ok: false, reason: "made_up", unsavedSightings: [] }, { ok: false, reason: "ledger_unwritable" }]) {
       const odd = { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger;
-      expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: odd, intake: w.stop }), JSON.stringify(answer)).toMatchObject({ kind: "ledger_failed", failure: "malformed_answer", withhold: WORKER_EXECUTOR });
+      expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: odd, intake: w.stop, links: w.links() }), JSON.stringify(answer)).toMatchObject({ kind: "ledger_failed", failure: "malformed_answer", withhold: WORKER_EXECUTOR });
     }
     // 다시 넘긴 값도 성공하면 applied다.
     expect(retryHelloAnswer((thrown as { retry: HelloRetry }).retry, LATER, { ledger }).kind).toBe("applied");
@@ -392,13 +414,13 @@ describe("보장 4: 자리를 풀지 않고, 기존 동작은 그대로다", () 
     const live = runningWorker(ledger);
     const w = new World(ledger);
     const first = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "failed_stopped", id())], SIGNED, RECEIVED);
-    const outcome = passHelloAnswer({ output: first.output, table: w.table, now: LATER }, { ledger: onlyAnswer(ledger), intake: w.stop });
+    const outcome = passHelloAnswer({ output: first.output, table: w.table, now: LATER }, { ledger: onlyAnswer(ledger), intake: w.stop, links: w.links() });
     expect(outcome).toMatchObject({ kind: "applied", moved: [{ runId: live.runId, runGeneration: 1, before: "running", after: "unknown_running" }] });
     expect(runState(ledger, live.runId)).toBe("unknown_running");
     const next = must(ledger.admitRun(worker())).run.runId;
     expect(ledger.startRun({ runId: next, requestId: id(), stopGeneration: 0, now: LATER })).toEqual({ ok: false, reason: "slot_busy" });
     const again = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED + 100, RECEIVED + 100);
-    expect(passHelloAnswer({ output: again.output, table: w.table, now: LATER + 1 }, { ledger: onlyAnswer(ledger), intake: w.stop })).toMatchObject({ kind: "applied", moved: [] });
+    expect(passHelloAnswer({ output: again.output, table: w.table, now: LATER + 1 }, { ledger: onlyAnswer(ledger), intake: w.stop, links: w.links() })).toMatchObject({ kind: "applied", moved: [] });
     expect(runState(ledger, live.runId)).toBe("unknown_running");
     expect(runState(ledger, next)).toBe("queued");
     ledger.close();
@@ -417,7 +439,7 @@ describe("보장 4: 자리를 풀지 않고, 기존 동작은 그대로다", () 
     // 실행기 시계로 시작 발행 + RUN_LEASE_MAX_MS 뒤에 서명한 전체 답에도 그 실행이 없다. 이 PR은 그것으로 닫지 않는다(D-90은 뒤 조각).
     const signed = NOW + limits.RUN_LEASE_MAX_MS + 1;
     const { output } = await w.greet(K0, WORKER_EXECUTOR, [status(ghost, "running")], signed, signed);
-    expect(passHelloAnswer({ output, table: w.table, now: signed + 1 }, { ledger: onlyAnswer(ledger), intake: w.stop })).toMatchObject({
+    expect(passHelloAnswer({ output, table: w.table, now: signed + 1 }, { ledger: onlyAnswer(ledger), intake: w.stop, links: w.links() })).toMatchObject({
       kind: "applied",
       answeredAt: signed,
       moved: [],
@@ -441,7 +463,7 @@ describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
     const w = new World(ledger);
     const { output } = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED, RECEIVED);
     const { calls, port } = spy(ledger);
-    const ports = { ledger: port, intake: w.stop };
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
     // 계약의 머리 시각과 장부의 시각은 1 이상이다. 0을 넘기면 장부가 입력을 거절해 재시도 없는 실행기 오류처럼 보인다.
     expect(passHelloAnswer({ output, table: w.table, now: 0 }, ports)).toEqual({ kind: "refused", why: "malformed_now" });
     expect(passHelloAnswer({ output: { ...(output as object), issuedAt: 0 }, table: w.table, now: LATER }, ports)).toEqual({ kind: "refused", why: "signed_time_missing" });
@@ -450,7 +472,7 @@ describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
         throw new Error("boom");
       },
     } as unknown as HelloAnswerLedger;
-    const retry = (passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop }) as { retry: HelloRetry }).retry;
+    const retry = (passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop, links: w.links() }) as { retry: HelloRetry }).retry;
     expect(retryHelloAnswer(retry, 0, { ledger: port })).toEqual({ kind: "refused", why: "malformed_now" });
     expect(calls).toEqual([]);
     expect(runState(ledger, live.runId)).toBe("running");
@@ -478,7 +500,7 @@ describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
     ];
     for (const answer of answers) {
       const odd = { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger;
-      const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: odd, intake: w.stop });
+      const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: odd, intake: w.stop, links: w.links() });
       expect(outcome, String(answers.indexOf(answer))).toMatchObject({ kind: "ledger_failed", failure: "malformed_answer", message: null, withhold: WORKER_EXECUTOR });
       expect((outcome as { retry: HelloRetry | null }).retry).not.toBeNull();
     }
@@ -518,7 +540,7 @@ describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
         unsavedSightings: [[shifting("sighting", { runId: ["s", ""], runGeneration: [4, 0] })], null],
       }),
     };
-    const outcome = (answer: unknown) => passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger, intake: w.stop });
+    const outcome = (answer: unknown) => passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: { applyExecutorAnswer: () => answer } as unknown as HelloAnswerLedger, intake: w.stop, links: w.links() });
     expect(outcome(answers.applied)).toMatchObject({
       kind: "applied",
       moved: [{ runId: "m", runGeneration: 1, before: "running", after: "unknown_running" }],
@@ -540,9 +562,119 @@ describe("경계: 시각 0, 장부 답의 꼴, 포트 오류의 원문", () => {
           throw thrown;
         },
       } as unknown as HelloAnswerLedger;
-      const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop });
+      const outcome = passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: throwing, intake: w.stop, links: w.links() });
       expect(outcome).toMatchObject({ kind: "ledger_failed", failure: "threw", message: null, withhold: WORKER_EXECUTOR });
       expect(JSON.stringify(outcome)).not.toContain("DIAGNOSTIC_CANARY");
     }
+  });
+});
+
+describe("인정이 끝난 연결의 인사: 관측만 적기(recordAnswerSightings)", () => {
+  function faulty() {
+    const fault = { failSighting: false };
+    const path = tempPath();
+    const ledger = ready(
+      open(path, {
+        faults: {
+          at(point) {
+            if (fault.failSighting && point === "answer_sighting:before_commit") throw Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
+          },
+        },
+      }),
+    );
+    return { fault, path, ledger };
+  }
+
+  test("밀려난 연결의 양성 인사는 applyExecutorAnswer 없이 full·서명 시각 그대로 관측만 적고, 같은 인사를 다시 넘겨도 1행이다. 상태·임대는 그대로다", async () => {
+    const { path, ledger } = faulty();
+    const live = runningWorker(ledger);
+    const w = new World(ledger);
+    const runs = [status(live.runId, "running")];
+    const first = await w.greet(K0, WORKER_EXECUTOR, runs, SIGNED, RECEIVED);
+    await w.greet(K0, WORKER_EXECUTOR, [], SIGNED + 10, RECEIVED + 10);
+    const lease = ledger.instructionTimes(live.runId);
+    const { calls, sights, port } = spy(ledger);
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
+    const expected = { kind: "not_current", executorId: WORKER_EXECUTOR, connection: first.conn, why: "not_greeted", sighting: { sighting: "saved" } };
+    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER }, ports)).toEqual(expected as HelloAnswerOutcome);
+    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER + 1 }, ports)).toEqual(expected as HelloAnswerOutcome);
+    expect(calls).toEqual([]);
+    expect(sights).toEqual([
+      [{ coverage: "full", runs, answeredAt: SIGNED, now: LATER }, { sender: WORKER_EXECUTOR }],
+      [{ coverage: "full", runs, answeredAt: SIGNED, now: LATER + 1 }, { sender: WORKER_EXECUTOR }],
+    ]);
+    expect(runState(ledger, live.runId)).toBe("running");
+    expect(ledger.instructionTimes(live.runId)).toEqual(lease);
+    ledger.close();
+    expect(sightings(path)).toEqual([{ run_id: live.runId, executor_id: WORKER_EXECUTOR, reported_state: "running", answered_at: SIGNED, received_at: LATER, coverage: "full" }]);
+  });
+
+  test("출력이 그 연결의 인사와 다르면(other_principal·other_greeting) 인정된 인사로 믿을 수 없어 관측도 적지 않는다", async () => {
+    const { ledger } = faulty();
+    const live = runningWorker(ledger);
+    const w = new World(ledger);
+    const mine = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED, RECEIVED);
+    await w.greet(K1, OTHER, [], SIGNED + 1, RECEIVED + 1);
+    const full = mine.output as Extract<Output, { kind: "occupancy" }>;
+    const { calls, sights, port } = spy(ledger);
+    const ports = { ledger: port, intake: w.stop, links: w.links() };
+    for (const [output, why] of [
+      [{ ...full, answer: { ...full.answer, executorId: OTHER } }, "other_principal"],
+      [{ ...full, issuedAt: SIGNED + 1 }, "other_greeting"],
+    ] as const) {
+      expect(passHelloAnswer({ output, table: w.table, now: LATER }, ports)).toMatchObject({ kind: "not_current", why, sighting: { sighting: "skipped", why: "output_mismatch" } });
+    }
+    expect([calls, sights]).toEqual([[], []]);
+    expect(ledger.hasRunSighting(live.runId)).toEqual({ known: true, value: false });
+  });
+
+  test("부르기 직전에 본 연결이 지금도 인정된 연결이거나(정지 세대만 오름) 모르면 관측을 적지 않는다", async () => {
+    const { ledger } = faulty();
+    const live = runningWorker(ledger);
+    const w = new World(ledger);
+    const { output } = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED, RECEIVED);
+    const { sights, port } = spy(ledger);
+    w.stop.generation = 1;
+    // 맞춘 세대는 0이라 넘기지 않지만 연결은 그대로 그 실행기의 인정된 연결이다.
+    const stale = { current: () => true };
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: stale })).toMatchObject({ why: "stop_generation_changed", sighting: { sighting: "skipped", why: "link_current" } });
+    const unknown = {
+      current: () => {
+        throw new Error("연결 표를 읽지 못함");
+      },
+    };
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: unknown })).toMatchObject({ sighting: { sighting: "skipped", why: "link_unknown" } });
+    expect(passHelloAnswer({ output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: { current: () => "no" as never } })).toMatchObject({ sighting: { sighting: "skipped", why: "link_unknown" } });
+    expect(sights).toEqual([]);
+  });
+
+  test("관측 쓰기가 실패하면 장부의 사유와 unsavedSightings를 그대로 싣는다(관측 0행)", async () => {
+    const { fault, ledger } = faulty();
+    const live = runningWorker(ledger);
+    const w = new World(ledger);
+    const first = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED, RECEIVED);
+    await w.greet(K0, WORKER_EXECUTOR, [], SIGNED + 10, RECEIVED + 10);
+    fault.failSighting = true;
+    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER }, { ledger, intake: w.stop, links: w.links() })).toMatchObject({
+      kind: "not_current",
+      sighting: { sighting: "unsaved", reason: "ledger_unwritable", unsavedSightings: [{ runId: live.runId, runGeneration: 1 }] },
+    });
+    fault.failSighting = false;
+    expect(ledger.hasRunSighting(live.runId)).toEqual({ known: true, value: false });
+  });
+
+  test("접수 대기(held) 뒤 연결이 바뀌어 not_current가 된 인사도 관측을 적는다", async () => {
+    const { ledger } = faulty();
+    const live = runningWorker(ledger);
+    const w = new World(ledger, intake(false));
+    const first = await w.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], SIGNED, RECEIVED);
+    const { calls, sights, port } = spy(ledger);
+    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() }).kind).toBe("held");
+    await w.greet(K0, WORKER_EXECUTOR, [], SIGNED + 10, RECEIVED + 10);
+    w.stop.open = true;
+    expect(passHelloAnswer({ output: first.output, table: w.table, now: LATER }, { ledger: port, intake: w.stop, links: w.links() })).toMatchObject({ kind: "not_current", why: "not_greeted", sighting: { sighting: "saved" } });
+    expect([calls.length, sights.length]).toEqual([0, 1]);
+    expect(ledger.hasRunSighting(live.runId)).toEqual({ known: true, value: true });
+    expect(runState(ledger, live.runId)).toBe("running");
   });
 });

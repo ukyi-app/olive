@@ -8,7 +8,7 @@
 
 1. **낸 쪽과 세대는 검증 결과에서만 온다.** 장부에 넘기는 `from`은 검증된 봉투 머리의 `sender`와 `run_generation`이다. 본문의 값(본문이 주장하는 실행기 이름이나 세대)으로 대신하지 않는다. 낸 쪽이 받아들여지는지, 세대가 맞는지는 장부가 본다(`sender_mismatch`, `run_generation_mismatch`). 장부의 규칙은 이렇다: 일반 영수증·보고는 그 실행의 지정 실행기만 낼 수 있다. 세션 인수 영수증(`receipt_session_takeover`)은 앞 세션의 지정 실행기이거나 대기 중인 세션 실행의 지정 실행기가 낼 수 있고, 같은 인수의 재전송은 처음 낸 쪽만 ack를 받는다(`src/ledger/ledger.md` "세션 증거"). 인수의 ack는 인수 증거를 저장했다는 확인일 뿐이고, 앞 세션의 종료나 다음 세션의 시작을 허가하지 않는다. 영수증과 다른 보고에서 이 모듈은 그 검사를 복사하지 않는다. 결과 보고만 보관 전에 장부의 읽기로 같은 것을 먼저 보고(본문을 맡지 않으려고), 장부가 기록할 때 다시 본다. ack의 받는 쪽도 같은 머리의 `sender`다.
 2. **장부가 받은 것에만 ack.** 장부가 `ok`를 돌려준 영수증·보고에만, 장부가 돌려준 그 id로 ack 초안을 만든다. 장부가 거절했거나, 던졌거나, 답이 꼴에 맞지 않으면(`ok`인데 `delivery`가 `new`·`duplicate`가 아니거나 `ack`가 넘긴 id와 다름, 거절 사유가 장부의 `REFUSALS` 밖, 답의 칸을 읽다 던짐) ack가 없어 실행기가 다시 보낸다. 답의 칸(`ok`·`delivery`·`ack`·`reason`)은 예외 경계 안에서 한 번씩만 읽어 그 지역 값으로만 판단하고, 읽다 던진 예외의 문구는 결과에 싣지 않는다(고정 사유 `malformed_answer`). 판정은 첫 읽기의 값으로 한다. 장부의 답이 읽을 때마다 같으면, 칸을 한 번씩 읽어도 칸을 다시 읽는 구현과 ack가 만들어지는 경우가 같다. 읽을 때마다 다른 값을 내는 답(접근자. 첫 읽기가 `duplicate`이고 다음 읽기가 다른 값이거나 던짐)에서는 첫 읽기의 값을 따르므로, 칸을 다시 읽는 구현에서는 없을 `duplicate` ack가 만들어질 수 있다. 그때도 장부의 줄은 그대로다. 실제 장부의 답은 평범한 값 객체라 읽을 때마다 같다. 이 경계는 영수증·보고·결과 보고가 함께 지나는 `settle`에 있다. 재전송은 장부가 `delivery: "duplicate"`(이미 반영함)로 받고, 그때 부르는 쪽이 감독의 정지 세대를 알고(`null`이 아님) `ackDraft`가 초안을 만들면 ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다. 정지 세대가 계속 `null`이면 재전송에도 계속 ack가 없다. 한 `forward` 안에서 장부 호출이 먼저이고, `ackDraft`(난수 포트를 쓰는 유일한 자리)는 장부가 `ok`를 돌려준 뒤에만 불린다.
-3. **`status_report`는 감독이 그 연결에 낸 조회의 답이고 지금 인정된 연결에서 왔을 때만 장부에 넘긴다.** 부르는 쪽이 넘긴 "답을 기다리는 조회" 목록에서 `in_reply_to`가 그 요청 ID인 것을 찾고, 그 조회를 받은 실행기(초안의 `recipient`)가 서명한 보고만 받는다. 답의 실행 ID 집합이 물은 실행 ID 집합과 같아야 하고, 답이 온 연결(`forward.connection`)이 그 조회를 실제로 실은 연결(항목의 `connection`)과 같아야 한다. 아니면 `status_unmatched`이고 장부를 부르지 않는다. 대조된 답은 **장부를 부를 때마다 그 직전에** 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 포트(`links`)에 묻고, 맞을 때만 장부의 `applyExecutorAnswer`에 `partial`로 넘긴다. 그 실행기의 밀린 답이 있으면 받은 순서대로 먼저 넘기고, 밀린 답마다 그 답이 온 연결을 같은 방식으로 본다(아래 "운영 중 상태 보고의 장부 반영").
+3. **`status_report`는 감독이 그 연결에 낸 조회의 답이고 지금 인정된 연결에서 왔을 때만 장부의 `applyExecutorAnswer`에 넘긴다.** 부르는 쪽이 넘긴 "답을 기다리는 조회" 목록에서 `in_reply_to`가 그 요청 ID인 것을 찾고, 그 조회를 받은 실행기(초안의 `recipient`)가 서명한 보고만 받는다. 답의 실행 ID 집합이 물은 실행 ID 집합과 같아야 하고, 답이 온 연결(`forward.connection`)이 그 조회를 실제로 실은 연결(항목의 `connection`)과 같아야 한다. 아니면 `status_unmatched`이고 장부를 부르지 않는다. 대조된 답은 **장부를 부를 때마다 그 직전에** 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 포트(`links`)에 묻고, 맞을 때만 장부의 `applyExecutorAnswer`에 `partial`로 넘긴다. 그 실행기의 밀린 답이 있으면 받은 순서대로 먼저 넘기고, 밀린 답마다 그 답이 온 연결을 같은 방식으로 본다(아래 "운영 중 상태 보고의 장부 반영"). 대조됐지만 인정이 끝난 연결의 답은 임대를 바꾸지 않고 "안다"는 항목만 관측으로 적는다(아래 "인정이 끝난 연결의 답: 관측만 적기").
 4. **결과 보고는 보관 → 장부 → ack이고 그 사이에 `await`가 없다.** `report_result`는 장부의 읽기로 먼저 거르고, 결과 보관소의 판단(`src/supervisor/scheduler/result-store.ts`의 `storeResult`)이 참조를 낸 뒤에만 그 참조와 결과 digest로 `recordReport`를 부르고, 장부가 받은 뒤에만 ack 초안을 만든다. 처리기 전체가 동기 함수다(아래 "결과 보고"). 보관이 모름이거나 거절이거나 장부가 받지 않으면 ack가 없다.
 
 ## 동작별 처리
@@ -40,18 +40,20 @@
 | 이름 | 꼴 |
 |---|---|
 | `handleForward(input, ports)` | `ForwardInput` → `ReceiptOutcome` |
-| `replayBacklog(input, ports)` | `{ backlog, now, links }`, `{ ledger: Pick<ReceiptLedger, "applyExecutorAnswer"> }` → `backlog_settled`(`settled`, `backlog`) 또는 `rejected`(`input_malformed`, `field`: `backlog`·`now`). 새 답 없이 한 실행기의 밀린 답을 다시 넘긴다. 사본마다 장부 호출 직전에 `links`에 그 답의 연결을 묻는다 |
+| `replayBacklog(input, ports)` | `{ backlog, now, links }`, `{ ledger: Pick<ReceiptLedger, "applyExecutorAnswer" \| "recordAnswerSightings"> }` → `backlog_settled`(`settled`, `backlog`) 또는 `rejected`(`input_malformed`, `field`: `backlog`·`now`). 새 답 없이 한 실행기의 밀린 답을 다시 넘긴다. 사본마다 장부 호출 직전에 `links`에 그 답의 연결을 묻는다 |
 | `ForwardInput` | `forward`(연결의 `forward` 출력, `verified`와 `connection`을 읽음), `now`(장부 시계와 같은 시계), `stopGeneration`(감독의 지금 정지 세대, 모르면 `null`), `pendingQueries: SentQuery[]`, `links: AnswerLinks`, `backlog`(그 실행기의 밀린 답, 받은 순서) |
 | `PendingQuery` | `requestId`, `recipient`, `runIds`. `statusQueryDraft`의 초안에서 그대로 옮긴다. 수명 박자(`life-loop.ts`)가 돌려주는 꼴이다 |
 | `SentQuery` | `PendingQuery`와 `connection`(그 조회를 실제로 실은 연결). `pendingQueries`의 항목이다 |
 | `AnswerLinks` | `current(connection, executorId): boolean`. 그 연결이 지금도 그 실행기의 인정된 연결인가. 동기. 장부 호출마다 그 직전에 불린다 |
 | `ExecutorAnswerCopy` | `sender`, `connection`(그 답이 온 연결), `coverage: "partial"`, `runs`, `answeredAt`. `connection` 밖은 `applyExecutorAnswer`에 넘기는 값 그대로 |
-| `AnswerSettlement` | 답 하나를 넘긴 결과: `applied`(`moved`, `deferred`, `outsideLedger`), `unsaved`(`reason`, `unsavedSightings`), `ledger_failed`(`threw`·`malformed_answer`), `not_current`(`link`: `not_current`·`unknown`. 넘기기 직전에 본 그 답의 연결이 인정된 연결이 아니거나 모름, 장부를 부르지 않음), `held`(앞의 밀린 답 때문에 넘기지 않음). 모두 `answer`(그 사본)를 싣는다 |
+| `AnswerSettlement` | 답 하나를 넘긴 결과: `applied`(`moved`, `deferred`, `outsideLedger`), `unsaved`(`reason`, `unsavedSightings`), `ledger_failed`(`threw`·`malformed_answer`), `not_current`(`link`: `not_current`·`unknown`. 넘기기 직전에 본 그 답의 연결이 인정된 연결이 아니거나 모름, `applyExecutorAnswer`를 부르지 않음. `sighting`: 관측만 적기의 결과), `held`(앞의 밀린 답 때문에 넘기지 않음). 모두 `answer`(그 사본)를 싣는다 |
+| `recordSighting(answer, ledger, links, now)` | `SightingAnswer`(`sender`, `connection`, `coverage`, `runs`, `answeredAt`) → `SightingOutcome`. 인정이 끝난 연결의 답에서 양성 관측만 적는다. 인사 처리기도 같은 함수를 쓴다 |
+| `SightingOutcome` | `saved`, `unsaved`(장부의 `reason`·`unsavedSightings` 그대로), `ledger_failed`(`threw`·`malformed_answer`), `skipped`(`why`: `SIGHTING_SKIPS`) |
 | `ReceiptPorts` | `ledger: ReceiptLedger`, `random: Random`(`ports.ts`), `results?: ResultPorts`(결과 보고에만 쓴다. 없으면 결과 보고는 `result_unknown`·`ports`) |
-| `ReceiptLedger` | `Pick<Ledger, "applyReceipt" \| "recordReport" \| "applyExecutorAnswer">`. 실제 장부가 그대로 맞는다 |
+| `ReceiptLedger` | `Pick<Ledger, "applyReceipt" \| "recordReport" \| "applyExecutorAnswer" \| "recordAnswerSightings">`. 실제 장부가 그대로 맞는다 |
 | `ResultPorts` | `backend: ResultBackend`(`result-store.ts`의 포트, 동기), `ledger: Pick<Ledger, "getRun" \| "instructionTimes" \| "recordReport">`(`instructionTimes`는 실행이 `not_started`일 때만 부른다). 결과 보고의 거르기와 기록을 같은 장부 객체로 한다 |
 | `EXECUTOR_ACTION_HANDLING` | 위 표의 동작 → 처리 |
-| `REJECT_REASONS`, `STATUS_UNMATCHED_REASONS`, `RESULT_REFUSALS` | 구별된 거절의 이름 |
+| `REJECT_REASONS`, `STATUS_UNMATCHED_REASONS`, `RESULT_REFUSALS`, `SIGHTING_SKIPS` | 구별된 거절·건너뜀의 이름 |
 
 `ReceiptOutcome`:
 
@@ -62,7 +64,7 @@
 | `ledger_refused` | 장부의 거절 사유 그대로 | 없음 |
 | `ledger_failed` | 장부가 던졌다(`threw`) 또는 답이 꼴에 맞지 않는다(`malformed_answer`, 답의 칸을 읽다 던진 것 포함) | 없음 |
 | `status_matched` | 기다리는 조회의 답이고 지금 인정된 연결에서 왔다. `queryRequestId`, `executor`, `connection`, `settled`(밀린 답 → 이번 답, 받은 순서. 마지막이 이번 답. 넘기는 동안 연결의 인정이 끝난 답은 `not_current`), `backlog`(다음에 그 실행기의 어떤 답보다 먼저 넘길 답) | 없음 |
-| `status_not_current` | 기다리는 조회의 답이지만 그 연결이 지금 인정된 연결이 아니거나(`link: "not_current"`) 그것을 모른다(`unknown`: 포트가 던지거나 `true`·`false` 밖의 답). 장부에 넘기지 않았다. `answer`에 그 답의 사본을 싣는다 | 없음 |
+| `status_not_current` | 기다리는 조회의 답이지만 그 연결이 지금 인정된 연결이 아니거나(`link: "not_current"`) 그것을 모른다(`unknown`: 포트가 던지거나 `true`·`false` 밖의 답). `applyExecutorAnswer`에 넘기지 않았다. `answer`에 그 답의 사본을, `sighting`에 관측만 적기의 결과를 싣는다 | 없음 |
 | `status_unmatched` | `unknown_query`, `other_executor`, `runs_mismatch`, `other_connection`(그 조회를 실은 연결이 아닌 연결에서 옴. 항목의 연결 번호가 없거나 꼴이 틀려도 이것). 장부를 부르지 않았다 | 없음 |
 | `result_refused` | 결과 보고를 장부에 넘기지 않았다. 확정된 이유(`reason`): 장부의 읽기로 본 `unknown_run`·`sender_mismatch`·`run_generation_mismatch`·`not_receivable`·`no_owner`, 보관소의 판단이 거절한 `conflict`·`too_large`·`digest_mismatch`·`invalid_input` | 없음 |
 | `result_unknown` | 결과 보고를 장부에 넘기지 않았다. 모름(`at`): `ports`(결과 포트가 없음), `ledger_read`(장부를 읽지 못함·꼴이 틀린 답·장부가 아는 목록과 꼴 밖의 값), `store`(보관이 `unknown`이거나 던짐) | 없음 |
@@ -102,7 +104,18 @@
 
 이 모듈은 연결 표를 직접 보지 않는다. 포트를 고른 이유: 값 칸(예: "지금 연결 번호")은 입력을 만든 때의 사실이라 장부를 부르는 순간의 사실이 아니다. 동기 포트는 장부 호출과 같은 동기 구간에서 답한다.
 
-`status_not_current`는 그 답의 사본(`answer`)을 싣는다. 그 답의 양성 항목은 받을 때 유효했지만, 장부에는 임대를 건드리지 않고 관측만 적는 운영 중 연산이 없어(`recordRunSightings`는 복원 열쇠가 있어야 한다) 이 처리기는 적지 않는다. 부르는 쪽은 같은 실행을 지금의 연결로 다시 조회한다(다시 조회로 얻는 것은 아래 "다시 조회로 얻는 것").
+`status_not_current`는 그 답의 사본(`answer`)과 관측만 적기의 결과(`sighting`)를 싣는다. 그 답의 양성 항목은 받을 때 유효했으므로 임대를 건드리지 않고 관측만 장부에 남긴다(아래 "인정이 끝난 연결의 답: 관측만 적기"). 부르는 쪽은 같은 실행을 지금의 연결로 다시 조회한다(다시 조회로 얻는 것은 아래 "다시 조회로 얻는 것").
+
+### 인정이 끝난 연결의 답: 관측만 적기
+
+대조됐지만 넘기는 순간 연결의 인정이 끝난 답(`status_not_current`, 밀린 사본의 `not_current`)과 인사 처리기의 `not_current` 인사는 `recordSighting` 하나로 장부의 `recordAnswerSightings`에 넘긴다(`src/ledger/ledger.md` "관측만 적는 연산을 부르는 쪽"). 그 연산은 첫 양성 관측만 적고 실행 상태·임대·영수증·자리를 바꾸지 않는다.
+
+- **부르는 때.** 갈래를 고를 때 본 연결이 `false`(인정이 끝남)였을 때만 부른다. 모름(`unknown`)이면 부르지 않는다(`link_unknown`). 안다는 항목이 없으면 붙들 관측이 없어 부르지 않는다(`no_positive`). `status_not_current`는 그 실행기의 밀린 사본이 남아 있으면 부르지 않는다(`backlog_first`): 부르는 쪽이 이 답을 밀린 목록 끝에 두고 앞 사본 다음 차례에 적는다(받은 차례). 밀린 목록을 읽지 못해도 남은 것으로 본다. 장부 시각이 꼴에 맞지 않으면 부르지 않는다(`now_malformed`).
+- **효과 직전의 차례.** 연산을 얻어 장부에 묶고(`ledger.recordAnswerSightings`를 한 번 읽음) 넘길 값(동결한 사본의 사본)을 만든 뒤, 부르기 직전에 `links.current(그 답의 connection, sender)`를 한 번 더 묻고, 그 사이에 외부 코드 없이 부른다. 장부는 연결을 보지 않고 `sender`를 그대로 믿으므로, 그 순간 연결이 인정된 연결이면(`link_current`: 그 답은 `applyExecutorAnswer`의 몫) 또는 모르면(`link_unknown`) 부르지 않는다. 연산을 읽거나 장부에 묶다 던지거나 함수가 아니면 `ledger_failed`·`threw`다.
+- **값.** 검증된 봉투의 값 그대로다: `sender`, `coverage`(상태 보고는 `partial`, 인사는 `full`), `runs`, `answeredAt`(서명 시각, 모르면 `null`). `now`는 부르는 쪽의 장부 시계다.
+- **결과.** 장부가 `ok`면 `saved`. 거절이면 장부의 `reason`·`unsavedSightings` 그대로 `unsaved`. 던지면 `ledger_failed`·`threw`, 답의 꼴이 틀리면(`ok`가 참·거짓이 아님, 사유가 장부의 `REFUSALS` 밖, `unsavedSightings`의 항목 꼴, 칸을 읽다 던짐) `malformed_answer`. 칸은 한 번씩 읽고 원문을 싣지 않는다.
+- **사본을 놓는 것은 `saved`뿐이다.** `saved`면 그 사본은 `backlog`에 남지 않아 그 실행기의 뒤 답이 막히지 않는다. 그 밖(거절·실패·건너뜀)이면 안다는 사본은 지금처럼 `backlog`에 남아 다시 넘길 때 다시 적어 본다(장부는 첫 관측만 적으므로 다시 적어도 해가 없다).
+- **닫기의 근거로 쓰지 않는다.** 이 연산은 목록에 없는 실행을 보지 않는다. 적힌 관측은 D-90 닫기의 `run_sighted` 거절의 재료가 될 뿐이다.
 
 ### 밀린 답
 
@@ -111,8 +124,8 @@
 - **받은 순서대로 넘긴다.** `backlog`를 이번 답보다 먼저 같은 값(`coverage`·`runs`·`answeredAt`·`sender`)으로 넘긴다. 앞 답이 또 저장되지 않으면 뒤 답은 장부에 넘기지 않고(`held`) 그 뒤에 줄 세운다. 그래서 "안다"는 앞 답이 그 실행을 빼먹은 뒤 답에 묻히지 않는다.
 - **다시 넘겨도 해가 없다.** 장부는 (실행, 실행기, 세대)의 첫 관측만 적고, 이미 옮긴 실행은 다시 옮기지 않는다. `ledger_failed`의 답은 적혔는지 모르지만 같은 이유로 다시 넘긴다.
 - **`not_known`만 실은 답의 실패는 남기지 않는다.** 붙들 관측이 없다. 그 답으로 거두려던 임대는 그대로 남는다(아래 "다시 조회로 얻는 것").
-- **장부 호출마다 그 직전에 그 답의 연결을 다시 본다.** `handleForward`가 밀린 목록을 넘기는 루프와 `replayBacklog` 양쪽에서, 사본 하나를 넘기기 직전마다 `links.current(사본의 connection, sender)`에 묻는다. 받을 때 맞았던 연결도 그 뒤 닫혔을 수 있고, 같은 루프의 앞선 장부 쓰기가 실패하며 그 연결의 인정을 끝낼 수 있다. `true`가 아니면 그 답으로 장부를 부르지 않고 `not_current`(`link`)이며, "안다"는 항목이 든 사본은 버리지 않고 `backlog`에 그대로 남긴다(뒤 답은 `held`). `not_known`만 실은 사본은 남기지 않는다.
-- **인정이 끝난 연결의 "안다"는 사본은 그 실행기의 뒤 답을 막는다.** 그 사본은 다시 넘겨도 늘 `not_current`다(연결은 다시 인정되지 않는다). 관측만 적는 운영 중 장부 연산이 생길 때까지 부르는 쪽이 쥐고, 그동안 그 실행기의 뒤 답은 모두 그 뒤에 줄 선다. 막힌 쪽은 닫는 쪽이다: 뒤 답이 끝났다·모른다고 해도 임대를 거두지 못하고 장부는 갱신을 계속 믿으며, 자리는 풀리지 않는다.
+- **장부 호출마다 그 직전에 그 답의 연결을 다시 본다.** `handleForward`가 밀린 목록을 넘기는 루프와 `replayBacklog` 양쪽에서, 사본 하나를 넘기기 직전마다 `links.current(사본의 connection, sender)`에 묻는다. 받을 때 맞았던 연결도 그 뒤 닫혔을 수 있고, 같은 루프의 앞선 장부 쓰기가 실패하며 그 연결의 인정을 끝낼 수 있다. `true`가 아니면 그 답으로 `applyExecutorAnswer`를 부르지 않고 `not_current`(`link`)다. `false`면 그 사본의 관측만 적어 보고(위 "관측만 적기"), 적히면 사본을 놓는다. 적지 못했거나 모르면(`unknown`) "안다"는 항목이 든 사본은 버리지 않고 `backlog`에 그대로 남긴다(뒤 답은 `held`). `not_known`만 실은 사본은 남기지 않는다.
+- **관측을 적지 못한 인정이 끝난 연결의 "안다"는 사본은 그 실행기의 뒤 답을 막는다.** 그 사본은 다시 넘겨도 늘 `not_current`다(연결은 다시 인정되지 않는다). 다시 넘길 때마다 관측만 적기를 다시 시도하고, 적힐 때까지 그 실행기의 뒤 답은 모두 그 뒤에 줄 선다. 막힌 쪽은 닫는 쪽이다: 뒤 답이 끝났다·모른다고 해도 임대를 거두지 못하고 장부는 갱신을 계속 믿으며, 자리는 풀리지 않는다.
 - **`backlog`의 꼴은 다시 본다.** 그 실행기(`sender`)의 사본이고 `connection`이 안전 정수, `coverage`가 `partial`이며 `runs`가 배열(항목마다 `run_id`)이고 `answeredAt`이 시각 또는 `null`이어야 한다. 아니면 장부를 부르지 않고 `input_malformed`·`backlog`다. 항목의 나머지 꼴은 장부가 본다.
 
 ### 다시 조회로 얻는 것
@@ -129,7 +142,9 @@
 - **영수증 하나에 ack 초안 하나.** 여러 id를 한 ack에 모으는 일은 하지 않는다.
 - **옛 연결의 답은 조회 항목의 연결 번호와 포트로 막는다.** 위 "옛 연결의 답". 조회를 실은 연결은 항목의 값으로 견주고(그 사실은 싣는 순간에 정해지고 바뀌지 않는다), 연결이 지금 인정됐는지는 장부 호출마다 포트에 묻는다. 포트가 모르면 넘기지 않는다.
 - **`PendingQuery`는 그대로 두고 연결 번호를 가진 `SentQuery`를 따로 둔다.** 수명 박자(`life-loop.ts`)는 내보내기 포트가 어느 연결에 실었는지 모르므로 `PendingQuery`를 돌려준다. `pendingQueries`가 `SentQuery`만 받아, 연결 번호를 더하지 않은 목록은 타입 검사에서 걸린다.
-- **인정이 끝난 연결의 "안다"는 사본은 버리지 않는다.** 버리면 장부에 흔적이 없어 뒤 조각(D-90)이 "안다고 한 적 없음"으로 잘못 읽을 수 있다. 그 대가로 그 실행기의 뒤 답이 막힌다(위 "밀린 답").
+- **인정이 끝난 연결의 "안다"는 사본은 관측이 장부에 적히기 전에는 버리지 않는다.** 버리면 장부에 흔적이 없어 뒤 조각(D-90)이 "안다고 한 적 없음"으로 잘못 읽을 수 있다. 적힌 뒤에는 놓는다(쥘 까닭이 없고, 쥐면 그 실행기의 뒤 답이 막힌다). 적지 못하는 동안은 그 대가로 뒤 답이 막힌다(위 "밀린 답").
+- **관측만 적기는 부르기 직전의 연결이 `false`일 때만이다.** 갈래를 고를 때와 부르기 직전 두 번 본다. 모르면 적지 않는다: 지금 연결의 답이었다면 그 관측은 `applyExecutorAnswer`로 가야 하고, 모르는 채 적으면 그 갈래를 우회한다. 사본이 남아 다음에 다시 본다.
+- **`status_not_current`는 앞 밀린 사본이 없을 때만 그 자리에서 적는다.** 있으면 목록 끝에 서서 받은 차례로 적힌다. 장부의 관측은 첫 줄만 남으므로 차례가 뒤바뀌면 뒤 답의 관측이 첫 줄이 된다.
 - **밀린 답은 입력으로 받고, 새 답 없는 재시도는 `replayBacklog` 하나로 한다.** 순서를 부르는 쪽의 규율에만 맡기지 않으려고 `handleForward`가 밀린 답을 이번 답 앞에 넘긴다.
 - **상태 보고는 실행 ID 집합까지 대조한다.** 실행기는 물은 실행 ID마다 하나씩 답한다(`src/executor/worker.ts`의 `onStatus`). 다른 집합이면 그 조회의 답으로 보지 않는다.
 - **`report_rule_check`는 받지 않는다.** 장부의 `recordReport`가 받는 꼴이 아니고(`applyRuleCheck`, `from`도 낸 쪽 이름 하나뿐), 그 증거를 쓰는 세션 계약 작업이 아직 없다. 지금 연결 판단은 작업자 실행기의 맞춤 요청만 받는다(`connections.ts`의 `syncRequest`).
@@ -140,13 +155,13 @@
 
 ## 이 모듈에 없는 것
 
-순환(언제 부르고 결과를 어디로 보내는가), 소켓과 ack의 봉하기·싣기, 기다리는 조회 목록의 보관과 만료, 조회 항목에 실은 연결의 번호를 붙이는 일, 밀린 답의 보관, 다시 조회하기(이 처리기는 조회를 내지 않는다), `links` 포트의 구현, 운영 중 `hello`의 `full` 답, 자리를 푸는 판단(D-90), 옛 연결 답의 양성 관측 기록, 결과 검사와 판정(`markResult`), 결과의 확정, 보관 백엔드의 조립, 고아 정리와 보관의 만료·삭제, 본체가 결과를 읽는 길, 규칙 확인의 반영.
+순환(언제 부르고 결과를 어디로 보내는가), 소켓과 ack의 봉하기·싣기, 기다리는 조회 목록의 보관과 만료, 조회 항목에 실은 연결의 번호를 붙이는 일, 밀린 답의 보관, 다시 조회하기(이 처리기는 조회를 내지 않는다), `links` 포트의 구현, 운영 중 `hello`의 `full` 답, 자리를 푸는 판단(D-90), 결과 검사와 판정(`markResult`), 결과의 확정, 보관 백엔드의 조립, 고아 정리와 보관의 만료·삭제, 본체가 결과를 읽는 길, 규칙 확인의 반영.
 
 ## 남는 한계
 
-- **인정이 끝난 연결에서 받은 "안다"는 항목은 장부에 적지 못한다.** 장부에 임대를 건드리지 않고 관측만 적는 운영 중 연산이 없다. `status_not_current`의 답과 `not_current`로 남은 사본이 그렇다. 그 사본이 그 실행기의 밀린 목록에 있는 동안 그 실행기의 뒤 답은 막히고(임대를 거두지 못한다), 프로세스가 다시 뜨거나 부르는 쪽이 사본을 놓으면 그 관측은 장부에 흔적이 없다. 그러면 뒤 조각(D-90)이 그 실행을 "안다고 한 적 없음"으로 잘못 읽을 수 있다. 관측만 적는 연산이 생기거나, D-90이 이 공백을 걸친 실행을 자동 해제에서 빼야 닫힌다. `status_not_current`의 `answer`는 처리기가 목록에 넣지 않는다: 부르는 쪽이 그 사본을 따로 들고만 있으면 뒤 답은 막히지 않고 장부에 닿는다(새 `not_known` 답이 임대를 거두고, 그 실행의 관측은 0행이다).
+- **인정이 끝난 연결에서 받은 "안다"는 항목은 관측 쓰기가 실패하는 동안 장부에 없다.** `status_not_current`의 답과 `not_current`로 남은 사본이 그렇다. 그 사본이 그 실행기의 밀린 목록에 있는 동안 그 실행기의 뒤 답은 막히고(임대를 거두지 못한다), 프로세스가 다시 뜨면 그 관측은 장부에 흔적이 없다. 그러면 뒤 조각(D-90)이 그 실행을 "안다고 한 적 없음"으로 잘못 읽을 수 있어, D-90은 밀린 사본이 남은 실행기를 대기로 보고 닫지 않는다(재시작을 걸친 공백은 장부의 `sent_by_other_open`이 막는다). `status_not_current`의 `answer`는 처리기가 목록에 넣지 않는다: 부르는 쪽이 관측이 적히지 않은 사본을 따로 들고만 있으면 뒤 답은 막히지 않고 장부에 닿는다(새 `not_known` 답이 임대를 거두고, 그 실행의 관측은 0행이다).
 - **밀린 답은 그 프로세스의 메모리에만 있다.** 재시작하면 사라지고 장부에 흔적이 없다(`ledger.md`의 "0행의 뜻(함정)").
-- **막힘에 상한이 없다.** 앞 답이 계속 저장되지 않거나 인정이 끝난 연결의 "안다"는 사본이 남아 있으면 그 실행기의 뒤 답은 무기한 `held`다. 상한과 경보는 정하지 않았다.
+- **막힘에 상한이 없다.** 앞 답이 계속 저장되지 않거나 인정이 끝난 연결의 "안다"는 사본의 관측 쓰기가 계속 실패하면 그 실행기의 뒤 답은 무기한 `held`다. 상한과 경보는 정하지 않았다.
 - **`not_known`만 실은 답을 저장하지 못하면 그 임대 거두기는 다시 조회의 새 답에 달린다.** 위 "다시 조회로 얻는 것".
 - **장부가 끝내 받지 않는 결과 보고는 본문부터 보관된다.** 거르기가 거르지 않는 경우다: 결과 없음으로 판정된 실행의 새 보고(`transition_denied`), 판정과 다른 결과(보고 없이 다른 digest로 판정된 `ready_result` 등, `receipt_conflict`), 이미 다른 실행에 쓴 보고 id를 다른 `run_id`로 다시 쓴 보고(그 실행의 자리에 보관된 뒤 장부가 `receipt_conflict`). 그 자리를 가리키는 커밋된 보고가 없으면 그 본문은 고아이고, 그 실행의 자리를 차지하므로 고아 정리가 지우기 전까지 판정에 맞는 뒤의 결과도 보관소의 `conflict`로 막힌다(ack가 없어 실행기는 계속 다시 보낸다). 고아 정리의 `keep`(장부에 커밋된 결과 참조 전부)을 만들 장부의 읽기는 아직 없다(`pendingReports()`는 반영 전 보고만 낸다).
 - **같은 실행의 다른 결과는 장부의 충돌 기록에 남지 않는다.** 보관소가 `conflict`로 먼저 거절하므로 장부의 `receipt_conflicts`에 줄이 생기지 않는다(장부의 충돌 규칙은 장부에 닿은 보고에만 적용된다). ack가 없는 것은 같다.
@@ -158,13 +173,14 @@
 - **`status_report`의 `forward`를 이 처리기로 넘긴다.** 연결 판단은 인정된 연결의 검증된 `status_report`를 점유 응답(`occupancy`, `partial`, `in_reply_to` 없음)과 `forward`(검증된 봉투 그대로, 연결 번호 함께)로 함께 낸다(`connections.ts`의 `envelope`). 대조와 장부 반영은 `forward`로만 한다. 점유 응답의 `partial` 행을 따로 `applyExecutorAnswer`에 넘기지 않는다(같은 답을 두 번 넘기게 되고, 그 행에는 대조할 `in_reply_to`도 서명 시각도 없다).
 - **조회는 싣는 연결에 등록한다.** 기다리는 조회(`SentQuery`)는 `statusQueryDraft`의 초안에서 `requestId`·`recipient`·`body.run_ids`를 그대로 옮기고, 그 봉투를 **실제로 실은 연결의 번호**를 `connection`에 넣는다. 수명 박자가 돌려주는 `pendingQueries`(`PendingQuery`)에는 연결 번호가 없으므로, 어느 연결에 실었는지 아는 내보내기 포트(조립)가 붙인다. 조회의 답은 박자가 결과를 돌려주기 전에 올 수 있으므로 빠른 답보다 먼저(싣기 직전에) 등록하거나, 등록될 때까지 그 답을 보관한다(`life-loop.md` "뒤 조각이 지켜야 할 것"). 같은 초안을 다른 연결로 다시 실으면 그 연결의 항목을 따로 더한다. 연결이 철회·교체되면 그 연결의 대기 항목을 끝낸다. 같은 초안을 다시 봉해 보내면 실행기가 매번 답하므로 같은 `in_reply_to`의 답이 여럿 올 수 있다. 목록에서 언제 지울지는 순환이 정한다.
 - **`links`를 지금의 연결 표로 잇는다.** 부르는 순간에 쥔 `Connections`와 지금의 복원기로, 그 연결이 `candidates(복원기)`에 있고 그 연결의 맞춤 주체(`sync.principal`)가 그 실행기 이름일 때만 `true`를 답한다. 동기로 답한다. 처리기는 상태를 바꿀 수 있는 장부 호출마다 그 직전에 묻으므로, 그 답은 묻는 순간의 사실이어야 한다(앞선 장부 쓰기가 복원기의 세대를 바꿨으면 그것까지 반영한다). 값을 미리 읽어 캐시하지 않는다.
-- **한 실행기의 답은 받은 순서대로 처리한다.** 같은 실행기의 `forward`를 받은 순서대로 이 처리기에 넘기고, 그 사이에 같은 실행기의 다른 답(운영 중 `hello`의 `full` 포함)을 장부에 먼저 넘기지 않는다. `partial`과 인사의 `full`이 서로 추월하지 않게 한다. `partial`은 검증된 `forward`에서 한 번만 넘긴다. 결과의 `backlog`는 그 실행기의 이름에 묶어 쥐고, 다음 `status_report`의 `backlog`로 넘기거나 `replayBacklog`로 다시 넘긴다. `status_matched`·`backlog_settled`의 `backlog`만 쥔 목록을 대신한다(넘겨서 끝난 앞부분만 빠진다). `status_not_current`·`status_unmatched`·`rejected`에는 `backlog`가 없으므로 쥐고 있던 목록을 그대로 둔다(빈 목록으로 덮지 않는다). `status_not_current`의 `answer`에 `not_known` 밖 항목이 있으면 그 사본을 쥐고 있던 목록 끝에 넣는다. 따로 들고만 있으면 그 실행기의 뒤 답은 막히지 않는다. `backlog`가 비어 있지 않은 동안 그 실행기의 다른 답(인사의 `full` 답 등)을 장부에 넘기는 쪽도 그 뒤에 넘긴다.
-- **밀린 "안다"는 사본은 저장될 때까지 쥔다.** 밀린 답은 그 프로세스의 메모리에만 있다. 연결이 철회되거나 실행이 끝났다는 이유만으로 버리지 않는다. 철회된 연결의 사본은 처리기가 임대 변경에 쓰지 않으므로(`not_current`), 그 관측을 임대와 따로 남기는 연산은 장부 작업의 몫이다. 그 전까지 그 실행기의 새 답은 뒤에 줄 서므로(`held`) 임대를 거두지 못하고 장부는 갱신을 계속 믿는다(자리는 풀리지 않는 쪽이다). 오래 막히면 경보한다(상한과 경보 기준은 뒤 결정이다). 재시작·복원 실패 등으로 사본을 잃어 증거가 끊긴 실행은 D-90에서 자동 해제하지 않는다(`ledger.md`의 "0행의 뜻(함정)").
+- **한 실행기의 답은 받은 순서대로 처리한다.** 같은 실행기의 `forward`를 받은 순서대로 이 처리기에 넘기고, 그 사이에 같은 실행기의 다른 답(운영 중 `hello`의 `full` 포함)을 장부에 먼저 넘기지 않는다. `partial`과 인사의 `full`이 서로 추월하지 않게 한다. `partial`은 검증된 `forward`에서 한 번만 넘긴다. 결과의 `backlog`는 그 실행기의 이름에 묶어 쥐고, 다음 `status_report`의 `backlog`로 넘기거나 `replayBacklog`로 다시 넘긴다. `status_matched`·`backlog_settled`의 `backlog`만 쥔 목록을 대신한다(넘겨서 끝난 앞부분만 빠진다). `status_not_current`·`status_unmatched`·`rejected`에는 `backlog`가 없으므로 쥐고 있던 목록을 그대로 둔다(빈 목록으로 덮지 않는다). `status_not_current`의 `answer`에 `not_known` 밖 항목이 있고 `sighting`이 `saved`가 아니면 그 사본을 쥐고 있던 목록 끝에 넣는다(`saved`면 관측이 장부에 있어 쥐지 않는다). 따로 들고만 있으면 그 실행기의 뒤 답은 막히지 않는다. `backlog`가 비어 있지 않은 동안 그 실행기의 다른 답(인사의 `full` 답 등)을 장부에 넘기는 쪽도 그 뒤에 넘긴다.
+- **밀린 "안다"는 사본은 저장될 때까지 쥔다.** 밀린 답은 그 프로세스의 메모리에만 있다. 연결이 철회되거나 실행이 끝났다는 이유만으로 버리지 않는다. 철회된 연결의 사본은 처리기가 임대 변경에 쓰지 않고(`not_current`) 관측만 적으며, 적히면 결과의 `backlog`에서 빠진다. 적히기 전까지 그 실행기의 새 답은 뒤에 줄 서므로(`held`) 임대를 거두지 못하고 장부는 갱신을 계속 믿는다(자리는 풀리지 않는 쪽이다). 오래 막히면 경보한다(상한과 경보 기준은 뒤 결정이다). 재시작·복원 실패 등으로 사본을 잃어 증거가 끊긴 실행은 D-90에서 자동 해제하지 않는다(`ledger.md`의 "0행의 뜻(함정)").
 - **`deferred`·실패·`status_not_current`·`not_current`면 같은 실행 ID로 다시 묻는다.** 실패(`unsaved`, `ledger_failed`)로 넘기지 못한 답의 실행도 같다. 새 답의 서명된 `issued_at`으로 다시 판단한다(위 "다시 조회로 얻는 것": 앞 답을 되살리지 않는다). 부정 답, `outsideLedger`, 부분 목록만으로 자리를 풀지 않는다. 조회는 수명 순환(`life-loop.ts`)이 내고, 이 처리기는 내지 않는다.
 - **복원이 붙든 관측이 운영의 답보다 먼저다.** 재시작 복원 2단계가 적지 못한 관측을 복원기가 붙들고 있는 동안(2단계 재시도 전) 그 실행기의 운영 중 답을 이 처리기로 장부에 넘기지 않는다. 복원의 재시도가 같은 실행기의 운영의 더 새 답보다 먼저 적혀야 앞 관측이 뒤 답에 묻히지 않는다.
 - **D-90은 닫는 트랜잭션에서 증거를 다시 본다.** 지정 실행기·세대, 영수증·보고, 빠짐없는 양성 관측 이력(위 공백을 걸친 실행은 빼고), 시작 재전송 중단, 마지막 시작 봉투의 시한이 지난 뒤의 지금 전체 점유 답에서 빠졌음을 함께 확인한다(`ledger.md` "D-90의 닫기"). D-91의 관리자 판단 대상과 D-92의 갱신 금지(옮긴 실행을 되살리지 않는다)를 지킨다.
 - **`src/ledger/ledger.md`의 "부르는 코드가 없다"는 두 문장(상태 조회 줄의 **미확인**, "실행기의 답을 넘기는 쪽"의 첫 문장)은 이제 낡았다.** 이 처리기가 대조된 조회의 답을 넘긴다. 장부 문서를 고치는 쪽이 맞춘다.
-- **`status_not_current`의 답은 버리지 않고, "안다"는 항목이 있으면 그 실행기의 밀린 목록 끝에 넣는다.** 그 사본은 다시 넘겨도 `not_current`이므로 그 실행기의 뒤 답은 그 뒤에 줄 선다(`held`, 위 "밀린 답"). 그 답의 양성 항목을 장부에 적는 연산(임대를 건드리지 않는 운영 중 관측 기록)은 장부 작업의 몫이다. 목록에 넣지 않고 따로 들고만 있으면 뒤 답은 막히지 않는다: 같은 실행을 지금의 연결로 다시 물으면 새 답이 장부에 닿아 새 답의 내용만 남는다(새 답이 `not_known`이면 임대를 거두고 관측은 0행이다). 어느 쪽이든 앞 답의 "안다"는 사실은 위 "남는 한계"의 공백으로 남는다.
+- **`status_not_current`의 답은 관측이 적히지 않았으면 버리지 않고, "안다"는 항목이 있으면 그 실행기의 밀린 목록 끝에 넣는다.** 그 사본은 다시 넘겨도 `not_current`이므로 다시 넘길 때마다 관측만 적기를 다시 시도하고, 적히기 전까지 그 실행기의 뒤 답은 그 뒤에 줄 선다(`held`, 위 "밀린 답"). 목록에 넣지 않고 따로 들고만 있으면 뒤 답은 막히지 않는다: 같은 실행을 지금의 연결로 다시 물으면 새 답이 장부에 닿아 새 답의 내용만 남는다(새 답이 `not_known`이면 임대를 거두고 관측은 0행이다). 그러면 앞 답의 "안다"는 사실은 위 "남는 한계"의 공백으로 남는다.
+- **관측 쓰기가 실패한 답의 실행기는 D-90에서 뺀다.** 상태 보고의 사본은 밀린 목록에 남아 대기로 보이고, 인사는 답 줄이 오염으로 남긴다(`src/supervisor/runtime/answers.md` "오염·대기·고장의 규칙").
 - **연결 번호는 밀린 사본이 살아 있는 동안 유효해야 한다.** 같은 연결 표를 이어 쓰면 닫은 번호를 다시 쓰지 않는다. 연결 표를 새로 시작하는 조립에서는 같은 실행기의 첫 연결 번호가 다시 처음 값이 될 수 있으므로, 밀린 사본이 살아 있는 동안 번호 발급을 이어 가거나 사본과 조회에 표의 식별을 묶는다.
 - **ack는 장부가 받은 것만 싣는다.** `ack` 결과의 초안만 봉해서 보낸다. `applied_without_ack`·`ledger_refused`·`ledger_failed`에 대해 ack를 따로 만들지 않는다. ack는 재전송을 멈추라는 뜻일 뿐이고 종료·정리·실행 허가가 아니다.
 - **`now`와 정지 세대는 장부와 같은 시계·같은 복원기에서 읽는다.** 정지 세대는 이 처리기를 부르는 순간의 값이다. 연결 판단이 봉투를 받아들인 때의 값을 다시 쓰지 않는다.
