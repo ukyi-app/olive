@@ -147,9 +147,38 @@ test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재�
   ]);
   expect(sendSites(src("src/supervisor/dispatch/envelopes.ts"))).toEqual([]);
   // 감독 안에서 봉투에 서명하는 자리는 봉투 모듈과 정지 동기화의 답(stop_sync_reply만 받는 포트)뿐이다.
+  // 감독 조립의 서명기(signer.ts)는 Signer·ReplyTools 포트의 구현이다: 받은 입력을 감독 키로 sealEnvelope에 그대로 넘기는 두 줄뿐이고
+  // 봉투를 만들거나 싣지 않는다(아래 SIGNER 단언). 봉투가 만들어지는 자리는 그대로 봉투 모듈과 정지 동기화의 답이다.
   const sealing = files.filter((file) => file.startsWith("src/supervisor/") && sealCalls(src(file)) > 0);
-  expect(sealing).toEqual(["src/supervisor/dispatch/envelopes.ts", "src/supervisor/transport/connections.ts"]);
+  expect(sealing).toEqual(["src/supervisor/dispatch/envelopes.ts", SIGNER, "src/supervisor/transport/connections.ts"]);
   expect(src("src/supervisor/transport/connections.ts")).toContain('seal(input: SealInput<"stop_sync_reply">): Envelope;');
+  expect(signerReach(src(SIGNER))).toEqual([]);
+});
+
+const SIGNER = "src/supervisor/runtime/signer.ts";
+// 서명기에서 봉하는 줄은 입력을 그대로 넘기는 이 둘뿐이어야 한다. 초안·시작 글자·송신 포트·표식에 닿는 글자가 있으면 그 이름이 드러난다.
+const SIGNER_SEALS = ["const signer: Signer = { seal: (input) => sealEnvelope(input, key) };", "seal: (input) => sealEnvelope(input, key),"];
+const signerReach = (source: string): string[] => [
+  ...CANNOT_SEND.filter(([name, shape]) => name !== "seal" && shape.test(source)).map(([name]) => name),
+  ...(/\bmarkStartDispatch\b/.test(source) ? ["markStartDispatch"] : []),
+  ...source
+    .split("\n")
+    .filter((line) => sealCalls(line) > 0)
+    .map((line) => line.trim())
+    .filter((line) => !SIGNER_SEALS.includes(line)),
+];
+
+test("대조군: 서명기에 초안·시작 글자·송신 포트나 다른 봉하기를 넣으면 위 단언이 잡는다", () => {
+  expect(sealCalls(src(SIGNER))).toBe(2);
+  for (const [snippet, expected] of [
+    ["const d = startDraft({ run });", ["startDraft"]],
+    ['const a = "task_start";', ["task_start"]],
+    ["readonly sink: InstructionSink;", ["sink"]],
+    ["ledger.markStartDispatch(x);", ["markStartDispatch"]],
+    ["const e = sealEnvelope({ ...input, action: other }, key);", ["const e = sealEnvelope({ ...input, action: other }, key);"]],
+  ] as const) {
+    expect([snippet, signerReach(`${src(SIGNER)}\n${snippet}`)]).toEqual([snippet, [...expected]]);
+  }
 });
 
 const UNRECEIVED = "src/supervisor/dispatch/unreceived.ts";
