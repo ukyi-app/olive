@@ -21,7 +21,7 @@
 
 ## 틀 쓰기 면 (`recognized`, `writeFrame`)
 
-감독이 실행기에 지시 봉투와 자격 값을 내보내는 문이다. 봉투용과 값용을 따로 두지 않는다: 서버는 틀의 종류를 모르고, 부르는 쪽이 `encodeFrame` 등으로 이미 만든 틀의 바이트를 받는다. 지금 이 면을 부르는 곳은 `src/`에 없다(내보내기 포트, 자격 값 보내기, 박자 순환기와 진입점은 뒤 조각이다).
+감독이 실행기에 지시 봉투와 자격 값을 내보내는 문이다(연결 하나를 닫는 문은 아래 "연결 하나 닫기"). 봉투용과 값용을 따로 두지 않는다: 서버는 틀의 종류를 모르고, 부르는 쪽이 `encodeFrame` 등으로 이미 만든 틀의 바이트를 받는다. 지금 이 면을 부르는 곳은 `src/`에 없다(내보내기 포트, 자격 값 보내기, 박자 순환기와 진입점은 뒤 조각이다).
 
 ```ts
 recognized(principal: string): number | null
@@ -52,19 +52,46 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 
    한 연결의 쓰기는 다른 연결이나 `tick()`·`applyRegistry()`·`close()`를 기다리게 하지 않는다(`writeFrame`은 동기이고 완료를 기다리지 않는다). `tick()`은 이 면으로 넘긴 틀의 완료 대기를 만료로 닫지 않는다(아래 "남는 한계").
 
+## 연결 하나 닫기 (`closeConnection`)
+
+```ts
+closeConnection(connection: number): { kind: "closed" } | { kind: "not_open" } | { kind: "stopping" }
+```
+
+감독이 실행기 하나에게 새 `hello`를 받게 하는 문이다. 계약 v1에는 감독이 실행기에게 "다시 인사하라"고 알리는 메시지가 없다(감독 → 실행기의 전송 메시지는 `stop_sync_reply`·`status_query`·`ack`뿐이고, `status_query`의 답 `status_report`는 전체 목록(`full`)이 아니다). 연결이 살아 있는 동안 실행기는 다시 인사하지 않으므로, 연결을 닫아 실행기가 다시 붙어 맞추고 인사하게 한다. 지금 이 면을 부르는 곳은 `src/`에 없다.
+
+1. **지금 쥔 연결만 닫는다.** 서버를 닫기 시작했으면(`close()`를 부른 뒤) 아무것도 하지 않고 `stopping`이다. 그 번호의 연결을 쥐고 있지 않으면(번호 없음, 이미 닫혀 빠짐, 지금 닫히는 중) 아무것도 하지 않고 `not_open`이다: 기록·판단 사건·전달이 없다. 같은 번호를 두 번 불러도 닫기는 한 번이다(두 번째는 `not_open`).
+2. **정상 끊김과 같은 길이다.** 닫기는 상대가 끊었을 때와 같은 내부 닫기 하나로 간다: 소켓 파기, 대기열 버림, 기록 `closed`(사유 `requested`), 판단에 `closed` 한 번, 인사를 마친 연결이면 판단이 낸 `withdrawn`을 `deliver`로 전달, 넘긴 틀의 `settled("closed")`. 철회를 받는 쪽(답 줄의 연결 철회 → 자격 값 송신기의 `forgetConnection` → 조회 등록부의 `dropConnection`, `runtime/answers.ts`)은 이 `withdrawn` 하나로 알므로 닫기만 따로 가는 길이 없다. 이 모두가 `closeConnection`이 돌아오기 전에 끝난다(소켓의 `close` 사건을 기다리지 않는다). 늦게 온 소켓 사건은 두 번째 닫힘을 만들지 않는다.
+3. **동기이고 시계·복원기를 읽지 않는다.** 판단의 닫힘 처리와 같다(보장 3).
+
+닫기와 겹칠 수 있는 일과 그 처리:
+
+| 겹치는 일 | 처리 |
+|---|---|
+| 그 연결로 오는 바이트(인사·영수증·보고) | 닫힌 연결의 `data`는 받지 않고 대기열은 버린다. 검증을 기다리던 봉투의 결과는 판단에 넘기지 않는다(`late_dropped`). 그 연결의 `forward`·`occupancy`가 나가지 않는다 |
+| 넘긴 지시·ack·자격 값 틀의 완료 대기 | `settled("closed")` 한 번. 늦은 완료 콜백은 다시 부르지 않는다(틀 쓰기 면 4) |
+| `writeFrame`의 `lastCheck`·`finalCheck` 안에서 그 연결을 닫음 | 바깥 쓰기는 `closed`이고 넘긴 바이트 0, `settled` 0번 |
+| 맞춤 답의 완료 대기 | 늦은 완료는 `reply_sent`를 넣지 않는다(보장 2) |
+| 닫힘이 전하는 `withdrawn` 안에서 같은 번호를 다시 부름 | `not_open`. 닫힘·철회는 한 번 |
+| 같은 실행기의 새 연결이 맞춰 옛 연결을 판단이 닫음 | 그 뒤의 옛 번호는 `not_open`. 연결 번호는 다시 쓰지 않으므로 옛 번호로 새 연결을 닫지 않는다 |
+| 서버 `close()` | 시작한 뒤에는 `stopping`. 남은 연결은 `shutdown`으로 닫힌다 |
+
+시험은 `test/supervisor/transport/close-connection.test.ts`다. 루프백 시험은 서버를 실제 답 줄·조회 등록부·임시 장부에 잇고, 닫은 뒤 실행기 흉내가 재접속 제한(`windowMs: 60000`, `max: 2`) 안에서 다시 붙어 보낸 새 `hello`가 새 연결로 인정되는 것, 옛 번호의 철회가 송신기 포트와 조회 등록부에 닿은 것을 본다.
+
 ## 공개 면
 
 | 이름 | 꼴 |
 |---|---|
 | `startConnectionServer(options)` | `ConnectionServerOptions` → `Promise<StartResult>`. 실패는 `bad_settings`(먼저 서버 자체의 시작 검사: `maxPendingWriteBytes`가 1부터 `Number.MAX_SAFE_INTEGER`까지의 정수가 아니다(빠짐 포함). 그다음 연결 판단이 받지 않는 설정), `no_material`(자기 TLS 재료, 사유 그대로), `listen_failed` |
-| `ConnectionServer` | `port`, `table()`(지금의 연결 표: `get`·`candidates`·`occupancy`를 읽는다), `registry()`(지금 판), `applyRegistry(input)`(적용 결과 그대로), `tick()`, `recognized(principal)`(부를 때마다 복원기 포트와 그 `stopGeneration()`을 읽는다), `writeFrame(connection, principal, frame, options)`(인정을 볼 때 복원기 포트와 그 `stopGeneration()`을 읽는다. `lastCheck`가 쓴다고 답하고 연결이 열려 있으면 그 객체의 `stopGeneration()`을 다시 읽고, 그것으로 인정될 때만 마지막으로 복원기 포트를 다시 읽는다. 그 앞에서 돌아가면 다시 읽지 않는다. 재확인을 통과하면 넘긴 `finalCheck`를 부르고 포트를 더 읽지 않고 쓴다. 위 "틀 쓰기 면" 2), `close()` |
+| `ConnectionServer` | `port`, `table()`(지금의 연결 표: `get`·`candidates`·`occupancy`를 읽는다), `registry()`(지금 판), `applyRegistry(input)`(적용 결과 그대로), `tick()`, `recognized(principal)`(부를 때마다 복원기 포트와 그 `stopGeneration()`을 읽는다), `writeFrame(connection, principal, frame, options)`(인정을 볼 때 복원기 포트와 그 `stopGeneration()`을 읽는다. `lastCheck`가 쓴다고 답하고 연결이 열려 있으면 그 객체의 `stopGeneration()`을 다시 읽고, 그것으로 인정될 때만 마지막으로 복원기 포트를 다시 읽는다. 그 앞에서 돌아가면 다시 읽지 않는다. 재확인을 통과하면 넘긴 `finalCheck`를 부르고 포트를 더 읽지 않고 쓴다. 위 "틀 쓰기 면" 2), `closeConnection(connection)`(`closed`·`not_open`·`stopping`. 위 "연결 하나 닫기"), `close()` |
+| `CloseConnectionResult` | `closed`(정상 끊김과 같은 길로 닫았다), `not_open`(그 번호의 연결을 쥐고 있지 않다), `stopping`(서버를 닫기 시작했다). 뒤의 둘은 아무것도 하지 않았다 |
 | `WriteFrameOptions` | `lastCheck: () => string \| null`(동기, 서버 확인 뒤), `finalCheck?: () => string \| null`(동기, 선택. 인정의 재확인 뒤 `write` 바로 앞), `settled: (end: SendEnd) => void`(넘긴 틀마다 정확히 한 번). `lastCheck`와 `settled`는 꼭 넘긴다 |
 | `SendEnd` | `flushed`(로컬 쓰기가 오류 없이 끝남), `failed`(로컬 쓰기 오류 또는 `write`가 던짐, 연결은 `send_failed`로 닫힘), `closed`(완료 전에 연결이 닫힘) |
 | `WriteFrameResult` | `written`(틀 전부를 한 번의 `write`로 넘겼다. 상대가 받았다는 뜻이 아니다), `not_written`(넘긴 바이트 0: `reason`이 `NOT_WRITTEN_REASONS` 가운데 하나, `refused`면 `refusal`에 `lastCheck`나 `finalCheck`의 이름), `unknown`(`write`가 던졌다. 연결을 닫았고, 돌아오기 전에 `settled`를 이미 한 번 불렀다) |
 | `NOT_WRITTEN_REASONS` | `not_recognized`(`lastCheck`가 쓴다고 답한 뒤의 재확인에서 인정을 잃은 때도 여기다. 이때 `lastCheck`는 불렸고 `finalCheck`는 불리지 않았다), `closed`, `backlog`(그 연결을 `send_backlog`로 닫았다), `refused`(`lastCheck` 또는 `finalCheck`의 이름), `check_failed`(둘 가운데 하나가 던졌거나 꼴 아닌 값), `reentered`. `backlog` 밖에는 연결을 닫지 않는다 |
 | `Delivered` | 부르는 쪽에 넘기는 출력 넷(`occupancy`·`candidate`·`withdrawn`·`forward`), 연결 판단의 `Output` 그대로 |
 | `ServerNote` | 기록용: `opened`, `rejected_tls`(TLS 판정 사유), `closed`(`cause`, 틀 거절이면 `frame`), `reply_not_sent`(`deadline`, `at`), `reply_written`(`at`은 넘긴 시각, `done`은 완료를 안 시각), `late_dropped` |
-| `LINK_CLOSE_CAUSES` | `judgment`, `peer`, `frame`, `before_reply`, `check_failed`, `judgment_failed`, `write_failed`, `write_busy`(답을 넘기려는 때 쓰기 버퍼가 비지 않았거나 묶였다. 넘긴 바이트 0), `write_late`, `reply_late`, `deliver_failed`, `clock_failed`, `send_backlog`(`writeFrame`이 넘기려는 때 묶였거나 대기량이 상한을 넘었다. 그 틀은 넘기지 않았다), `send_failed`(`writeFrame`으로 넘긴 틀의 로컬 쓰기가 오류로 끝났거나 `write`가 던졌다), `shutdown` |
+| `LINK_CLOSE_CAUSES` | `judgment`, `peer`, `frame`, `before_reply`, `check_failed`, `judgment_failed`, `write_failed`, `write_busy`(답을 넘기려는 때 쓰기 버퍼가 비지 않았거나 묶였다. 넘긴 바이트 0), `write_late`, `reply_late`, `deliver_failed`, `clock_failed`, `send_backlog`(`writeFrame`이 넘기려는 때 묶였거나 대기량이 상한을 넘었다. 그 틀은 넘기지 않았다), `send_failed`(`writeFrame`으로 넘긴 틀의 로컬 쓰기가 오류로 끝났거나 `write`가 던졌다), `shutdown`, `requested`(부르는 쪽이 `closeConnection`으로 닫았다) |
 
 서버가 받는 포트(`ConnectionServerOptions`):
 
@@ -107,7 +134,7 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 | `withdrawn` | 부르는 쪽 | 그 연결의 주체가 후보에서 빠짐 |
 | `forward` | 부르는 쪽 | `dispatch/receipts.ts`의 `handleForward` |
 
-서버가 판단에 넣는 사건: 인증된 연결마다 `open`, 봉투마다 `check` → `envelope`, 답의 로컬 쓰기가 끝난 뒤 `reply_sent`, `tick()`과 늦은 답마다 `tick`, 닫힘마다 `closed`, `applyRegistry`마다 `registry`.
+서버가 판단에 넣는 사건: 인증된 연결마다 `open`, 봉투마다 `check` → `envelope`, 답의 로컬 쓰기가 끝난 뒤 `reply_sent`, `tick()`과 늦은 답마다 `tick`, 닫힘마다(`closeConnection` 포함) `closed`, `applyRegistry`마다 `registry`.
 
 ## 정한 것
 
@@ -156,6 +183,10 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 - **`nonces`는 동시에 불려도, 재시작을 지나도 한 번만 성공한다.** `reply`의 요청 ID·nonce는 암호학적 난수이고 `seal`은 키를 내주지 않는다(계약 v1 구현 인수 조건 2).
 - **인증서를 교체한 뒤의 재인증을 정한다.** 이 서버는 맺은 연결의 인증서를 다시 보지 않는다.
 - **키 유출 때의 순서(정지 → 폐기 판 → `registry().readout().revision` 대조 → 옛 연결 차단 확인 → 풀기)는 런북의 일이다.** 이 서버는 `applyRegistry`가 돌아오기 전에 믿지 않는 연결을 닫는다.
+- **`closeConnection`은 그 실행기에 임대를 믿는 실행이 없을 때만 부른다.** 받은 적 없는 실행을 닫으려고 새 인사가 필요한 박자(D-90)가 부르는 쪽이다. 닫으면 그 실행기는 다시 붙어 맞출 때까지 후보에서 빠지고 지시·값을 받지 못한다: 임대를 믿고 도는 실행이 있으면 그 연장·지시가 끊긴다. 번호는 `recognized(주체)`로 그 박자에 얻고, 결과가 `not_open`·`stopping`이면 아무 일도 없었던 것으로 다룬다.
+- **닫은 뒤 같은 박자에 그 실행기를 다시 판단하지 않는다.** `closed`가 돌아온 때 그 실행기는 판단에서 빠졌고 새 `hello`는 아직 없다. 새 인사의 판단은 실행기가 다시 붙어 인사한 뒤의 박자에서 한다. 한 실행기에 박자마다 닫지 않는다: 새 연결이 맞추기도 전에 다시 닫게 된다.
+- **재접속 제한과 간격을 맞춘다.** `settings.reconnect`를 쓰면 같은 상대 인증서 URI의 받아들인 연결이 `windowMs` 안에 `max`개를 넘지 못한다(`connections.ts`의 `open`). 닫힌 연결도 연 때부터 그 창의 한 칸이다. 그래서 창 안에서 한 실행기를 닫는 횟수는 `max - 1` 이하이고, 망 끊김으로 다시 붙는 몫도 남겨야 한다. 넘으면 다시 붙은 연결이 `throttled`로 곧바로 닫혀 새 인사가 오지 않는다. 실행기가 닫힌 뒤 다시 붙는 간격은 실행기 진입점의 값이고 이 서버가 정하지 않는다: 그 간격과 박자의 주기로 "닫은 뒤 새 인사를 기다리는 시간"을 정한다.
+- **서버를 닫기 시작한 뒤에는 부르지 않는다.** 불러도 `stopping`이고 닫지 않는다. 발급을 닫는 순서(`runtime/issuance.ts`)에서 박자가 먼저 끝나므로 정상 조립에서는 겹치지 않는다.
 
 ## 남는 한계
 

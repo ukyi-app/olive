@@ -17,6 +17,8 @@
 //   부른 뒤 곧바로 write한다. 줄을 두지 않는다:
 //   묶였거나 대기량이 상한을 넘으면 넘기지 않고 그 연결을 닫는다. 넘긴 틀마다 settled를 로컬 쓰기가 끝났을 때, write가 던졌을 때,
 //   또는 그 전에 연결이 닫혔을 때 가운데 먼저 온 쪽에서 정확히 한 번 부른다.
+// - closeConnection은 상대가 끊었을 때와 같은 closeLink로만 닫는다. 철회를 받는 쪽(답 줄·조회 등록부·자격 값 송신기)은 판단의
+//   withdrawn 하나로 알므로, 다른 길로 닫으면 옛 연결의 답·값이 지금 연결의 것으로 남는다.
 //
 // 타이머를 두지 않는다. 시간이 흘러 생기는 판단(답·hello의 기한, 복원기가 바뀜)은 부르는 쪽이 tick()을 불러야 일어난다.
 import type * as tls from "node:tls";
@@ -156,6 +158,8 @@ export const LINK_CLOSE_CAUSES = [
   "send_failed",
   // 서버를 닫는다.
   "shutdown",
+  // 부르는 쪽이 closeConnection으로 그 연결 하나를 닫았다.
+  "requested",
 ] as const;
 export type LinkCloseCause = (typeof LINK_CLOSE_CAUSES)[number];
 
@@ -180,6 +184,14 @@ export type StartFailure =
 
 export type StartResult = { readonly ok: true; readonly server: ConnectionServer } | { readonly ok: false; readonly failure: StartFailure };
 
+export type CloseConnectionResult =
+  // 지금 쥔 연결이었고 정상 끊김과 같은 길로 닫았다. 돌아올 때 판단의 closed와 그 철회(withdrawn)의 전달이 이미 끝났다.
+  | { readonly kind: "closed" }
+  // 그 번호의 연결을 쥐고 있지 않다(번호 없음, 이미 닫혀 빠짐, 지금 닫히는 중). 아무것도 하지 않았다.
+  | { readonly kind: "not_open" }
+  // 서버를 닫기 시작했다. 아무것도 하지 않았다(남은 연결은 close()가 shutdown으로 닫는다).
+  | { readonly kind: "stopping" };
+
 export interface ConnectionServer {
   readonly port: number;
   // 지금의 연결 표. get·candidates·occupancy를 읽는 데 쓴다. 불변 값이라 받은 뒤 서버가 바꿔도 받은 값은 그대로다.
@@ -195,6 +207,9 @@ export interface ConnectionServer {
   recognized(principal: string): number | null;
   // 인정된 연결 하나에 부르는 쪽이 이미 만든 틀 하나를 넘긴다. 기다리지 않고, 넘기지 못한 틀을 쥐었다가 뒤에 쓰지 않는다.
   writeFrame(connection: number, principal: string, frame: Uint8Array, options: WriteFrameOptions): WriteFrameResult;
+  // 지금 쥔 연결 하나를 닫는다. 상대가 끊었을 때와 같은 닫기(closed 한 번, 인사를 마친 연결이면 withdrawn 전달, 넘긴 틀의 settled)를 탄다.
+  // 동기이고 시계·복원기를 읽지 않는다. 실행기가 다시 붙어 새 hello를 보내게 하는 데 쓴다(실행기의 재접속은 이 서버가 정하지 않는다).
+  closeConnection(connection: number): CloseConnectionResult;
   close(): Promise<void>;
 }
 
@@ -631,6 +646,16 @@ class Server implements ConnectionServer {
       if (!link.dead && link.writing !== null && !(at < link.writing.deadline)) this.closeLink(link, "write_late");
     }
     this.step({ kind: "tick" }, undefined, at);
+  }
+
+  // 닫기는 closeLink 하나로 간다: 상대가 끊었을 때와 같이 대기열·늦은 check·답 쓰기 대기·넘긴 틀을 정리하고 판단에 closed를 넣는다.
+  // 닫는 중인 연결은 closeLink가 첫머리에서 links에서 빼므로 여기서 not_open이다(닫힘 안의 전달에서 다시 불려도 두 번 닫지 않는다).
+  closeConnection(connection: number): CloseConnectionResult {
+    if (this.stopping) return { kind: "stopping" };
+    const link = this.links.get(connection);
+    if (link === undefined || link.dead) return { kind: "not_open" };
+    this.closeLink(link, "requested");
+    return { kind: "closed" };
   }
 
   async close(): Promise<void> {
