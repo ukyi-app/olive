@@ -35,6 +35,7 @@ import {
   scratch,
   scriptedIo,
   sha256,
+  stopWrite,
   supervisorKeys,
   T0,
   taskStartBody,
@@ -67,7 +68,7 @@ function contents(): Map<string, string> {
   ]);
 }
 
-const TIMING: ExecutorSettings["timing"] = { replyWaitMs: 5_000, helloWaitMs: 1_000, helloPollMs: 50, tickMs: 1_000, stopWaitMs: 2_000 };
+const TIMING: ExecutorSettings["timing"] = { replyWaitMs: 5_000, helloWaitMs: 1_000, helloPollMs: 50, tickMs: 1_000, stopWaitMs: 2_000, settleWaitMs: 1_500 };
 
 function settings(over: Partial<ExecutorSettings> = {}): ExecutorSettings {
   return {
@@ -705,6 +706,8 @@ test("제품 설정의 응답 상한은 10초이고 worker의 exitWaitMs와 원�
   });
   if (!parsed.ok) throw new Error(parsed.name);
   expect(parsed.settings.timing.replyWaitMs).toBe(10_000);
+  // 다시 붙기 전 앞 지시와 기동 단계의 상한: 종료·계수 상한 둘(각 replyWaitMs)보다 길다.
+  expect(parsed.settings.timing.settleWaitMs).toBe(25_000);
   const result = await begin(harness(), parsed.settings);
   if (!result.ok) throw new Error(result.reason);
   expect(optionsOf(result.running.worker).exitWaitMs).toBe(10_000);
@@ -712,7 +715,9 @@ test("제품 설정의 응답 상한은 10초이고 worker의 exitWaitMs와 원�
 });
 
 // 루프백의 실제 상호 TLS 감독 흉내에 붙어 맞춤과 인사까지 마친 실행기. connects는 TLS 클라이언트의 connect 호출(TCP를 열기 전) 수다.
-async function loopbackRun() {
+// synced가 false면 맞춤 답을 보낸 뒤 인사를 기다리지 않고 돌려준다(세대 쓰기가 멈춘 경우).
+// clock을 주면 단조 시계와 타이머를 그것으로 바꾼다(기한 정각의 콜백 차례를 시험이 정할 때).
+async function loopbackRun(options: { openStore?: ExecutorDeps["openStore"]; synced?: boolean; clock?: Pick<ExecutorDeps, "monoNow" | "setTimer"> } = {}) {
   const supervisorLeaf = pki.supervisor();
   const peers: { socket: tls.TLSSocket; got: Envelope[]; closed: boolean }[] = [];
   const server = await startTlsServer({
@@ -735,7 +740,7 @@ async function loopbackRun() {
   const agent = new FakeAgent();
   const deps: ExecutorDeps = {
     readText: async (path) => contents().get(path)!,
-    openStore: (dir, now) => ExecutorStore.open(dir, { now }),
+    openStore: options.openStore ?? ((dir, now) => ExecutorStore.open(dir, { now })),
     listenAgent: (remote) => {
       agent.attach(remote);
       agent.hello();
@@ -753,6 +758,7 @@ async function loopbackRun() {
     },
     random: () => 0,
     log: (line) => calls.push(`log ${line}`),
+    ...options.clock,
   };
   const result = await startExecutor(settings({ supervisor: { address: "127.0.0.1", port: server.port, serverName: SUPERVISOR_DNS, uri: SUPERVISOR_URI } }), deps);
   if (!result.ok) {
@@ -764,7 +770,7 @@ async function loopbackRun() {
   const peer = peers[0]!;
   const clock = new Clock(Date.now());
   peer.socket.write(frame(fromSupervisor(clock, worker.name, "stop_sync_reply", { challenge: (peer.got[0]!.body as { challenge: string }).challenge }, { stop_generation: 0 })));
-  await until(() => peer.got.some((e) => e.header.action === "hello") && link.live());
+  if (options.synced !== false) await until(() => peer.got.some((e) => e.header.action === "hello") && link.live());
   return { server, peers, peer, calls, clock, running: result.running, connects: () => connects };
 }
 
@@ -806,6 +812,31 @@ test("앞 연결의 지시가 끝나기 전에는 다시 붙지 않는다: 재�
     } finally {
       await r.server.close();
     }
+  }
+});
+
+test("앞 연결의 지시를 기다리는 다시 붙기에도 상한이 있다: 맞춤 답의 정지 세대 쓰기가 끝나지 않으면 settleWaitMs 뒤 다시 붙지 않고 89로 끝난다(루프백 TLS)", async () => {
+  const disk = scriptedIo();
+  const write = disk.hold(stopWrite);
+  const r = await loopbackRun({ openStore: (dir, now) => ExecutorStore.open(dir, { now, io: disk.io }), synced: false });
+  try {
+    await write.entered;
+    r.peer.socket.destroy();
+    await until(() => r.calls.some((call) => call.startsWith("log 감독 소켓: closed(")));
+    await until(() => r.calls.includes("log 앞 연결의 지시 처리가 끝나기를 기다린 뒤 다시 붙는다"));
+    // 상한 전에는 다시 붙지도 끝나지도 않는다.
+    expect(await within(r.running.done, TIMING.settleWaitMs - 300)).toBe("timeout");
+    expect(r.connects()).toBe(1);
+    expect(await within(r.running.done, 2_000)).toBe(EXECUTOR_EXIT.fatal);
+    await Bun.sleep(300);
+    expect(r.connects()).toBe(1);
+    expect(r.peers).toHaveLength(1);
+    expect(r.calls).toContain("client.close");
+    expect(r.calls).toContain("listener.stop");
+  } finally {
+    write.open();
+    await r.running.stop();
+    await r.server.close();
   }
 });
 
@@ -866,6 +897,45 @@ test("종료 영수증이 저장되고 실행 기록 쓰기만 실패한 볼륨:
   await connection.receive(fromSupervisor(clock, worker.name, "task_start", body, { stop_generation: 0, run_generation: 1 }));
   await until(() => writes.some((text) => text.includes('"type":"start"') && text.includes(runId)));
   expect(writes.filter((text) => text.includes('"type":"start"'))).toHaveLength(1);
+});
+
+test("정리 영수증만 남고 같은 세대의 종료 영수증이 없는 stopping(G02 입력)은 잠금을 풀지 않는다: 원격을 처음부터 잠그고 대리 hello를 믿지 않는다", async () => {
+  const dir = scratch();
+  const seeded = await ExecutorStore.open(dir, { now: () => T0 });
+  const run = randomUUID();
+  const instruction = randomUUID();
+  const accepted = randomUUID();
+  const cleaned = randomUUID();
+  await seeded.adoptStopGeneration(0);
+  const window = { start_stop_generation: 0, instruction_request_id: instruction, deadline_at: T0 + 50_000, lease_until: T0 + 20_000, credential_digest: "0".repeat(64) };
+  expect(await seeded.beginRun({ run_id: run, run_generation: 1, state: "preparing", ...window, exit: null, last_receipt_id: null })).toBe(true);
+  const acceptedBody = { receipt_id: accepted, run_id: run, instruction_request_id: instruction, instruction: "task_start" };
+  const cleanedBody = { receipt_id: cleaned, run_id: run, instruction_request_id: randomUUID(), cleaned_at: T0 };
+  const written = await seeded.commit(run, { state: "stopping", exit: "failed", last_receipt_id: cleaned }, [
+    { entry: { action: "receipt_accepted", id: accepted, run_id: run, run_generation: 1, acked: false, body: acceptedBody } },
+    { entry: { action: "receipt_cleaned", id: cleaned, run_id: run, run_generation: 1, acked: false, body: cleanedBody } },
+  ]);
+  expect(written.saved).toBe(true);
+
+  const h = harness({ hello: false });
+  const writes: string[] = [];
+  h.deps.listenAgent = (remote) => {
+    h.calls.push("listenAgent");
+    h.agent.remote = remote;
+    h.agent.session = remote.connect({ write: (bytes) => void writes.push(new TextDecoder().decode(bytes)), close: () => {} });
+    return { stop: () => h.calls.push("listener.stop") };
+  };
+  const starting = startExecutor(settings({ storeDir: dir }), h.deps);
+  await until(() => h.agent.remote !== null);
+  // 잠그지 않으면 hello 뒤 복원이 이 대리에 정리 요청(terminate)을 보내고 그 답을 기다린다.
+  expect(h.agent.remote!.state().distrusted).toBe("inherited_unverified");
+  h.agent.hello();
+  const result = await starting;
+  if (!result.ok) throw new Error(result.reason);
+  runs.push(Promise.resolve(result));
+  expect(result.running.remote.state().greeted).toBe(false);
+  expect(writes.filter((text) => text.includes('"type":"terminate"'))).toHaveLength(0);
+  expect(h.connects).toBe(1);
 });
 
 test("잠그지 않고 기동했는데 recover 뒤에 장부가 보류되면 감독에 붙지 않고 87로 끝나며 대리 소켓을 닫는다", async () => {
@@ -1002,4 +1072,184 @@ test("기동 중 멈춤 요청 뒤 단계가 실패해도 멈춤이 이긴다: �
   }
   expect(recovering.calls.at(-1)).toBe("listener.stop");
   expect(recovering.connects + opening.connects + reading.connects).toBe(0);
+});
+
+test("기동의 기다림에도 상한이 있다: 재료 읽기·저장소 열기·recover가 settleWaitMs 안에 끝나지 않으면 그 단계의 코드(timed_out)로 끝나고 연결 0", async () => {
+  const never = new Promise<never>(() => {});
+  const recover = WorkerExecutor.prototype.recover;
+  const cases: { step: StartStep; code: number; stall: (h: Harness) => void }[] = [
+    { step: "material", code: EXECUTOR_EXIT.material, stall: (h) => (h.deps.readText = () => never) },
+    { step: "store", code: EXECUTOR_EXIT.store, stall: (h) => (h.deps.openStore = () => never) },
+    { step: "recover", code: EXECUTOR_EXIT.recover, stall: () => (WorkerExecutor.prototype.recover = () => never) },
+  ];
+  try {
+    for (const c of cases) {
+      const h = harness();
+      c.stall(h);
+      const starting = startExecutor(settings(), h.deps);
+      await until(() => h.steps.includes(c.step));
+      h.timers.advance(TIMING.settleWaitMs - 1);
+      expect(await within(starting, 50), c.step).toBe("timeout");
+      h.timers.advance(1);
+      expect(await within(starting, 1_000)).toEqual({ ok: false, step: c.step, code: c.code, reason: "timed_out" });
+      expect(h.connects).toBe(0);
+      expect(h.calls.includes("listener.stop"), c.step).toBe(c.step === "recover");
+      WorkerExecutor.prototype.recover = recover;
+    }
+  } finally {
+    WorkerExecutor.prototype.recover = recover;
+  }
+});
+
+test("기동의 기다림은 결과를 받아들이는 때의 시각으로 판정한다: 재료·저장소·recover의 정상 결과가 기한 1ms 전이면 기동, 정각·정각 뒤면 타이머보다 먼저 와도 그 단계의 코드(timed_out)·연결 0. 기한은 단계를 부르기 전부터 잰다", async () => {
+  const recover = WorkerExecutor.prototype.recover;
+  const S = TIMING.settleWaitMs;
+  const codes = { material: EXECUTOR_EXIT.material, store: EXECUTOR_EXIT.store, recover: EXECUTOR_EXIT.recover } as const;
+  try {
+    for (const step of ["material", "store", "recover"] as const) {
+      for (const offset of [-1, 0, 1]) {
+        const label = `${step} ${offset}`;
+        const h = harness();
+        const held = Promise.withResolvers<void>();
+        const entered = Promise.withResolvers<void>();
+        const take = async <T>(value: T) => {
+          entered.resolve();
+          await held.promise;
+          return value;
+        };
+        const read = h.deps.readText;
+        const open = h.deps.openStore;
+        if (step === "material") h.deps.readText = async (path) => take(await read(path));
+        if (step === "store") h.deps.openStore = async (dir, now) => take(await open(dir, now));
+        if (step === "recover") {
+          WorkerExecutor.prototype.recover = async function (this: WorkerExecutor) {
+            await take(await recover.call(this));
+          };
+        }
+        const run = begin(h);
+        await entered.promise;
+        // 타이머를 부르지 않고 시계만 옮긴다: 정상 결과가 상한 타이머의 콜백보다 먼저 처리된다.
+        h.timers.t = S + offset;
+        held.resolve();
+        const result = await within(run, 1_000);
+        if (offset < 0) {
+          expect(result !== "timeout" && result.ok, label).toBe(true);
+          expect(h.calls, label).toContain("connect");
+        } else {
+          expect(result, label).toEqual({ ok: false, step, code: codes[step], reason: "timed_out" });
+          expect(h.connects, label).toBe(0);
+          expect(h.calls.includes("listener.stop"), label).toBe(step === "recover");
+        }
+        WorkerExecutor.prototype.recover = recover;
+      }
+    }
+    // 단계 호출 안에서 시각이 상한만큼 흐르면(동기 부분이 오래 걸림) 그 결과도 만료다. 기한을 호출 뒤에 재면 통과한다.
+    const h = harness();
+    const open = h.deps.openStore;
+    h.deps.openStore = (dir, now) => {
+      h.timers.t += S;
+      return open(dir, now);
+    };
+    expect(await within(begin(h), 1_000)).toEqual({ ok: false, step: "store", code: EXECUTOR_EXIT.store, reason: "timed_out" });
+    expect(h.connects).toBe(0);
+  } finally {
+    WorkerExecutor.prototype.recover = recover;
+  }
+});
+
+test("기동의 기다림에서 상한 타이머가 정각 전에 깨면 시각을 다시 보고 남은 시간으로 다시 건다: 그 사이 온 정상 결과로 기동한다", async () => {
+  const h = harness();
+  const S = TIMING.settleWaitMs;
+  const held = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  const read = h.deps.readText;
+  h.deps.readText = async (path) => {
+    const text = await read(path);
+    entered.resolve();
+    await held.promise;
+    return text;
+  };
+  // 첫 상한 타이머만 1ms 일찍 깨운다(실제 타이머도 단조 시계보다 조금 일찍 불릴 수 있다).
+  const setTimer = h.deps.setTimer;
+  let early = true;
+  h.deps.setTimer = (ms, fire) => {
+    if (early && ms === S) {
+      early = false;
+      return setTimer(ms - 1, fire);
+    }
+    return setTimer(ms, fire);
+  };
+  const run = begin(h);
+  await entered.promise;
+  h.timers.advance(S - 1);
+  expect(await within(run, 50)).toBe("timeout");
+  held.resolve();
+  const result = await within(run, 1_000);
+  expect(result !== "timeout" && result.ok).toBe(true);
+  expect(h.calls).toContain("connect");
+});
+
+test("다시 붙기 전 앞 지시의 기한은 결과를 받아들이는 때의 시각으로 판정한다: 정각·정각 뒤면 결과와 타이머의 차례와 상관없이 89·재연결 0, 정각 1ms 전 정상 결과면 다시 붙는다(루프백 TLS)", async () => {
+  const S = TIMING.settleWaitMs;
+  const cases = [
+    { at: S - 1, first: "result", reconnects: true },
+    { at: S, first: "result", reconnects: false },
+    { at: S, first: "timer", reconnects: false },
+    { at: S + 1, first: "result", reconnects: false },
+  ] as const;
+  for (const c of cases) {
+    const label = `${c.at} ${c.first}-first`;
+    // 단조 시계는 시험이 옮긴다. 다시 붙기 전 기다림의 상한 타이머(ms = S)만 잡아 시험이 부르고, 나머지는 실제 타이머다.
+    let logical = 0;
+    let catchGate = false;
+    let due: (() => void) | undefined;
+    const clock = {
+      monoNow: () => logical,
+      setTimer: (ms: number, fire: () => void) => {
+        if (catchGate && ms === S) {
+          due = fire;
+          return () => (due = undefined);
+        }
+        const handle = setTimeout(fire, ms);
+        return () => clearTimeout(handle);
+      },
+    };
+    const r = await loopbackRun({ clock });
+    const complete = Promise.withResolvers<void>();
+    try {
+      const { worker } = r.running;
+      const handle = worker.handle.bind(worker);
+      let entered = false;
+      worker.handle = async (...args: Parameters<typeof handle>) => {
+        const out = await handle(...args);
+        entered = true;
+        await complete.promise;
+        return out;
+      };
+      r.peer.socket.write(frame(fromSupervisor(r.clock, worker.name, "status_query", { run_ids: [randomUUID()] }, { stop_generation: 0 })));
+      await until(() => entered);
+      catchGate = true;
+      r.peer.socket.destroy();
+      await until(() => due !== undefined);
+      logical = c.at;
+      if (c.first === "timer") due!();
+      complete.resolve();
+      if (c.reconnects) {
+        await until(() => r.peers[1]?.got.some((e) => e.header.action === "stop_sync_request") ?? false);
+        expect(r.connects(), label).toBe(2);
+        expect(await r.running.stop(), label).toBe(0);
+      } else {
+        expect(await within(r.running.done, 2_000), label).toBe(EXECUTOR_EXIT.fatal);
+        await Bun.sleep(300);
+        expect(r.connects(), label).toBe(1);
+        expect(r.peers, label).toHaveLength(1);
+        expect(r.calls, label).toContain("client.close");
+        expect(r.calls, label).toContain("listener.stop");
+      }
+    } finally {
+      complete.resolve();
+      await r.running.stop();
+      await r.server.close();
+    }
+  }
 });

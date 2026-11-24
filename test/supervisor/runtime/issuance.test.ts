@@ -186,6 +186,7 @@ function cycleWith(wait: () => Promise<void>) {
       return done("life");
     },
     resend: async () => done("resend"),
+    unreceived: () => done("unreceived"),
     assign: async () => done("assign"),
   };
   return createCycle({

@@ -98,6 +98,56 @@ test("대리 진입점: 제어가 아직 듣지 않으면 retryMs마다 다시 �
   expect(port.types()).toEqual(["hello"]);
 });
 
+test("대리 진입점: 정리 코어 기록(prepare)이 붙기 상한 안에 돌아오지 않으면 82로 끝나고 소켓에 붙지 않는다", async () => {
+  const order: string[] = [];
+  const runtime = new FakeRuntime();
+  const port = new Port();
+  const { connect, state } = connector(order, port);
+  const stalled = parts(order, { record: () => new Promise<never>(() => {}) });
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: stalled, connect, connectWaitMs: 250, retryMs: 100, monoNow: runtime.now });
+  await settle();
+  runtime.advance(249);
+  await settle();
+  expect(runtime.exits).toEqual([]);
+  runtime.advance(1);
+  expect(await running).toBeNull();
+  expect(runtime.exits).toEqual([ROLE_AGENT_EXIT.unreachable]);
+  expect(state.attempts).toBe(0);
+  expect(port.written).toEqual([]);
+});
+
+test("대리 진입점: 정리 코어 기록의 결과는 받아들이는 때의 시각으로 판정한다: 기한 전 실패는 80, 정각·정각 뒤 실패는 상한 타이머보다 먼저 와도 82, 상한이 먼저 82로 끝낸 뒤의 늦은 실패는 종료를 더하지 않는다", async () => {
+  const LIMIT = 60_000;
+  for (const finishMs of [LIMIT - 1, LIMIT, LIMIT + 1]) {
+    const order: string[] = [];
+    const runtime = new FakeRuntime();
+    const port = new Port();
+    const { connect, state } = connector(order, port);
+    const io = Promise.withResolvers<FakeSpace>();
+    const base = runtime.t;
+    const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order, { record: () => io.promise }), connect, connectWaitMs: LIMIT, retryMs: 500, monoNow: () => runtime.t - base });
+    // 타이머를 부르지 않고 시계만 옮긴다: 기록 실패가 상한 타이머의 콜백보다 먼저 처리된다.
+    runtime.t = base + finishMs;
+    io.reject(new Error("EIO"));
+    expect(await running).toBeNull();
+    expect(runtime.exits, String(finishMs)).toEqual([finishMs < LIMIT ? AGENT_EXIT.space_unavailable : ROLE_AGENT_EXIT.unreachable]);
+    expect(state.attempts).toBe(0);
+  }
+  const order: string[] = [];
+  const runtime = new FakeRuntime();
+  const port = new Port();
+  const { connect, state } = connector(order, port);
+  const io = Promise.withResolvers<FakeSpace>();
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order, { record: () => io.promise }), connect, connectWaitMs: LIMIT, retryMs: 500, monoNow: runtime.now });
+  await settle();
+  runtime.advance(LIMIT);
+  expect(await running).toBeNull();
+  io.reject(new Error("EIO"));
+  await settle();
+  expect(runtime.exits).toEqual([ROLE_AGENT_EXIT.unreachable]);
+  expect(state.attempts).toBe(0);
+});
+
 test("대리 진입점: 상한 안에 붙지 못하면 82로 끝나고 hello를 보내지 않는다", async () => {
   const order: string[] = [];
   const runtime = new FakeRuntime();

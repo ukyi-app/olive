@@ -19,7 +19,11 @@
 //   프로세스 안에서 다시 열지 않고 소켓을 멈춘 뒤 fatal 코드로 끝내 컨테이너 재시작에 맡긴다(같은 저장소를 두 객체가 쥐지 않는다).
 //   그 거절은 연결의 닫힘 사유와 따로 끝내기로 잇는다(아래 fatal). 끝내기는 예약기(setTimer)에 기대지 않는다.
 //   앞 연결에서 시작한 지시 처리가 끝나기 전에는 다시 붙지 않는다(아래 gatedClient): 그 결과가 거절이면 끝내야 할 worker다.
+//   그 기다림은 settleWaitMs에 묶는다. 넘으면 다시 붙지 않고 fatal로 끝낸다.
+// - 기동의 기다림(재료 읽기·저장소 열기·recover)도 하나마다 settleWaitMs에 묶는다. 넘으면 그 단계의 코드로 끝난다(사유 timed_out).
 // - 끝낼 때 소켓 stop()을 기다린 뒤 TLS 클라이언트를 닫는다. stop이 상한(stopWaitMs) 안에 끝나지 않거나 상한을 걸지 못하면 기다리지 않고 닫는다.
+// - 기한이 있는 기다림은 결과를 받아들이는 때의 단조 시각으로 판정한다(untilDeadline, hello는 받은 시각). 기한 정각 이후면 상한 타이머보다
+//   먼저 처리된 결과여도 만료다. 타이머는 깨우는 수단이다.
 import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
 import { encodeControl } from "../agent/link.ts";
 import { type Role, ROLES } from "../contract/v1/index.ts";
@@ -92,6 +96,10 @@ export interface ExecutorTiming {
   readonly tickMs: number;
   // 끝낼 때 소켓 stop()을 기다리는 상한.
   readonly stopWaitMs: number;
+  // 기동의 기다림(재료 읽기·저장소 열기·recover) 하나와, 감독에 다시 붙기 전 앞 연결의 지시 처리를 기다리는 상한(단조 시계).
+  // 넘으면 이 worker를 버린다(기동이면 그 단계의 코드, 다시 붙기면 fatal). 지시 처리와 recover 안에서 상한이 걸린 기다림
+  // (종료·계수 각각 replyWaitMs)보다 길어야 정상 처리를 끊지 않는다. 진입점의 값과 그 근거는 src/main/executor.ts에 있다.
+  readonly settleWaitMs: number;
 }
 
 export interface ExecutorSettings {
@@ -286,6 +294,75 @@ async function readMaterial(settings: ExecutorSettings, readText: ExecutorDeps["
   };
 }
 
+class StepTimeout extends Error {
+  constructor(readonly code: "timed_out" | "bound_unavailable") {
+    super(code);
+  }
+}
+
+type Waited<T> =
+  | { readonly kind: "done"; readonly value: T }
+  | { readonly kind: "failed"; readonly error: unknown }
+  // 기한 정각 이후에 결과를 받았거나 상한 타이머가 기한에 닿았다.
+  | { readonly kind: "lapsed" }
+  // 상한 타이머를 걸지 못했다(기다리지 않는다).
+  | { readonly kind: "unarmed" }
+  | { readonly kind: "aborted" };
+
+// 기한이 있는 기다림 하나. 기한(limit)은 단조 시계(monoNow)의 절대 시각이다. 판정은 시각이 한다: 결과(성공·거절)를 받아들이는 때
+// monoNow가 기한 정각 이후면 콜백 차례와 상관없이 lapsed다. 타이머는 깨우는 수단이라 정각 전에 불리면 시각을 다시 보고 남은 시간으로
+// 다시 건다(올림, 최소 1ms라 실제 시계에서 끝난다).
+// 함정: 정각에 결과와 상한 타이머가 같은 차례에 서면 이벤트 루프가 고른 쪽이 이긴다. 결과 쪽에서 시각을 보지 않으면 기한이 지난 결과로
+// 다음 단계(기동, 다시 붙기)에 들어간다. 진행 중인 작업 자체는 취소하지 않는다. 늦게 끝난 결과는 버린다.
+function untilDeadline<T>(work: Promise<T>, limit: number, deps: Pick<ExecutorDeps, "monoNow" | "setTimer">, signal?: AbortSignal): Promise<Waited<T>> {
+  return new Promise((resolve) => {
+    let ended = false;
+    let cancel: () => void = () => {};
+    const end = (outcome: Waited<T>) => {
+      if (ended) return;
+      ended = true;
+      resolve(outcome);
+      try {
+        cancel();
+      } catch {
+        // 취소하지 못한 상한 타이머가 늦게 불려도 이미 정해진 결과는 바뀌지 않는다
+      }
+    };
+    const accept = (outcome: Waited<T>) => end(deps.monoNow() >= limit ? { kind: "lapsed" } : outcome);
+    const arm = () => {
+      try {
+        cancel = deps.setTimer(Math.max(1, Math.ceil(limit - deps.monoNow())), () => (deps.monoNow() >= limit ? end({ kind: "lapsed" }) : arm()));
+      } catch {
+        end({ kind: "unarmed" });
+      }
+    };
+    work.then(
+      (value) => accept({ kind: "done", value }),
+      (error: unknown) => accept({ kind: "failed", error }),
+    );
+    if (signal?.aborted) return end({ kind: "aborted" });
+    signal?.addEventListener("abort", () => end({ kind: "aborted" }), { once: true });
+    arm();
+  });
+}
+
+// 기동의 기다림 하나. 기한은 단계를 부르기 전에 잰다: 단계의 동기 부분이 쓴 시간도 상한에 든다. 정각 이후에 받은 결과는 성공이든 실패든
+// StepTimeout(timed_out)이다. 상한을 걸지 못하면 bound_unavailable. 늦은 결과(열린 저장소, 진행 중인 복원)는 기동이 실패하면 진입점이
+// 프로세스를 끝내므로 쓸 자리가 없다.
+async function bounded<T>(begin: () => Promise<T>, ms: number, deps: Pick<ExecutorDeps, "monoNow" | "setTimer">): Promise<T> {
+  const limit = deps.monoNow() + ms;
+  let work: Promise<T>;
+  try {
+    work = begin();
+  } catch (error) {
+    work = Promise.reject(error);
+  }
+  const waited = await untilDeadline(work, limit, deps);
+  if (waited.kind === "done") return waited.value;
+  if (waited.kind === "failed") throw waited.error;
+  throw new StepTimeout(waited.kind === "unarmed" ? "bound_unavailable" : "timed_out");
+}
+
 // 오류에서 사유 이름만 꺼낸다. 메시지에는 경로나 값이 들 수 있어 쓰지 않는다.
 function reasonOf(error: unknown): string {
   if (error instanceof MaterialError) return error.message;
@@ -370,7 +447,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   step("material");
   let material: Material;
   try {
-    material = await readMaterial(settings, deps.readText);
+    material = await bounded(() => readMaterial(settings, deps.readText), timing.settleWaitMs, deps);
   } catch (error) {
     return fail("material", EXECUTOR_EXIT.material, error);
   }
@@ -379,7 +456,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   step("store");
   let store: ExecutorStore;
   try {
-    store = await deps.openStore(settings.storeDir, deps.wallNow);
+    store = await bounded(() => deps.openStore(settings.storeDir, deps.wallNow), timing.settleWaitMs, deps);
   } catch (error) {
     return fail("store", EXECUTOR_EXIT.store, error);
   }
@@ -435,10 +512,12 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 함정: 장부는 worker 생성자의 기동 대조(auditRuns)를 지난 뒤에 본다. 그 전의 장부에는 접수가 아닌 최초 preparing(사건·영수증 없음)이 남아,
   // 물려받은 실행이 없는데도 대리를 잠그고 감독에 빈 목록으로 인사한 뒤 새 작업을 띄우지 못한다.
   // 함정: 상태 이름만 보지 않는다. 종료 영수증은 저장되고 실행 기록 쓰기만 실패한 실행은 checking 등으로 남지만, recover는 그 유효한 사건으로
-  // 맺고 남은 수를 세지 않는다(worker.reconcile: 보류되지 않은 실행의 같은 세대 receipt_stopped·receipt_cleaned). 대리의 계수를 쓰지 않는
-  // 실행으로 잠그면 recover 뒤에도 잠금이 풀리지 않아, 정상 대리를 거절하고 새 작업을 띄우지 못한다. 그래서 같은 사건으로 판단한다.
-  const settledByEvent = (runId: string) =>
-    !store.suspectRun(runId) && store.validEvents(runId).some((entry) => entry.action === "receipt_stopped" || entry.action === "receipt_cleaned");
+  // 맺고 남은 수를 세지 않는다(worker.reconcile). 대리의 계수를 쓰지 않는 실행으로 잠그면 recover 뒤에도 잠금이 풀리지 않아, 정상 대리를
+  // 거절하고 새 작업을 띄우지 못한다. 그래서 같은 사건으로 판단한다.
+  // 함정: 잠금을 푸는 조건은 recover가 고를 후보 상태를 저장소가 받아들일 때와 같아야 한다. 그 후보(failed_stopped·ready_result·finalized)는
+  // 모두 같은 세대의 유효한 receipt_stopped를 전제한다(store.ts REQUIRED_EVENTS). receipt_cleaned만 있으면 finalized가 거절돼 보류가 서고
+  // recover가 남은 수를 센다: 그때 잠기지 않은 원격이면 방금 붙은 대리에 정리 요청을 보낸다. 그래서 receipt_cleaned 하나로는 풀지 않는다.
+  const settledByEvent = (runId: string) => !store.suspectRun(runId) && store.validEvents(runId).some((entry) => entry.action === "receipt_stopped");
   const unverified = () => store.ledgerHeld() || store.runs().some((run) => UNFINISHED.includes(run.state) && !settledByEvent(run.run_id));
   const inheritedUnverified = unverified();
   const agent = new GreetedRemote(
@@ -478,7 +557,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
 
   step("recover");
   try {
-    await worker.recover();
+    await bounded(() => worker.recover(), timing.settleWaitMs, deps);
   } catch (error) {
     listener.stop();
     return fail("recover", EXECUTOR_EXIT.recover, error);
@@ -547,16 +626,14 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       }
       deps.log(`실행기를 멈춘다(${reason}), 코드 ${code}`);
       if (socket !== undefined) {
-        const stopping = socket.stop().then(() => true);
-        let stopped: boolean;
+        const stopLimit = deps.monoNow() + timing.stopWaitMs;
+        let stopping: Promise<void>;
         try {
-          let cancelBound: () => void = () => {};
-          const bound = new Promise<boolean>((resolve) => (cancelBound = deps.setTimer(timing.stopWaitMs, () => resolve(false))));
-          stopped = await Promise.race([stopping, bound]);
-          cancelBound();
-        } catch {
-          stopped = false;
+          stopping = socket.stop();
+        } catch (error) {
+          stopping = Promise.reject(error);
         }
+        const stopped = (await untilDeadline(stopping, stopLimit, deps)).kind === "done";
         if (!stopped) deps.log("감독 소켓이 상한 안에 멈추지 않았거나 상한을 걸지 못해 기다리지 않고 닫는다");
       }
       try {
@@ -619,18 +696,23 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 감독 소켓이 붙을 때마다(처음과 다시 붙기) 앞 연결에서 시작한 지시 처리가 모두 끝난 뒤에만 TCP를 연다. 그 처리가 거절되면 fatal이
   // 정해져 붙지 않는다. 함정: 소켓은 연결이 닫히면 그 연결의 처리를 기다리지 않고 다시 붙기를 건다. 기다리지 않으면 재정리 응답이 다시 붙기
   // 간격보다 늦고 응답 상한보다 이를 때, 곧 끝낼 worker가 감독과 다시 맞추고 인사·영수증 재전송을 한 뒤에야 89로 끝난다.
-  // 처리는 worker의 상한(exitWaitMs 등)으로 끝난다. 소켓의 멈춤(중단 신호)이면 기다리지 않고 거절한다.
-  const settledInFlight = (signal: AbortSignal | undefined) =>
-    new Promise<void>((resolve) => {
-      if (signal?.aborted) return resolve();
-      signal?.addEventListener("abort", () => resolve(), { once: true });
-      void Promise.all([...inFlight]).then(() => resolve());
-    });
+  // 함정: 처리 안의 저장소 쓰기(맞춤 답의 정지 세대 쓰기, 검증의 nonce, 영수증·실행 기록)에는 상한이 없다. 그 쓰기가 돌아오지 않으면
+  // 이 기다림도 끝나지 않아, 실행기가 살아 있는 채 다시 붙지도 끝나지도 않는다. 그래서 기다림마다 settleWaitMs를 걸고, 넘으면 다시 붙지
+  // 않고 fatal로 끝내 컨테이너 재시작에 맡긴다. 저장소는 쓰기를 차례로 하므로 멈춘 쓰기 뒤에서는 새 연결의 맞춤도 끝나지 않는다.
+  // 소켓의 멈춤(중단 신호)이면 기다리지 않고 거절한다. 처리의 끝을 받아들이는 때에도 시각을 본다(untilDeadline): 기한 정각 이후에 끝난
+  // 처리는 상한 타이머보다 먼저 처리돼도 lapsed라, 새 TCP를 열기 전에 fatal이 정해진다. 상한을 걸지 못해도 기다리지 않고 lapsed다
+  // (끝나지 않을 수 있는 처리에 다시 붙기를 묶지 않는다).
+  const settledInFlight = async (signal: AbortSignal | undefined, limit: number): Promise<"settled" | "aborted" | "lapsed"> => {
+    const waited = await untilDeadline(Promise.all([...inFlight]), limit, deps, signal);
+    if (waited.kind === "done") return "settled";
+    return waited.kind === "aborted" ? "aborted" : "lapsed";
+  };
   const gatedClient: Pick<TlsClient, "connect" | "close"> = {
     connect: async (signal) => {
-      while (inFlight.size > 0 && !signal?.aborted) {
+      const limit = deps.monoNow() + timing.settleWaitMs;
+      while (inFlight.size > 0 && !signal?.aborted && fatalReason === null) {
         deps.log("앞 연결의 지시 처리가 끝나기를 기다린 뒤 다시 붙는다");
-        await settledInFlight(signal);
+        if ((await settledInFlight(signal, limit)) === "lapsed") fatal("in_flight_stalled");
       }
       if (signal?.aborted) throw new Error("connect_aborted");
       if (fatalReason !== null || ending !== undefined) throw new Error("executor_stopping");
