@@ -2,7 +2,7 @@
 
 올리브의 감독과 작업자 실행기다. 감독은 모델이 아닌 프로세스로, 서명된 지시로 역할별 파드의 실행기에 작업자를 띄우게 하고 예산과 동시 실행 상한을 집행한다. 실행기는 감독에 먼저 붙어 연결을 유지하고 그 위로 지시를 받는다. 듣는 쪽은 감독이다.
 
-지금은 뼈대다. 두 진입점은 기능 없이 "아직 구현되지 않았다"를 찍고 0이 아닌 코드로 끝난다.
+감독 진입점은 아직 자리다(기능 없이 "아직 구현되지 않았다"를 찍고 0이 아닌 코드로 끝난다). 작업자 실행기의 진입점(제어 컨테이너)과 역할 컨테이너의 대리 진입점은 조립을 갖췄지만, 운영 차트가 그 환경을 아직 다 주지 않아 운영에서는 연결 전에 정한 코드로 끝난다(아래 "작업자 실행기 진입점").
 
 설계와 결정은 homelab 저장소의 `docs/plans/2026-11-13-olive/`에 있다. 저장소 배치는 `spec.md` §4.1, 파드 배치는 `supervisor.md` §1.1, 이 저장소의 첫 일은 `issues/O09-supervisor.md`다.
 
@@ -17,21 +17,25 @@
 
 - **하나의 이미지, 역할은 명령으로:** 감독과 작업자 실행기가 같은 이미지를 쓴다. 파드는 `command`로 역할을 고른다.
   - 감독: `["bun", "src/main/supervisor.ts"]`
-  - 작업자 실행기: `["bun", "src/main/executor.ts"]`
+  - 작업자 실행기(제어 컨테이너): `["bun", "src/main/executor.ts"]`
+  - 대리 설치(작업자 실행기 파드의 init 컨테이너): `["bun", "src/main/agent-install.ts"]`. 이미지의 `/opt/olive/olive-agent`를 공유 볼륨의 `/opt/olive-agent/olive-agent`에 놓는다(아래 "대리 설치").
+  - 역할 컨테이너의 대리(PID 1): `/opt/olive-agent/olive-agent`(`src/main/role-agent.ts`를 컴파일한 파일). 역할 컨테이너는 다른 이미지(glibc 계열)이고 대리를 init이 놓는다(D-103·D-107).
   - 기본 명령(`src/main/no-role.ts`)은 역할을 고르라고 찍고 64로 끝난다. 이미지의 `ENTRYPOINT`는 비어 있어 `command`가 그대로 돈다.
-- **종료 코드:** 64는 역할을 고르지 않음, 69는 아직 구현되지 않음.
-- **사용자와 파일시스템:** 비root uid·gid 65532. 루트 파일시스템은 읽기 전용 전제이고 쓰기는 `/tmp`만 된다(파드가 emptyDir를 붙인다).
+- **종료 코드:** 64는 역할을 고르지 않음, 69는 아직 구현되지 않음(감독). 실행기의 81~89, 대리의 75~82, 대리 설치의 90~93은 아래 "작업자 실행기 진입점".
+- **사용자와 파일시스템:** 비root uid·gid 65532. 루트 파일시스템은 읽기 전용 전제이고, 쓰기는 파드가 컨테이너마다 붙인 emptyDir에서만 된다: 모든 컨테이너의 `/tmp`, 작업자 실행기 파드 init 컨테이너의 `/opt/olive-agent`(`agent-bin`, 대리 설치 대상. 역할 컨테이너에는 읽기 전용).
 - **포트:** 이미지에 듣는 포트를 적지 않는다(`EXPOSE`·`PORT` 없음). 실행기는 TCP 포트를 듣지 않는다. 듣는 곳은 역할 컨테이너의 대리가 붙는 경로 유닉스 소켓 하나(`src/executor/agent-listener.ts`, D-102)뿐이고 abstract 소켓도 쓰지 않는다.
 - **들이지 않는 것:** hc 실행 파일, `/etc/claude-code`(관리 설정), 모델 CLI. 앞의 둘은 빌드가 확인한다.
+- **들이는 것: 대리 실행 파일 하나, glibc(D-107).** `/opt/olive/olive-agent`는 `src/main/role-agent.ts`를 `bun build --compile --target=bun-linux-x64`로 Bun 런타임째 묶은 파일이다(약 104MiB, 이미지가 그만큼 커진다). glibc 동적 링크(`/lib64/ld-linux-x86-64.so.2`)라 Alpine 같은 musl 이미지에서는 돌지 않는다. 실행 폴더의 `.env`·`bunfig.toml`을 읽지 않게 컴파일한다(대리는 역할 컨테이너의 작업 폴더에서 prepare 전에 뜬다). 이 이미지 안에서는 돌리지 않는다.
 - **기반 이미지:** `oven/bun:<버전>-slim`(설치·시험 단계)과 `oven/bun:<버전>-distroless`(최종 단계, 셸 없음). 둘 다 digest로 고정한다.
 - **amd64 단일 빌드:** `app-build`가 `--platform linux/amd64`로 부른다.
 
 ### 빌드가 확인하는 것
 
-Dockerfile 단계는 `deps` → `runtime-files` → `image-check` → `test` → 최종 단계다.
+Dockerfile 단계는 `deps` → `agent-build` → `runtime-files` → `image-check` → `test` → 최종 단계다.
 
 - `deps`: 기반 이미지(slim)의 `bun --version`이 `.bun-version`과 같다.
-- `image-check`: 최종 이미지의 파일 내용(`runtime-files`)을 셸이 있는 단계에 복사해 본다. distroless 안의 bun이 `.bun-version`과 같고, 이름이 `hc`인 파일이 하나도 없고, `/etc/claude-code`가 없다. 최종 단계는 셸이 없어 `RUN`을 쓸 수 없기 때문이다.
+- `agent-build`: `deps`의 bun으로 대리를 컴파일한다. 빌드 호스트와 같은 대상이라 내려받기가 없다.
+- `image-check`: 최종 이미지의 파일 내용(`runtime-files`)을 셸이 있는 단계에 복사해 본다. distroless 안의 bun이 `.bun-version`과 같고, 이름이 `hc`인 파일이 하나도 없고, `/etc/claude-code`가 없다. 대리는 심링크 아닌 실행 파일이고, `BUN_BE_BUN=1 … --version`으로 찍은 내장 bun 판이 `.bun-version`과 같고, 환경 없이 띄우면 81로 끝난다(이 단계는 glibc라 실제로 뜬다). 최종 단계는 셸이 없어 `RUN`을 쓸 수 없기 때문이다.
 - `test`: `image-check`의 결과 파일을 받아 오므로 그 검사 뒤에만 돈다. 타입 검사(`bun run check`)와 시험(`bun run test`, 아래 "시험")을 돌린다. 공용 빌드가 PR과 main push에서 `--target test`로 이 단계를 돌린다.
 
 ## 버전 고정
@@ -54,7 +58,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 대리를 glibc 대상으로 컴파일해 image-check가 본다(`dockerfile`), 대리 설치가 복사·sha256 대조·모드 0555·덮어쓰기를 하고 실패마다 정한 코드로 끝난다(`agent-install`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 두 진입점뿐이다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -96,12 +100,15 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 ```text
 src/main/
 ├── supervisor.ts   # 감독 진입점(자리)
-├── executor.ts     # 작업자 실행기 진입점(자리)
+├── executor.ts     # 작업자 실행기(제어 컨테이너) 진입점: 환경 → 조립(src/executor/runtime.ts)
+├── role-agent.ts   # 역할 컨테이너의 대리 진입점: 환경 → prepare → 제어 소켓에 붙음
+├── agent-install.ts # init 컨테이너의 대리 설치: 이미지의 대리 → 공유 볼륨(환경을 읽지 않는다)
 ├── no-role.ts      # 이미지 기본 명령: 역할을 고르지 않으면 실패
 └── placeholder.ts  # 자리 진입점이 함께 쓰는 종료 코드와 메시지
 src/contract/v1/    # 계약 olive-control/v1(순수 모듈), 요약은 src/contract/v1.md
 src/contract/v2/    # 계약 olive-control/v2(현관과 감독, 후보), 요약은 src/contract/v2.md
-src/executor/       # 작업자 실행기의 핵심(실제 연결 없이 돈다. 진입점 조립은 아직 없다)
+src/executor/       # 작업자 실행기의 핵심(환경을 읽지 않는다. 실제 파일·시계·소켓은 진입점이 넘긴다)
+├── runtime.ts      # 기동 조립: 재료 → 저장소 → worker → 대리 hello → recover → 감독 소켓 하나
 ├── store.ts        # 지속 상태: 저장소 ID, 정지 세대, nonce, 실행 상태와 사건의 전이(commit), 연산별 저장 장애, 장부 대조와 표식
 ├── worker.ts       # 지시 처리, 효과 직전 확인, 영수증·결과 보고, 재시작 뒤 대조
 ├── link.ts         # 연결 하나의 수명: 정지 세대 맞춤 → hello → 재전송
@@ -146,7 +153,7 @@ GitHub 검사 `containment`(`.github/workflows/containment.yaml`)는 호스트 �
 
 ### 알려진 결함
 
-아래는 이 코드가 **아직 보장하지 않는 것**이고, 조립하는 쪽이 지킬 조건이다(지키기 전에는 이 실행기를 진입점에 잇지 않는다).
+아래는 이 코드가 **아직 보장하지 않는 것**이고, 조립하는 쪽이 지킬 조건이다. 조립(`src/executor/runtime.ts`)은 저장소의 낮은 쓰기 입구를 부르지 않고(상태와 사건은 `WorkerExecutor`로만 만든다), `recover`가 거절되면 연결 전에 87로 끝나며, 연결 뒤 지시 처리가 던지면 그 `WorkerExecutor`를 버리고 89로 끝나 컨테이너 재시작에 맡긴다(아래 "작업자 실행기 진입점").
 
 - **저장소의 낮은 쓰기 입구:** `beginRun`과 `addOutbox`는 상태의 전제와 사건 ID의 중복을 대조하지 않고 쓰고 `commit`은 새 사건의 실행·세대와 배치 안의 ID 중복을 보지 않으므로, 이 입구에 임의의 기록이나 사건을 넘기면 전제 없는 상태가 적히거나 기존 사건 파일이 덮인다. 닫는 조건(조립): 실행 상태와 사건은 `WorkerExecutor`로만 만들고, 임의의 `RunRecord`, 원시 outbox 사건, 다른 실행의 사건을 섞은 배치를 저장소에 넘기지 않는다.
 - **첫 접수 영수증의 서명 실패:** 시작 기록을 적은 뒤 첫 `receipt_accepted`의 서명이 예외를 던지면 사건 없는 `preparing` 기록이 슬롯을 쥔 채 남아, 서명이 회복돼도 재시작 전까지 새 시작을 받지 못하고 같은 ID의 재전송에도 답하지 못한다. 닫는 조건(조립): 첫 사건을 예약하기 전에 로컬 서명이 실패하면 그 `WorkerExecutor`를 계속 쓰지 않고 버린 뒤, 서명이 회복되면 기동 순서대로 다시 연다.
@@ -168,6 +175,95 @@ v1을 바꾸지 않고 실행기가 정한 동작이다. 감독 작업은 이것
 - **세대가 어긋나면 연결을 닫는다:** 맞춘 연결에서 서명이 맞는 정지 세대 불일치가 오거나 정지 세대를 저장하지 못하면 실행기가 연결을 닫는다. 세대를 디스크에 쓰는 동안에는 그 세대로 서명한 재전송을 내보내지 않는다. 감독은 새 연결의 맞춤으로 다시 받는다.
 - **설명할 수 없는 장부는 쓰지 않는다:** 저장소 ID를 잃었거나(`storage_id_lost`), 기동 때 센 점유·보류 실행이 `STATUS_MAX_RUNS`를 넘거나(`over_capacity`), 실행 기록을 잃은 사건이 있거나 실행 기록 폴더를 잃은(`run_missing`, `dir_missing`) 장부는 세대만 맞추고 `hello` 없이 연결을 닫는다. v1의 `hello`는 8건까지만 싣고 기록을 잃은 실행은 목록에 올릴 수 없으므로 감독은 그 장부의 실행을 끝내 알 수 없고, 운영자가 대조해야 한다. 사건도 마지막 영수증도 없는 `preparing` 기록은 이 점유 수에 넣지 않는다. 기동 뒤에는 점유·보류가 8건에 이른 동안 점유하지 않던 실행의 `result_finalize`에 정리를 예약하지 않고 답하지도 않는다(이미 점유 중인 실행의 정리 재시도는 받는다. 감독은 자리가 난 뒤 같은 확정을 다시 보낸다). 그래도 인사할 때마다 지금의 점유·보류 실행을 다시 세어, 실행 중에 선 보류나 저장소의 낮은 쓰기 입구로 8건을 넘는 동안은 일부만 담은 `hello`를 보내지 않고 연결을 닫으며(표식은 남기지 않는다) 8건 이하로 줄면 다음 연결에서 인사한다. 이미 적힌 `over_capacity` 표식은 저절로 지우지 않는다. 일부 사건만 설명할 수 없으면(`outbox_body`, 세대가 어긋난 `run_missing`, `receipt_missing`, `receipt_mismatch` 등) 접수를 닫고, 그 사건이 속한 실행이나 상태의 전제 사건·포인터가 어긋난 실행은 상태·사건·정리 승인을 함께 보류한다. 그 실행은 `unknown_running`으로 답하고, 마지막 영수증을 말하지 않고, 사건을 보내지 않고, 폴더를 지우지 않는다. 프로세스를 끝내고 세는 일은 계속하지만 그 결과로 새 영수증이나 완료 상태를 맺지 않는다. `outbox_body`는 저장된 본문이 계약에 맞지 않을 때만 세운다. 저장한 사건을 다시 서명할 때 키·시계·서명기가 실패하면 장부의 손상이 아니라서 그 송신만 미룬다. 첫 접수 영수증의 서명 실패는 여기에 들지 않는다(위 "알려진 결함"). 판정은 볼륨의 `ledger-hold` 표식으로 다음 기동에도 남고, 운영자가 장부를 대조한 뒤 이 파일을 지워야 풀린다. 장부를 바꾸기 전에 표식의 지속을 확인한다: 기동 때 표식을 적지 못하면 저장소를 열지 않고, 실행 중이면 세대·상태 쓰기를 멈춘다. 판정이 서면 이미 시작한 파일 작업 하나만 끝나고, 그 뒤의 쓰기와 재확인 파일의 삭제는 표식이 적힌 것을 확인한 뒤에 시작한다.
 
+## 작업자 실행기 진입점
+
+작업자 실행기 파드는 컨테이너 둘이다(D-100). 제어 컨테이너는 `bun src/main/executor.ts`(키·TLS·저장소를 가짐), 역할 컨테이너는 대리 `src/main/role-agent.ts`가 PID 1이다(D-102). 환경을 읽는 곳은 이 두 파일뿐이고(`test/entrypoints.test.ts`), 조립(`src/executor/runtime.ts`)은 값과 주입받은 파일·시계·타이머·소켓으로만 돈다.
+
+### 기동 순서와 종료 코드
+
+제어(`runtime.ts`의 `startExecutor`). 1~8은 감독 연결 전에 실패한다. 89는 감독 소켓을 시작한 뒤(첫 TLS 연결 전 포함) 일어날 수 있다. 2의 재료 읽기, 3의 저장소 열기, 7의 `recover`는 각각 25초(`settleWaitMs`) 안에 끝나지 않으면 그 단계의 코드(사유 `timed_out`)로 끝난다. 정각 이후에 받은 결과는 상한 타이머보다 먼저 처리돼도 성공이든 실패든 같다(아래 "기한이 있는 기다림").
+
+1. 환경 읽기(`executor.ts`의 `settingsFromEnv`). 없거나 빈 값이거나 틀리면 **81**, 그 이름 하나를 찍는다. 연결 전에 거를 수 있는 꼴은 여기서 본다: 역할은 v1 역할 이름, 인스턴스는 실행기 이름(`executor/<역할>/<인스턴스>/<저장소 ID>`)의 칸(계약의 `parsePrincipal`), 정책 revision은 v1 revision 꼴, 주소는 `IPv4:포트`, 감독 DNS 이름은 RFC 1123 호스트 이름(대문자도 받고 그대로 넘긴다. TLS 정책이 인증서 SAN과 글자 그대로 견준다), 감독 URI는 `parseIdentityUri`의 감독 신원. 저장소를 만들기 전이다.
+2. 재료 읽기: 역할 프로필 JSON(칸이 `RoleProfile`과 정확히 같고 `role`이 `OLIVE_ROLE`과 같음, `revision`은 v1 revision 꼴, 대리 링크의 `start`에 실림: argv 256개·고정 env 128개 이하이고, worker가 넘기는 출력 상한(64KiB)과 가장 긴 시간 값으로 인코딩한 `start`가 틀 크기 상한(65,536바이트) 안), 효과 서명 개인 키(Ed25519 PEM), 감독 공개 키(Ed25519, 공개 형식 PEM `PUBLIC KEY`만. 개인 키·인증서 PEM은 거절), TLS 인증서·키·신뢰 묶음. **82**.
+3. 저장소 열기. **83**.
+4. `WorkerExecutor`(기동 대조). **84**.
+5. 대리 소켓 듣기: 지난 기동의 소켓 파일은 지우고(소켓이 아닌 파일이면 거절), bind 동안 umask `0177`, 듣기 뒤 `0606`. **85**.
+6. 대리의 `hello`를 기다린다(상한 30초). hello는 받은 때(단조 시계)와 그 연결 세대로 판정한다: 상한 뒤에 받은 hello는 확인이 밀려도 늦은 것이고, 상한 전에 받은 hello는 확인이 밀려도 제때다. 없거나 늦거나 그 전에 두 번째 연결로 잠기면 **86**. 4의 기동 대조를 지난 장부에 끝을 맺지 못한 실행(`preparing`·`running`·`stopping`·`checking`·`unknown_running`)이 있거나 장부가 보류됐으면 원격을 처음부터 잠그고(`inheritedUnverified`) 기다리지 않는다. 잠긴 원격은 어떤 `hello`도 받지 않아, 기다리면 감독에게 그 실행을 알릴 길이 없다. 사건도 마지막 영수증도 없는 최초 `preparing`은 기동 대조가 접수가 아니라고 거르므로 잠금에 들지 않는다. 7의 `recover`가 남은 수를 세지 않고 맺는 실행(보류되지 않았고 같은 세대의 유효한 `receipt_stopped`가 있는 실행. 종료 영수증만 저장되고 실행 기록 쓰기가 실패한 자리)도 같은 사건(`store.validEvents`)으로 판단해 잠금에 들지 않는다. `receipt_cleaned`만 있고 `receipt_stopped`가 없으면 잠근다: `recover`가 고를 `finalized`는 두 영수증을 모두 전제해 저장소가 거절하고, 그 실행은 보류된 채 남은 수를 센다. `recover` 뒤에 그 판단과 달리 끝을 맺지 못한 실행이 남거나 장부가 보류되면 감독에 붙지 않고 **87**.
+7. `recover`. 거절되면(로컬 서명 실패 등) **87**. 그 사이 대리 연결이 바뀌었으면(인사한 세대가 끊기고 새 세대가 붙음) 6의 상한에 남은 시간 안에서 지금 세대의 `hello`를 다시 기다린다. 기다림에서 돌아올 때마다 지금 세대를 다시 보고, 상한 안에 인사한 세대가 그대로 남지 않으면(없거나 계속 바뀜) **86**. 여기부터 감독 소켓 `start`까지 기다림이 없다.
+8. `ExecutorLink` 하나, TLS 클라이언트, 감독 소켓 하나 `start`. 클라이언트(재료)나 소켓(정책)을 만들지 못하면 **88**.
+9. `link.tick`·`worker.tick`을 1초마다 부른다.
+10. 붙은 뒤 지시 처리(`Connection.receive`)가 던지거나(첫 접수·재정리 종료 영수증의 로컬 서명 실패 등) tick이 던지거나 다음 tick·다시 붙기 타이머를 걸지 못하면, 그 `WorkerExecutor`를 더 쓰지 않고 **89**로 끝나 컨테이너 재시작에 맡긴다. 지시 처리의 거절은 연결이 먼저 닫혔어도(상대가 끊음 등) 끝내기로 이어지고, 그 순간부터 새 연결을 열지 않는다. 앞 연결에서 시작한 지시 처리가 아직 끝나지 않았으면 다시 붙기 타이머가 돌아도 그 결과가 정해질 때까지 TCP를 열지 않는다(거절이면 다시 붙지 않고 89, 정상이면 그때 붙는다). 그 기다림은 25초(`settleWaitMs`)에 묶는다: 처리 안의 저장소 쓰기(맞춤 답의 정지 세대 쓰기, 검증의 nonce, 영수증·실행 기록)에는 상한이 없어, 그 안에 끝나지 않으면 다시 붙지 않고 89로 끝난다. 정각 이후에 끝난 처리는 상한 타이머보다 먼저 처리돼도 새 TCP를 열기 전에 89다. 25초는 처리 안에서 상한이 걸린 종료·계수 기다림(각 응답 상한 10초)과 저장소 쓰기의 여유다. 끝내기는 타이머에 기대지 않고, 멈춤 상한을 걸 타이머가 고장 났으면 `stop()`을 기다리지 않고 TLS 클라이언트와 대리 소켓을 닫는다. 프로세스 안에서 다시 열지 않는다(같은 저장소를 두 객체가 쥐지 않는다).
+11. SIGTERM·SIGINT면 **0**. 처리기는 기동 전에 건다(이 프로세스가 컨테이너의 PID 1이면 커널은 처리기 없는 신호를 버린다). 기동을 마친 뒤면 소켓 `stop()`을 기다린 뒤(상한 10초) TLS 클라이언트와 대리 소켓을 닫는다. 기동 중(2~7, hello 대기 포함)이면 그 기다림이 끝나는 대로 기동을 멈추고 감독에 붙지 않으며, 연 대리 소켓을 닫는다. 멈춤 요청이 단계 실패보다 앞선다: 요청을 받은 뒤 그 기다림이 실패로 끝나도(깨진 프로필, 저장소 열기·`recover` 거절 등) 82~87이 아니라 0이다. 연 저장소는 닫는 입구가 없어 프로세스 종료에 맡긴다.
+
+대리(`role-agent.ts`): 환경이 없거나 절대 경로가 아니면 **81**. `RoleAgent.prepare`(non-dumpable 78, PID 1 79, 정리 코어 기록 80)가 소켓보다 먼저다. 제어가 아직 듣지 않으면 0.5초마다 다시 붙고 60초 안에 못 붙으면 **82**. 60초는 `prepare` 전부터 단조 시계로 재고(`prepare`가 그 안에 돌아오지 않아도 **82**) 다시 붙기 직전·붙기가 끝난 때·붙는 중의 기다림에 모두 건다. `prepare`의 실패 코드(78~80)와 상한의 82는 `role-agent.ts`의 한 자리(`finishPrepare`)에서 고른다: 정각 이후에 정해진 실패는 80이 아니라 **82**이고, 82로 끝낸 뒤 늦게 온 실패는 종료를 더하지 않는다. 상한 뒤에 늦게 돌아온 연결은 hello 없이 닫는다. 붙으면 `hello`. 붙은 뒤 소켓이 닫히면 `linkClosed()`로 실행을 멈추고 75로 끝난다(76·77은 `src/agent/agent.md`).
+
+### 기한이 있는 기다림
+
+판정은 시각이 한다. 결과(성공·거절)를 받아들이는 자리마다 같은 단조 시계(`monoNow`, 제품은 `performance.now`)로 절대 기한과 견주고, 정각(`monoNow() >= 기한`) 이후면 콜백 차례와 상관없이 만료다. 상한 타이머는 깨우는 수단이라 정각 전에 불리면 시각을 다시 보고 남은 시간으로 다시 건다. 함정: 정각에 결과와 타이머가 같은 차례에 서면 이벤트 루프가 고른 쪽이 이긴다. 결과 쪽에서 시각을 보지 않으면 기한이 지난 결과로 다음 단계에 들어간다.
+
+| 기다림 | 기한(재기 시작) | 받아들이는 자리 | 시각 비교 자리 | 만료 뒤 |
+|---|---|---|---|---|
+| 재료 읽기·저장소 열기·`recover`(2·3·7) | 25초, 단계를 부르기 전 | `bounded` → `untilDeadline`의 결과 반응 | `untilDeadline`의 `accept`와 타이머 콜백 | 82·83·87(`timed_out`), 연결 0. 멈춤 요청이 먼저면 0 |
+| 대리 `hello`(6, 7 뒤 다시 기다림) | 30초, 듣기 직후(다시 기다려도 같은 기한) | `GreetedRemote`가 받은 때의 시각을 적고 `waitForHello`가 확인 | `waitForHello`: 받은 시각 `< 기한`, 확인 때 `monoNow() >= 기한` | 86, 연결 0 |
+| 다시 붙기 전 앞 지시(10) | 25초, `gatedClient.connect`에 든 때 | `settledInFlight` → `untilDeadline`의 결과 반응 | `untilDeadline`의 `accept`와 타이머 콜백 | 89, 새 TCP 0 |
+| 멈춤의 소켓 `stop()`(10·11) | 10초, 끝내기를 시작한 때 | `untilDeadline`의 결과 반응 | 같음 | 기다리지 않고 클라이언트·대리 소켓 닫기(코드는 그대로) |
+| 대리 `prepare` | 60초(붙기와 공유), `prepare` 전 | `untilLimit`의 결과 반응, `prepare` 안의 실패 종료(감싼 `runtime.exit`) | `untilLimit`의 `accept`와 타이머 콜백, `finishPrepare` | 82(정각 전 실패는 78~80) |
+| 대리 붙기 | 같은 60초 | `untilLimit`의 결과 반응(포트·거절) | `untilLimit`의 `accept`와 타이머 콜백, 붙기 직전, 다시 붙기 간격 전 | 82, 늦게 돌아온 포트는 hello 없이 닫음 |
+
+감독 TLS 붙기 자체(`tls-client`의 connect)와 연결이 열린 동안의 지시 처리는 이 표 밖이다. 이 조립은 그 둘에 기한을 두지 않는다.
+
+같은 응답 상한(10초, `limits.STOP_GRACE_MS` 5초 + 5초) 하나를 worker의 `exitWaitMs`와 원격의 `replyWaitMs`에 넘기고, 원격의 `runtime.now`에는 worker의 상한 타이머(전역 `setTimeout`)와 시간 기준이 같은 `performance.now`를 넘긴다. worker·link·저장소·TLS의 시계는 벽시계다. 대리의 `runtime.now`도 벽시계다(`start`의 기한·임대 끝과 바로 견준다).
+
+운영 숫자는 `executor.ts`의 임시값이다: hello 상한 30초, tick 1초, 멈춤 상한 10초, 기동 단계·다시 붙기 전 앞 지시의 상한 25초, 다시 붙기 1초에서 30초까지 2배씩(흔들림 20%), 받아 둘 양 1MiB. 실측 뒤 바꾼다.
+
+### 대리 설치
+
+init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역할 컨테이너보다 먼저 돈다. 환경을 읽지 않고 두 고정 경로만 쓴다: 원본 `/opt/olive/olive-agent`(이미지 안), 대상 `/opt/olive-agent/olive-agent`(공유 볼륨). 이 이미지는 distroless라 셸·`cp`가 없어 복사를 bun으로 한다.
+
+1. 원본이 심링크 아닌 일반 파일이고, 끝까지 읽어 sha256을 구한다. 아니거나 읽지 못하면 **90**(그 digest에 대리가 없거나 틀렸다).
+2. 대상 폴더가 있는 폴더다. 아니면 **91**(볼륨이 그 경로에 붙지 않았다).
+3. 같은 폴더의 임시 이름(`.olive-agent.tmp`)에 앞선 실행이 남긴 것을 먼저 지우고 복사한다. 실패하면 **92**.
+4. 임시 파일의 sha256·길이가 원본과 다르면 **93**.
+5. 모드 `0555`로 바꾸고 대상 이름으로 rename한다(이미 있으면 덮어쓴다. 같은 폴더라 원자적이다). 실패하면 **92**.
+
+0이 아닌 코드로 끝나면 파드가 역할 컨테이너를 띄우지 않는다. 대상 이름에는 4의 대조를 마친 파일만 rename으로 들어간다. 3~5에서 실패하면 임시 파일을 지우려 하지만, 1·2에서 멈추거나(정리 전) 대상 폴더에 지울 권한이 없으면 앞선 실행의 임시 파일이 남는다. 원인을 고친 다음 init이 3에서 그것을 지우고 새로 놓는다. 성공하면 대상 경로·sha256·바이트 수를 한 줄 찍고 0.
+
+복사는 `copyFileSync(…, COPYFILE_EXCL)`에 맡긴다(몇 번에 나눠 옮길지는 Bun과 커널이 정한다). 1MiB는 원본·사본의 sha256을 계산할 때 한 번에 읽는 양이라, 해시 때문에 파일 크기만큼 메모리를 쓰지 않는다.
+
+### 환경
+
+제어 컨테이너. 빈 값은 없는 것과 같다. 경로 칸은 절대 경로여야 한다. 꼴이 틀린 값도 81이다(위 1).
+
+| 이름 | 뜻 | 출처 | 없을 때 |
+|---|---|---|---|
+| `OLIVE_ROLE` | v1 역할 이름(계약의 역할 다섯 중 하나). 대상 ID가 아니다: 읽기 대상 `reader` → `isolated_reader`, `diagnosis` → `diagnosis` | 차트(지금 차트는 대상 ID를 넘긴다. H-split이 역할 이름으로 바꾼다) | 81 |
+| `OLIVE_SUPERVISOR_ADDR` | 감독 주소 `IPv4:포트` | 차트 | 81 |
+| `OLIVE_SUPERVISOR_SERVER_NAME` | 감독 인증서의 DNS SAN | 차트 | 81 |
+| `OLIVE_SUPERVISOR_URI` | 감독 인증서의 URI SAN | 차트 | 81 |
+| `OLIVE_STORE_DIR` | 저장소 폴더(실행기마다의 PVC 아래, D-75) | 차트 | 81 |
+| `OLIVE_TLS_DIR` | 그 안의 `tls.crt`·`tls.key` | 차트(PKI가 켜진 때만) | 81, 파일이 없으면 82 |
+| `OLIVE_TRUST_DIR` | 그 안의 `ca-bundle.pem`·`supervisor-signing.pub`(감독 공개 키) | 차트(신뢰 ConfigMap. 공개 키 파일은 차트 값이 있을 때만) | 81, 파일이 없으면 82 |
+| `OLIVE_SIGNING_KEY_FILE` | 효과 서명 개인 키 파일(D-73, 제어 컨테이너에만) | 미정(Infisical → Secret 마운트, 차트 PR-B) | 81, 파일이 없으면 82 |
+| `OLIVE_PROFILE_FILE` | 역할 프로필 JSON 파일 | 미정(O11·O12) | 81, 파일이 없으면 82 |
+| `OLIVE_INSTANCE` | 실행기 이름의 인스턴스 칸 | 미정 | 81 |
+| `OLIVE_POLICY_REVISION` | 정책 revision | 미정 | 81 |
+| `OLIVE_AGENT_SOCKET` | 대리가 붙는 경로 유닉스 소켓(링크 폴더 안) | 미정(차트 분할 H-split) | 81 |
+
+역할 컨테이너는 `OLIVE_AGENT_SOCKET` 하나를 읽는다(제어와 같은 경로, 미정, 없으면 81).
+
+### 뒤 조각이 지켜야 할 것
+
+- **차트 분할(H-split):** 컨테이너 둘, `shareProcessNamespace` 없음, 역할 uid ≠ 제어 uid. 링크 폴더(emptyDir)는 제어에 쓰기, 역할에 읽기 전용이고 두 컨테이너의 `OLIVE_AGENT_SOCKET`이 그 안의 같은 경로다. 소켓 파일은 `0606`이다: D-103으로 역할 컨테이너가 제어의 그룹에 들지 않아 기타 권한으로 붙는다. 공유 보조 그룹을 쓰기로 바꾸면 `executor.ts`의 값을 `0660`으로 좁힌다. 환경 이름은 위 표에 맞춘다. 키·TLS·저장소 볼륨은 제어에만, 역할 컨테이너에 exec·프로브를 두지 않는다.
+- **대리 설치(H-split, D-103·D-107):** init 컨테이너는 이 이미지(제어와 같은 digest)로 `["bun", "src/main/agent-install.ts"]`를 돌린다. emptyDir `agent-bin`을 init에는 쓰기로, 역할 컨테이너에는 읽기 전용으로 둘 다 `/opt/olive-agent`에 붙이고, 역할 컨테이너의 `command`는 `["/opt/olive-agent/olive-agent"]`다. 제어 컨테이너에는 붙이지 않는다. emptyDir은 디스크 매체로 둔다(`medium: Memory`면 약 104MiB가 메모리 상한에 든다). 역할 이미지는 glibc 계열(데비안·우분투·distroless)이어야 한다. 켤 때 넣는 올리브 digest에 설치 진입점 `src/main/agent-install.ts`와 원본 `/opt/olive/olive-agent`가 둘 다 있어야 init이 성공한다. 이 PR 전의 digest에는 진입점부터 없어 init이 bun의 `Module not found`로 1에 끝나고, 90은 진입점이 떴는데 원본이 없을 때다.
+- **역할 컨테이너 환경(H-split, 대리보다 먼저 읽히는 것):** 컴파일한 대리 안의 Bun과 glibc 로더는 아래 변수를 대리 코드보다 먼저 읽고, `bun build --compile`에 이를 끄는 플래그가 없다. 차트 CI는 렌더된 역할 컨테이너 `env`(`BUN_OPTIONS`·`BUN_BE_BUN`·`LD_PRELOAD`가 빈 값)만 검사한다. 역할 이미지의 `ENV`에 `BUN_`·`LD_`로 시작하는 이름과 `NODE_CHANNEL_FD`가 없어야 한다는 조건은 역할 이미지를 정하는 PR이 지킨다.
+  - 차트가 역할 컨테이너 `env`에 `BUN_OPTIONS: ""`, `BUN_BE_BUN: ""`, `LD_PRELOAD: ""`를 명시한다. 빈 값이면 대리가 그대로 뜬다(1.4.4 실측). 값이 있으면 `BUN_OPTIONS=--version`은 판만 찍고 0으로 끝나 `hello`가 오지 않고(제어는 86), `BUN_OPTIONS=--preload=…`는 그 파일을 대리보다 먼저 돌리고, `BUN_BE_BUN=1`은 대리 대신 bun으로 돈다.
+  - 역할 이미지 `ENV`의 그 조건에서 위 셋을 빈 값으로 덮는 것은 뺀다. `BUN_JSC_*`는 이름이 정해지지 않은 무리이고 빈 값을 주면 bun이 1로 끝나 빈 값으로 덮을 수 없다.
+- **역할 값(H-split):** 차트는 `OLIVE_ROLE`에 대상 ID가 아니라 v1 역할 이름을 넘긴다(대상 `reader` → `isolated_reader`, `diagnosis` → `diagnosis`). 지금 차트처럼 대상 ID를 그대로 넘기면 읽기 실행기는 81로 끝난다. 실행기는 대상 ID를 역할로 옮기지 않는다: 한 대상에 여러 역할이 붙을 수 있다(D-64).
+- **서명 키(PR-B, H-split 뒤):** `OLIVE_SIGNING_KEY_FILE`이 가리키는 Ed25519 PEM을 제어 컨테이너에만 붙인 Secret 파일로 준다(TLS 키와 같은 꼴). 환경에는 경로만 둔다(아래 "공개 저장소").
+- **감독 공개 키·인스턴스 이름·정책 revision·역할 프로필:** 공개 키는 신뢰 ConfigMap의 `supervisor-signing.pub`를 읽는다(차트 값이 비면 파일이 없어 82, 공개 형식 PEM이 아니면 82). 차트도 공개 형식만 넣어야 한다: 실행기는 이미 잘못 배포된 개인 키의 노출을 되돌리지 못한다. 인스턴스 이름과 정책 revision의 출처, 역할 프로필의 자리(O11·O12)는 정하지 않았다. 값은 위 1·2의 꼴(v1 revision, 실행기 이름 칸, 링크가 싣는 argv·env 크기)에 맞춘다.
+- **회복 길(D-104, 이 진입점에 없음):** 실행 중 링크가 끊기면 지금은 원격이 잠기고 그 실행은 슬롯을 쥔 `unknown_running`으로 남는다(프로세스는 끝나지 않는다). D-104의 정한 코드로 끝나 파드 전체를 다시 띄우고 init의 새 세대 표식을 본 뒤 `inheritedUnverified: false`로 넘기는 길은 뒤 조각이다. 그 전에는 물려받은 실행이 있는 기동마다 원격이 잠겨 새 실행을 띄우지 않는다.
+- **작업 폴더(O13):** 제어 컨테이너는 실행마다 만드는 폴더가 없어 `RunSpace`(`noRunFiles`)는 준비하지 않고, 지우기는 확인할 수 없어 언제나 "지우지 못함"(false)으로 답한다. 그래서 확정(`result_finalize`)을 받은 실행은 `cleanup_pending`으로 슬롯을 쥔 채 남고 `receipt_cleaned`는 나가지 않는다(감독은 그 실행의 슬롯을 풀지 않는다). **O13 전에는 감독 장부 하나의 공용 worker 슬롯이 첫 정리 대기에 묶인다.** 첫 확정 하나 뒤로는 다른 실행기(다른 인스턴스·역할 포함)의 worker 작업도 시작하지 못하고(`slot_busy`, 배정 후보 0), 파드 교체·관리자 닫기(`stop_confirmed`)로도 풀 수 없다. 세션 슬롯은 별도라 묶이지 않는다. 그 실행기도 슬롯을 쥔 실행이 있어 새 `task_start`에 답하지 않고(위 "작업자 실행기가 감독 쪽에 기대는 것"), 재시작해도 그 기록은 남는다. 역할 컨테이너의 작업 폴더를 실행마다 지우고 그것을 확인한 뒤에만 `true`를 돌려주는 일은 O13이 이 자리를 바꿔 정한다.
+
 ## 공개 저장소
 
-tailnet 이름(`*.ts.net`)과 Tailscale 주소를 코드·로그·이미지에 두지 않는다(공용 빌드가 막는다). 시크릿 값은 저장소·로그·이미지에 두지 않고 Infisical에서 환경변수로만 받는다. 파일(`.env` 등)로 만들지 않는다.
+tailnet 이름(`*.ts.net`)과 Tailscale 주소를 코드·로그·이미지에 두지 않는다(공용 빌드가 막는다). 시크릿 값은 저장소·로그·이미지에 두지 않는다. 개발·빌드·시험의 비밀은 Infisical에서 환경변수로만 받고 파일(`.env` 등)로 만들지 않는다. 실행 시의 키는 다르다: 작업자 실행기는 키 **경로**만 환경에서 읽고, PEM **값**(효과 서명 개인 키, TLS 키)은 제어 컨테이너에만 붙인 Secret 파일에서 읽는다(D-73·D-100).

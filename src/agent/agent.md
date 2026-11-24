@@ -6,7 +6,7 @@
 - `agent.ts`: 대리 핵심(`RoleAgent`)과 제품 조립(`productionParts`).
 - `dumpable.ts`: `prctl(PR_SET_DUMPABLE, 0)`(`bun:ffi`로 libc를 연다).
 
-이 대리를 부르는 진입점(소켓 연결, 환경 읽기)과 제어 쪽 원격 구현은 아직 없다.
+이 대리를 부르는 진입점은 `src/main/role-agent.ts`다. 환경(`OLIVE_AGENT_SOCKET`)을 읽고 `prepare` 뒤에 제어의 경로 유닉스 소켓에 붙는다(README "작업자 실행기 진입점"). 제어 쪽 원격 구현은 `src/executor/remote-agent.ts`다.
 
 ## 링크 메시지
 
@@ -96,7 +96,7 @@
 - **제어(O-b)**: **띄우기가 보류된 동안의 0은 종료 증거가 아니다.** `start`를 보낸 뒤 `spawned`·`not_spawned`가 오기 전에는 대리가 사전 계수를 기다리는 중일 수 있고, 그때의 `count`는 빈 공간의 0을 답하지만 그 뒤 같은 실행이 뜰 수 있다. 시작 응답이 미결일 때 받은 `counted`를 영수증으로 승격하지 않고, 실행·요청·단계가 맞는 최종 계수만 쓴다. `start`를 보낸 실행은 시작 응답과 `exited`·`unconfirmed`·`not_spawned` 뒤의 종료 단계에서 보낸 계수다. `start`를 보내지 않았고 앞으로도 보내지 않을 실행은 시작 응답을 기다리지 않고, 그 실행의 정리 단계에서 새로 보낸 계수를 쓴다. 열린 실행 밖의 `terminated`·`counted`도 공간 전체의 사실일 뿐이므로 같은 규칙으로 고른다.
 - **제어(O-b)**: 값 틀을 만드는 자리가 하나 는다. `src/`에서 `encodeCredentialFrame`을 부르는 곳을 `credential-send.ts` 하나로 묶은 정적 규칙(`test/supervisor/dispatch/credential-send.test.ts`)을 같은 변경에서 다시 정한다. 링크 쓰기 자리가 `.send(` 꼴이면 송신 자리 목록(`start-send.test.ts`)에도 걸린다.
 - **제어(O-b)**: 듣는 소켓은 경로 유닉스 소켓 하나다(TCP·abstract 금지). 대리 쪽 소켓을 대리가 듣는 반대 방향은 쓰지 않는다(같은 uid의 모델이 바꿔치기할 수 있다).
-- **진입점(O-c)**: `RoleAgent.prepare`를 소켓 연결보다 먼저 부른다. 환경 읽기와 소켓은 진입점에만 두고, 소켓이 닫히거나 오류가 나면 `linkClosed()`를 부른다. `runtime.exit`은 실제로 프로세스를 끝내야 한다.
+- **진입점(`src/main/role-agent.ts`)**: `RoleAgent.prepare`를 소켓 연결보다 먼저 부른다. 환경 읽기와 소켓은 진입점에만 두고, 소켓이 닫히거나 오류가 나면 `linkClosed()`를 부른다. `runtime.exit`은 실제로 프로세스를 끝내야 한다. `runtime.now`는 벽시계다(`start`의 `deadline_at`·`lease_until`과 바로 견준다). 이 차례와 끊김의 종료는 `test/agent/role-agent.test.ts`가 본다. 대리 진입점에서 닿는 코드에 듣는 API가 없다는 것은 `test/entrypoints.test.ts`가 본다.
 - **차트(H-split)**: 역할 컨테이너는 자기 PID 공간을 가진다(`shareProcessNamespace` 없음). 링크 폴더는 역할 컨테이너에 읽기 전용, 키·TLS·저장소 볼륨은 제어 컨테이너에만. 역할 컨테이너에 exec·프로브를 두지 않는다.
 - `test/containment-junit.ts`의 기대 목록이 29개가 됐다. README "실행기 시험의 실제 프로세스"의 개수(23)를 다음에 README를 고치는 변경에서 맞춘다.
 
