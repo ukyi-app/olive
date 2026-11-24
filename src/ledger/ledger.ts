@@ -1744,10 +1744,12 @@ export class Ledger {
   // 감독 관리 통로의 상태 조회 하나(README "감독 관리 통로"). 다른 읽기와 달리 실패해도 장부를 고장으로 표시하지 않고 허가를 버리지 않는다:
   // 감독 밖에서 온 조회가 감독의 접수와 끝 차례를 바꾸지 않게. 장부가 정말 고장이면 감독 자신의 다음 읽기·쓰기가 그것을 본다.
   // 접수 판정은 intakeOpen(attempt)과 같은 조건을 이 읽기의 정지 기록으로 본다. attempt가 null이면 닫힘이다.
+  // 이미 고장으로 표시된 장부는 알려진 값을 내지 않는다: 저장에 실패한 뒤에는 더 새로운 정지를 놓쳤을 수 있다(syncStopGeneration과 같은 판정).
   // 개수는 줄을 펼치지 않고 cap에서 멈춰 센다. 함정: 조건에 맞는 줄을 찾는 훑기는 cap과 상관없이 표 크기만큼 돈다(상태 칸에 색인이 없다).
   peekStatus(cap: number, attempt: RestoreAttempt | null): Read<StatusPeek> {
     if (!Number.isSafeInteger(cap) || cap < 1) throw new LedgerInputError("cap: 1 이상의 안전 정수여야 한다");
     if (this.#closed) return { known: false, reason: "closed" };
+    if (this.#broken !== null) return { known: false, reason: this.#broken };
     const count = (sql: string, ...params: (string | number)[]): number => {
       const row = this.#db.query(`SELECT COUNT(*) AS n FROM (${sql} LIMIT ?)`).get(...params, cap) as { n: number };
       return safe(row.n, "status.count");
@@ -1763,8 +1765,7 @@ export class Ledger {
         waitingRequests: count("SELECT 1 FROM tool_requests WHERE phase = 'waiting_assignment' AND run_id IS NULL"),
         queuedRuns: count("SELECT 1 FROM runs WHERE state = 'queued'"),
         slotRuns: count(`SELECT run_id, run_generation FROM runs WHERE state NOT IN (${free}) UNION SELECT run_id, run_generation FROM slot_holds WHERE holds_slot = 1`, ...SLOT_FREE),
-        intakeOpen:
-          attempt !== null && this.#grant !== null && this.#broken === null && this.#grant.attempt === attempt && stop !== null && this.#grantHolds(stop),
+        intakeOpen: attempt !== null && this.#grant !== null && this.#grant.attempt === attempt && stop !== null && this.#grantHolds(stop),
       };
       return { known: true, value };
     } catch (error) {

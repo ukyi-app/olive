@@ -66,7 +66,10 @@ function judge(sources: AdminSources): StatusAnswer {
   const queued = waitingRequests + queuedRuns;
   const running = slotRuns;
   if (queued >= STATUS_MAX_COUNT || running >= STATUS_MAX_COUNT || !Number.isSafeInteger(stop.generation) || stop.generation < 0) return unknown("out_of_range");
-  const alive = progress.alive === true;
+  // 받아들인 허가와 장부의 지금 허가가 어긋나면(새 정지 기록이 허가를 버림, 받아들이지 않은 허가가 열림) 조립의 다음 박자가
+  // intake_discarded·intake_unaccepted로 끝낸다. 사유는 이미 생겼으므로 살아 있음으로 내지 않는다. 처음부터 허가가 없는 감독은 살아 있을 수 있다.
+  // 박자의 래치(look)를 부르지 않고 이 읽기의 값만 견준다.
+  const alive = progress.alive === true && progress.granted === (view.value.intakeOpen === true);
   // 접수 열림은 셋이 모두 참일 때다: 조립이 살아 있고, 5단계의 허가를 받아들였고, 장부가 이 읽기에서 열림으로 판정한다.
   const intakeOpen = alive && progress.granted === true && view.value.intakeOpen === true;
   return {

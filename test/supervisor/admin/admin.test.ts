@@ -27,7 +27,7 @@ import { type AdminClockReading, type AdminProgress, type AdminSources, readStat
 import type { RunningSupervisor } from "../../../src/supervisor/runtime/boot.ts";
 import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
 import { root } from "../../files.ts";
-import { id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempDir, tempPath, worker, WORKER_EXECUTOR } from "../../ledger/helpers.ts";
+import { digest, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempDir, tempPath, worker, WORKER_EXECUTOR } from "../../ledger/helpers.ts";
 import { loopbackTime, manualTime, WALL, type World, world } from "../runtime/boot-world.ts";
 
 const STATUS: SupervisorStatus = { alive: true, queued: 2, running: 1, diagnosis: "active", stop: "none", stopGeneration: 3, intakeOpen: true };
@@ -145,8 +145,11 @@ describe("상태 읽기", () => {
     };
     expect(intake({ restored: true, alive: true, granted: true }, true)).toEqual([true, true]);
     expect(intake({ restored: true, alive: false, granted: true }, true)).toEqual([false, false]);
-    expect(intake({ restored: true, alive: true, granted: false }, true)).toEqual([true, false]);
-    expect(intake({ restored: true, alive: true, granted: true }, false)).toEqual([true, false]);
+    // 처음부터 허가를 받지 않은 감독은 살아 있고 접수만 닫힘이다.
+    expect(intake({ restored: true, alive: true, granted: false }, false)).toEqual([true, false]);
+    // 받아들인 허가가 장부에서 사라짐(intake_discarded), 받아들이지 않은 허가가 열림(intake_unaccepted): 끝낼 사유가 이미 생겼다.
+    expect(intake({ restored: true, alive: true, granted: false }, true)).toEqual([false, false]);
+    expect(intake({ restored: true, alive: true, granted: true }, false)).toEqual([false, false]);
   });
 
   test("장부를 읽지 못함·정지 기록 없음·상한 넘는 수는 모름이다(지어내지 않는다)", () => {
@@ -202,11 +205,62 @@ describe("부작용 없는 읽기: 장부의 peekStatus와 공유 시계의 peek
     expect(armed()).toBe(false);
     expect(state()).toEqual(before);
     expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toMatchObject({ known: true, value: { intakeOpen: true } });
-    // 대조군: 같은 고장을 감독의 읽기(readStop)가 만나면 장부가 고장으로 표시되고 허가가 사라진다. 그 뒤의 상태 읽기는 접수 닫힘이다.
+    // 대조군: 같은 고장을 감독의 읽기(readStop)가 만나면 장부가 고장으로 표시되고 허가가 사라진다. 그 뒤의 상태 읽기는 알려진 값을 내지 않는다:
+    // 정지 행은 읽혀도 더 새로운 정지를 놓쳤을 수 있다(syncStopGeneration과 같은 판정).
     arm();
     expect(ledger.readStop()).toEqual({ known: false, reason: "io" });
     expect(state()).toEqual({ health: { writable: false, reason: "io" }, intake: false });
-    expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toMatchObject({ known: true, value: { intakeOpen: false } });
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toEqual({ known: false, reason: "io" });
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, null)).toEqual({ known: false, reason: "io" });
+    expect(state()).toEqual({ health: { writable: false, reason: "io" }, intake: false });
+  });
+
+  test("장부의 상태 읽기는 SELECT 하나하나의 실패를 모름으로 낸다(빈 값으로 바꾸지 않는다). 어느 SELECT가 실패해도 장부 건강·허가가 그대로다", () => {
+    let armed = 0;
+    let calls = 0;
+    let trace = false;
+    const traced: string[] = [];
+    const ledger = ready(
+      open(tempPath(), {
+        faults: {
+          at() {},
+          onOpen(db) {
+            const query = db.query.bind(db);
+            db.query = ((sql: string) => {
+              if (trace) {
+                calls += 1;
+                traced.push(sql);
+                if (calls === armed) throw Object.assign(new Error("fixture"), { code: "SQLITE_IOERR" });
+              }
+              return query(sql);
+            }) as typeof db.query;
+          },
+        },
+      }),
+    );
+    const attempt = attemptOf(ledger);
+    const peek = () => {
+      calls = 0;
+      traced.length = 0;
+      trace = true;
+      try {
+        return ledger.peekStatus(STATUS_MAX_COUNT, attempt);
+      } finally {
+        trace = false;
+      }
+    };
+    expect(peek()).toMatchObject({ known: true, value: { intakeOpen: true } });
+    // 정지·일시 중지·대기 부탁·대기 실행·점유 합집합.
+    const shape = [...traced];
+    expect(shape.map((sql) => /FROM (\w+)/.exec(sql)?.[1])).toEqual(["stop_state", "diagnosis_pause", "tool_requests", "runs", "runs"]);
+    for (let i = 1; i <= shape.length; i += 1) {
+      armed = i;
+      expect(peek(), shape[i - 1]).toEqual({ known: false, reason: "io" });
+      expect(ledger.health()).toEqual({ writable: true });
+      expect(ledger.intakeOpen(attempt)).toBe(true);
+    }
+    armed = 0;
+    expect(peek()).toMatchObject({ known: true, value: { intakeOpen: true } });
   });
 
   test("장부의 상태 읽기: 자리를 쥔 실행은 장부 줄과 점유 관측(장부 밖 실행 포함)을 (실행, 세대)로 합쳐 세고, 개수는 상한에서 멈춘다", () => {
@@ -235,6 +289,40 @@ describe("부작용 없는 읽기: 장부의 peekStatus와 공유 시계의 peek
     expect(ledger.peekStatus(STATUS_MAX_COUNT, Symbol("other"))).toMatchObject({ known: true, value: { intakeOpen: false } });
     const answer = readStatus({ progress: () => ({ restored: true, alive: true, granted: true }), view: (cap) => ledger.peekStatus(cap, attempt), now: () => okAt(NOW) });
     expect(answer).toEqual({ known: true, status: { alive: true, queued: 1, running: 2, diagnosis: "active", stop: "none", stopGeneration: 0, intakeOpen: true } });
+  });
+
+  test("상태 수는 실제 장부의 전이를 따른다: 대기는 배정 전 부탁(취소되면 빠짐)과 대기 실행, 작업은 unknown_running·cleanup_pending까지 자리를 쥔 실행이다", () => {
+    const ledger = open(tempPath());
+    const started = startedWorker(ledger);
+    const owner = id();
+    const ref = id();
+    const sourceRef = `inbox/${owner}`;
+    must(ledger.enqueueInput({ requestId: owner, source: "admin-dm", sourceRef: { ref: sourceRef, expiresAt: NOW + 3_600_000 }, receivedAt: NOW }));
+    must(
+      ledger.recordToolRequest({ ref, owner, dedupeKey: `start_worker:${owner}:diagnose`, role: "diagnosis", purpose: "diagnose", sourceRef, inputDigest: digest("fixture"), sessionId: "session-1", callId: id(), now: NOW }),
+    );
+    const counts = () => {
+      const answer = readStatus({ progress: () => ({ restored: true, alive: true, granted: false }), view: (cap) => ledger.peekStatus(cap, null), now: () => okAt(NOW) });
+      return answer.known ? [answer.status.queued, answer.status.running] : answer.reason;
+    };
+    expect(counts()).toEqual([1, 1]);
+    must(ledger.admitRun(worker()));
+    expect(counts()).toEqual([2, 1]);
+    must(ledger.markLost(NOW));
+    expect(ledger.getRun(started.runId)).toMatchObject({ known: true, value: { state: "unknown_running" } });
+    expect(counts()).toEqual([2, 1]);
+    must(ledger.cancelToolRequest({ owner, ref, sessionId: "session-1", callId: id(), now: NOW }));
+    expect(counts()).toEqual([1, 1]);
+    must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: started.runId, exit: "failed", bodyDigest: digest("stopped"), now: NOW }, started.from));
+    must(ledger.markCleanupPending({ runId: started.runId, now: NOW }));
+    expect(ledger.getRun(started.runId)).toMatchObject({ known: true, value: { state: "cleanup_pending" } });
+    expect(counts()).toEqual([1, 1]);
+    const finalize = id();
+    must(ledger.recordFinalizeInstruction({ runId: started.runId, requestId: finalize, stopGeneration: 0, now: NOW }));
+    must(
+      ledger.applyReceipt({ action: "receipt_cleaned", receiptId: id(), runId: started.runId, instructionRequestId: finalize, bodyDigest: digest("cleaned"), now: NOW }, started.from),
+    );
+    expect(counts()).toEqual([1, 0]);
   });
 
   test("공유 시계의 peek는 now()가 낼 값을 내되 하한을 올리지 않는다: 일시 중지를 읽는 조회가 있든 없든 다음 읽기의 판정이 같다", () => {
@@ -594,14 +682,14 @@ describe("루프백: 실제 경로 유닉스 소켓", () => {
 });
 
 // 실제 조립(boot.ts)의 관리 포트. 장부를 감싸 부른 메서드를 적고, 가짜 서버의 송신 두 자리를 센다. fault는 장부의 "read" 고장 자리에 걸린다.
-async function bootAdmin(fault?: () => void): Promise<{ w: World; running: RunningSupervisor; calls: string[]; raw: () => Ledger; sends: { frames: number; closes: number } }> {
+async function bootAdmin(fault?: () => void, faultPoint = "read"): Promise<{ w: World; running: RunningSupervisor; calls: string[]; raw: () => Ledger; sends: { frames: number; closes: number } }> {
   const calls: string[] = [];
   let raw: Ledger | null = null;
   const w = world({
     deps: {
       openLedger: (file, options) => {
         const base = options.faults;
-        const faults = fault === undefined ? base : { ...base, at: (point: string) => (point === "read" && fault(), base?.at(point)) };
+        const faults = fault === undefined ? base : { ...base, at: (point: string) => (point === faultPoint && fault(), base?.at(point)) };
         const result = openLedger(file, { ...options, faults });
         if (!result.ok) return result;
         raw = result.ledger;
@@ -703,6 +791,38 @@ describe("실제 조립의 관리 포트", () => {
     expect(w.names()).not.toContain("fatal");
     expect(statusOf(running)).toEqual({ kind: "status", status: { alive: true, queued: 0, running: 0, diagnosis: "active", stop: "none", stopGeneration: 0, intakeOpen: true } });
     expect(await running.stop()).toBe(0);
+  });
+
+  test("끝낼 사유가 이미 생긴 감독은 다음 박자 전에도 살아 있음으로 내지 않는다: 장부 고장은 모름(1), 허가 폐기는 alive false. 조회는 래치·조립 상태를 바꾸지 않는다", async () => {
+    for (const model of ["failed_stop", "revoked"] as const) {
+      let armed = false;
+      const { w, running, raw } = await bootAdmin(() => {
+        if (!armed) return;
+        armed = false;
+        throw Object.assign(new Error("fixture"), { code: "SQLITE_IOERR" });
+      }, "stop:before_commit");
+      await untilStep(w, 5);
+      expect(statusOf(running)).toMatchObject({ kind: "status", status: { alive: true, intakeOpen: true } });
+      armed = model === "failed_stop";
+      const change = raw().applyStop({ generation: 1, stopped: true, now: WALL + 1 });
+      expect(change.ok, model).toBe(model === "revoked");
+      const before = running.admin.progress();
+      expect(before, model).toEqual({ restored: true, alive: true, granted: true });
+      const reply = statusOf(running);
+      if (model === "failed_stop") {
+        expect(raw().health()).toEqual({ writable: false, reason: "io" });
+        expect(reply).toEqual({ kind: "unknown", reason: "ledger_unreadable" });
+        expect(exitFor({ kind: "reply", reply: reply! })).toMatchObject({ code: 1, stdout: "" });
+      } else {
+        expect(reply).toEqual({ kind: "status", status: { alive: false, queued: 0, running: 0, diagnosis: "active", stop: "stopping", stopGeneration: 1, intakeOpen: false } });
+      }
+      expect(running.admin.progress(), model).toEqual(before);
+      expect(w.names(), model).not.toContain("fatal");
+      // 사유를 붙잡는 것은 감독 자신의 다음 박자다.
+      await w.time.advance(w.settings.timing.beatEveryMs);
+      expect(w.events.filter((e) => e.event === "fatal").map((e) => e.fields.reason), model).toEqual([model === "failed_stop" ? "ledger_unwritable" : "intake_discarded"]);
+      expect(await running.done).toBe(96);
+    }
   });
 
   test("일시 중지를 읽는 조회도 공유 시계의 하한을 올리지 않는다: 조회 뒤 원천 시계가 조회 시각보다 이르게 와도 감독의 다음 읽기는 regressed가 아니다", async () => {
