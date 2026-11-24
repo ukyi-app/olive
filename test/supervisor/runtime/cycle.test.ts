@@ -911,7 +911,7 @@ describe("실제 박자 넷과 장부", () => {
 });
 
 describe("공유 시계", () => {
-  test("원천이 하한보다 이르면 now()는 하한을 내고 read()는 regressed다. 읽지 못하면 now()는 던진다", () => {
+  test("원천이 하한보다 이르면 now()는 하한을 내고 read()는 regressed다. 무효 값은 하한을 바꾸지 않고 now()가 그대로 내며, 원천이 던지면 now()도 던진다", () => {
     let wall = 1_000;
     const shared = createSharedClock({ now: () => wall });
     expect([shared.now(), shared.read()]).toEqual([1_000, { state: "ok", at: 1_000 }]);
@@ -924,8 +924,10 @@ describe("공유 시계", () => {
     for (const bad of [Number.NaN, 0, -1, 1.5]) {
       wall = bad;
       expect([bad, shared.read()]).toEqual([bad, { state: "unavailable" }]);
-      expect(() => shared.now()).toThrow(RangeError);
+      expect(shared.now()).toBe(bad);
     }
+    wall = 1_999;
+    expect([shared.now(), shared.read()]).toEqual([2_000, { state: "regressed" }]);
     const throwing = createSharedClock({
       now: () => {
         throw new Error("시계 없음");
@@ -1009,6 +1011,126 @@ describe("멈춘 배정과 꼴이 틀린 답", () => {
     h.next.linkLoss = () => linkLossRan();
     await cycle.beat();
     expect(h.seen.linkLoss.at(-1)?.input.watch).toEqual([{ executorId: W1, absentSince: 5 }]);
+  });
+});
+
+describe("박자 함수와 완료 신호", () => {
+  test("박자 함수는 만들 때 한 번 꺼내 쥐고, 박자마다 마지막 확인 뒤에 외부 객체에서 다시 읽지 않는다(수신자는 그 객체)", async () => {
+    const h = harness();
+    const trace: string[] = [];
+    const methods: Record<string, unknown> = { target: h.deps.beats };
+    for (const name of ["linkLoss", "life", "resend", "assign"] as const) {
+      Object.defineProperty(methods, name, {
+        get() {
+          trace.push(`get.${name}`);
+          return function (this: { target: CycleBeats }, ...args: unknown[]) {
+            trace.push(`enter.${name}`);
+            return (this.target[name] as (...input: unknown[]) => unknown)(...args);
+          };
+        },
+      });
+    }
+    const restoreDone = () => {
+      trace.push("gate");
+      return true;
+    };
+    const cycle = createCycle({ ...h.deps, beats: methods as unknown as CycleBeats, restoreDone });
+    expect(trace.splice(0)).toEqual(["get.linkLoss", "get.life", "get.resend", "get.assign"]);
+    for (let pass = 0; pass < 2; pass += 1) {
+      const report = ran(await cycle.beat());
+      expect(trace.splice(0)).toEqual(["gate", "enter.linkLoss", "gate", "enter.life", "gate", "enter.resend", "gate", "enter.assign"]);
+      expect([report.linkLoss.kind, report.life.kind, report.resend.kind, report.assign.map((step) => step.kind)]).toEqual(["returned", "returned", "returned", ["returned"]]);
+    }
+  });
+
+  test("끊김 함수를 얻지 못하면 순서기를 만들지 않아 수명 박자도 돌지 않고, 얻은 끊김 함수가 던지면 수명 박자는 돈다", async () => {
+    const h = harness();
+    const unavailable = {
+      ...h.deps.beats,
+      get linkLoss(): never {
+        throw new Error("어댑터 없음");
+      },
+    };
+    expect(() => createCycle({ ...h.deps, beats: unavailable as unknown as CycleBeats })).toThrow("어댑터 없음");
+    expect(() => createCycle({ ...h.deps, beats: { ...h.deps.beats, linkLoss: undefined } as unknown as CycleBeats })).toThrow(TypeError);
+    expect(h.calls).toEqual([]);
+
+    h.next.linkLoss = () => {
+      throw new Error("끊김 실패");
+    };
+    const report = ran(await createCycle(h.deps).beat());
+    expect([report.linkLoss.kind, report.life.kind, h.calls.filter((call) => call === "life").length]).toEqual(["threw", "returned", 1]);
+  });
+
+  test("호출자가 잡은 박자의 거부는 미처리 거부로 다시 나오지 않고, 그 박자 안에서 부른 닫기는 박자가 돌아온 뒤에 정상으로 끝난다", async () => {
+    const unhandled: unknown[] = [];
+    const listen = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", listen);
+    try {
+      const broken = () =>
+        ({
+          ...linkLossRan(),
+          get executors(): never {
+            throw new Error("결과 칸 없음");
+          },
+        }) as LinkLossTickResult;
+      const h = harness();
+      h.next.linkLoss = broken;
+      const caught = await createCycle(h.deps)
+        .beat()
+        .then(
+          () => "fulfilled",
+          (error: Error) => error.message,
+        );
+
+      const trace: string[] = [];
+      const other = harness();
+      const cycle = createCycle(other.deps);
+      let closing: Promise<unknown> | null = null;
+      other.next.linkLoss = () => {
+        closing = cycle.closeIssuance().then(() => trace.push("close.done"));
+        return broken();
+      };
+      await cycle.beat().then(
+        () => trace.push("beat.fulfilled"),
+        () => trace.push("beat.rejected"),
+      );
+      await closing;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect([caught, trace, unhandled]).toEqual(["결과 칸 없음", ["beat.rejected", "close.done"], []]);
+    } finally {
+      process.off("unhandledRejection", listen);
+    }
+  });
+
+  test("ledgerClock은 만들 때 한 번만 읽고 검사한 그 값을 쓴다", async () => {
+    const h = harness();
+    const checked = h.deps.ledgerClock;
+    const lookalike = { now: () => 1, read: () => ({ state: "ok", at: 1 }) };
+    let reads = 0;
+    const deps = {
+      ...h.deps,
+      get ledgerClock() {
+        reads += 1;
+        return reads === 1 ? checked : lookalike;
+      },
+    } as unknown as CycleDeps;
+    const cycle = createCycle(deps);
+    await cycle.beat();
+    expect([reads, h.seen.assign]).toEqual([1, [h.state.wall]]);
+  });
+
+  test("장부 조회 중 원천이 무효 값을 한 번 내도 장부는 계속 쓸 수 있다(공유 시계는 무효 값을 장부의 무효 시각 처리로 넘긴다)", () => {
+    let wall: number = NOW;
+    const shared = createSharedClock({ now: () => wall });
+    const ledger = open(tempPath(), { clock: () => shared.now() });
+    wall = Number.NaN;
+    const read = ledger.queueView();
+    const during = ledger.health();
+    wall = NOW + 1;
+    expect([read.known, during, ledger.health(), shared.now()]).toEqual([true, { writable: true }, { writable: true }, NOW + 1]);
   });
 });
 

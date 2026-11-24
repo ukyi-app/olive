@@ -7,10 +7,12 @@ import type { Clock } from "../dispatch/ports.ts";
 export type ClockReading = { readonly state: "ok"; readonly at: number } | { readonly state: "regressed" | "unavailable" };
 
 export interface SharedClock extends Clock {
-  // 원천 값이 하한보다 이르면 하한을 낸다(내는 값은 줄지 않는다). 원천이 던지거나 양의 안전 정수가 아니면 던진다:
-  // 0이나 음수를 시각으로 받는 소비자가 있어(싱크는 안전 정수만 본다) 그런 값을 넘기면 하한이 뚫린다.
+  // 원천 값이 하한보다 이르면 하한을 낸다(유효한 값으로는 내는 값이 줄지 않는다). 원천 값이 양의 안전 정수가 아니면 하한을 바꾸지
+  // 않고 그 값을 그대로 낸다: 던지면 장부는 읽기 실패로 실패 표시를 남기고 TLS 수락 콜백에서는 예외가 밖으로 나간다. 무효 값은
+  // 각 소비자의 무효 시각 처리를 따른다(장부는 모든 기한이 지난 것으로 본다). 함정: 싱크는 안전 정수면 0·음수도 시각으로 받으므로
+  // 원천이 그런 값을 내면 그 읽기는 하한을 지키지 못한다. 원천이 던지면 던진다.
   now(): number;
-  // 순서기의 읽기. 원천 값이 하한 이상이면 ok(하한을 올린다), 이르면 regressed, 읽지 못하면 unavailable이다. regressed와
+  // 순서기의 읽기. 원천 값이 하한 이상이면 ok(하한을 올린다), 이르면 regressed, 읽지 못하거나 무효 값이면 unavailable이다. regressed와
   // unavailable은 하한을 바꾸지 않는다. 다른 소비자가 now()로 올린 하한도 여기서 보이므로 순서기가 그 후퇴를 안다.
   read(): ClockReading;
 }
@@ -19,6 +21,13 @@ const made = new WeakSet<object>();
 
 export function createSharedClock(source: Clock): SharedClock {
   let floor = 0;
+  // 원천 값 하나를 하한과 견준다. ok일 때만 하한을 올린다.
+  const judge = (at: unknown): ClockReading => {
+    if (!Number.isSafeInteger(at) || (at as number) <= 0) return { state: "unavailable" };
+    if ((at as number) < floor) return { state: "regressed" };
+    floor = at as number;
+    return { state: "ok", at: floor };
+  };
   const read = (): ClockReading => {
     let at: unknown;
     try {
@@ -26,17 +35,20 @@ export function createSharedClock(source: Clock): SharedClock {
     } catch {
       return { state: "unavailable" };
     }
-    if (!Number.isSafeInteger(at) || (at as number) <= 0) return { state: "unavailable" };
-    if ((at as number) < floor) return { state: "regressed" };
-    floor = at as number;
-    return { state: "ok", at: floor };
+    return judge(at);
   };
   const clock: SharedClock = Object.freeze({
     now(): number {
-      const reading = read();
+      let at: unknown;
+      try {
+        at = source.now();
+      } catch {
+        throw new RangeError("clock_unavailable");
+      }
+      const reading = judge(at);
       if (reading.state === "ok") return reading.at;
       if (reading.state === "regressed") return floor;
-      throw new RangeError("clock_unavailable");
+      return at as number;
     },
     read,
   });

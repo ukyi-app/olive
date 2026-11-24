@@ -8,6 +8,7 @@
 // 지키는 것:
 // 1. 박자를 겹쳐 부르지 않는다. 박자가 진행 중이면 beat()는 기다리지 않고 거절한다(박자 안의 포트에서 다시 부른 것도 같다).
 // 2. 복원이 끝나기 전에는 서버 tick만 부르고 박자 넷은 부르지 않는다. 박자를 부르기 직전마다, 그 앞의 포트 읽기를 마친 뒤에 다시 본다.
+//    박자 함수는 만들 때 꺼내 쥔 것을 부르므로 그 확인과 함수 진입 사이에 외부 객체를 읽지 않는다.
 //    한 번 막히면 그 박자의 남은 박자도 부르지 않는다(끊김 박자 없이 수명 박자만 도는 박자를 만들지 않는다).
 // 3. 장부 시계는 공유 비후퇴 시계(shared-clock.ts)다. 원천 값이 그 하한(장부·내보내기 포트·서버가 읽은 값 포함)보다 이르면 박자에는
 //    읽지 못한 시계로 보인다. 박자 처음의 읽기가 그러면 그 박자의 재전송·배정을 부르지 않는다. 끊김 박자의 단조 시계도 하한을 둔다.
@@ -24,6 +25,7 @@ import { type ClockReading, isSharedClock, type SharedClock } from "./shared-clo
 
 // 박자 넷. 조립은 실제 박자 함수에 그 포트·정책을 묶어 넘긴다(예: linkLoss = (c, p, i) => linkLossTick({ ...포트, ...c }, p, i)).
 // 시계와 끊김·재전송의 정책은 이 순서기가 넘기는 것을 그대로 포트에 넣어야 한다: 시계 하한과 정책 검사가 그 값에 걸려 있다.
+// createCycle이 네 함수를 한 번 꺼내 쥐므로 나중에 이 객체의 속성을 바꿔도 따르지 않는다. 지금의 장부·어댑터로 바꾸는 것은 함수 본문 안에서 한다.
 export interface CycleBeats {
   linkLoss(clocks: { readonly clock: Clock; readonly monotonic: MonotonicClock }, policy: LinkLossPolicy, input: LinkLossTickInput): LinkLossTickResult;
   life(clock: Clock, input: LifeTickInput): Promise<LifeTickResult>;
@@ -90,7 +92,7 @@ export type Step<R> =
 export type RereadBeat = "link_loss" | "life" | "resend" | "assign";
 
 export type Reread =
-  // 결과 밖을 대조할 목록. runs는 실행 목록, waiting_requests는 대기 부탁 목록(배정이 멈췄을 때만)이다. known은 그 목록을 읽었는지까지다:
+  // 결과 밖을 대조할 목록. runs는 실행 목록, waiting_requests는 대기 부탁 목록(배정이 던지거나 halted: "threw"일 때만)이다. known은 그 목록을 읽었는지까지다:
   // 끊김 박자 뒤의 known: true도 실행이 unknown_running으로 옮겨졌는지는 말하지 않는다.
   | {
       readonly beat: RereadBeat;
@@ -155,11 +157,26 @@ function bump(memory: Map<string, number>, key: string, at: number): void {
 
 const copyWatch = (entries: readonly WatchEntry[]): WatchEntry[] => entries.map(({ executorId, absentSince }) => ({ executorId, absentSince }));
 
+// 박자 함수를 한 번 꺼내 쥔다. 박자마다 beats에서 다시 읽으면 그 읽기(접근자)가 마지막 확인 뒤에 사용자 코드를 돌린다.
+// 수신자는 beats로 묶는다(메서드가 this를 쓸 수 있다). 묶은 함수는 부를 때 아무 속성도 읽지 않고, bind를 사용자 함수에서 찾지 않으려고
+// Function.prototype의 것을 쓴다. 함정: Reflect.apply는 송신 자리 정적 시험(start-send.test.ts)이 송신으로 센다.
+const bindTo = Function.prototype.bind;
+function takeBeats(beats: CycleBeats): CycleBeats {
+  const take = <K extends keyof CycleBeats>(name: K): CycleBeats[K] => {
+    const fn: unknown = beats[name];
+    if (typeof fn !== "function") throw new TypeError(`순서기의 beats.${name}는 함수여야 한다`);
+    return bindTo.call(fn, beats) as CycleBeats[K];
+  };
+  return Object.freeze({ linkLoss: take("linkLoss"), life: take("life"), resend: take("resend"), assign: take("assign") });
+}
+
 export function createCycle(deps: CycleDeps): Cycle {
   const policy = readPolicy(deps.policy);
-  if (!isSharedClock(deps.ledgerClock)) throw new TypeError("순서기의 ledgerClock은 createSharedClock이 만든 시계여야 한다");
-  const { beats, ledger } = deps;
-  const shared = deps.ledgerClock;
+  // 한 번 읽어 검사한 그 값을 쥔다. 다시 읽으면 접근자가 검사하지 않은 다른 시계를 낼 수 있다.
+  const shared: unknown = deps.ledgerClock;
+  if (!isSharedClock(shared)) throw new TypeError("순서기의 ledgerClock은 createSharedClock이 만든 시계여야 한다");
+  const beats = takeBeats(deps.beats);
+  const { ledger } = deps;
 
   let watch: readonly WatchEntry[] = [];
   const lastQueries = new Map<string, number>();
@@ -191,7 +208,8 @@ export function createCycle(deps: CycleDeps): Cycle {
 
   let busy = false;
   let closed = false;
-  let inFlight: Promise<BeatReport> | null = null;
+  // 닫기가 기다리는 완료 신호. 박자가 이행하든 거부하든 이행만 한다: 거부를 따라가면 닫기를 부르지 않은 동안 받을 곳 없는 거부가 된다.
+  let inFlight: Promise<void> | null = null;
 
   const setWatch = (entry: string): void => {
     const next = new Map(watch.map((item) => [item.executorId, item.absentSince] as const));
@@ -385,8 +403,9 @@ export function createCycle(deps: CycleDeps): Cycle {
     }
 
     const assign: Step<AssignTickResult>[] = [];
-    // 배정이 멈추면 결과에 없는 대기 부탁과 실행 전체를 다시 읽는다(assign-loop.md "박자가 멈출 때"). 대기 부탁은 실행 줄이 생기기
-    // 전부터 있는 별도 목록이라 실행 목록만으로는 대조가 끝나지 않는다.
+    // 배정이 던지거나 halted: "threw"로 멈추면 결과에 없는 대기 부탁과 실행 전체를 다시 읽는다(assign-loop.md "박자가 멈출 때").
+    // halted: "intake_closed"는 되풀이만 멈추고 다시 읽지 않는다. 대기 부탁은 실행 줄이 생기기 전부터 있는 별도 목록이라 실행 목록만으로는
+    // 대조가 끝나지 않는다.
     const rereadAssign = (cause: "threw" | "halted"): void => {
       rereads.push({ beat: "assign", cause, read: "waiting_requests", known: readWaiting() });
       rereadRuns("assign", cause);
@@ -435,29 +454,26 @@ export function createCycle(deps: CycleDeps): Cycle {
       // 박자 안의 동기 구간(서버 tick, 끊김 박자)에서 다시 불려도 잡도록 약속을 만들기 전에 세운다.
       if (busy) return Promise.resolve(report({ kind: "skipped", reason: "beat_in_progress" }));
       busy = true;
-      // 첫 포트(서버 tick, 끊김 박자, 수명 박자의 동기 구간)를 부르기 전에 이 박자의 완료 약속을 게시한다. 그 포트 안에서
-      // closeIssuance()가 불려도 이 약속을 기다리므로 박자보다 먼저 돌아오지 않는다.
-      let settle!: (beat: Promise<BeatReport>) => void;
-      inFlight = new Promise<BeatReport>((resolve) => {
-        settle = resolve;
+      // 첫 포트(서버 tick, 끊김 박자, 수명 박자의 동기 구간)를 부르기 전에 이 박자의 완료 신호를 게시한다. 그 포트 안에서
+      // closeIssuance()가 불려도 이 신호를 기다리므로 박자보다 먼저 돌아오지 않는다. 신호는 finally에서 이행하고 박자의 약속은 그 직후
+      // 같은 차례에 정해지므로, 닫기의 약속은 박자의 약속보다 늦게 정해진다.
+      let finish!: () => void;
+      inFlight = new Promise<void>((resolve) => {
+        finish = resolve;
       });
-      const current = (async () => {
+      return (async () => {
         try {
           return report(await runBeat());
         } finally {
           busy = false;
+          finish();
         }
       })();
-      settle(current);
-      return current;
     },
     async closeIssuance(): Promise<void> {
       closed = true;
       const pending = inFlight;
-      if (pending !== null) await pending.then(
-        () => undefined,
-        () => undefined,
-      );
+      if (pending !== null) await pending;
     },
     issuanceOpen(): boolean {
       return !closed;
