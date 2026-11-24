@@ -53,6 +53,7 @@ export {
   type SnapshotResult,
   type StartBar,
   type StartDispatchInput,
+  type StatusPeek,
   STOP_PHASES,
   type StopInstructionInput,
   type StopRecord,

@@ -7,7 +7,8 @@
 //   막는 상태에서 부른다. 차트는 이 경로의 폴더(/tmp emptyDir)를 감독 컨테이너에만 붙인다(README "감독 관리 통로").
 // - 경로에 지난 프로세스의 소켓이 남아 있으면(emptyDir는 컨테이너 재시작에도 남는다) 지우고 듣는다. 소켓이 아닌 파일이면 지우지 않고 거절한다.
 // - Bun의 socket.write는 다 쓰지 못하면 쓴 만큼만 돌려준다. 나머지는 쥐고 drain에서 이어 쓰며, 다 쓴 뒤에 닫는다.
-// - 기한은 연결을 받은 순간에 정하고, 요청 줄을 다 받은 순간의 단조 시각으로 판정한다. 타이머는 쉬는 연결을 깨우는 수단일 뿐이다.
+// - 기한은 둘이다. 요청 받기는 연결을 받은 순간에 정하고 요청 줄을 다 받은 순간의 단조 시각으로, 답 쓰기는 쓰기 시작 전에 정하고
+//   drain을 받은 순간의 단조 시각으로 판정한다(정각이면 만료). 타이머는 쉬는 연결을 깨우는 수단일 뿐이다: drain이 오지 않아도 회수한다.
 import { ADMIN_LIMITS, encodeReply } from "./protocol.ts";
 
 // 연결 하나의 소켓에서 이 파일이 쓰는 면.
@@ -37,7 +38,7 @@ export interface AdminFs {
   chmod(path: string, mode: number): void;
 }
 
-export type AdminConnectionNote = "busy" | "late" | "too_long" | "answer_threw" | "reply_too_long" | "write_failed";
+export type AdminConnectionNote = "busy" | "late" | "too_long" | "answer_threw" | "reply_too_long" | "write_failed" | "write_late";
 
 export interface AdminListenerOptions {
   path: string;
@@ -80,6 +81,7 @@ const ENCODER = new TextEncoder();
 interface Connection {
   readonly peer: AdminPeer;
   readonly limit: number;
+  writeLimit: number;
   chunks: Uint8Array[];
   bytes: number;
   pending: Uint8Array | null;
@@ -146,6 +148,30 @@ export function listenAdmin(options: AdminListenerOptions): AdminListening {
     if (connection.pending === null) shut(connection);
   };
 
+  // 기한 타이머를 건다. 불린 순간의 시각으로 판정하고, 이르게 불렸으면 다시 건다. 그 사이 연결이 다른 단계로 넘어갔으면 아무것도 하지 않는다.
+  const arm = (connection: Connection, state: "reading" | "writing", limit: number) => {
+    const late: AdminConnectionNote = state === "reading" ? "late" : "write_late";
+    let left: number;
+    try {
+      left = Math.max(1, Math.ceil(limit - options.monoNow()));
+      if (!Number.isFinite(left)) throw new RangeError("clock");
+    } catch {
+      note(late);
+      return shut(connection);
+    }
+    try {
+      connection.cancel = options.setTimer(left, () => {
+        if (connection.state !== state) return;
+        if (!pastLimit(limit)) return arm(connection, state, limit);
+        note(late);
+        shut(connection);
+      });
+    } catch {
+      note(late);
+      shut(connection);
+    }
+  };
+
   const reply = (connection: Connection, text: string) => {
     const bytes = ENCODER.encode(text);
     if (bytes.length > ADMIN_LIMITS.replyMaxBytes) {
@@ -158,8 +184,20 @@ export function listenAdmin(options: AdminListenerOptions): AdminListening {
     } catch {
       // 기한 타이머가 늦게 불려도 쓰는 중인 연결은 닫지 않는다(state를 본다).
     }
+    // 쓰기의 기한은 첫 쓰기 전에 정한다. 시각을 읽지 못하면 쓰지 않고 닫는다.
+    try {
+      connection.writeLimit = options.monoNow() + ADMIN_LIMITS.serverWriteWaitMs;
+    } catch {
+      connection.writeLimit = Number.NaN;
+    }
+    if (!Number.isFinite(connection.writeLimit)) {
+      note("write_late");
+      return shut(connection);
+    }
     connection.pending = bytes;
     flush(connection);
+    // 다 쓰지 못했다: 남은 바이트는 drain에서 이어 쓰되, drain이 오지 않아도 기한에 회수한다.
+    if (connection.state === "writing") arm(connection, "writing", connection.writeLimit);
   };
 
   // 받은 바이트에서 요청 한 줄을 찾는다. 줄을 다 받은 순간의 시각으로 기한을 판정한다.
@@ -212,7 +250,7 @@ export function listenAdmin(options: AdminListenerOptions): AdminListening {
       } catch {
         // 시각을 읽지 못한 연결은 기한이 이미 지난 연결이다(NaN은 늘 지난 것으로 판정된다).
       }
-      const connection: Connection = { peer, limit, chunks: [], bytes: 0, pending: null, state: "reading", cancel: () => {} };
+      const connection: Connection = { peer, limit, writeLimit: Number.NaN, chunks: [], bytes: 0, pending: null, state: "reading", cancel: () => {} };
       if (connections.size >= ADMIN_LIMITS.maxConnections || !Number.isFinite(limit)) {
         if (Number.isFinite(limit)) note("busy");
         else note("late");
@@ -231,28 +269,7 @@ export function listenAdmin(options: AdminListenerOptions): AdminListening {
         return;
       }
       connections.set(peer, connection);
-      const arm = () => {
-        let left: number;
-        try {
-          left = Math.max(1, Math.ceil(limit - options.monoNow()));
-          if (!Number.isFinite(left)) throw new RangeError("clock");
-        } catch {
-          note("late");
-          return shut(connection);
-        }
-        try {
-          connection.cancel = options.setTimer(left, () => {
-            if (connection.state !== "reading") return;
-            if (!pastLimit(limit)) return arm();
-            note("late");
-            shut(connection);
-          });
-        } catch {
-          note("late");
-          shut(connection);
-        }
-      };
-      arm();
+      arm(connection, "reading", limit);
     },
     data: (peer, chunk) => {
       const connection = connections.get(peer);
@@ -263,7 +280,13 @@ export function listenAdmin(options: AdminListenerOptions): AdminListening {
     },
     drain: (peer) => {
       const connection = connections.get(peer);
-      if (connection?.state === "writing") flush(connection);
+      if (connection?.state !== "writing") return;
+      // drain을 받은 순간이 쓰기 기한 정각 이후면 남은 바이트를 쓰지 않고 닫는다(타이머가 아직 불리지 않았어도).
+      if (pastLimit(connection.writeLimit)) {
+        note("write_late");
+        return shut(connection);
+      }
+      flush(connection);
     },
     close: (peer) => {
       const connection = connections.get(peer);

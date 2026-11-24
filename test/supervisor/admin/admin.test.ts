@@ -1,12 +1,12 @@
 // 감독 관리 통로(src/supervisor/admin/)와 관리 진입점(src/main/admin.ts)의 시험: 말의 꼴(homelab CLI가 읽는 상태 한 줄), 상태 읽기의
 // 판정, 실제 조립에서의 복원 전 모름·쓰기 0·송신 0, 실제 경로 유닉스 소켓의 루프백(권한·남은 소켓·감독 없음), 받는 순간의 기한 판정.
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { adminFs } from "../../../src/main/supervisor.ts";
-import { type Ledger, openLedger, type Run, type StopRecord } from "../../../src/ledger/index.ts";
-import { ask, type AskOutcome, type ClientDeps, type ClientHandlers, commandOf, exitFor, USAGE } from "../../../src/supervisor/admin/client.ts";
+import { type Ledger, openLedger, type Read, type StatusPeek, type StopRecord } from "../../../src/ledger/index.ts";
+import { RESTORE_KEY } from "../../../src/ledger/ledger.ts";
+import { ask, type AskOutcome, type ClientDeps, type ClientHandlers, type ClientSocket, commandOf, exitFor, USAGE } from "../../../src/supervisor/admin/client.ts";
 import { answerLine, createAdminHandlers } from "../../../src/supervisor/admin/commands.ts";
 import { type AdminFs, AdminListenRefused, type AdminPeer, type AdminSocketHandlers, listenAdmin } from "../../../src/supervisor/admin/listener.ts";
 import {
@@ -18,14 +18,16 @@ import {
   encodeRequest,
   parseReply,
   parseRequest,
+  STATUS_MAX_COUNT,
   STATUS_SCHEMA,
   statusLine,
   type SupervisorStatus,
 } from "../../../src/supervisor/admin/protocol.ts";
-import { type AdminProgress, type AdminSources, readStatus } from "../../../src/supervisor/admin/status.ts";
+import { type AdminClockReading, type AdminProgress, type AdminSources, readStatus } from "../../../src/supervisor/admin/status.ts";
 import type { RunningSupervisor } from "../../../src/supervisor/runtime/boot.ts";
+import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
 import { root } from "../../files.ts";
-import { tempDir } from "../../ledger/helpers.ts";
+import { id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempDir, tempPath, worker, WORKER_EXECUTOR } from "../../ledger/helpers.ts";
 import { loopbackTime, manualTime, WALL, type World, world } from "../runtime/boot-world.ts";
 
 const STATUS: SupervisorStatus = { alive: true, queued: 2, running: 1, diagnosis: "active", stop: "none", stopGeneration: 3, intakeOpen: true };
@@ -34,22 +36,18 @@ const CLI_FIELDS = ["schema", "alive", "queued", "running", "diagnosis", "stop",
 const STATUS_REQUEST = '{"command":"status"}';
 const decode = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 const known = <T>(value: T) => ({ known: true as const, value });
-const runOf = (state: Run["state"]) => ({ state }) as Run;
 const stopOf = (over: Partial<StopRecord> = {}): StopRecord => ({ generation: 3, stopped: false, phase: "none", updatedAt: WALL, ...over });
+// STATUS와 같은 값이 나오는 장부 읽기(대기 1+1, 자리 1).
+const PEEK: StatusPeek = { stop: stopOf(), pauseUntil: null, waitingRequests: 1, queuedRuns: 1, slotRuns: 1, intakeOpen: true };
+const okAt = (at: number): AdminClockReading => ({ state: "ok", at });
 
 // 읽은 자리를 적는 가짜 읽기 포트.
-function sources(over: Partial<{ progress: AdminProgress; stop: ReturnType<AdminSources["ledger"]["readStop"]>; pause: ReturnType<AdminSources["ledger"]["readPause"]>; runs: Run[]; waiting: number; intake: () => boolean; now: () => number }> = {}) {
+function sources(over: Partial<{ progress: AdminProgress; view: () => Read<StatusPeek>; peek: Partial<StatusPeek>; now: () => AdminClockReading }> = {}) {
   const calls: string[] = [];
   const value: AdminSources = {
     progress: () => (calls.push("progress"), over.progress ?? { restored: true, alive: true, granted: true }),
-    intakeOpen: () => (calls.push("intakeOpen"), (over.intake ?? (() => true))()),
-    now: () => (calls.push("now"), (over.now ?? (() => WALL))()),
-    ledger: {
-      readStop: () => (calls.push("readStop"), over.stop ?? known(stopOf())),
-      readPause: () => (calls.push("readPause"), over.pause ?? known(null)),
-      listRuns: () => (calls.push("listRuns"), known(over.runs ?? [runOf("queued"), runOf("running")])),
-      listWaitingToolRequests: () => (calls.push("listWaitingToolRequests"), known(Array.from({ length: over.waiting ?? 1 }, () => ({}) as never))),
-    },
+    view: (cap) => (calls.push(`view:${cap}`), over.view === undefined ? known({ ...PEEK, ...over.peek }) : over.view()),
+    now: () => (calls.push("now"), (over.now ?? (() => okAt(WALL)))()),
   };
   return { value, calls };
 }
@@ -105,17 +103,16 @@ describe("상태 읽기", () => {
     expect(s.calls).toEqual(["progress"]);
   });
 
-  test("알려진 상태: 대기는 배정 전 부탁과 자리 받기 전 실행, 작업은 자리를 쥔 실행이다", () => {
-    const runs = ["queued", "queued", "preparing", "running", "unknown_running", "cleanup_pending", "finalized", "not_started"].map((state) => runOf(state as Run["state"]));
-    const s = sources({ runs, waiting: 3 });
+  test("알려진 상태: 대기는 배정 전 부탁과 자리 받기 전 실행, 작업은 자리를 쥔 실행이다. 장부 읽기는 한 번이고 상한에서 멈춘다", () => {
+    const s = sources({ peek: { waitingRequests: 3, queuedRuns: 2, slotRuns: 4 } });
     expect(readStatus(s.value)).toEqual({ known: true, status: { alive: true, queued: 5, running: 4, diagnosis: "active", stop: "none", stopGeneration: 3, intakeOpen: true } });
     // 일시 중지가 없으면 시계를 읽지 않는다.
-    expect(s.calls).toEqual(["progress", "readStop", "readPause", "listRuns", "listWaitingToolRequests", "intakeOpen"]);
+    expect(s.calls).toEqual(["progress", "view:1000000"]);
   });
 
   test("정지는 실행 쪽 소멸까지 확인했을 때만 stopped다. 접수만 된 정지는 stopping, 풀린 정지는 none", () => {
     const stopAs = (over: Partial<StopRecord>) => {
-      const answer = readStatus(sources({ stop: known(stopOf(over)) }).value);
+      const answer = readStatus(sources({ peek: { stop: stopOf(over) } }).value);
       return answer.known ? answer.status.stop : answer.reason;
     };
     expect(stopAs({ stopped: true, phase: "runtime_verified" })).toBe("stopped");
@@ -124,14 +121,16 @@ describe("상태 읽기", () => {
   });
 
   test("진단 일시 중지는 끝이 장부 시계보다 뒤일 때만 paused다. 시계를 모르면 모름", () => {
-    const diagnosis = (until: number | null, now: () => number = () => WALL) => {
-      const answer = readStatus(sources({ pause: known(until), now }).value);
+    const diagnosis = (until: number | null, now: () => AdminClockReading = () => okAt(WALL)) => {
+      const answer = readStatus(sources({ peek: { pauseUntil: until }, now }).value);
       return answer.known ? answer.status.diagnosis : answer.reason;
     };
     expect(diagnosis(null)).toBe("active");
     expect(diagnosis(WALL + 1)).toBe("paused");
     expect(diagnosis(WALL)).toBe("active");
-    expect(diagnosis(WALL + 1, () => Number.NaN)).toBe("clock_unavailable");
+    expect(diagnosis(WALL + 1, () => okAt(Number.NaN))).toBe("clock_unavailable");
+    expect(diagnosis(WALL + 1, () => ({ state: "unavailable" }))).toBe("clock_unavailable");
+    expect(diagnosis(WALL + 1, () => ({ state: "regressed" }))).toBe("clock_unavailable");
     expect(
       diagnosis(WALL + 1, () => {
         throw new Error("clock");
@@ -141,7 +140,7 @@ describe("상태 읽기", () => {
 
   test("접수 열림은 조립이 살아 있고 허가를 받아들였고 복원기가 지금도 열림일 때뿐이다", () => {
     const intake = (progress: AdminProgress, open: boolean) => {
-      const answer = readStatus(sources({ progress, intake: () => open }).value);
+      const answer = readStatus(sources({ progress, peek: { intakeOpen: open } }).value);
       return answer.known ? [answer.status.alive, answer.status.intakeOpen] : answer.reason;
     };
     expect(intake({ restored: true, alive: true, granted: true }, true)).toEqual([true, true]);
@@ -151,20 +150,123 @@ describe("상태 읽기", () => {
   });
 
   test("장부를 읽지 못함·정지 기록 없음·상한 넘는 수는 모름이다(지어내지 않는다)", () => {
-    const unread = { known: false as const, reason: "closed" as const };
-    expect(readStatus(sources({ stop: unread }).value)).toEqual({ known: false, reason: "ledger_unreadable" });
-    expect(readStatus(sources({ pause: unread }).value)).toEqual({ known: false, reason: "ledger_unreadable" });
-    expect(readStatus(sources({ stop: known(null) }).value)).toEqual({ known: false, reason: "stop_unrecorded" });
-    expect(readStatus(sources({ waiting: 1_000_000 }).value)).toEqual({ known: false, reason: "out_of_range" });
+    for (const reason of ["closed", "io"] as const) expect(readStatus(sources({ view: () => ({ known: false, reason }) }).value)).toEqual({ known: false, reason: "ledger_unreadable" });
+    expect(readStatus(sources({ peek: { stop: null } }).value)).toEqual({ known: false, reason: "stop_unrecorded" });
+    expect(readStatus(sources({ peek: { waitingRequests: 1_000_000 } }).value)).toEqual({ known: false, reason: "out_of_range" });
+    expect(readStatus(sources({ peek: { slotRuns: 1_000_000 } }).value)).toEqual({ known: false, reason: "out_of_range" });
+    expect(readStatus(sources({ peek: { queuedRuns: -1 } }).value)).toEqual({ known: false, reason: "out_of_range" });
     expect(
       readStatus(
         sources({
-          intake: () => {
+          view: () => {
             throw new Error("x");
           },
         }).value,
       ),
     ).toEqual({ known: false, reason: "read_threw" });
+  });
+});
+
+// 장부의 "read" 고장 자리에 I/O 오류 한 번을 거는 장부.
+function faultyLedger() {
+  let armed = false;
+  const ledger = open(tempPath(), {
+    faults: {
+      at(point: string) {
+        if (point !== "read" || !armed) return;
+        armed = false;
+        throw Object.assign(new Error("fixture"), { code: "SQLITE_IOERR" });
+      },
+    },
+  });
+  return { ledger, arm: () => void (armed = true), armed: () => armed };
+}
+// 복원 시도 하나를 열고 그 시도의 허가를 낸다(정지 기록은 ready가 적는다).
+function attemptOf(ledger: Ledger): symbol {
+  const attempt = ledger.beginRestore(RESTORE_KEY);
+  ledger.pinRestore(RESTORE_KEY, attempt);
+  expect(ledger.grantIntake(RESTORE_KEY, attempt)).toBe(true);
+  return attempt;
+}
+
+describe("부작용 없는 읽기: 장부의 peekStatus와 공유 시계의 peek", () => {
+  test("장부의 상태 읽기가 실패해도 장부를 고장으로 표시하지 않고 허가를 버리지 않는다. 같은 고장을 다른 읽기가 만나면 표시한다(대조군)", () => {
+    const { ledger, arm, armed } = faultyLedger();
+    ready(ledger);
+    const attempt = attemptOf(ledger);
+    const state = () => ({ health: ledger.health(), intake: ledger.intakeOpen(attempt) });
+    const before = state();
+    expect(before).toEqual({ health: { writable: true }, intake: true });
+    arm();
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toEqual({ known: false, reason: "io" });
+    expect(armed()).toBe(false);
+    expect(state()).toEqual(before);
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toMatchObject({ known: true, value: { intakeOpen: true } });
+    // 대조군: 같은 고장을 감독의 읽기(readStop)가 만나면 장부가 고장으로 표시되고 허가가 사라진다. 그 뒤의 상태 읽기는 접수 닫힘이다.
+    arm();
+    expect(ledger.readStop()).toEqual({ known: false, reason: "io" });
+    expect(state()).toEqual({ health: { writable: false, reason: "io" }, intake: false });
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toMatchObject({ known: true, value: { intakeOpen: false } });
+  });
+
+  test("장부의 상태 읽기: 자리를 쥔 실행은 장부 줄과 점유 관측(장부 밖 실행 포함)을 (실행, 세대)로 합쳐 세고, 개수는 상한에서 멈춘다", () => {
+    const ledger = open(tempPath());
+    const started = startedWorker(ledger);
+    must(ledger.admitRun(worker()));
+    const attempt = attemptOf(ledger);
+    const outside = id();
+    must(
+      ledger.holdSlots(
+        RESTORE_KEY,
+        [
+          // 장부 밖 실행이 세션 자리를 쥐고 있다(복원 2단계의 관측, 실행 줄은 없다). 두 실행기가 같은 (실행, 세대)를 말하면 하나다.
+          { executorId: SESSION_EXECUTOR, runId: outside, kind: "session", runGeneration: 1, holdsSlot: true, why: "outside_ledger" },
+          { executorId: "executor/session/1/store-t", runId: outside, kind: "session", runGeneration: 1, holdsSlot: true, why: "outside_ledger" },
+          // 장부 줄이 이미 자리를 쥔 실행의 같은 세대 관측은 더하지 않는다.
+          { executorId: WORKER_EXECUTOR, runId: started.runId, kind: "worker", runGeneration: started.from.runGeneration, holdsSlot: true, why: "state" },
+        ],
+        NOW,
+      ),
+    );
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, attempt)).toMatchObject({ known: true, value: { pauseUntil: null, waitingRequests: 0, queuedRuns: 1, slotRuns: 2, intakeOpen: true } });
+    expect(ledger.peekStatus(1, attempt)).toMatchObject({ known: true, value: { queuedRuns: 1, slotRuns: 1 } });
+    // 접수 판정은 복원기가 넘긴 시도의 허가만 센다.
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, null)).toMatchObject({ known: true, value: { intakeOpen: false } });
+    expect(ledger.peekStatus(STATUS_MAX_COUNT, Symbol("other"))).toMatchObject({ known: true, value: { intakeOpen: false } });
+    const answer = readStatus({ progress: () => ({ restored: true, alive: true, granted: true }), view: (cap) => ledger.peekStatus(cap, attempt), now: () => okAt(NOW) });
+    expect(answer).toEqual({ known: true, status: { alive: true, queued: 1, running: 2, diagnosis: "active", stop: "none", stopGeneration: 0, intakeOpen: true } });
+  });
+
+  test("공유 시계의 peek는 now()가 낼 값을 내되 하한을 올리지 않는다: 일시 중지를 읽는 조회가 있든 없든 다음 읽기의 판정이 같다", () => {
+    const next = (query: boolean) => {
+      let value = 100;
+      const clock = createSharedClock({ now: () => value });
+      clock.now();
+      value = 200;
+      const answer = query ? readStatus({ ...sources({ peek: { pauseUntil: 250 } }).value, now: () => clock.peek() }) : null;
+      value = 150;
+      return { answer, next: clock.read() };
+    };
+    expect(next(false).next).toEqual({ state: "ok", at: 150 });
+    const queried = next(true);
+    expect(queried.answer).toMatchObject({ known: true, status: { diagnosis: "paused" } });
+    expect(queried.next).toEqual({ state: "ok", at: 150 });
+    // 원천이 하한보다 이르면 하한을 ok로 낸다(now()가 낼 값). 무효 값·던짐은 unavailable이고 던지지 않는다. 어느 쪽도 하한을 바꾸지 않는다.
+    let value = 300;
+    const clock = createSharedClock({ now: () => value });
+    clock.now();
+    value = 250;
+    expect(clock.peek()).toEqual({ state: "ok", at: 300 });
+    value = Number.NaN;
+    expect(clock.peek()).toEqual({ state: "unavailable" });
+    value = 250;
+    expect(clock.read()).toEqual({ state: "regressed" });
+    const throwing = createSharedClock({
+      now: () => {
+        throw new Error("x");
+      },
+    });
+    expect(throwing.peek()).toEqual({ state: "unavailable" });
   });
 });
 
@@ -266,6 +368,34 @@ describe("붙는 쪽의 기한: 답을 받는 순간의 단조 시각으로 판�
       expect(await ask("status", deps, "/x/admin.sock")).toEqual({ kind: "unreachable", reason });
     }
   });
+
+  test("연결을 받은 순간이 기한 정각이면 요청을 쓰지 않고 닫는다(타이머가 아직 불리지 않았어도). 1ms 전이면 쓴다", async () => {
+    for (const [late, writes] of [
+      [ADMIN_LIMITS.clientWaitMs, 0],
+      [ADMIN_LIMITS.clientWaitMs - 1, 1],
+    ] as const) {
+      const time = manualTime();
+      const written: string[] = [];
+      const ended: number[] = [];
+      let complete: (socket: ClientSocket) => void = () => {};
+      const deps: ClientDeps = {
+        connect: () =>
+          new Promise((resolve) => {
+            complete = resolve;
+          }),
+        monoNow: time.monoNow,
+        setTimer: time.setTimer,
+      };
+      const asked = ask("status", deps, "/x/admin.sock");
+      time.set(1_000 + late);
+      complete({ write: (bytes) => (written.push(decode(bytes)), bytes.length), end: () => void ended.push(1) });
+      await time.flush();
+      expect(written).toEqual(writes === 0 ? [] : [`${STATUS_REQUEST}\n`]);
+      if (writes === 0) expect(ended.length).toBe(1);
+      else await time.advance(ADMIN_LIMITS.clientWaitMs);
+      expect(await asked).toEqual({ kind: "failed", reason: "timeout" });
+    }
+  });
 });
 
 // 손으로 넣는 듣기. 시험이 연결을 열고 바이트를 넣는다.
@@ -273,6 +403,7 @@ function fakeListener(time: ReturnType<typeof manualTime>, answer: (line: string
   let handlers: AdminSocketHandlers | null = null;
   const fsCalls: string[] = [];
   const answered: string[] = [];
+  const notes: string[] = [];
   let stops = 0;
   const fs: AdminFs = {
     kind: () => kind,
@@ -286,6 +417,7 @@ function fakeListener(time: ReturnType<typeof manualTime>, answer: (line: string
     monoNow: time.monoNow,
     setTimer: time.setTimer,
     answer: (line) => (answered.push(line), answer(line)),
+    note: (value) => void notes.push(value),
     listen: (_path, given) => {
       fsCalls.push("listen");
       handlers = given;
@@ -305,7 +437,7 @@ function fakeListener(time: ReturnType<typeof manualTime>, answer: (line: string
     };
     return { value, out, ends: () => ends };
   };
-  return { listening, fsCalls, answered, handlers: () => handlers as unknown as AdminSocketHandlers, peer, stops: () => stops };
+  return { listening, fsCalls, answered, notes, handlers: () => handlers as unknown as AdminSocketHandlers, peer, stops: () => stops };
 }
 
 describe("듣는 쪽: 연결 하나 = 요청 한 줄 → 답 한 줄 → 닫기", () => {
@@ -360,6 +492,43 @@ describe("듣는 쪽: 연결 하나 = 요청 한 줄 → 답 한 줄 → 닫기"
     for (let i = 0; i < 100 && slow.ends() === 0; i += 1) l.handlers().drain(slow.value);
     expect(slow.out.join("")).toBe(encodeReply({ kind: "status", status: STATUS }));
     expect(slow.ends()).toBe(1);
+  });
+
+  test("다 못 쓴 답에 drain이 오지 않으면 쓰기 기한에 닫고 연결 자리를 돌려준다. drain을 받은 순간이 기한 정각이면 쓰지 않고 닫는다", async () => {
+    const request = new TextEncoder().encode(`${STATUS_REQUEST}\n`);
+    const time = manualTime();
+    const l = fakeListener(time);
+    const stuck = Array.from({ length: ADMIN_LIMITS.maxConnections }, () => l.peer(0));
+    for (const p of stuck) {
+      l.handlers().open(p.value);
+      l.handlers().data(p.value, request);
+    }
+    expect(stuck.map((p) => p.ends())).toEqual([0, 0, 0, 0]);
+    await time.advance(ADMIN_LIMITS.serverWriteWaitMs - 1);
+    expect(stuck.map((p) => p.ends())).toEqual([0, 0, 0, 0]);
+    await time.advance(1);
+    expect(stuck.map((p) => p.ends())).toEqual([1, 1, 1, 1]);
+    expect(l.notes).toEqual(["write_late", "write_late", "write_late", "write_late"]);
+    expect(time.pending()).toBe(0);
+    // 자리를 돌려받았다: 새 연결이 busy 없이 답을 받는다.
+    const fresh = l.peer();
+    l.handlers().open(fresh.value);
+    l.handlers().data(fresh.value, request);
+    expect([fresh.out, fresh.ends()]).toEqual([[encodeReply({ kind: "status", status: STATUS })], 1]);
+    for (const [at, closed] of [
+      [ADMIN_LIMITS.serverWriteWaitMs, true],
+      [ADMIN_LIMITS.serverWriteWaitMs - 1, false],
+    ] as const) {
+      const t = manualTime();
+      const s = fakeListener(t);
+      const slow = s.peer(0);
+      s.handlers().open(slow.value);
+      s.handlers().data(slow.value, request);
+      const writes = slow.out.length;
+      t.set(1_000 + at);
+      s.handlers().drain(slow.value);
+      expect([slow.out.length - writes, slow.ends()]).toEqual(closed ? [0, 1] : [1, 0]);
+    }
   });
 
   test("경로: 남은 소켓은 지우고 듣고, 소켓이 아닌 파일·상대 경로는 듣지 않는다. 듣고 나서 권한을 0600으로 둔다", () => {
@@ -424,14 +593,16 @@ describe("루프백: 실제 경로 유닉스 소켓", () => {
   });
 });
 
-// 실제 조립(boot.ts)의 관리 포트. 장부를 감싸 부른 메서드를 적고, 가짜 서버의 송신 두 자리를 센다.
-async function bootAdmin(): Promise<{ w: World; running: RunningSupervisor; calls: string[]; raw: () => Ledger; sends: { frames: number; closes: number } }> {
+// 실제 조립(boot.ts)의 관리 포트. 장부를 감싸 부른 메서드를 적고, 가짜 서버의 송신 두 자리를 센다. fault는 장부의 "read" 고장 자리에 걸린다.
+async function bootAdmin(fault?: () => void): Promise<{ w: World; running: RunningSupervisor; calls: string[]; raw: () => Ledger; sends: { frames: number; closes: number } }> {
   const calls: string[] = [];
   let raw: Ledger | null = null;
   const w = world({
     deps: {
       openLedger: (file, options) => {
-        const result = openLedger(file, options);
+        const base = options.faults;
+        const faults = fault === undefined ? base : { ...base, at: (point: string) => (point === "read" && fault(), base?.at(point)) };
+        const result = openLedger(file, { ...options, faults });
         if (!result.ok) return result;
         raw = result.ledger;
         const ledger = new Proxy(result.ledger, {
@@ -463,7 +634,15 @@ async function untilStep(w: World, step: number): Promise<void> {
   expect(restoreSteps(w)).toContain(step);
 }
 const statusOf = (running: RunningSupervisor) => parseReply(answerLine(STATUS_REQUEST, createAdminHandlers(running.admin)).slice(0, -1));
-const fileHash = (path: string) => (existsSync(path) ? createHash("sha256").update(readFileSync(path)).digest("hex") : null);
+// 장부 파일의 해시는 다른 프로세스에서 잰다: 감독이 장부를 연 동안 같은 프로세스가 그 파일을 따로 열고 닫으면 감독의 POSIX 잠금이
+// 풀릴 수 있다(src/ledger/ledger.md).
+function fileHash(path: string): string | null {
+  const script = `const fs = require("node:fs"); const p = ${JSON.stringify(path)}; process.stdout.write(fs.existsSync(p) ? require("node:crypto").createHash("sha256").update(fs.readFileSync(p)).digest("hex") : "null");`;
+  const result = Bun.spawnSync([process.execPath, "-e", script], { env: { PATH: process.env.PATH ?? "" }, timeout: 10_000 });
+  if (result.exitCode !== 0) throw new Error(`해시를 재지 못함: ${result.stderr.toString()}`);
+  const text = result.stdout.toString();
+  return text === "null" ? null : text;
+}
 
 describe("실제 조립의 관리 포트", () => {
   test("복원 4단계까지 받아들인 감독(정지 기록은 이미 합침)도 5단계 전에는 모름(restore_not_done, 3)이고 장부를 읽지 않는다. 5단계 뒤에는 알려진 상태다", async () => {
@@ -491,8 +670,7 @@ describe("실제 조립의 관리 포트", () => {
     const before = { files: files(), calls: calls.length, sends: { ...sends } };
     const replies = [statusOf(running), statusOf(running), statusOf(running)];
     for (const reply of replies) expect(reply).toEqual({ kind: "status", status: { alive: true, queued: 0, running: 0, diagnosis: "paused", stop: "none", stopGeneration: 0, intakeOpen: true } });
-    const reads = ["readStop", "readPause", "listRuns", "listWaitingToolRequests", "intakeOpen"];
-    expect(calls.slice(before.calls)).toEqual([...reads, ...reads, ...reads]);
+    expect(calls.slice(before.calls)).toEqual(["peekStatus", "peekStatus", "peekStatus"]);
     expect(files()).toEqual(before.files);
     expect(before.files[0]).not.toBeNull();
     expect(sends).toEqual(before.sends);
@@ -501,5 +679,40 @@ describe("실제 조립의 관리 포트", () => {
     const after = statusOf(running);
     expect(after).toEqual({ kind: "unknown", reason: "ledger_unreadable" });
     expect(exitFor({ kind: "reply", reply: after! }).code).toBe(1);
+  });
+
+  test("상태 조회 중 장부 읽기가 실패해도 감독 상태가 그대로다: 그 조회만 모름(1)이고, 장부 건강·조립 상태·장부 파일이 같고, 감독은 끝나지 않는다", async () => {
+    let armed = false;
+    const { w, running, raw } = await bootAdmin(() => {
+      if (!armed) return;
+      armed = false;
+      throw Object.assign(new Error("fixture"), { code: "SQLITE_IOERR" });
+    });
+    await untilStep(w, 5);
+    const state = () => ({ health: raw().health(), progress: running.admin.progress(), files: [w.ledgerPath, `${w.ledgerPath}-wal`].map(fileHash) });
+    const before = state();
+    expect(before.progress).toEqual({ restored: true, alive: true, granted: true });
+    armed = true;
+    const reply = statusOf(running);
+    expect(armed).toBe(false);
+    expect(reply).toEqual({ kind: "unknown", reason: "ledger_unreadable" });
+    expect(exitFor({ kind: "reply", reply: reply! })).toEqual({ code: 1, stdout: "", stderr: "olive admin: 상태 모름: 감독이 상태를 읽지 못했다(ledger_unreadable)\n" });
+    expect(state()).toEqual(before);
+    // 감독은 박자를 이어 가고 끝낼 사유를 붙잡지 않는다. 다음 조회는 알려진 상태이고 접수는 열려 있다.
+    for (let i = 0; i < 3; i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
+    expect(w.names()).not.toContain("fatal");
+    expect(statusOf(running)).toEqual({ kind: "status", status: { alive: true, queued: 0, running: 0, diagnosis: "active", stop: "none", stopGeneration: 0, intakeOpen: true } });
+    expect(await running.stop()).toBe(0);
+  });
+
+  test("일시 중지를 읽는 조회도 공유 시계의 하한을 올리지 않는다: 조회 뒤 원천 시계가 조회 시각보다 이르게 와도 감독의 다음 읽기는 regressed가 아니다", async () => {
+    const { w, running, raw } = await bootAdmin();
+    await untilStep(w, 5);
+    expect(raw().setPause(WALL + 60_000)).toEqual({ ok: true });
+    w.wall = WALL + 50_000;
+    expect(statusOf(running)).toMatchObject({ kind: "status", status: { diagnosis: "paused" } });
+    w.wall = WALL + 10_000;
+    expect(w.captured.shared?.read()).toEqual({ state: "ok", at: WALL + 10_000 });
+    expect(await running.stop()).toBe(0);
   });
 });

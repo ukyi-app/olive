@@ -17,9 +17,16 @@ export interface SharedClock extends Clock {
   read(): ClockReading;
 }
 
+// createSharedClock이 내는 시계. 순서기·장부 등 다른 소비자는 SharedClock만 받는다.
+export interface PeekableClock extends SharedClock {
+  // 감독 관리 통로의 읽기. now()가 낼 값(원천 값과 하한 중 늦은 쪽)을 ok로 내되 하한을 바꾸지 않는다: 감독 밖에서 온 조회가 다음 박자의
+  // 시계 판정(regressed)을 바꾸지 않게. 원천이 던지거나 무효 값이면 unavailable이고 던지지 않는다.
+  peek(): ClockReading;
+}
+
 const made = new WeakSet<object>();
 
-export function createSharedClock(source: Clock): SharedClock {
+export function createSharedClock(source: Clock): PeekableClock {
   let floor = 0;
   // 원천 값 하나를 하한과 견준다. ok일 때만 하한을 올린다.
   const judge = (at: unknown): ClockReading => {
@@ -37,7 +44,7 @@ export function createSharedClock(source: Clock): SharedClock {
     }
     return judge(at);
   };
-  const clock: SharedClock = Object.freeze({
+  const clock: PeekableClock = Object.freeze({
     now(): number {
       let at: unknown;
       try {
@@ -51,6 +58,16 @@ export function createSharedClock(source: Clock): SharedClock {
       return at as number;
     },
     read,
+    peek(): ClockReading {
+      let at: unknown;
+      try {
+        at = source.now();
+      } catch {
+        return { state: "unavailable" };
+      }
+      if (!Number.isSafeInteger(at) || (at as number) <= 0) return { state: "unavailable" };
+      return { state: "ok", at: Math.max(at as number, floor) };
+    },
   });
   made.add(clock);
   return clock;

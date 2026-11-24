@@ -383,8 +383,8 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 - **소켓:** `/tmp/olive-admin.sock`(코드 상수, 환경으로 받지 않는다). 감독이 기동을 마친 직후, 복원 전부터 듣고 권한을 `0600`으로 둔다. 감독과 exec로 들어온 진입점은 같은 컨테이너의 같은 uid다. 경로에 지난 프로세스의 소켓이 남아 있으면(emptyDir는 컨테이너 재시작에도 남는다) 지우고 듣는다. 소켓이 아닌 파일이면 지우지 않고 듣지 않는다. 듣지 못해도 감독은 계속 돈다: 기록에 `admin_listen_failed`가 남고 상태 조회는 "닿지 못함"(1)이 된다. 정상 끝 차례 뒤에는 소켓 파일이 사라진다.
 - **감독의 두 번째 듣기:** 감독의 듣기는 연결 서버의 TCP와 이 소켓 둘이다. 이 소켓은 실행기 쪽 듣기와 같은 규칙(unix 경로 하나, TCP·abstract 없음)을 지킨다(`test/entrypoints.test.ts`).
-- **상태 한 줄:** homelab CLI가 검사하는 `olive-supervisor-status/v1`의 여덟 칸 그대로다(`schema`, `alive`, `queued`, `running`, `diagnosis`, `stop`, `stopGeneration`, `intakeOpen`). `alive`는 끝 차례에 들지 않았고 끝낼 사유가 없음, `queued`는 배정 전 부탁과 자리를 받기 전 실행(`queued`)의 수, `running`은 자리를 쥔 실행(모름·정리 대기 포함)의 수, `diagnosis`는 진단 일시 중지의 끝이 장부 시계보다 뒤면 `paused`, `stop`은 정지가 아니면 `none`·실행 쪽 소멸까지 확인했으면(`runtime_verified`) `stopped`·그 밖의 정지는 `stopping`, `intakeOpen`은 조립이 살아 있고 5단계의 허가를 받아들였고 복원기가 지금도 열림으로 판정할 때만 참이다.
-- **읽기만 한다:** 조립(`boot.ts`의 `const admin`)이 넘기는 것은 장부의 읽기 넷(`readStop`·`readPause`·`listRuns`·`listWaitingToolRequests`), 복원기의 접수 판정, 공유 시계뿐이다. 장부 쓰기·송신·끝낼 사유의 래치(`look()`)를 부르지 않고, 도구 처리기의 포트(`RunningSupervisor.tools`)를 쓰지 않는다(S42). 상태 읽기는 한 동기 구간이라 읽는 사이에 장부가 바뀌지 않는다. 함정: 장부 읽기가 실패하면 장부가 스스로 고장으로 표시하고 감독은 끝 차례로 간다(박자의 읽기와 같은 규칙).
+- **상태 한 줄:** homelab CLI가 검사하는 `olive-supervisor-status/v1`의 여덟 칸 그대로다(`schema`, `alive`, `queued`, `running`, `diagnosis`, `stop`, `stopGeneration`, `intakeOpen`). `alive`는 끝 차례에 들지 않았고 끝낼 사유가 없음, `queued`는 배정 전 부탁과 자리를 받기 전 실행(`queued`)의 수, `running`은 자리를 쥔 실행(모름·정리 대기 포함, 복원 2단계가 남긴 장부 밖 실행의 점유 관측 포함, 같은 실행·세대는 하나로 센다)의 수, `diagnosis`는 진단 일시 중지의 끝이 장부 시계보다 뒤면 `paused`, `stop`은 정지가 아니면 `none`·실행 쪽 소멸까지 확인했으면(`runtime_verified`) `stopped`·그 밖의 정지는 `stopping`, `intakeOpen`은 조립이 살아 있고 5단계의 허가를 받아들였고 장부가 같은 읽기에서 열림으로 판정할 때만 참이다.
+- **감독 상태를 바꾸지 않는다:** 조립(`boot.ts`의 `const admin`)이 넘기는 것은 조립 상태(변수 읽기), 복원기의 `statusView`(장부 `peekStatus` 한 번), 공유 시계의 `peek`뿐이다. `peekStatus`는 다른 장부 읽기와 달리 실패해도 장부를 고장으로 표시하지 않고 접수 허가를 버리지 않는다: 그 조회만 `ledger_unreadable`(1)이고 감독의 접수·끝 차례는 그대로다. 장부가 정말 고장이면 감독 자신의 다음 읽기·쓰기가 본다. `peek`는 `now()`가 낼 값을 읽되 공유 하한을 올리지 않아, 조회가 다음 박자의 시계 판정(`regressed`)을 바꾸지 않는다. 장부 쓰기·송신·끝낼 사유의 래치(`look()`)를 부르지 않고, 도구 처리기의 포트(`RunningSupervisor.tools`)를 쓰지 않는다(S42). 상태 읽기는 한 동기 구간이라 읽는 사이에 장부가 바뀌지 않는다. 개수는 줄을 객체로 펼치지 않고 1,000,000에서 멈춰 센다. 함정: 조건에 맞는 줄을 찾는 훑기는 실행 표 크기만큼 돈다(상태 칸에 색인이 없다).
 - **명령:** 요청은 `{"command":"status"}` 한 줄이다. 새 명령은 `protocol.ts`의 `ADMIN_COMMANDS`와 `commands.ts`의 처리기 표에 함께 더한다.
 
 **모름 갈래와 종료 코드**(D-61의 CLI 공통 규칙: 0 완료, 1 실패, 3 대기, 64 사용법). 0이 아니면 stdout에 아무것도 쓰지 않고 stderr에 사유 낱말을 실은 한 줄만 쓴다.
@@ -403,8 +403,9 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 | 자리 | 값 | 정하는 때 | 판정하는 때 | 넘으면 |
 |---|---|---|---|---|
-| 진입점: 붙기·요청·답 한 줄 | 5초(`clientWaitMs`). CLI의 kubectl 요청 상한 20초보다 짧게 | 붙기 전 | 답 한 줄·끊김·연결 실패를 받는 순간 | 1(`timeout`) |
+| 진입점: 붙기·요청·답 한 줄 | 5초(`clientWaitMs`). CLI의 kubectl 요청 상한 20초보다 짧게 | 붙기 전 | 연결 성공(정각 이후면 요청을 쓰지 않고 닫음)·답 한 줄·끊김·연결 실패를 받는 순간 | 1(`timeout`) |
 | 감독: 요청 한 줄 받기 | 2초(`serverWaitMs`) | 연결을 받은 순간 | 줄바꿈까지 받은 순간 | 답하지 않고 닫음 |
+| 감독: 답 한 줄 쓰기 | 2초(`serverWriteWaitMs`) | 첫 쓰기 전 | drain·타이머를 받는 순간(drain이 오지 않아도 타이머가 회수) | 남은 바이트를 버리고 닫음(연결 자리 회수) |
 | 요청 한 줄 | 1,024바이트(줄바꿈 포함) | | | 답하지 않고 닫음 |
 | 답 한 줄 | 4,096바이트(CLI가 받는 진입점 출력 상한과 같다) | | | 1(`too_long`) |
 | 동시 관리 연결 | 4 | | 연결을 받는 순간 | `busy`를 답하고 닫음(1) |

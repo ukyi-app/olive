@@ -7,7 +7,20 @@
 // 반환값은 그 순간의 판정이다. 그 뒤의 판단(stopGeneration, intakeOpen)은 단계 결과가 아니라 지금의 장부에서 읽는다.
 import { CONTRACT as CONTRACT_V1, parsePrincipal, queriesAfterReconnect, type RunStatus } from "../contract/v1/index.ts";
 import { CONTRACT as CONTRACT_V2 } from "../contract/v2/index.ts";
-import { type Ledger, type PendingInputs, type PendingReport, RESTORE_KEY, type RestoreAttempt, type Run, type RunSightingObservation, type SlotHold, type SlotHoldObservation, type SnapshotOrigin } from "./ledger.ts";
+import {
+  type Ledger,
+  type PendingInputs,
+  type PendingReport,
+  type Read,
+  RESTORE_KEY,
+  type RestoreAttempt,
+  type Run,
+  type RunSightingObservation,
+  type SlotHold,
+  type SlotHoldObservation,
+  type SnapshotOrigin,
+  type StatusPeek,
+} from "./ledger.ts";
 import { SLOT_FREE, TERMINAL } from "./states.ts";
 
 // ---- 포트(뒤 작업이 채운다) ----
@@ -223,6 +236,11 @@ export class Restorer {
   // 새 접수·새 실행·자격 발급을 지금 열어도 되는가. 이 복원기가 낸 허가가 살아 있고 지금의 장부가 건강하고 정지가 아닐 때만 true다.
   intakeOpen(): boolean {
     return this.#done === 5 && this.#attempt !== null && this.ledger.intakeOpen(this.#attempt);
+  }
+
+  // 감독 관리 통로의 상태 조회(Ledger.peekStatus). 접수 판정은 intakeOpen과 같은 조건이되, 읽기가 실패해도 장부를 고장으로 표시하지 않는다.
+  statusView(cap: number): Read<StatusPeek> {
+    return this.ledger.peekStatus(cap, this.#done === 5 ? this.#attempt : null);
   }
 
   // 단계 완료를 확정하는 곳은 여기 하나다. 결과는 fn이 끝난 뒤 같은 동기 구간에서 #done과 함께 게시하고, 호출자에게는 복사본을 준다.

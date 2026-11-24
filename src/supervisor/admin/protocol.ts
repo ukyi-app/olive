@@ -18,6 +18,9 @@ export const ADMIN_LIMITS = {
   clientWaitMs: 5_000,
   // 감독: 연결을 받은 순간부터 요청 한 줄을 다 받기까지. 받는 순간의 단조 시각으로 판정한다.
   serverWaitMs: 2_000,
+  // 감독: 답을 쓰기 시작한 순간부터 다 쓰기까지. 상대가 받지 않아(drain이 오지 않아) 남은 바이트와 연결 자리를 쥐는 상한이다.
+  // drain·타이머를 받는 순간의 단조 시각으로 판정한다. 요청 받기와 합쳐도 진입점의 기한(clientWaitMs)보다 짧다.
+  serverWriteWaitMs: 2_000,
   // 감독이 동시에 쥐는 관리 연결의 상한. 넘친 연결에는 busy를 답하고 닫는다.
   maxConnections: 4,
 } as const;

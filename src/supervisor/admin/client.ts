@@ -1,7 +1,7 @@
 // 관리 진입점(src/main/admin.ts)의 붙는 쪽. 감독의 관리 소켓에 붙어 요청 한 줄을 쓰고 답 한 줄을 읽어 종료 코드와 출력을 정한다.
 // 소켓 API는 진입점이 connect 포트로 넘긴다. 듣지 않는다. 장부·박자·연결 서버를 import하지 않는다(protocol.ts만 쓴다).
-// 기한은 붙기 전에 정한 절대 기한 하나이고(ADMIN_LIMITS.clientWaitMs), 답 한 줄을 받는 순간(또는 끊김·연결 실패를 받는 순간)의
-// 단조 시각으로 판정한다. 타이머가 늦게 와도 정각 이후에 받은 답은 쓰지 않는다.
+// 기한은 붙기 전에 정한 절대 기한 하나이고(ADMIN_LIMITS.clientWaitMs), 연결 성공·답 한 줄·끊김·연결 실패를 받는 순간의
+// 단조 시각으로 판정한다. 타이머가 늦게 와도 정각 이후에 받은 연결에는 요청을 쓰지 않고, 정각 이후에 받은 답은 쓰지 않는다.
 import { ADMIN_COMMANDS, ADMIN_LIMITS, ADMIN_SOCKET_PATH, type AdminCommand, type AdminReply, encodeRequest, parseReply, statusLine } from "./protocol.ts";
 
 export interface ClientSocket {
@@ -133,6 +133,9 @@ export function ask(command: AdminCommand, deps: ClientDeps, path: string = ADMI
           return;
         }
         socket = opened;
+        // 연결을 받은 순간이 기한 정각 이후면 요청을 쓰지 않고 닫는다(타이머가 아직 불리지 않았어도). 쓰면 호출자는 실패를 받는데
+        // 감독에는 처리할 요청이 남는다.
+        if (pastLimit()) return end({ kind: "failed", reason: "timeout" });
         const request = new TextEncoder().encode(encodeRequest(command));
         let wrote: number;
         try {
