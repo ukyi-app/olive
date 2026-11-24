@@ -275,6 +275,22 @@ test("start_worker: 조회와 기록 사이에 같은 키가 생기면(조회가
   expect(written(w.ledger)).toBe(before);
 });
 
+test("start_worker: 남이 같은 문자열의 키를 먼저 적어도 내 조회는 없음이고 새 참조로 적히며, 두 소유자가 같은 문자열을 조회하면 각자 자기 참조다", () => {
+  const w = world();
+  // B가 A의 처리기가 만들 키 문자열 그대로를 자기 소유로 먼저 적는다.
+  const others = waiting(w.ledger, B, keyOf(A));
+  const ports = opened(w.ports);
+  expect(w.ports.ledger.findByRetryKey({ owner: A, retryKey: keyOf(A) })).toEqual({ known: true, value: null });
+  const a = handleToolCall("start_worker", startArgs(SRC_A), ctx(A), ports) as { outcome: string; ref: string };
+  expect(a).toMatchObject({ outcome: "ok", phase: "waiting_assignment" });
+  expect(a.ref).not.toBe(others);
+  expect(w.ports.ledger.findByRetryKey({ owner: A, retryKey: keyOf(A) })).toMatchObject({ known: true, value: { ref: a.ref, owner: A } });
+  expect(w.ports.ledger.findByRetryKey({ owner: B, retryKey: keyOf(A) })).toMatchObject({ known: true, value: { ref: others, owner: B, content: { sourceRef: SRC_B } } });
+  const list = w.ledger.listWaitingToolRequests();
+  if (!list.known) throw new Error("읽기 실패");
+  expect(list.value.map((r) => r.ref).sort()).toEqual([a.ref, others].sort());
+});
+
 test("start_worker: 장부가 정지면 stopped, 복원 중(접수 허가 없음)이면 intake_closed이고 아무것도 적지 않는다", () => {
   const stoppedWorld = world();
   must(stoppedWorld.ledger.applyStop({ generation: 1, stopped: true, now: NOW }));
@@ -426,6 +442,93 @@ test("worker_status: 참조 읽기가 남의 줄을 주면 not_found, 던짐·�
     w.over.readToolRequest = fake;
     expect(handleToolCall("worker_status", refArgs(MISSING), ctx(A), opened(w.ports)), name).toEqual(expected);
   }
+});
+
+// 소유자 칸이 문자열이지만 UUID 꼴이 아닌 값. 남의 줄인지 가릴 수 없다.
+const BAD_OWNERS = ["", " ", "AAAAAAAA-0000-4000-8000-000000000001", `${A} `, "owner-a"];
+
+test("읽기: 소유자 칸이 UUID 꼴이 아닌 줄(빈 문자열 등)은 남의 줄이 아니라 모름이고, 기록·취소를 부르지 않는다", () => {
+  for (const bad of BAD_OWNERS) {
+    const byKey = world();
+    byKey.over.findToolRequest = () => ({ known: true, value: row({ owner: bad }) });
+    const beforeKey = written(byKey.ledger);
+    const startAnswer = handleToolCall("start_worker", startArgs(SRC_A), ctx(A), opened(byKey.ports));
+    expect({ calls: byKey.calls, written: written(byKey.ledger) === beforeKey }, bad).toEqual({ calls: ["findToolRequest"], written: true });
+    expect(startAnswer, bad).toEqual(unknown("start_worker"));
+    expect(byKey.ports.ledger.findByRetryKey({ owner: A, retryKey: keyOf(A) }), bad).toEqual({ known: false });
+
+    const byRef = world();
+    byRef.over.readToolRequest = () => ({ known: true, value: row({ owner: bad }) });
+    const beforeRef = written(byRef.ledger);
+    expect(handleToolCall("worker_status", refArgs(MISSING), ctx(A), opened(byRef.ports)), bad).toEqual(unknown("worker_status"));
+    expect(handleToolCall("worker_result", refArgs(MISSING), ctx(A), opened(byRef.ports)), bad).toEqual(unknown("worker_result"));
+    expect(handleToolCall("cancel_worker", refArgs(MISSING), ctx(A), opened(byRef.ports)), bad).toEqual(unknown("cancel_worker"));
+    expect(byRef.ports.ledger.readOwnedWork({ owner: A, ref: MISSING }), bad).toEqual({ known: false });
+    expect(byRef.calls, bad).toEqual(["readToolRequest", "readToolRequest", "readToolRequest", "readToolRequest"]);
+    expect(written(byRef.ledger), bad).toBe(beforeRef);
+    expect(byRef.events, bad).toEqual([]);
+  }
+});
+
+test("읽기: 장부 줄의 칸은 한 번만 읽고, 소유자를 판정한 값 그대로 옮긴다", () => {
+  // 읽을 때마다 다른 값을 내는 접근자: 처음은 자기 소유자, 그 뒤는 남의 소유자.
+  const shifting = (counter: { n: number }) => ({
+    ...row(),
+    get owner() {
+      counter.n += 1;
+      return counter.n === 1 ? A : B;
+    },
+  });
+  const byRef = world();
+  const refReads = { n: 0 };
+  byRef.over.readToolRequest = () => ({ known: true, value: shifting(refReads) });
+  expect(byRef.ports.ledger.readOwnedWork({ owner: A, ref: MISSING })).toMatchObject({ known: true, value: { owner: A, ref: MISSING } });
+  expect(refReads.n).toBe(1);
+
+  const byKey = world();
+  const keyReads = { n: 0 };
+  byKey.over.findToolRequest = () => ({ known: true, value: shifting(keyReads) });
+  expect(byKey.ports.ledger.findByRetryKey({ owner: A, retryKey: keyOf(A) })).toMatchObject({ known: true, value: { owner: A, retryKey: keyOf(A) } });
+  expect(keyReads.n).toBe(1);
+});
+
+test("읽기: 재시도 키가 장부의 중복 키 꼴(1~200자, 허용 문자)이 아닌 자기 줄은 상태·결과·취소 모두 unknown이고 취소를 부르지 않는다", () => {
+  for (const bad of ["", " ", "a b", ":start", "x".repeat(201), "키", "start_worker\n"]) {
+    // 실제 장부에 있는 자기 대기 부탁의 줄에서 키만 바꾼다: 키를 거르지 않으면 취소가 실제로 적힌다.
+    const w = world();
+    const own = waiting(w.ledger, A);
+    w.over.readToolRequest = () => ({ known: true, value: row({ ref: own, dedupeKey: bad }) });
+    const before = written(w.ledger);
+    const ports = opened(w.ports);
+    const answers = ["worker_status", "worker_result", "cancel_worker"].map((tool) => handleToolCall(tool, refArgs(own), ctx(A), ports));
+    expect({ answers, calls: w.calls, written: written(w.ledger) === before }, JSON.stringify(bad)).toEqual({
+      answers: ["worker_status", "worker_result", "cancel_worker"].map(unknown),
+      calls: ["readToolRequest", "readToolRequest", "readToolRequest"],
+      written: true,
+    });
+  }
+  // 처리기가 만들지 않는 꼴이라도 장부가 받는 키(200자, 허용 문자 전부)는 그대로 옮긴다.
+  for (const good of ["x".repeat(200), "manual/key@1+a=b.c_d-e:f"]) {
+    const w = world();
+    w.over.readToolRequest = () => ({ known: true, value: row({ dedupeKey: good }) });
+    expect(w.ports.ledger.readOwnedWork({ owner: A, ref: MISSING }), good).toMatchObject({ known: true, value: { retryKey: good } });
+    expect(handleToolCall("worker_status", refArgs(MISSING), ctx(A), opened(w.ports)), good).toEqual({ outcome: "ok", tool: "worker_status", ref: MISSING, phase: "waiting_assignment" });
+  }
+});
+
+test("start_worker: 기록 답의 ok 칸은 한 번만 읽는다(읽을 때마다 바뀌는 답은 모름)", () => {
+  const w = world();
+  let reads = 0;
+  w.over.recordToolRequest = ((input: Record<string, unknown>) => ({
+    get ok() {
+      reads += 1;
+      return reads === 1 ? "maybe" : true;
+    },
+    outcome: "created",
+    request: row({ ref: input.ref }),
+  })) as Fn;
+  expect(handleToolCall("start_worker", startArgs(SRC_A), ctx(A), opened(w.ports))).toEqual(unknown("start_worker"));
+  expect(reads).toBe(1);
 });
 
 // ---- cancel_worker ----

@@ -6,10 +6,11 @@
 // 1. 지금 장부에 맞는 연산이 있는 포트 넷만 잇는다. findByRetryKey → findToolRequest, readOwnedWork → readToolRequest,
 //    recordStart → recordToolRequest, requestCancel → cancelAdapter(dispatch/cancel.ts, 안에서 cancelToolRequest).
 // 2. 맞는 연산이 없는 포트 셋(liveSession, inputPinned, readResult)은 지어내지 않고 늘 모름(known: false)이다. 처리기는 모름을
-//    unknown으로 닫고 그 뒤의 포트를 부르지 않는다. liveSession은 처리기가 도구마다 먼저 부르므로, 이 공장이 돌려준 포트 그대로는
-//    네 도구 모두 장부를 읽지도 쓰지도 않고 unknown이다. 세션 계약(U6)이 그 연산을 낼 때까지 그렇게 닫혀 있는 것이 정한 동작이다.
-// 3. 장부가 돌려준 줄의 소유자가 묻는 소유자와 다르면 없는 줄(null)로 답한다(처리기 포트의 전제). 남의 줄이 있든 없든 답이 같다.
-//    소유자를 가릴 수 없는 줄, 꼴이 틀린 줄, 묻는 키·참조와 다른 자기 줄, 장부의 읽기 실패·던짐은 없음이 아니라 모름이다.
+//    unknown으로 닫고 그 뒤의 포트를 부르지 않는다. liveSession은 처리기가 문맥·정지·인자 검사 다음에 도구마다 먼저 부르므로,
+//    이 공장이 돌려준 포트 그대로는 그 검사를 통과한 네 도구 모두 장부를 읽지도 쓰지도 않고 unknown이다(검사에 걸리면 그 거절이
+//    먼저 나고, 그때도 장부 호출은 0이다). 세션 계약(U6)이 그 연산을 낼 때까지 그렇게 닫혀 있는 것이 정한 동작이다.
+// 3. 장부가 돌려준 줄의 소유자가 UUID 꼴이고 묻는 소유자와 다르면 없는 줄(null)로 답한다(처리기 포트의 전제). 남의 줄이 있든 없든 답이 같다.
+//    소유자를 가릴 수 없는 줄(칸 없음, 빈 문자열·다른 꼴), 꼴이 틀린 줄(중복 키 포함), 묻는 키·참조와 다른 자기 줄, 장부의 읽기 실패·던짐은 없음이 아니라 모름이다.
 //    모름을 없음으로 바꾸면 본체가 같은 작업을 다시 부르거나 있는 작업을 잃는다.
 // 4. 쓰기의 답은 넘긴 값과 대조한 뒤에만 넘긴다. 장부가 말한 결과(created·existing·conflict)와 돌려준 줄의 내용·소유자·키가
 //    맞지 않으면 무엇이 적혔는지 모르는 것이라 모름이다. 거절은 장부 설명(ledger.md "작업 부탁")의 옮김대로 stopped,
@@ -18,6 +19,8 @@
 //    취소의 관측 포트는 공장을 만들 때 받는다: 처리기가 어댑터를 부르기 전에 받는 쪽이 이미 붙어 있다(일부 관측은 처리기의 반환보다 먼저 온다).
 import { ROLES } from "../../contract/v1/index.ts";
 import type { Ledger } from "../../ledger/index.ts";
+// 장부의 중복 키 꼴(1~200자, 첫 글자 영숫자, 허용 문자). 장부가 쓰기에서 거르는 규칙을 다시 쓰지 않고 그대로 가져온다.
+import { REF as LEDGER_KEY } from "../../ledger/input.ts";
 import { type CancelPorts, cancelAdapter } from "../dispatch/cancel.ts";
 import { newUuid } from "../dispatch/envelopes.ts";
 import type { Random } from "../dispatch/ports.ts";
@@ -67,12 +70,29 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> => {
 const matches = (value: unknown, pattern: RegExp): value is string => typeof value === "string" && pattern.test(value);
 const isFunction = (value: unknown): value is (...args: never[]) => unknown => typeof value === "function";
 
-// 장부 줄(ToolRequest)을 포트의 줄(WorkRecord)로 옮긴다. 이름만 다르다(dedupeKey ↔ retryKey, 펼친 네 칸 ↔ content).
-// 칸은 한 번씩만 읽고, 처리기의 꼴(PATTERNS·PHASES·ROLES)에 맞지 않으면 null이다. 장부도 꼴을 거르지만 그 보장에 기대지 않는다:
-// 처리기의 줄 검사는 목적·원본 참조·digest가 문자열인지만 보므로, 꼴이 틀린 값이 그대로 내용 대조(retry_conflict)에 쓰인다.
-function toWork(row: Record<string, unknown>): WorkRecord | null {
+// 장부 줄의 칸을 한 번씩만 읽어 둔 값. 접근자가 읽을 때마다 다른 값을 내도, 소유자 판정과 옮김이 같은 값을 쓴다.
+interface RowFields {
+  readonly ref: unknown;
+  readonly owner: unknown;
+  readonly dedupeKey: unknown;
+  readonly role: unknown;
+  readonly purpose: unknown;
+  readonly sourceRef: unknown;
+  readonly inputDigest: unknown;
+  readonly phase: unknown;
+}
+const readFields = (row: Record<string, unknown>): RowFields => {
   const { ref, owner, dedupeKey, role, purpose, sourceRef, inputDigest, phase } = row;
-  if (!matches(ref, PATTERNS.uuid) || !matches(owner, PATTERNS.uuid) || typeof dedupeKey !== "string") return null;
+  return { ref, owner, dedupeKey, role, purpose, sourceRef, inputDigest, phase };
+};
+
+// 장부 줄(ToolRequest)을 포트의 줄(WorkRecord)로 옮긴다. 이름만 다르다(dedupeKey ↔ retryKey, 펼친 네 칸 ↔ content).
+// 처리기의 꼴(PATTERNS·PHASES·ROLES)과 장부의 중복 키 꼴(REF)에 맞지 않으면 null이다. 장부도 꼴을 거르지만 그 보장에 기대지 않는다:
+// 처리기의 줄 검사는 목적·원본 참조·digest·키가 문자열인지만 보므로, 꼴이 틀린 값이 그대로 내용 대조(retry_conflict)에 쓰이고,
+// 참조로 찾은 줄은 키를 대조하지 않아 빈 키의 줄도 자기 줄로 읽히고 취소된다.
+function toWork(fields: RowFields): WorkRecord | null {
+  const { ref, owner, dedupeKey, role, purpose, sourceRef, inputDigest, phase } = fields;
+  if (!matches(ref, PATTERNS.uuid) || !matches(owner, PATTERNS.uuid) || !matches(dedupeKey, LEDGER_KEY)) return null;
   if (!(ROLES as readonly unknown[]).includes(role) || !matches(purpose, PATTERNS.purpose)) return null;
   if (!matches(sourceRef, PATTERNS.sourceRef) || !matches(inputDigest, PATTERNS.sha256)) return null;
   if (!(PHASES as readonly unknown[]).includes(phase)) return null;
@@ -88,17 +108,18 @@ function toWork(row: Record<string, unknown>): WorkRecord | null {
 const sameContent = (a: StartContent, b: StartContent) => a.role === b.role && a.purpose === b.purpose && a.sourceRef === b.sourceRef && a.inputDigest === b.inputDigest;
 
 // 소유자로 찾는 읽기 하나의 답. identity는 묻는 소유자와, 그 줄이 같아야 하는 식별 칸(재시도 키 또는 참조)이다.
-// 순서: 읽기 실패 → 없음 → 소유자 → 꼴 → 식별. 소유자를 꼴보다 먼저 본다: 남의 줄은 꼴이 틀려도 없는 줄과 같은 답이어야 한다.
+// 순서: 읽기 실패 → 없음 → 소유자 → 꼴 → 식별. 소유자를 다른 칸의 꼴보다 먼저 본다: 남의 줄은 꼴이 틀려도 없는 줄과 같은 답이어야 한다.
 function ownedRead(read: unknown, owner: string, identity: { readonly field: "retryKey" | "ref"; readonly value: string }): Answer<WorkRecord | null> {
   if (!isPlainObject(read) || read.known !== true || !Object.hasOwn(read, "value")) return UNKNOWN;
   const value: unknown = read.value;
   if (value === null) return NONE;
   if (!isPlainObject(value)) return UNKNOWN;
-  const rowOwner: unknown = value.owner;
-  // 소유자 칸이 없으면 남의 줄인지 가릴 수 없다. 없음으로 바꾸지 않는다.
-  if (typeof rowOwner !== "string") return UNKNOWN;
-  if (rowOwner !== owner) return NONE;
-  const record = toWork(value);
+  const fields = readFields(value);
+  // 소유자가 UUID 꼴일 때만 남의 줄인지 가릴 수 있다. 칸이 없거나 빈 문자열·다른 꼴이면 없음으로 바꾸지 않는다:
+  // 없음이면 처리기가 키 조회 뒤 새 줄을 적거나, 참조 조회에서 있는 작업을 not_found로 답한다.
+  if (!matches(fields.owner, PATTERNS.uuid)) return UNKNOWN;
+  if (fields.owner !== owner) return NONE;
+  const record = toWork(fields);
   if (record === null) return UNKNOWN;
   // 자기 줄인데 묻는 키·참조가 아니면 장부가 다른 줄을 돌려준 것이다. 없음(not_found)으로 답하면 본체가 자기 작업을 잃는다.
   if (record[identity.field] !== identity.value) return UNKNOWN;
@@ -144,18 +165,19 @@ function recordStart(ledger: ToolLedger, random: Random) {
 
     const written: unknown = ledger.recordToolRequest({ ref: candidate, owner, dedupeKey: retryKey, role, purpose, sourceRef, inputDigest, sessionId, callId, now });
     if (!isPlainObject(written)) return UNKNOWN;
-    if (written.ok === false) {
+    const ok: unknown = written.ok;
+    if (ok === false) {
       const reason: unknown = written.reason;
       if (reason === "stopped") return { known: true, value: { ok: false, reason: "stopped" } };
       if (reason === "intake_closed" || reason === "snapshot_hold") return { known: true, value: { ok: false, reason: "intake_closed" } };
       // stop_unknown·ledger_unwritable·invariant_violation(소유자가 접수한 입력이 아님, 이미 쓰인 참조 후보) 등: 처리기의 답 꼴에 갈래가 없다.
       return UNKNOWN;
     }
-    if (written.ok !== true) return UNKNOWN;
+    if (ok !== true) return UNKNOWN;
     const outcome: unknown = written.outcome;
     const request: unknown = written.request;
     if (!START_OUTCOMES.includes(outcome) || !isPlainObject(request)) return UNKNOWN;
-    const record = toWork(request);
+    const record = toWork(readFields(request));
     // 쓰기가 남의 줄을 돌려주면 없음으로 바꿀 수 없다: 이미 무엇인가 적혔을 수 있다.
     if (record === null || record.owner !== owner || record.retryKey !== retryKey) return UNKNOWN;
     const same = sameContent(record.content, content);
@@ -170,7 +192,8 @@ function recordStart(ledger: ToolLedger, random: Random) {
 
 // 맞는 장부 연산이 없는 포트들. 늘 모름이라 처리기는 그 도구를 unknown으로 닫고 아무것도 적지 않는다.
 
-// 지금 호출권을 가진 세션과 세대: 장부에 세션을 여는 길이 아직 닫혀 있다(startSession은 늘 session_start_closed). 세션 계약(U6)의 일이다.
+// 지금 호출권을 가진 세션과 세대: 장부에 세션을 여는 길이 아직 닫혀 있다(startSession은 입력·접수 허가·정지의 공통 전제를 통과해도
+// session_start_closed). 세션 계약(U6)의 일이다.
 const liveSession = (): Answer<{ readonly id: string; readonly generation: number } | null> => UNKNOWN;
 
 // 원본 참조와 digest가 그 논리 요청의 고정된 입력인가: 장부의 입력 줄(inputs)에는 입력 digest가 없고 원본 참조를 소유자로 대조해
