@@ -25,6 +25,7 @@ import {
 } from "../../ledger/index.ts";
 import type { Connections, StopGenerationSource } from "../transport/connections.ts";
 import type { Clock } from "./ports.ts";
+import { callAfterGate } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 쓰기는 markLostFor 하나다.
 export type LinkLossLedger = Pick<Ledger, "listRuns" | "markLostFor">;
@@ -297,14 +298,13 @@ function judge(
   if (mono - absentSince <= judgeMs) return { executorId, outcome: "within_judge", absentSince };
 
   const failed = (reason: LinkLossFailure): ExecutorOutcome => ({ executorId, outcome: "ledger_failed", absentSince, reason });
-  // 앞 실행기의 장부 쓰기가 박자 안에서 시간을 썼을 수 있다. 장부 호출마다 바로 앞에서 박자 유효 문을 본다.
-  if (!beatValid(ports)) return { executorId, outcome: "beat_closed", absentSince };
-  let answer: unknown;
-  try {
-    answer = ports.ledger.markLostFor({ executorId, now });
-  } catch {
-    return failed("threw");
-  }
+  // 앞 실행기의 장부 쓰기가 박자 안에서 시간을 썼을 수 있다. 장부 호출마다 장부 포트 객체·메서드·인자를 먼저 얻고 바로 앞에서 박자
+  // 유효 문을 본다(send-gate.ts의 callAfterGate. 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간을 보지 못한다).
+  const lostInput = { executorId, now };
+  const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markLostFor, args: [lostInput] }; }, () => beatValid(ports));
+  if (call.kind === "closed") return { executorId, outcome: "beat_closed", absentSince };
+  if (call.kind === "threw") return failed("threw");
+  const answer: unknown = call.value;
   // 여기부터 장부는 옮겼을 수 있다. 답을 읽다 던지면 박자는 멈추고 이 항목은 "옮겼는지 모름"으로 남는다.
   trace.fallback = () => failed("malformed_answer");
   if (!isObject(answer)) return failed("malformed_answer");

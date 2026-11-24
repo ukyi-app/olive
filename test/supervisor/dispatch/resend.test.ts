@@ -1038,6 +1038,63 @@ describe("박자 유효 문(beatValid): 시작의 송신 표식을 적는 공유
     }
   });
 
+  test("공유 함수가 내보내기 포트의 수신 객체나 send를 얻는 접근자 안에서 박자 기한이 지나면 표식·송신 0(withheld beat_closed). 대조군은 표식 1·송신 1", async () => {
+    for (const on of ["sink", "send", null] as const) {
+      const w = world();
+      const s = started(w);
+      w.setClock(NOW + 6_000);
+      let valid = true;
+      const real = w.ports.sink;
+      const sink = {
+        get send() {
+          if (on === "send") valid = false;
+          return real.send;
+        },
+      } as ResendPorts["sink"];
+      const ports = {
+        ...w.ports,
+        beatValid: () => valid,
+        get sink() {
+          if (on === "sink") valid = false;
+          return sink;
+        },
+      } as ResendPorts;
+      const result = await resendTick(ports, { resendEveryMs: EVERY }, { lastResends: [] });
+      if (on !== null) {
+        expect([on, outcomes(result)]).toEqual([on, [{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "beat_closed" }]]);
+        expect([on, marks(w), w.sent.length]).toEqual([on, [], 0]);
+      } else {
+        expect(outcomes(result)).toMatchObject([{ requestId: s.requestId, outcome: "resent" }]);
+        expect([marks(w).length, w.sent.length]).toEqual([1, 1]);
+      }
+    }
+  });
+
+  test("표식 포트의 markStartDispatch를 얻는 접근자 안에서 박자 기한이 지나면 표식·송신 0(withheld beat_closed). 대조군은 표식 1·송신 1", async () => {
+    for (const lapse of [true, false]) {
+      const w = world();
+      const s = started(w);
+      w.setClock(NOW + 6_000);
+      let valid = true;
+      const real = w.ports.ledger;
+      const ledger = {
+        ...real,
+        get markStartDispatch() {
+          if (lapse) valid = false;
+          return real.markStartDispatch;
+        },
+      } as ResendPorts["ledger"];
+      const result = await resendTick({ ...w.ports, ledger, beatValid: () => valid }, { resendEveryMs: EVERY }, { lastResends: [] });
+      if (lapse) {
+        expect(outcomes(result)).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "beat_closed" }]);
+        expect([marks(w), w.sent.length]).toEqual([[], 0]);
+      } else {
+        expect(outcomes(result)).toMatchObject([{ requestId: s.requestId, outcome: "resent" }]);
+        expect([marks(w).length, w.sent.length]).toEqual([1, 1]);
+      }
+    }
+  });
+
   test("유효 문이 던지거나 true가 아니면 표식을 적지 않는다", async () => {
     for (const beatValid of [() => undefined as unknown as boolean, () => { throw new Error("유효 문 실패"); }]) {
       const w = world();

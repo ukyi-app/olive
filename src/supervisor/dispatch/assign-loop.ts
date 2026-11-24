@@ -33,7 +33,7 @@ import type { Candidate } from "../transport/connections.ts";
 import { newUuid, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, type StartDraftInput } from "./envelopes.ts";
 import { type Pick as PickResult, pickAssignment, type PickInput, type PreAssignFacts, type RunPlan } from "./pick.ts";
 import type { CredentialPort, InstructionSink, Random, Signer } from "./ports.ts";
-import { type MarkFailure, sendInstruction } from "./send-gate.ts";
+import { callAfterGate, type MarkFailure, sendInstruction } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. markStartDispatch는 시작 봉투의 송신 표식이고,
 // startRun을 부른 그 장부 객체로 적는다(표식은 장부 열기마다 따로 센다).
@@ -75,9 +75,9 @@ export interface AssignLoopPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
-  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 장부 쓰기(startRun·assignToolRequest) 바로 앞과 송신 표식을
-  // 적는 공유 함수를 부르기 바로 앞에서, 마지막 외부 호출 뒤에 본다. 거짓·던짐이면 그 쓰기를 부르지 않는다. 빠지면 늘 유효다(이 부품
-  // 단독의 쓰임). 조립은 반드시 넘긴다.
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 장부 쓰기(startRun·assignToolRequest)는 장부 포트 객체와
+  // 인자를 얻은 뒤 바로 앞에서, 송신 표식과 송신은 공유 함수(send-gate.ts)가 내보내기 포트의 수신 객체와 send를 얻은 뒤 바로 앞에서 본다.
+  // 거짓·던짐이면 그 쓰기·송신을 부르지 않는다. 빠지면 늘 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
   readonly beatValid?: () => boolean;
 }
 
@@ -478,15 +478,12 @@ async function assignOne(
 
   const runId = freshUuid(ports.random);
   if (runId === null) return { ref, outcome: "assign_failed", failure: "random_unavailable" };
-  let answer: unknown;
-  try {
-    const ledger = ports.ledger;
-    // 마지막 외부 호출(난수, 장부 포트 얻기) 뒤, 장부 호출 바로 앞.
-    if (!beatValid(ports)) return "beat_closed";
-    answer = ledger.assignToolRequest({ ...picked.input, runId });
-  } catch {
-    return { ref, outcome: "assign_failed", failure: "threw" };
-  }
+  // 장부 포트 객체·메서드·인자를 먼저 얻고, 마지막 외부 호출(난수, 장부 포트 얻기) 뒤 장부 호출 바로 앞에서 박자 유효 문을 본다(callAfterGate).
+  const assignInput = { ...picked.input, runId };
+  const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.assignToolRequest, args: [assignInput] }; }, () => beatValid(ports));
+  if (call.kind === "closed") return "beat_closed";
+  if (call.kind === "threw") return { ref, outcome: "assign_failed", failure: "threw" };
+  const answer: unknown = call.value;
   if (!isObject(answer)) return { ref, outcome: "assign_failed", failure: "malformed_answer" };
   if (answer.ok === false) return isRefusal(answer.reason) ? { ref, outcome: "assign_refused", reason: answer.reason } : { ref, outcome: "assign_failed", failure: "malformed_answer" };
   const run = answer.run;
@@ -504,17 +501,15 @@ async function assignOne(
 async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: number, now: number): Promise<StartOutcome | "beat_closed"> {
   const requestId = freshUuid(ports.random);
   if (requestId === null) return { runId, outcome: "start_failed", failure: "random_unavailable" };
-  let answer: unknown;
   // 송신 표식은 startRun을 부른 이 장부 객체로 적는다(포트의 접근자가 부를 때마다 다른 객체를 내도 같은 열기에 남긴다).
-  let ledger: AssignLoopLedger;
-  try {
-    ledger = ports.ledger;
-    // 마지막 외부 호출(난수, 장부 포트 얻기) 뒤, 장부 호출 바로 앞.
-    if (!beatValid(ports)) return "beat_closed";
-    answer = ledger.startRun({ runId, requestId, stopGeneration, now });
-  } catch {
-    return { runId, outcome: "start_failed", failure: "threw" };
-  }
+  // 장부 포트 객체·메서드·인자 → 박자 유효 문 → 호출(callAfterGate). 마지막 외부 호출(난수, 장부 포트 얻기) 뒤다.
+  let held: AssignLoopLedger | null = null;
+  const startInput = { runId, requestId, stopGeneration, now };
+  const call = callAfterGate(() => { const ledger = (held = ports.ledger); return { receiver: ledger, fn: ledger.startRun, args: [startInput] }; }, () => beatValid(ports));
+  if (call.kind === "closed") return "beat_closed";
+  if (call.kind === "threw" || held === null) return { runId, outcome: "start_failed", failure: "threw" };
+  const ledger: AssignLoopLedger = held;
+  const answer: unknown = call.value;
   if (!isObject(answer) || (answer.ok !== true && answer.ok !== false)) return { runId, outcome: "start_failed", failure: "malformed_answer" };
   if (answer.ok === false) return isRefusal(answer.reason) ? { runId, outcome: "start_refused", reason: answer.reason } : { runId, outcome: "start_failed", failure: "malformed_answer" };
 
@@ -560,10 +555,10 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
   // 송신 표식 → 내보내기는 공유 함수 하나로만 한다(재전송 박자와 같은 자리, send-gate.md). 표식은 봉한 뒤, 포트 호출 직전이다:
   // 그 앞의 실패(초안·봉하기)에는 표식이 남지 않는다. 표식이 ok가 아니면 싣지 않고, 장부에 적힌 시작은 그대로 둔다(재전송이 다시 시도한다).
   // 표식은 이 박자의 now와 장부의 발행 시각 가운데 늦은 값(봉한 시각)으로 적는다. 박자는 시계 포트가 없고 그 뒤의 시각을 읽지 않는다.
-  // 표식도 장부 쓰기다. 공유 함수를 부르기 바로 앞, 마지막 외부 호출(봉하기의 서명·난수) 뒤에 박자 유효 문을 본다. 여기부터 표식까지는
-  // 공유 함수 안의 봉투·포트 묶음 속성 읽기뿐이다(send-gate.ts의 차례). 닫혔으면 적힌 시작은 그대로 두고 표식 없이 남긴다(재전송이 다룬다).
-  if (!beatValid(ports)) return notSent("beat_closed");
+  // 표식도 장부 쓰기다. 박자 유효 문(ports.beatValid)은 공유 함수가 포트의 수신 객체와 send를 얻은 뒤, 표식과 송신 바로 앞에서 본다
+  // (send-gate.ts의 차례). 닫혔으면 적힌 시작은 그대로 두고 싣지 않는다(재전송이 다룬다).
   const gate = await sendInstruction(ports, envelope, { marker: ledger, at: sealAt });
+  if (gate.kind === "beat_closed") return notSent("beat_closed");
   if (gate.kind === "unmarked") return notSent("start_unmarked", { markReason: gate.markReason });
   if (gate.kind === "sink_unavailable") return notSent("sink_unavailable");
   if (gate.kind !== "answered") return notSent("send_threw", { delivery: "unknown" });

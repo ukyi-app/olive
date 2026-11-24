@@ -1193,6 +1193,68 @@ describe("박자 유효 문(beatValid): 장부에 적기 직전, 마지막 시�
     }
   });
 
+  test("종료·갱신: 장부 포트 객체를 얻는 접근자 안에서 박자 기한이 지나면 적지 않고 beat_closed다. 대조군은 적고 내보낸다", async () => {
+    for (const planned of ["stop", "renew_lease"] as const) {
+      for (const lapse of [true, false]) {
+        const w = world();
+        const s = planned === "stop" ? started(w, { deadlineAt: NOW + 20_000 }) : started(w);
+        accept(w, s);
+        const at = planned === "stop" ? NOW + 20_000 : NOW + 10_000;
+        w.setClock(at);
+        let reads = 0;
+        let valid = true;
+        const ledger = w.ports.ledger;
+        // 기록 시각(둘째 시계 읽기) 뒤에 장부 포트 객체를 얻으면 그 접근자 안에서 박자 기한이 지난다.
+        const ports: LifeLoopPorts = {
+          ...w.ports,
+          clock: { now: () => ((reads += 1), at) },
+          get ledger() {
+            if (lapse && reads >= 2) valid = false;
+            return ledger;
+          },
+          beatValid: () => valid,
+        };
+        const outcome = only(await plain(ports), s.runId);
+        if (lapse) {
+          expect([planned, outcome]).toEqual([planned, { runId: s.runId, outcome: "beat_closed", planned }]);
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [], 0]);
+        } else {
+          expect(outcome).toMatchObject({ outcome: planned === "stop" ? "stop_sent" : "renew_sent" });
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [planned === "stop" ? "recordStopInstruction" : "recordRenewInstruction"], 1]);
+        }
+      }
+    }
+  });
+
+  test("종료·갱신: 장부 쓰기 메서드를 얻는 접근자 안에서 박자 기한이 지나면 적지 않고 beat_closed다. 대조군은 적고 내보낸다", async () => {
+    for (const planned of ["stop", "renew_lease"] as const) {
+      for (const lapse of [true, false]) {
+        const w = world();
+        const s = planned === "stop" ? started(w, { deadlineAt: NOW + 20_000 }) : started(w);
+        accept(w, s);
+        w.setClock(planned === "stop" ? NOW + 20_000 : NOW + 10_000);
+        let valid = true;
+        const real = w.ports.ledger;
+        const name = planned === "stop" ? "recordStopInstruction" : "recordRenewInstruction";
+        const ledger = { ...real };
+        Object.defineProperty(ledger, name, {
+          get() {
+            if (lapse) valid = false;
+            return real[name];
+          },
+        });
+        const outcome = only(await plain({ ...w.ports, ledger, beatValid: () => valid }), s.runId);
+        if (lapse) {
+          expect([planned, outcome]).toEqual([planned, { runId: s.runId, outcome: "beat_closed", planned }]);
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [], 0]);
+        } else {
+          expect(outcome).toMatchObject({ outcome: planned === "stop" ? "stop_sent" : "renew_sent" });
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [name], 1]);
+        }
+      }
+    }
+  });
+
   test("접수가 닫혀도 유효한 박자의 종료는 적는다(접수 문과 박자 유효 문은 다르다). 유효 문이 던지거나 true가 아니면 적지 않는다", async () => {
     const closed = world();
     const s = started(closed, { deadlineAt: NOW + 20_000 });

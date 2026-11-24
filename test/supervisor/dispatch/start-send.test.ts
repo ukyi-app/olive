@@ -59,7 +59,9 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
   const inventory = Object.fromEntries(files.map((file) => [file, sendSites(src(file))]).filter(([, sites]) => sites.length > 0));
   expect(inventory).toEqual({
     // 시작 봉투가 포트에 닿는 한 자리(표식 → 마지막 확인 → 호출). read는 표식 전에 수신 객체의 send를 얻는 자리다.
-    [GATE]: ["read", "reflect"],
+    // reflect 둘: 포트 호출 한 자리와, 쥔 장부·표식 메서드를 박자 유효 문 뒤에 부르는 callAfterGate 한 자리(아래 "callAfterGate" 시험이
+    // 그 본문과 부르는 줄을 글자 그대로 본다).
+    [GATE]: ["read", "reflect", "reflect"],
     // 취소·갱신·조회·확정을 내는 박자. 시작 봉투를 만들 수 없음을 아래 시험이 본다.
     "src/supervisor/dispatch/cancel.ts": ["method_call"],
     "src/supervisor/dispatch/life-loop.ts": ["method_call", "method_call", "method_call"],
@@ -256,14 +258,16 @@ test("정적: 공유 함수 밖의 송신 자리는 시작 봉투를 만들 수 
 });
 
 test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례는 표식 → 마지막 확인 → 포트 호출이다", () => {
-  const marking = files.filter((file) => !file.startsWith("src/ledger/") && /\bmarkStartDispatch\s*\(/.test(src(file)));
+  // 표식은 쥔 메서드로 부르므로(callAfterGate) 호출 꼴 대신 메서드 속성을 읽는 자리를 센다. 읽기도 세므로 다른 파일이 메서드를 쥐어
+  // 부르는 자리도 잡는다.
+  const marking = files.filter((file) => !file.startsWith("src/ledger/") && /\.markStartDispatch\b/.test(src(file)));
   expect(marking).toEqual([GATE]);
   const gate = src(GATE);
   const body = gate.slice(gate.indexOf("export async function sendInstruction"));
   const at = (needle: string) => body.indexOf(needle);
-  expect([at("send = (target as InstructionSink).send"), at("mark(envelope, start)"), at("start.lastCheck?.()"), at("Reflect.apply(")].every((index) => index >= 0)).toBe(true);
-  expect(at("send = (target as InstructionSink).send")).toBeLessThan(at("mark(envelope, start)"));
-  expect(at("mark(envelope, start)")).toBeLessThan(at("start.lastCheck?.()"));
+  expect([at("send = (target as InstructionSink).send"), at("const marking = callAfterGate("), at("start.lastCheck?.()"), at("Reflect.apply(")].every((index) => index >= 0)).toBe(true);
+  expect(at("send = (target as InstructionSink).send")).toBeLessThan(at("const marking = callAfterGate("));
+  expect(at("const marking = callAfterGate(")).toBeLessThan(at("start.lastCheck?.()"));
   expect(at("start.lastCheck?.()")).toBeLessThan(at("Reflect.apply("));
   // 표식과 포트 호출 사이에 기다림이 없다(첫 await가 포트 호출이다). 뒤에 줄바꿈이 오는 await도 낱말로 찾는다.
   // .then( 콜백으로 포트 호출을 미루는 것처럼 await 낱말이 없는 양보는 보지 못한다(send-gate.md "정적 시험").
@@ -272,6 +276,55 @@ test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례�
   for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process."]) {
     expect([banned, gate.includes(banned)]).toEqual([banned, false]);
   }
+});
+
+// 쥔 함수를 박자 유효 문 뒤에 부르는 공유 함수(send-gate.ts의 callAfterGate). 본문은 얻기(get) → 유효 문(open) → Reflect.apply 한 번이고,
+// 이 이름이 나오는 줄은 import 셋과 장부 쓰기 다섯·송신 표식 하나의 부르는 줄뿐이다. 이 함수로 송신 포트를 부르거나(다른 줄),
+// 다른 이름에 담아 부르는 자리가 생기면 줄 목록이 달라진다. 부르는 줄은 쥘 메서드 이름까지 글자 그대로 견준다.
+const squash = (text: string) => text.replace(/\s+/g, " ").trim();
+const LIFE = "src/supervisor/dispatch/life-loop.ts";
+const CALL_AFTER_GATE = "export function callAfterGate(get: () => { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }, open: () => boolean): GatedCall { let held: { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }; try { held = get(); } catch { return { kind: \"threw\" }; } const { receiver, fn, args } = held; if (typeof fn !== \"function\") return { kind: \"threw\" }; if (!open()) return { kind: \"closed\" }; try { return { kind: \"called\", value: Reflect.apply(fn, receiver, args) }; } catch { return { kind: \"threw\" }; } }";
+const GATED_LINES = [
+  "src/supervisor/dispatch/assign-loop.ts: const call = callAfterGate(() => { const ledger = (held = ports.ledger); return { receiver: ledger, fn: ledger.startRun, args: [startInput] }; }, () => beatValid(ports));",
+  "src/supervisor/dispatch/assign-loop.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.assignToolRequest, args: [assignInput] }; }, () => beatValid(ports));",
+  "src/supervisor/dispatch/assign-loop.ts: import { callAfterGate, type MarkFailure, sendInstruction } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/life-loop.ts: const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordRenewInstruction, args: [renewInput] }; }, () => beatValid(ctx.ports));",
+  "src/supervisor/dispatch/life-loop.ts: const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordStopInstruction, args: [stopInput] }; }, () => beatValid(ctx.ports));",
+  "src/supervisor/dispatch/life-loop.ts: import { callAfterGate } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/link-loss.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markLostFor, args: [lostInput] }; }, () => beatValid(ports));",
+  "src/supervisor/dispatch/link-loss.ts: import { callAfterGate } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/send-gate.ts: const marking = callAfterGate(() => { const marker = start.marker; return { receiver: marker, fn: marker.markStartDispatch, args: [input] }; }, () => beatValid(holder));"
+];
+const gatedLines = (sources: ReadonlyMap<string, string>) =>
+  [...sources]
+    .flatMap(([file, source]) =>
+      source
+        .split("\n")
+        .filter((line) => /\bcallAfterGate\b/.test(line) && !line.includes("export function callAfterGate("))
+        .map((line) => `${file}: ${line.trim()}`),
+    )
+    .sort();
+const gatedBody = (source: string) => {
+  const start = source.indexOf("export function callAfterGate(");
+  return start < 0 ? null : squash(source.slice(start, source.indexOf("\n}\n", start) + 2));
+};
+
+test("정적: callAfterGate는 얻기 → 박자 유효 문 → Reflect.apply 한 번이고, 그 이름은 장부 쓰기 다섯·송신 표식 하나를 부르는 줄과 import에만 있다", () => {
+  expect(gatedBody(src(GATE))).toBe(CALL_AFTER_GATE);
+  expect(gatedLines(sources)).toEqual(GATED_LINES);
+});
+
+test("대조군: callAfterGate로 송신 포트를 부르거나 다른 이름에 담거나, 본문에서 얻기를 유효 문 뒤로 옮기면 위 단언이 잡는다", () => {
+  for (const injected of [
+    "const sent = callAfterGate(() => ({ receiver: sink, fn: sink.send, args: [envelope] }), () => true);",
+    "const relay = callAfterGate;",
+  ]) {
+    const changed = new Map(sources);
+    changed.set(LIFE, `${src(LIFE)}\n${injected}`);
+    expect([injected, gatedLines(changed).length]).toEqual([injected, GATED_LINES.length + 1]);
+  }
+  const moved = src(GATE).replace("if (!open()) return { kind: \"closed\" };", "").replace("held = get();", "if (!open()) return { kind: \"closed\" };\n    held = get();");
+  expect([moved !== src(GATE), gatedBody(moved) === CALL_AFTER_GATE]).toEqual([true, false]);
 });
 
 test("대조군: 송신 자리의 모양을 실제로 잡는다", () => {

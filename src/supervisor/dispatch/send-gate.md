@@ -7,7 +7,7 @@
 ## 공개 면
 
 ```ts
-sendInstruction<S>(holder: { sink: InstructionSink }, envelope: Envelope, start: StartMark<S> | null): Promise<GateResult<S>>
+sendInstruction<S>(holder: { sink: InstructionSink, beatValid?: () => boolean }, envelope: Envelope, start: StartMark<S> | null): Promise<GateResult<S>>
 
 StartMark<S> = {
   marker: StartMarker        // ports.ts: Pick<Ledger, "markStartDispatch">. 박자가 읽고 쓰는 그 장부 객체
@@ -21,26 +21,33 @@ GateResult<S> =
   | { kind: "sink_unavailable" }                 // 포트를 얻지 못해 부르지 않았다. 이번 시도는 새 표식을 쓰지 않았다(앞선 시도의 표식은 남아 있을 수 있다)
   | { kind: "unmarked", markReason: MarkFailure } // 시작인데 표식이 ok가 아니어서 부르지 않았다
   | { kind: "stopped", value: S }                // 시작의 마지막 확인이 싣지 말라고 했다
+  | { kind: "beat_closed" }                      // 박자 유효 문이 닫혀 부르지 않았다(표식 앞이면 표식 없음, 시작의 표식 뒤면 표식이 커밋됐을 수 있다)
 
 MarkFailure = 장부의 거절 이름 | "threw" | "malformed_answer" | "marker_missing" | "envelope_unreadable"
+
+callAfterGate(get: () => { receiver, fn, args }, open: () => boolean): GatedCall   // 박자 안의 장부 쓰기·표식 하나
+GatedCall = { kind: "called", value } | { kind: "closed" } | { kind: "threw" }   // get이 던지거나 fn이 함수가 아니면 부르지 않은 채 threw
 ```
 
-두 박자는 이 결과를 자기 결과로 옮긴다: 배정·시작 박자는 `recorded_not_sent`의 `reason: "start_unmarked"`(+ `markReason`)·`"sink_unavailable"`, 재전송 박자는 `not_sent`의 같은 두 이름(둘 다 `delivery: "not_sent"`)이다.
+두 박자는 이 결과를 자기 결과로 옮긴다: 배정·시작 박자는 `recorded_not_sent`의 `reason: "start_unmarked"`(+ `markReason`)·`"sink_unavailable"`·`"beat_closed"`, 재전송 박자는 `not_sent`의 앞 두 이름(둘 다 `delivery: "not_sent"`)과 `withheld`의 `beat_closed`다.
+
+`holder.beatValid`는 박자 유효 문을 받는 선택 칸이다. 빠지면 늘 유효, 던지거나 `true`가 아니면 닫힘이다. 두 박자는 자기 포트 묶음을 `holder`로 넘기므로 조립이 박자에 넘긴 유효 문이 그대로 이 칸이다.
 
 ## 차례
 
 1. 시작인지 가른다. **부르는 쪽의 말이 아니라 봉투의 `header.action`으로 가른다.** 읽지 못하면 시작으로 친다. 시작인데 `start`가 `null`이면 `unmarked`/`marker_missing`이고 포트를 부르지 않는다.
-2. 내보내기 포트의 수신 객체(`holder.sink`)와 함수(`sink.send`)를 얻는다. 표식과 마지막 확인보다 먼저다: 그 접근자가 뒤에 돌면 그 안에서 흐른 시간만큼 마지막 확인이 낡는다. 얻다 던지거나 함수가 아니면 포트를 부르지 않고 **이번 시도는 새 표식을 적지 않는다**(앞선 시도의 표식은 남아 있을 수 있다. 시작이면 마지막 확인을 표식 없이 먼저 보고, 그것이 싣지 말라면 `stopped`, 아니면 `sink_unavailable`. 재전송 박자의 결과 차례다).
-3. 시작이면 봉투의 `header.request_id`와 `body.run_id`로 `markStartDispatch({ runId, requestId, now: at })`를 부른다. `{ ok: true, created: boolean }`만 `ok`다(`created: false`, 같은 열기에서 이미 적은 표식도 `ok`). 거절이면 그 이름, 던지면 `threw`, 다른 꼴이면 `malformed_answer`, 봉투에서 두 ID를 읽지 못하면 `envelope_unreadable`이고 모두 싣지 않는다. 답의 칸(`ok`, `created`, `reason`)은 예외 처리 안에서 칸마다 한 번만 읽고, 판정과 반환은 그 읽은 값으로만 한다: 칸이 접근자면 다시 읽을 때 값이 바뀌어 검사한 거절이 성공(`null`)으로 돌아갈 수 있다. 칸을 읽다 던지면 메서드가 던진 것과 같은 `threw`다.
+2. 내보내기 포트의 수신 객체(`holder.sink`)와 함수(`sink.send`)를 얻는다. 박자 유효 문·표식·마지막 확인보다 먼저다: 그 접근자가 뒤에 돌면 그 안에서 흐른 시간만큼 유효 문과 마지막 확인이 낡는다. 얻다 던지거나 함수가 아니면 포트를 부르지 않고 **이번 시도는 새 표식을 적지 않는다**(앞선 시도의 표식은 남아 있을 수 있다. 시작이면 마지막 확인을 표식 없이 먼저 보고, 그것이 싣지 말라면 `stopped`, 아니면 `sink_unavailable`. 재전송 박자의 결과 차례다).
+3. 시작이면 봉투의 `header.request_id`와 `body.run_id`로 인자 `{ runId, requestId, now: at }`를 만들고, `callAfterGate`로 표식 포트(`start.marker`)와 그 메서드 `markStartDispatch`를 얻은 뒤 박자 유효 문(`holder.beatValid`)을 보고 바로 `Reflect.apply`로 부른다. 유효 문이 닫혔으면 `beat_closed`(표식 없음). `{ ok: true, created: boolean }`만 `ok`다(`created: false`, 같은 열기에서 이미 적은 표식도 `ok`). 거절이면 그 이름, 던지면 `threw`, 다른 꼴이면 `malformed_answer`, 봉투에서 두 ID를 읽지 못하면 `envelope_unreadable`이고 모두 싣지 않는다. 답의 칸(`ok`, `created`, `reason`)은 예외 처리 안에서 칸마다 한 번만 읽고, 판정과 반환은 그 읽은 값으로만 한다: 칸이 접근자면 다시 읽을 때 값이 바뀌어 검사한 거절이 성공(`null`)으로 돌아갈 수 있다. 칸을 읽다 던지면 메서드가 던진 것과 같은 `threw`다.
 4. 시작이면 `lastCheck`. 재전송 박자는 여기서 시계를 다시 읽어 발행 + 19000ms 한도를 본다. 표식의 커밋(fsync)에 걸린 시간을 이 읽기가 잰다.
-5. 2에서 얻은 함수를 수신 객체를 `this`로 해 부른다(`Reflect.apply`). 1~4는 동기라 **표식·마지막 확인과 포트 호출 사이에 `await`가 없다**(첫 `await`가 포트 호출이다. 정적 시험이 본다). 포트의 답을 받으면 바로 돌아온다. 송신 뒤 시계 읽기는 부르는 쪽(재전송 박자)의 일이다.
+5. 박자 유효 문을 다시 본다(표식 커밋과 마지막 확인에 쓴 시간). 닫혔으면 `beat_closed`(시작이면 표식은 남았을 수 있다). 열렸으면 바로 2에서 얻은 함수를 수신 객체를 `this`로 해 부른다(`Reflect.apply`). 유효 문과 호출 사이에 다른 외부 코드가 없다. 1~5는 동기라 **표식·마지막 확인과 포트 호출 사이에 `await`가 없다**(첫 `await`가 포트 호출이다. 정적 시험이 본다). 포트의 답을 받으면 바로 돌아온다. 송신 뒤 시계 읽기는 부르는 쪽(재전송 박자)의 일이다.
 
-취소·확정·갱신 같은 시작이 아닌 봉투는 2와 5만 한다. 표식을 부르지 않고 `start`를 보지 않는다.
+취소·확정·갱신 같은 시작이 아닌 봉투는 2와 5만 한다(5의 박자 유효 문 포함). 표식을 부르지 않고 `start`를 보지 않는다.
 
 ## 표식 뒤에 싣지 않고 돌아가는 길
 
 표식을 커밋한 뒤 싣지 못한 것은 안전한 쪽이다: 그 실행은 다른 열기에서 자동으로 닫히지 않는다(`sent_by_other_open`, 손 닫기로 간다). 같은 열기에서는 표식이 닫기를 막지 않지만, 그때 닫는 근거는 실행기의 전체 답이 그 실행을 싣지 않았다는 것이라 실제로 싣지 않은 시작과 어긋나지 않는다. 표식은 포트 호출 직전에 두어 이 길을 줄였고, **실제 장부를 표식 포트로 그대로 쓸 때** 남는 길은 아래뿐이다.
 
+- **표식 뒤 박자 유효 문이 닫혔을 때**(`beat_closed`). 표식 커밋이나 마지막 시계 읽기 안에서 박자 기한이 지났다.
 - **재전송 시작의 마지막 시계 읽기가 막을 때.** 표식 커밋 중이나 그 뒤에 발행 + 19000ms를 넘었거나(`start_expired`) 시계를 읽지 못했다(`withheld`/`clock_unavailable`). 순서상 표식이 시계 읽기보다 앞이어야 하므로(커밋 시간을 재야 한다) 이 길은 없앨 수 없다.
 - **포트가 싣지 않았다고 답할 때**(`no_connection`·`too_late_to_send`).
 - **포트가 던지거나 정의 밖의 값을 돌려줄 때**(`delivery: "unknown"`). 실렸을 수 있다.
@@ -57,7 +64,8 @@ MarkFailure = 장부의 거절 이름 | "threw" | "malformed_answer" | "marker_m
 - `startDraft`를 부르는 모듈은 배정·시작 박자와 재전송 박자뿐이고, 둘에는 송신 자리가 없고 `sendInstruction`을 정확히 한 번 부른다.
 - `task_start`를 문자열로 쓰는 감독 모듈은 봉투 모듈·재전송 박자·이 파일뿐이다. 감독에서 서명 포트(`.seal(`)나 계약의 `sealEnvelope`를 부르는 자리는 봉투 모듈과 정지 동기화의 답(`stop_sync_reply`만 받는 포트)뿐이다.
 - 이 파일 밖의 송신 자리가 있는 모듈은 `startDraft`를 부르지 않고 `task_start` 문자열이 없다. 실행기 모듈은 감독 모듈을 import하지 않는다.
-- `markStartDispatch`를 부르는 곳(장부 밖)은 이 파일뿐이고, 이 함수 안의 차례는 포트 얻기 → 표식 → 마지막 확인 → 포트 호출, 첫 `await`가 포트 호출이다. `await`는 낱말로 찾으므로 뒤에 줄바꿈이 와도 잡는다.
+- `markStartDispatch` 속성을 읽는 곳(장부 밖, 호출과 쥐기 모두)은 이 파일뿐이고, 이 함수 안의 차례는 포트 얻기 → 표식(`const marking = callAfterGate(`) → 마지막 확인 → 포트 호출, 첫 `await`가 포트 호출이다.
+- `callAfterGate`(박자 안의 장부 쓰기·표식을 얻기 → 박자 유효 문 → `Reflect.apply`로 부르는 함수)의 본문은 글자 그대로, 그 이름이 나오는 줄은 import 셋과 장부 쓰기 다섯(`assignToolRequest`·`startRun`·`recordRenewInstruction`·`recordStopInstruction`·`markLostFor`)·표식 하나를 부르는 줄뿐이다. 이 파일의 `reflect` 둘은 포트 호출과 이 함수다. `await`는 낱말로 찾으므로 뒤에 줄바꿈이 와도 잡는다.
 
 **보지 못하는 것.** 실행 중에 만든 이름(`sink["se" + "nd"]`), 중괄호가 겹친 구조 분해(`{ a: { b }, send: f } = sink`)와 함수 매개변수의 구조 분해(`({ send: f }) => f(envelope)`), `await` 낱말 없이 포트 호출을 미루는 것(예: `return Promise.resolve().then(async () => ... await Reflect.apply(...))`는 한 번 양보한 뒤 싣지만 첫 `await`가 여전히 포트 호출이라 통과한다), 다른 이름의 메서드로 감싼 포트를 넘겨받아 부르는 함수, `Function.prototype.call.call` 같은 간접 호출, `eval`·`new Function`, `task_start`를 실행 중에 조립한 초안, `src/` 밖의 코드, 아직 없는 조립·전송 구현(예: 연결 처리기의 `send_reply` 출력을 실제로 쓰는 쪽). 실행기가 자기 키로 봉한 봉투는 감독의 시작으로 받아들여지지 않는다는 계약의 방향 규칙에 기대고, 그것을 이 시험이 보지는 않는다. 함수가 봉투의 동작으로 시작을 가르는지는 행동 시험이 본다.
 

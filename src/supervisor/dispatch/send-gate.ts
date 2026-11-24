@@ -18,7 +18,7 @@ export interface StartMark<S> {
   // 표식에 적는 시각. 박자가 마지막으로 읽은 시각(장부와 같은 시계)이다.
   readonly at: number;
   // 표식을 커밋한 뒤 포트를 부르기 직전의 마지막 확인. null이면 싣고, 값이면 싣지 않고 그 값을 돌려준다.
-  // 표식은 커밋(fsync)에 시간이 걸리므로 시계로 재는 확인은 표식 뒤에 둔다. 이 확인과 포트 호출 사이에는 아무것도 없다.
+  // 표식은 커밋(fsync)에 시간이 걸리므로 시계로 재는 확인은 표식 뒤에 둔다. 이 확인과 포트 호출 사이에는 박자 유효 문 하나뿐이다.
   // 던지지 않아야 한다: 던지면 포트를 부르지 않은 채 이 함수 밖으로 예외가 나가고, 부르는 쪽은 실렸는지를 가르지 못한다.
   readonly lastCheck?: () => S | null;
 }
@@ -33,7 +33,9 @@ export type GateResult<S> =
   // 시작인데 표식이 ok가 아니어서 부르지 않았다.
   | { readonly kind: "unmarked"; readonly markReason: MarkFailure }
   // 시작의 마지막 확인이 싣지 말라고 했다. 표식이 커밋됐을 수 있다(포트를 얻지 못한 경우는 표식 없이 이 길로 온다).
-  | { readonly kind: "stopped"; readonly value: S };
+  | { readonly kind: "stopped"; readonly value: S }
+  // 박자 유효 문이 닫혀 부르지 않았다. 표식 앞에서 닫혔으면 표식이 없고, 시작의 표식 뒤(송신 앞)에서 닫혔으면 표식이 커밋됐을 수 있다.
+  | { readonly kind: "beat_closed" };
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isRefusal = (value: unknown): value is LedgerRefusal => (LEDGER_REFUSALS as readonly unknown[]).includes(value);
@@ -47,24 +49,52 @@ function isStart(envelope: Envelope): boolean {
   }
 }
 
-// 그 봉투의 실행·요청 ID로 표식을 커밋한다. ok면 null, 아니면 싣지 않을 이유다.
-function mark(envelope: Envelope, start: StartMark<unknown>): MarkFailure | null {
+export type GatedCall = { readonly kind: "called"; readonly value: unknown } | { readonly kind: "closed" } | { readonly kind: "threw" };
+
+// 박자 안의 장부 쓰기·송신 표식 하나의 차례: 수신 객체·메서드·인자를 모두 얻고(get) → 박자 유효 문(open) → 그 바로 뒤에 호출 하나.
+// get 안의 접근자는 유효 문보다 먼저 돌므로 그 안에서 흐른 시간은 유효 문의 시각 비교에 든다. Reflect.apply는 함수의 call 같은
+// 속성을 읽지 않는다. get이 던지거나 메서드가 함수가 아니면 부르지 않은 채 threw다(부르는 쪽은 메서드가 던진 것과 같이 다룬다).
+// 이 함수를 부르는 자리는 정적 시험(start-send.test.ts)이 글자 그대로 센다: 송신 포트를 부르는 데 쓰지 않는다.
+export function callAfterGate(get: () => { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }, open: () => boolean): GatedCall {
+  let held: { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] };
+  try {
+    held = get();
+  } catch {
+    return { kind: "threw" };
+  }
+  const { receiver, fn, args } = held;
+  if (typeof fn !== "function") return { kind: "threw" };
+  if (!open()) return { kind: "closed" };
+  try {
+    return { kind: "called", value: Reflect.apply(fn, receiver, args) };
+  } catch {
+    return { kind: "threw" };
+  }
+}
+
+// 표식의 인자. 봉투에서 실행·요청 ID를 읽지 못하면 null.
+function markInput(envelope: Envelope, at: number): { readonly runId: string; readonly requestId: string; readonly now: number } | null {
   let runId: unknown;
   let requestId: unknown;
   try {
     requestId = envelope.header.request_id;
     runId = isObject(envelope.body) ? envelope.body.run_id : undefined;
   } catch {
-    return "envelope_unreadable";
+    return null;
   }
-  if (typeof runId !== "string" || typeof requestId !== "string") return "envelope_unreadable";
+  return typeof runId === "string" && typeof requestId === "string" ? { runId, requestId, now: at } : null;
+}
+
+// 표식 포트의 답을 판정한다. ok면 null, 아니면 싣지 않을 이유다.
+function markVerdict(call: GatedCall): MarkFailure | null {
+  if (call.kind !== "called") return "threw";
   // 답의 칸은 접근자일 수 있다. 칸마다 한 번만 읽어 지역 값에 담고, 판정과 반환은 그 값으로만 한다: 다시 읽으면 검사한 값과
   // 돌려주는 값이 달라져 거절이 성공(null)으로 바뀔 수 있다. 칸을 읽다 던지면 표식 메서드가 던진 것과 같다.
   let ok: unknown;
   let created: unknown;
   let reason: unknown;
   try {
-    const answer: unknown = start.marker.markStartDispatch({ runId, requestId, now: start.at });
+    const answer: unknown = call.value;
     if (!isObject(answer)) return "malformed_answer";
     ok = answer.ok;
     if (ok === true) created = answer.created;
@@ -77,11 +107,25 @@ function mark(envelope: Envelope, start: StartMark<unknown>): MarkFailure | null
   return "malformed_answer";
 }
 
+// 박자 유효 문. 칸이 없으면 늘 유효, 던지거나 true가 아니면 닫힘이다(모름을 유효로 읽지 않는다).
+function beatValid(holder: { readonly beatValid?: () => boolean }): boolean {
+  try {
+    return holder.beatValid === undefined || holder.beatValid() === true;
+  } catch {
+    return false;
+  }
+}
+
 // 봉투 하나를 holder.sink에 싣는다. 시작이 아니면 표식·마지막 확인 없이 싣는다(start는 보지 않는다).
-// 차례: 포트의 수신 객체와 send를 얻는다 → (시작) 표식 → (시작) 마지막 확인 → 포트 호출. 수신 객체와 send는 표식 전에 얻는다:
-// 그 접근자가 표식과 마지막 확인 사이나 확인 뒤에 돌면 그 안에서 흐른 시간만큼 확인이 낡는다.
+// 차례: 포트의 수신 객체와 send를 얻는다 → (시작) 표식의 인자·표식 포트·메서드 → 박자 유효 문 → 표식 → 마지막 확인 → 박자 유효 문 → 포트 호출.
+// 박자 유효 문(holder.beatValid, 선택 칸)은 장부 쓰기(표식)와 송신 바로 앞에서 본다. 수신 객체와 send는 그 앞에서 얻는다:
+// 그 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간만큼 유효 문과 마지막 확인이 낡는다.
 // 포트를 얻지 못하면 표식을 적지 않는다. 다만 시작이면 마지막 확인을 먼저 보고(재전송의 결과 차례), 그 확인도 표식 없이 부른다.
-export async function sendInstruction<S = never>(holder: { readonly sink: InstructionSink }, envelope: Envelope, start: StartMark<S> | null): Promise<GateResult<S>> {
+export async function sendInstruction<S = never>(
+  holder: { readonly sink: InstructionSink; readonly beatValid?: () => boolean },
+  envelope: Envelope,
+  start: StartMark<S> | null,
+): Promise<GateResult<S>> {
   const starting = isStart(envelope);
   if (starting && start === null) return { kind: "unmarked", markReason: "marker_missing" };
   let target: unknown;
@@ -97,13 +141,19 @@ export async function sendInstruction<S = never>(holder: { readonly sink: Instru
     return stop !== null ? { kind: "stopped", value: stop } : { kind: "sink_unavailable" };
   }
   if (starting && start !== null) {
-    const refused = mark(envelope, start);
+    const input = markInput(envelope, start.at);
+    if (input === null) return { kind: "unmarked", markReason: "envelope_unreadable" };
+    // 표식: 표식 포트와 그 메서드를 얻고 → 박자 유효 문 → 호출. 메서드를 유효 문 뒤에 읽으면 그 접근자 안에서 흐른 시간을 보지 못한다.
+    const marking = callAfterGate(() => { const marker = start.marker; return { receiver: marker, fn: marker.markStartDispatch, args: [input] }; }, () => beatValid(holder));
+    if (marking.kind === "closed") return { kind: "beat_closed" };
+    const refused = markVerdict(marking);
     if (refused !== null) return { kind: "unmarked", markReason: refused };
     const stop = start.lastCheck?.() ?? null;
     if (stop !== null) return { kind: "stopped", value: stop };
   }
+  if (!beatValid(holder)) return { kind: "beat_closed" };
   try {
-    // 표식(과 마지막 확인) 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
+    // 박자 유효 문 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
     return { kind: "answered", answer: await Reflect.apply(send, target, [envelope]) };
   } catch {
     return { kind: "threw" };

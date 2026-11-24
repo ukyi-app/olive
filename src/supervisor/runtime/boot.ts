@@ -454,32 +454,56 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   let stopping = false;
   let exitCode: number = 0;
   let granted = false;
+  // 복원 단계를 불렀고 그 결과를 아직 받지 않았다(kickRestore).
+  let restoring = false;
   let beatLimit: number | null = null;
-  // 끝낼 사유가 이미 생겼는가. 박자 앞뒤와 끝 차례가 본다. 모름을 건강·닫힘으로 읽지 않는다: 장부 건강을 읽다 던지면
-  // ledger_unwritable, 허가를 읽다 던지면 intake_unreadable이다. 후자는 처음부터 닫힌 판정(기존 실행의 정리를 허락)과 다르다:
-  // 허가가 있는지조차 모르므로 끝낸다.
-  const haltReason = (): string | null => {
+  // 처음 본 끝낼 사유. 한 번 보면 다음 읽기가 정상이어도 풀지 않는다: 박자 안의 문이 본 사유(허가 읽기 한 번의 예외 등)를
+  // 거짓 한 값으로만 쓰면 주기가 그 사유를 다시 보지 못하고 감독이 계속 돈다.
+  let halted: string | null = null;
+  // 5단계를 부른 뒤 그 결과를 받기 전에 장부에 이미 낸 허가. 닫힘이지만 끝낼 사유는 아니다: 5단계는 첫 호출 안에서 동기로 허가를 내고
+  // 결과는 그 뒤의 마이크로태스크에 받으므로, 그 사이(같은 동기 구간의 서버 tick 등)에 문을 읽으면 이 상태다. 사유로 붙잡으면
+  // 정상 기동이 96으로 끝난다. 결과를 기한 안에 받지 못하면 kickRestore가 따로 끝낸다.
+  const PENDING = { pending: true } as const;
+  // 장부 건강과 허가를 읽는다. 모름을 건강·닫힘으로 읽지 않는다: 장부 건강을 읽다 던지면 ledger_unwritable, 허가를 읽다 던지면
+  // intake_unreadable이다. 후자는 처음부터 닫힌 판정(기존 실행의 정리를 허락)과 다르다: 허가가 있는지조차 모르므로 끝낸다.
+  const judge = (): string | typeof PENDING | null => {
+    if (halted !== null) return halted;
+    let seen: string | typeof PENDING | null = null;
+    let open = false;
     try {
-      if (ledger.health().writable !== true) return "ledger_unwritable";
+      if (ledger.health().writable !== true) seen = "ledger_unwritable";
     } catch {
-      return "ledger_unwritable";
+      seen = "ledger_unwritable";
     }
-    let open: boolean;
-    try {
-      open = restorer.intakeOpen() === true;
-    } catch {
-      return "intake_unreadable";
+    if (seen === null) {
+      try {
+        open = restorer.intakeOpen() === true;
+      } catch {
+        seen = "intake_unreadable";
+      }
     }
     // 받아들인 허가가 사라졌다(새 정지 기록, 장부 고장). 반대로 조립이 받아들이지 않은 허가(기한을 넘겨 끝난 5단계가 장부에 이미 낸 것)도
     // 소비자에게 보이지 않게 닫힘으로 본다.
-    if (granted && !open) return "intake_discarded";
-    if (!granted && open) return "intake_unaccepted";
-    return null;
+    if (seen === null && granted && !open) seen = "intake_discarded";
+    if (seen === null && !granted && open) seen = restoring ? PENDING : "intake_unaccepted";
+    if (typeof seen === "string") halted = seen;
+    return seen;
   };
-  // 박자 유효 문. 처음부터 닫힌 5단계(받아들인 허가 없음, 장부의 허가도 없음)는 열림이다: 기존 실행의 정지·상태 조회는 나간다.
+  // 끝낼 사유가 이미 생겼는가. 박자 앞뒤와 끝 차례가 본다.
+  const haltReason = (): string | null => {
+    const seen = judge();
+    return typeof seen === "string" ? seen : null;
+  };
+  // 박자 유효 문. 차례가 판단이다: 끝 코드 → 장부 건강·허가 읽기 → 단조 시각 비교. 시각을 맨 끝에 보아야 읽기에 쓴 시간까지
+  // 기한 비교에 든다. 처음부터 닫힌 5단계(받아들인 허가 없음, 장부의 허가도 없음)는 열림이다: 기존 실행의 정지·상태 조회는 나간다.
   // 새 접수·시작·갱신·자격 값은 아래 접수 문이 따로 막는다. 박자 다섯의 beatValid 포트에 이 함수 그대로를 넘긴다(빠지면 그 부품은
-  // 늘 유효로 읽으므로 조립이 빠뜨리면 안 된다: boot-effects.test.ts의 같은 객체 단언).
-  const effectsOpen = (): boolean => exitCode === 0 && !(beatLimit !== null && pastLimit(deps, beatLimit)) && haltReason() === null;
+  // 늘 유효로 읽으므로 조립이 빠뜨리면 안 된다: boot-effects.test.ts의 같은 객체 단언). 이 함수는 읽기만 한다(답 줄·증거·연결·장부를
+  // 바꾸지 않는다): D-90 박자가 마지막 증거 확인 뒤에 부른다(unreceived.md, boot-effects.test.ts "읽기만 한다").
+  const effectsOpen = (): boolean => {
+    if (exitCode !== 0) return false;
+    if (judge() !== null) return false;
+    return !(beatLimit !== null && pastLimit(deps, beatLimit));
+  };
   // 박자 넷이 장부에 발급을 적기 직전에 보는 접수 문. 복원기의 접수에 효과의 문을 더한다. 정지 세대는 복원기 그대로다.
   const intake = {
     intakeOpen: (): boolean => effectsOpen() && restorer.intakeOpen() === true,
@@ -665,7 +689,6 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const settled = new Promise<number>((resolve) => {
     settle = resolve;
   });
-  let restoring = false;
   let lastRestoreFailure = "";
 
   const markFatal = (why: string) => {

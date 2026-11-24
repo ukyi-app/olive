@@ -1269,6 +1269,37 @@ describe("박자 유효 문(beatValid): 장부 쓰기와 송신 표식의 공유
     }
   });
 
+  test("송신 표식: 공유 함수가 내보내기 포트의 send를 얻는 접근자 안에서 박자 기한이 지나면 표식·송신 0(recorded_not_sent beat_closed). 대조군은 표식 1·송신 1", async () => {
+    for (const lapse of [true, false]) {
+      const w = world();
+      logMarks(w);
+      w.enqueueRequest();
+      const assigned = ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests[0];
+      if (assigned?.outcome !== "assigned") throw new Error(JSON.stringify(assigned));
+      w.log.length = 0;
+      let valid = true;
+      const real = w.ports.sink;
+      const ports: AssignLoopPorts = {
+        ...w.ports,
+        beatValid: () => valid,
+        sink: {
+          get send() {
+            if (lapse) valid = false;
+            return real.send;
+          },
+        } as AssignLoopPorts["sink"],
+      };
+      const result = ran(await assignAndStartTick(ports, POLICY, NOW));
+      if (lapse) {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "recorded_not_sent", reason: "beat_closed", delivery: "not_sent" }]);
+        expect([w.log, marks(w), w.sent.length]).toEqual([["startRun", "seal"], [], 0]);
+      } else {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "sent" }]);
+        expect([w.log, marks(w).length]).toEqual([["startRun", "seal", "markStartDispatch", "send"], 1]);
+      }
+    }
+  });
+
   test("송신 표식: 봉하기(서명) 사이 박자 기한이 지나면 표식을 적지 않고 싣지 않는다(recorded_not_sent beat_closed, 적힌 시작은 남음)", async () => {
     for (const on of ["signer", null] as const) {
       const w = world();

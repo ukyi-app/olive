@@ -55,9 +55,9 @@ export interface ResendPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
-  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 시작이면 공유 함수(송신 표식을 적는 자리)를 부르기 바로 앞,
-  // 마지막 외부 호출(봉하기의 서명·난수) 뒤에 본다. 거짓·던짐이면 표식을 적지 않고 싣지 않는다. 빠지면 늘 유효다(이 부품 단독의 쓰임).
-  // 조립은 반드시 넘긴다.
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 공유 함수(send-gate.ts)가 내보내기 포트의 수신 객체와 send를
+  // 얻은 뒤, 시작의 표식 바로 앞과 모든 송신 바로 앞에서 본다. 거짓·던짐이면 그 뒤를 하지 않는다(withheld beat_closed). 빠지면 늘
+  // 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
   readonly beatValid?: () => boolean;
 }
 
@@ -280,15 +280,6 @@ function readClock(ports: { readonly clock: Clock }, floor: number): number | nu
 function intakeOpen(intake: ResendIntake): boolean {
   try {
     return intake.intakeOpen() === true;
-  } catch {
-    return false;
-  }
-}
-
-// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
-function beatValid(ports: ResendPorts): boolean {
-  try {
-    return ports.beatValid === undefined || ports.beatValid() === true;
   } catch {
     return false;
   }
@@ -553,11 +544,11 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
     const checked = startStillSealable();
     return typeof checked === "number" ? null : checked;
   };
-  // 시작의 표식은 장부 쓰기다. 공유 함수를 부르기 바로 앞에서 박자 유효 문을 본다. 여기부터 표식까지는 공유 함수 안의 봉투·포트 묶음
-  // 속성 읽기(수신 객체와 send 얻기)뿐이고 포트 호출과 await가 없다(send-gate.ts의 차례).
-  if (action === "task_start" && !beatValid(ctx.ports)) return withheld("beat_closed");
+  // 시작의 표식은 장부 쓰기다. 박자 유효 문(ctx.ports.beatValid)은 공유 함수가 포트의 수신 객체와 send를 얻은 뒤, 표식과 송신
+  // 바로 앞에서 본다(send-gate.ts의 차례). 여기서 먼저 보면 그 접근자 안에서 흐른 시간을 보지 못한다.
   const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck } : null);
   if (gate.kind === "stopped") return gate.value;
+  if (gate.kind === "beat_closed") return withheld("beat_closed");
   if (gate.kind === "sink_unavailable") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };
   if (gate.kind === "unmarked") return { ...head, outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId, sealedAt: sealAt, markReason: gate.markReason };
   const threw = gate.kind === "threw";

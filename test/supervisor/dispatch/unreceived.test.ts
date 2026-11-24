@@ -951,6 +951,26 @@ describe("정적", () => {
     }
   });
 
+  // confirm 뒤에 부르는 박자 유효 문의 본문과 그 함수가 쓰는 invoke의 본문. 꺼내 둔 함수를 꺼내 둔 수신자로 한 번 부르고 원시값만 견준다.
+  // 그 함수(조립의 박자 유효 문)가 답 줄·증거·연결을 바꾸지 않는 것은 포트의 조건이고 조립 시험(boot-effects.test.ts)이 본다.
+  const BEAT_STILL_VALID = 'function beatStillValid(held: Held): boolean { if (held.beatValid === "absent") return true; const answer = invoke(held.beatValid, []); return answer !== null && answer.value === true; }';
+  const INVOKE = "function invoke(bound: Bound | null, args: readonly unknown[]): { readonly value: unknown } | null { if (bound === null) return null; try { return { value: apply(bound.fn, bound.receiver, args) }; } catch { return null; } }";
+  const bodyOf = (source: string, head: string) => {
+    const start = source.indexOf(head);
+    return start < 0 || source.indexOf(head, start + 1) >= 0 ? null : squash(source.slice(start, source.indexOf("\n}\n", start) + 2));
+  };
+
+  test("confirm 뒤의 박자 유효 문은 꺼내 둔 함수를 한 번 부르고 원시값만 견준다(본문까지 글자 그대로)", async () => {
+    const source = await code(FILE);
+    expect([bodyOf(source, "function beatStillValid("), bodyOf(source, "function invoke(")]).toEqual([BEAT_STILL_VALID, INVOKE]);
+    // 대조군: 본문에 속성 읽기·다른 포트 호출을 넣으면 잡는다.
+    for (const injected of ["invoke(held.settled, []);", "const late = held.close;"]) {
+      const anchor = 'if (held.beatValid === "absent") return true;';
+      const broken = source.replace(anchor, `${anchor}\n  ${injected}`);
+      expect([injected, broken !== source, bodyOf(broken, "function beatStillValid(") === BEAT_STILL_VALID]).toEqual([injected, true, false]);
+    }
+  });
+
   test("대조군: 닫기 호출을 두 번 두거나, confirmLast의 반환 직전이나 확인문과 같은 줄에 호출을 넣으면 위 단언이 잡는다", async () => {
     const source = await code(FILE);
     const ret = 'return answer === "current" ||';

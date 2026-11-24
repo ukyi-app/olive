@@ -33,6 +33,7 @@ import { type LifecycleIntent, type LifecyclePolicy, type LifecycleView, nextInt
 import { newUuid, type RefusalReason as DraftRefusalReason, renewDraft, sealDraft, statusQueryDraft, stopDraft } from "./envelopes.ts";
 import type { Clock, InstructionSink, Random, Signer } from "./ports.ts";
 import type { PendingQuery } from "./receipts.ts";
+import { callAfterGate } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 확정 기록(recordFinalizeInstruction)은 받지 않는다.
 export type LifeLoopLedger = Pick<Ledger, "listRuns" | "listInputs" | "instructionTimes" | "recordRenewInstruction" | "recordStopInstruction">;
@@ -597,14 +598,13 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
   const { executorId, runGeneration, deadlineAt } = fresh.run;
   const stopGeneration = ctx.stopGeneration;
   const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "renew_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, reason });
-  // 마지막 외부 호출(시계 읽기) 뒤, 장부 호출 바로 앞. 그 사이 흐른 시간으로 박자 기한이 지났으면 적지 않는다.
-  if (!beatValid(ctx.ports)) return { runId, outcome: "beat_closed", planned: "renew_lease" };
-  let answer: unknown;
-  try {
-    answer = ctx.ports.ledger.recordRenewInstruction({ runId, requestId, stopGeneration, now: recordAt });
-  } catch {
-    return recordUnknown("threw");
-  }
+  // 장부 포트 객체·메서드·인자를 먼저 얻고, 박자 유효 문을 본 뒤 바로 부른다(send-gate.ts의 callAfterGate). 접근자가 유효 문 뒤에 돌면
+  // 그 안에서 흐른 시간으로 박자 기한이 지나도 적는다. 얻다 던지면 부르지 않았지만 메서드가 던진 것과 같이 적었는지 모름으로 싣는다.
+  const renewInput = { runId, requestId, stopGeneration, now: recordAt };
+  const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordRenewInstruction, args: [renewInput] }; }, () => beatValid(ctx.ports));
+  if (call.kind === "closed") return { runId, outcome: "beat_closed", planned: "renew_lease" };
+  if (call.kind === "threw") return recordUnknown("threw");
+  const answer: unknown = call.value;
   trace.fallback = () => recordUnknown("threw");
   if (!isObject(answer)) return recordUnknown("malformed_answer");
   const ok: unknown = answer.ok;
@@ -688,15 +688,13 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   const { executorId } = fresh.run;
   const stopGeneration = ctx.stopGeneration;
   const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "stop_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, cancelReason, reason });
-  // 갱신과 같은 자리. 접수 문은 보지 않지만(닫힌 접수에서도 종료는 적는다) 무효인 박자의 종료는 적지 않는다.
-  if (!beatValid(ctx.ports)) return { runId, outcome: "beat_closed", planned: "stop" };
-  let answer: unknown;
-  try {
-    // 사유를 늘 넘긴다. 빼고 적은 종료 지시는 장부가 본문을 다시 만들 수 없음으로 남기고, 같은 요청 ID로 나중에 채울 수도 없다.
-    answer = ctx.ports.ledger.recordStopInstruction({ runId, requestId, action: "task_cancel", stopGeneration, now: recordAt, reason: cancelReason });
-  } catch {
-    return recordUnknown("threw");
-  }
+  // 갱신과 같은 차례(장부 포트 객체·메서드·인자 → 박자 유효 문 → 호출). 접수 문은 보지 않지만(닫힌 접수에서도 종료는 적는다) 무효인 박자의
+  // 종료는 적지 않는다. 사유를 늘 넘긴다: 빼고 적은 종료 지시는 장부가 본문을 다시 만들 수 없음으로 남기고, 같은 요청 ID로 나중에 채울 수도 없다.
+  const stopInput = { runId, requestId, action: "task_cancel" as const, stopGeneration, now: recordAt, reason: cancelReason };
+  const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordStopInstruction, args: [stopInput] }; }, () => beatValid(ctx.ports));
+  if (call.kind === "closed") return { runId, outcome: "beat_closed", planned: "stop" };
+  if (call.kind === "threw") return recordUnknown("threw");
+  const answer: unknown = call.value;
   trace.fallback = () => recordUnknown("threw");
   if (!isObject(answer)) return recordUnknown("malformed_answer");
   const ok: unknown = answer.ok;

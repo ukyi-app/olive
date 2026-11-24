@@ -437,7 +437,9 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     expect(await run.stop()).toBe(96);
   });
 
-  test("처음부터 닫힌 5단계에서도 기존 실행의 정리(종료·조회)는 나간다: 박자 유효 문은 접수 문과 다르다", async () => {
+  // 처음부터 닫힌 5단계(현관의 정지 기록)와 시작된 작업 하나. 박자 유효 문은 접수 문과 달라 기존 실행의 정리는 나간다.
+  // 입력마다 나가야 할 봉투가 다르다: 기한이 지난 작업은 종료(task_cancel), 기한 안의 작업은 상태 조회(status_query).
+  const closedFromStart = async (wall: number): Promise<string[]> => {
     const w = world();
     const seed = openLedger(w.ledgerPath, { mode: "reopen", clock: () => WALL });
     if (!seed.ok) throw new Error(seed.reason);
@@ -446,17 +448,137 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     must(seed.ledger.startRun({ runId: admitted.runId, requestId: id(), stopGeneration: 0, now: WALL }));
     seed.ledger.close();
     w.front.stop = async () => ({ generation: 1, stopped: true });
-    w.wall = WALL + 600_001;
+    w.wall = wall;
     const frames = observeFrames(w);
     const run = await running(w);
     await untilStep(w, 5);
     for (let i = 0; i < 3; i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
     expect(named(w, "restore_step").at(-1)?.fields).toMatchObject({ step: 5, intakeMayOpen: false });
-    const sent = frames.filter((f) => f.refused === null).map((f) => f.action);
-    expect(sent.length).toBeGreaterThan(0);
-    expect(sent.every((action) => action === "status_query" || action === "task_cancel")).toBe(true);
     expect(fatals(w)).toEqual([]);
     expect(await run.stop()).toBe(0);
+    return frames.filter((f) => f.refused === null).map((f) => f.action);
+  };
+
+  test("처음부터 닫힌 5단계에서도 기존 실행의 정지는 나간다: 기한이 지난 작업에 task_cancel", async () => {
+    expect(await closedFromStart(WALL + 600_001)).toEqual(["task_cancel"]);
+  });
+
+  test("처음부터 닫힌 5단계에서도 기존 실행의 상태 조회는 나간다: 기한 안의 작업에 status_query", async () => {
+    expect(await closedFromStart(WALL + 1_000)).toEqual(["status_query"]);
+  });
+
+  test("박자 유효 문은 읽기만 한다: 부르는 동안 증거 포트·답 줄·서버를 부르지 않고 장부에 쓰지 않는다(D-90의 confirm 뒤 조건)", async () => {
+    const w = world();
+    const commits = countCommits(w);
+    const run = await running(w);
+    await untilStep(w, 5);
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    const gate = w.captured.beatPorts?.unreceived?.beatValid;
+    if (typeof gate !== "function") throw new Error("beatValid가 없다");
+    // 증거 포트·답 줄(맡기지 않을 실행기 포함)·서버의 함수 칸을 모두 감싸, 유효 문을 부르는 동안의 호출을 적는다.
+    const touched: string[] = [];
+    let watching = false;
+    const seen = new WeakSet<object>();
+    const watch = (label: string, target: object) => {
+      if (seen.has(target)) return;
+      seen.add(target);
+      for (const key of Object.keys(target)) {
+        const value: unknown = (target as Record<string, unknown>)[key];
+        if (typeof value === "object" && value !== null) watch(`${label}.${key}`, value);
+        if (typeof value !== "function") continue;
+        (target as Record<string, unknown>)[key] = (...args: unknown[]) => {
+          if (watching) touched.push(`${label}.${key}`);
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+    };
+    watch("evidence", w.deps.evidence);
+    watch("lines", w.captured.lines!.value);
+    watch("server", w.fake.server);
+    const before = commits.length;
+    const look = () => {
+      watching = true;
+      try {
+        return gate();
+      } finally {
+        watching = false;
+      }
+    };
+    const open = look();
+    // 허가를 버려 문이 닫히는 쪽도 같은 것만 읽는다.
+    must(w.opened!.applyStop({ generation: 1, stopped: true, now: WALL }));
+    const after = commits.length;
+    const closed = look();
+    expect({ open, closed, touched, writes: [...commits.slice(before, after - 1), ...commits.slice(after)] }).toEqual({ open: true, closed: false, touched: [], writes: [] });
+    expect(await run.stop()).toBe(96);
+  });
+});
+
+describe("박자 유효 문은 장부 건강·허가를 읽은 뒤 시각을 맨 끝에 본다", () => {
+  // 기한이 끝난 작업 하나. 수명 박자가 종료 기록 직전에 부르는 유효 문 안에서 장부 건강 읽기나 허가 읽기 하나가 박자 기한 ± 1ms를 쓴다.
+  // 기록 포트는 불린 수만 세고 거절로 답한다(실제 쓰기 없음).
+  test("유효 문 안의 읽기가 박자 기한 + 1ms를 쓰면 종료 기록 포트를 부르지 않고 96이다. 대조군(기한 - 1ms)은 부르고 0이다", async () => {
+    for (const where of ["health", "intake"] as const) {
+      for (const extra of [1, -1]) {
+        const w = world();
+        const cost = w.settings.timing.beatWaitMs + extra;
+        let offset = 0;
+        let armed = false;
+        let inGate = false;
+        let spent = false;
+        const mono = w.deps.monoNow;
+        const ticks = w.deps.make!.ticks!;
+        w.deps = {
+          ...w.deps,
+          monoNow: () => mono() + offset,
+          make: {
+            ...w.deps.make,
+            ticks: {
+              ...ticks,
+              life: (ports, policy, input) => {
+                if (!armed) return ticks.life(ports, policy, input);
+                const gate = ports.beatValid!;
+                const watched = () => {
+                  inGate = true;
+                  try {
+                    return gate();
+                  } finally {
+                    inGate = false;
+                  }
+                };
+                return ticks.life({ ...ports, beatValid: watched }, policy, input);
+              },
+            },
+          },
+        };
+        const spend = () => {
+          if (inGate && !spent) {
+            spent = true;
+            offset += cost;
+          }
+        };
+        const run = await running(w);
+        await untilStep(w, 5);
+        const ledger = w.opened!;
+        const admitted = must(ledger.admitRun(worker({ now: WALL, deadlineAt: WALL + 600_000 }))).run;
+        must(ledger.startRun({ runId: admitted.runId, requestId: id(), stopGeneration: 0, now: WALL }));
+        w.wall = WALL + 600_001;
+        let calls = 0;
+        ledger.recordStopInstruction = (() => ((calls += 1), { ok: false, reason: "transition_denied" })) as unknown as typeof ledger.recordStopInstruction;
+        if (where === "health") {
+          const health = ledger.health.bind(ledger);
+          ledger.health = () => (spend(), health());
+        } else {
+          const restorer = w.captured.restorer!.value;
+          const intakeOpen = restorer.intakeOpen.bind(restorer);
+          restorer.intakeOpen = () => (spend(), intakeOpen());
+        }
+        armed = true;
+        await w.time.advance(w.settings.timing.beatEveryMs);
+        const late = extra > 0;
+        expect({ where, extra, spent, calls, code: await run.stop(), fatal: fatals(w) }).toEqual({ where, extra, spent: true, calls: late ? 0 : 1, code: late ? 96 : 0, fatal: late ? ["beat_lapsed"] : [] });
+      }
+    }
   });
 });
 
@@ -544,6 +666,40 @@ describe("모름과 시각을 읽지 못함(R5·R7)", () => {
     await w.time.advance(w.settings.timing.beatEveryMs);
     expect(fatals(w)).toEqual(["intake_unreadable"]);
     expect(await run.stop()).toBe(96);
+  });
+
+  test("박자 안의 허가 읽기가 한 번만 던져도 그 사유를 붙잡는다: 다음 읽기가 정상이어도 96 intake_unreadable, 업무 쓰기 0", async () => {
+    const w = world();
+    const commits = countCommits(w);
+    const run = await running(w);
+    await untilStep(w, 5);
+    const before = commits.length;
+    const server = w.fake.server;
+    const tick = server.tick.bind(server);
+    const restorer = w.captured.restorer!.value;
+    const intakeOpen = restorer.intakeOpen.bind(restorer);
+    let once = true;
+    let armed = false;
+    let errors = 0;
+    // 서버 tick 직후(박자 안)의 첫 허가 읽기만 던진다.
+    server.tick = () => {
+      tick();
+      if (once) {
+        once = false;
+        armed = true;
+      }
+    };
+    restorer.intakeOpen = () => {
+      if (armed) {
+        armed = false;
+        errors += 1;
+        throw new Error("허가 읽기 한 번 실패");
+      }
+      return intakeOpen();
+    };
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    expect({ errors, fatal: fatals(w), writes: commits.slice(before), code: await run.stop() }).toEqual({ errors: 1, fatal: ["intake_unreadable"], writes: [], code: 96 });
   });
 
   test("박자를 부르기 전 시각이 유한하지 않으면 박자를 부르지 않고 96이다", async () => {
