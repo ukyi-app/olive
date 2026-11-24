@@ -70,7 +70,9 @@ function events<T>() {
 }
 
 test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 실제 장부에 적히고, 조회는 연결과 함께 등록·철회되며, 바뀐 연결 뒤에는 옛 연결의 답이 적히지 않는다", async () => {
-  const now = Date.now();
+  // 두 상태 보고의 issued_at을 가르려고 한 번 1ms 옮긴다(서버·장부·실행기가 같은 값을 읽는다).
+  let now = Date.now();
+  const t0 = now;
   const pki = makePki();
   const sup = keys();
   const k1 = keys();
@@ -100,14 +102,18 @@ test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 
   if (!admitted.ok) throw new Error(`admit: ${admitted.reason}`);
   const RUN = admitted.run.runId;
   if (!real.startRun({ runId: RUN, requestId: uuid(), stopGeneration: GEN, now }).ok) throw new Error("start");
-  // 장부에 넘긴 답을 차례로 적는다(덮어쓰지 않고 실제 장부를 그대로 부른다).
+  // 장부에 넘긴 답(호출 차례)과 그 호출의 트랜잭션 결과를 따로 적는다(덮어쓰지 않고 실제 장부를 그대로 부른다).
+  // 호출 차례는 저장 실패한 호출도 센다. 장부가 행으로 남기는 것은 성공한 쓰기 중 처음 본 양성 관측뿐이다.
   const order: string[] = [];
+  const results: string[] = [];
   const ledger: ReceiptLedger = {
     applyReceipt: (i, f) => real.applyReceipt(i, f),
     recordReport: (i, f) => real.recordReport(i, f),
     applyExecutorAnswer(i, f) {
       order.push(`${i.coverage}:${i.runs.map((r) => r.state).join(",")}@${i.answeredAt}`);
-      return real.applyExecutorAnswer(i, f);
+      const result = real.applyExecutorAnswer(i, f);
+      results.push(result.ok ? "ok" : result.reason);
+      return result;
     },
   };
 
@@ -219,10 +225,15 @@ test("루프백: 인사 → 상태 보고 → 밀린 사본이 받은 차례로 
   expect(queries.pending()).toEqual([]);
   const q2 = await ask();
   const asked2 = await one.frames.next((e) => e.header.action === "status_query" && e.header.request_id === q2);
+  now += 1;
   one.put("status_report", { in_reply_to: asked2.header.request_id, runs: runs("running") });
   await forwards.next((connection) => connection === c1);
   await answered.next((kind) => kind === "status_matched");
-  expect(order).toEqual([`full:preparing@${now}`, `partial:running@${now}`, `partial:running@${now}`, `partial:running@${now}`]);
+  // 밀린 사본(t0)이 다음 보고(t0 + 1)보다 먼저 장부에 갔다. 저장에 실패한 첫 호출도 차례에 든다.
+  expect(order).toEqual([`full:preparing@${t0}`, `partial:running@${t0}`, `partial:running@${t0}`, `partial:running@${t0 + 1}`]);
+  expect(results).toEqual(["ok", "ledger_unwritable", "ok", "ok"]);
+  // 양성 관측은 있다. 장부는 그 실행의 첫 양성 관측만 행으로 남기므로(인사의 full) 뒤 호출의 성공은 새 행을 뜻하지 않는다.
+  expect(real.hasRunSighting(RUN)).toEqual({ known: true, value: true });
   expect(lines.backlog(R1)).toEqual([]);
 
   // 2. 답하지 않은 조회는 그 연결이 철회되면 끝난다.

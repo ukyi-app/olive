@@ -400,4 +400,188 @@ describe("조회 등록부(C43·C11)", () => {
     expect(h.queries.pending()).toEqual([]);
     expect(h.calls).toEqual([]);
   });
+
+  test("같은 조회를 같은 연결에 두 번 실으면 항목이 둘이고, 대조된 답 하나가 항목 하나만 끝낸다: 두 번째 답의 관측도 장부에 간다", () => {
+    const h = harness();
+    h.table.greet(1, R1, []);
+    const q = h.ask(1, R1, [RUN]);
+    // 같은 초안을 다시 봉해 실었다: 요청 ID가 같고 등록 객체는 새것이다(내보내기 포트는 쓸 때마다 더한다).
+    h.queries.add({ ...q, runIds: [...q.runIds] });
+    const counts = [h.queries.pending().length];
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "not_known")], NOW + 1));
+    counts.push(h.queries.pending().length);
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "stopping")], NOW + 2));
+    counts.push(h.queries.pending().length);
+    expect(counts).toEqual([2, 1, 0]);
+    expect(statusOutcomes(h.notes)).toEqual(["status_matched", "status_matched"]);
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`not_known@${NOW + 1}`, `stopping@${NOW + 2}`]);
+    // 실은 횟수보다 많은 답(같은 답의 중복)은 남은 항목이 없어 대조되지 않는다.
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "stopping")], NOW + 2));
+    expect(statusOutcomes(h.notes).at(-1)).toBe("unknown_query");
+    expect(h.calls.length).toBe(2);
+  });
+});
+
+const statusOutcomes = (notes: readonly AnswerNote[]): string[] =>
+  notes.flatMap((n) => (n.kind !== "status" ? [] : [n.outcome.outcome === "status_unmatched" ? n.outcome.reason : n.outcome.outcome]));
+
+describe("맞지 않는 답과 받은 때의 등록(C43)", () => {
+  test("물은 실행과 맞지 않는 답은 그 조회의 항목을 끝내지 않는다: 뒤에 온 올바른 답이 대조된다", () => {
+    const h = harness();
+    h.table.greet(1, R1, []);
+    const q = h.ask(1, R1, [RUN]);
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN2, "running")], NOW + 1));
+    expect(h.queries.pending().length).toBe(1);
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "running")], NOW + 2));
+    expect(statusOutcomes(h.notes)).toEqual(["runs_mismatch", "status_matched"]);
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`running@${NOW + 2}`]);
+    expect(h.queries.pending()).toEqual([]);
+  });
+
+  test("받은 뒤 같은 키로 등록한 조회는 먼저 받은 답과 대조하지 않는다", () => {
+    const h = harness({ settled: false });
+    h.table.greet(1, R1, []);
+    const requestId = uuid();
+    h.lines.deliver(statusForward(1, R1, requestId, [run(RUN, "stopping")], NOW + 1));
+    h.queries.add({ requestId, recipient: R1, runIds: [RUN], connection: 1 });
+    h.lines.deliver(statusForward(1, R1, requestId, [run(RUN, "running")], NOW + 2));
+    h.state.settled = true;
+    h.lines.pump();
+    expect(statusOutcomes(h.notes)).toEqual(["unknown_query", "status_matched"]);
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`running@${NOW + 2}`]);
+    expect(h.queries.pending()).toEqual([]);
+  });
+});
+
+describe("등록부 예외와 밀린 사본(C15·C18·C20)", () => {
+  test("넘길 때 등록부 읽기가 한 번 던지면 그 답은 줄 맨 앞에 남았다가 회복된 뒤 장부에 간다", () => {
+    const h = harness({ settled: false });
+    h.table.greet(1, R1, []);
+    const q = h.ask(1, R1, [RUN]);
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "running")], NOW + 1));
+    const pending = h.queries.pending.bind(h.queries);
+    let broken = true;
+    (h.ports.queries as { pending: () => readonly SentQuery[] }).pending = () => {
+      if (broken) {
+        broken = false;
+        throw new Error("등록부");
+      }
+      return pending();
+    };
+    h.state.settled = true;
+    h.lines.pump();
+    expect(h.calls).toEqual([]);
+    h.lines.pump();
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`running@${NOW + 1}`]);
+    expect(statusOutcomes(h.notes)).toEqual(["status_matched"]);
+    expect(h.queries.pending()).toEqual([]);
+  });
+
+  test("밀린 사본과 새 답을 반영한 뒤 등록 마감이 한 번 던져도 반영한 사본을 다시 넘기지 않고, 마감은 다음 처리에서 끝낸다", () => {
+    const h = harness();
+    h.table.greet(1, R1, []);
+    const q1 = h.ask(1, R1, [RUN]);
+    h.answers.push(new Error("disk"));
+    h.lines.deliver(statusForward(1, R1, q1.requestId, [run(RUN, "running")], NOW + 1));
+    const q2 = h.ask(1, R1, [RUN]);
+    const settle = h.queries.settle.bind(h.queries);
+    let broken = true;
+    (h.ports.queries as { settle: (...args: never[]) => unknown }).settle = (...args: never[]) => {
+      if (broken) {
+        broken = false;
+        throw new Error("등록부");
+      }
+      return (settle as (...a: never[]) => unknown)(...args);
+    };
+    h.lines.deliver(statusForward(1, R1, q2.requestId, [run(RUN, "stopping")], NOW + 2));
+    expect(h.lines.backlog(R1)).toEqual([]);
+    expect(h.queries.pending().map((q) => q.requestId)).toEqual([q2.requestId]);
+    h.lines.pump();
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`running@${NOW + 1}`, `running@${NOW + 1}`, `stopping@${NOW + 2}`]);
+    expect(h.queries.pending()).toEqual([]);
+  });
+
+  test("밖에 낸 밀린 사본과 기록기에 넘긴 결과를 고쳐도 다시 넘기는 내용은 실행기가 보낸 그대로다", () => {
+    const h = harness();
+    h.table.greet(1, R1, []);
+    const q = h.ask(1, R1, [RUN]);
+    h.answers.push(new Error("disk"));
+    h.lines.deliver(statusForward(1, R1, q.requestId, [run(RUN, "running")], NOW + 1));
+    const shown = h.lines.backlog(R1);
+    expect(() => {
+      (shown[0]!.runs[0] as { state: string }).state = "stopping";
+    }).toThrow();
+    const noted = h.notes.find((n) => n.kind === "status");
+    if (noted?.kind !== "status" || noted.outcome.outcome !== "status_matched") throw new Error("status_matched 기록이 없다");
+    (noted.outcome.backlog[0]!.runs[0] as { state: string }).state = "stopping";
+    h.lines.pump();
+    expect(h.calls.map((c) => `${c.states}@${c.answeredAt}`)).toEqual([`running@${NOW + 1}`, `running@${NOW + 1}`]);
+  });
+
+  test("한 줄을 비우는 중 기록이 복원 대기 신호를 다시 세우면 다음 답을 넘기지 않는다", () => {
+    const h = harness({ settled: false });
+    h.table.greet(1, R1, []);
+    const q1 = h.ask(1, R1, [RUN]);
+    const q2 = h.ask(1, R1, [RUN]);
+    h.lines.deliver(statusForward(1, R1, q1.requestId, [run(RUN, "running")], NOW + 1));
+    h.lines.deliver(statusForward(1, R1, q2.requestId, [run(RUN, "stopping")], NOW + 2));
+    let raised = false;
+    (h.ports as { observe: AnswerLinePorts["observe"] }).observe = (n) => {
+      h.notes.push(n);
+      if (n.kind === "status" && !raised) {
+        raised = true;
+        h.state.settled = false;
+      }
+    };
+    h.state.settled = true;
+    h.lines.pump();
+    expect(h.calls.map((c) => c.states)).toEqual(["running"]);
+    h.state.settled = true;
+    h.lines.pump();
+    expect(h.calls.map((c) => c.states)).toEqual(["running", "stopping"]);
+  });
+});
+
+describe("반영한 인사의 해제 재확인(C15·C29·C19)", () => {
+  test("인사를 반영한 직후 연결 확인이 한 번 실패해도 다음 처리에서 해제 조건만 다시 보고 내린다: 인사는 다시 넘기지 않는다", () => {
+    const h = harness();
+    h.table.greet(1, R1, [run(RUN, "preparing")]);
+    const answers = h.ports.wire.answers as { current: (connection: number, executorId: string) => boolean };
+    const current = answers.current;
+    let broken = true;
+    answers.current = (connection, executorId) => {
+      if (broken) {
+        broken = false;
+        throw new Error("게시 함수");
+      }
+      return current(connection, executorId);
+    };
+    h.lines.deliver(helloOutput(1, R1, [run(RUN, "preparing")]));
+    expect(h.lines.withheld.executors()).toEqual({ known: true, value: [R1] });
+    h.lines.pump();
+    expect(h.lines.withheld.executors()).toEqual({ known: true, value: [] });
+    expect(h.calls.map((c) => `${c.kind}:${c.states}`)).toEqual(["full:preparing"]);
+  });
+
+  test("반영한 인사의 연결이 더는 인정된 연결이 아니면 맡기지 않음을 내리지 않고, 새 연결의 인사가 반영될 때 내린다", () => {
+    const h = harness();
+    h.table.greet(1, R1, []);
+    const answers = h.ports.wire.answers as { current: (connection: number, executorId: string) => boolean };
+    const current = answers.current;
+    let broken = true;
+    answers.current = (connection, executorId) => {
+      if (broken) {
+        broken = false;
+        return false;
+      }
+      return current(connection, executorId);
+    };
+    h.lines.deliver(helloOutput(1, R1, []));
+    h.table.greet(2, R1, [], NOW + 10);
+    h.lines.pump();
+    expect(h.lines.withheld.executors()).toEqual({ known: true, value: [R1] });
+    h.lines.deliver(helloOutput(2, R1, [], NOW + 10));
+    expect(h.lines.withheld.executors()).toEqual({ known: true, value: [] });
+    expect(h.calls.map((c) => `${c.kind}@${c.answeredAt}`)).toEqual([`full@${NOW}`, `full@${NOW + 10}`]);
+  });
 });
