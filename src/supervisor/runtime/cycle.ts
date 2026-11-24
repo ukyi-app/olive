@@ -1,24 +1,26 @@
-// 감독의 박자 순서기. 한 박자에 연결 서버의 tick과 박자 넷(끊김 → 수명 → 재전송 → 배정·시작)을 정해진 차례로 한 번씩 부르고,
-// 박자 사이의 기억(watch, lastQueries, lastResends, unsentRenews)을 쥐었다가 다음 박자에 넘긴다. 박자의 결과를 바꾸거나 다시 해석하지
-// 않는다: 결과의 정해진 칸을 기억으로 옮기고, 멈췄거나 적혔는지 모르는 결과 뒤에 장부를 다시 읽는 것만 한다.
+// 감독의 박자 순서기. 한 박자에 연결 서버의 tick과 박자 넷(끊김 → 수명 → 재전송 → 배정·시작)을 정해진 차례로 부르고(배정만
+// assigned가 나오면 같은 박자에서 정책의 횟수까지 되풀이한다), 박자 사이의 기억(watch, lastQueries, lastResends, unsentRenews)을
+// 쥐었다가 다음 박자에 넘긴다. 박자의 결과를 바꾸거나 다시 해석하지 않는다: 결과의 정해진 칸을 기억으로 옮기고, 멈췄거나 적혔는지
+// 모르는 결과 뒤에 장부를 다시 읽는 것만 한다.
 // 박자 함수·서버 tick·장부 읽기·시계 둘·복원 끝 여부는 포트로 받는다. 시계·난수·타이머를 직접 부르지 않고 박자의 주기는 부르는 쪽이 정한다.
 // 기억은 이 객체의 메모리에만 있다. 감독이 다시 뜨면 새 객체가 빈 기억으로 시작한다(저장하지 않는다).
 //
 // 지키는 것:
 // 1. 박자를 겹쳐 부르지 않는다. 박자가 진행 중이면 beat()는 기다리지 않고 거절한다(박자 안의 포트에서 다시 부른 것도 같다).
-// 2. 복원이 끝나기 전에는 서버 tick만 부르고 박자 넷은 부르지 않는다. 박자를 부르기 직전마다 다시 보고, 한 번 막히면 그 박자의
-//    남은 박자도 부르지 않는다(끊김 박자 없이 수명 박자만 도는 박자를 만들지 않는다).
-// 3. 장부 시계가 이 프로세스에서 읽은 가장 늦은 값보다 이르면 박자에는 읽지 못한 시계로 보인다. 박자 처음의 읽기가 그러면 그 박자의
-//    재전송·배정을 부르지 않는다. 끊김 박자의 단조 시계도 같은 하한을 둔다.
+// 2. 복원이 끝나기 전에는 서버 tick만 부르고 박자 넷은 부르지 않는다. 박자를 부르기 직전마다, 그 앞의 포트 읽기를 마친 뒤에 다시 본다.
+//    한 번 막히면 그 박자의 남은 박자도 부르지 않는다(끊김 박자 없이 수명 박자만 도는 박자를 만들지 않는다).
+// 3. 장부 시계는 공유 비후퇴 시계(shared-clock.ts)다. 원천 값이 그 하한(장부·내보내기 포트·서버가 읽은 값 포함)보다 이르면 박자에는
+//    읽지 못한 시계로 보인다. 박자 처음의 읽기가 그러면 그 박자의 재전송·배정을 부르지 않는다. 끊김 박자의 단조 시계도 하한을 둔다.
 // 4. closeIssuance() 뒤에는 새 박자를 시작하지 않고, 진행 중인 박자는 남은 박자를 부르지 않고 돌아온다. closeIssuance()는 그 박자가
-//    돌아온 뒤에 돌아온다.
+//    돌아온 뒤에 돌아온다(박자 안의 첫 포트에서 부른 것도 같다).
 import { limits, parsePrincipal } from "../../contract/v1/index.ts";
-import type { Ledger } from "../../ledger/index.ts";
+import { LEDGER_RUN_STATES, type Ledger } from "../../ledger/index.ts";
 import type { TickResult as AssignTickResult } from "../dispatch/assign-loop.ts";
 import type { LifeTickInput, LifeTickResult } from "../dispatch/life-loop.ts";
 import type { LinkLossPolicy, LinkLossTickInput, LinkLossTickResult, MonotonicClock, WatchEntry } from "../dispatch/link-loss.ts";
 import type { Clock } from "../dispatch/ports.ts";
 import { type ResendPolicy, type ResendTickInput, type ResendTickResult, START_LAST_SEAL_MS } from "../dispatch/resend.ts";
+import { type ClockReading, isSharedClock, type SharedClock } from "./shared-clock.ts";
 
 // 박자 넷. 조립은 실제 박자 함수에 그 포트·정책을 묶어 넘긴다(예: linkLoss = (c, p, i) => linkLossTick({ ...포트, ...c }, p, i)).
 // 시계와 끊김·재전송의 정책은 이 순서기가 넘기는 것을 그대로 포트에 넣어야 한다: 시계 하한과 정책 검사가 그 값에 걸려 있다.
@@ -30,7 +32,7 @@ export interface CycleBeats {
 }
 
 // 멈춘 박자 뒤와 싣지 못한 갱신을 뺄지 정할 때 읽는 장부. 박자들이 쓰는 그 장부 객체여야 한다.
-export type CycleLedger = Pick<Ledger, "listRuns" | "instructionTimes" | "unansweredInstructions">;
+export type CycleLedger = Pick<Ledger, "listRuns" | "listWaitingToolRequests" | "instructionTimes" | "unansweredInstructions">;
 
 export interface CyclePolicy {
   // 끊김 판정 시간. RUN_LEASE_MAX_MS 이상이어야 한다(판정할 때 실행기는 갱신 없이 임대가 끝나 이미 닫혀 있다).
@@ -48,8 +50,9 @@ export interface CycleDeps {
   readonly beats: CycleBeats;
   // 연결 서버의 tick(). 서버에는 타이머가 없어 이것이 hello 대기·복원기 교체·답 기한의 시간 판단을 일으킨다.
   readonly serverTick: () => void;
-  // 장부에 주입한 그 시계. 박자에는 하한을 씌운 것을 넘긴다.
-  readonly ledgerClock: Clock;
+  // 장부·내보내기 포트·연결 서버에 넘긴 그 공유 시계(createSharedClock). 꼴만 같은 시계면 createCycle이 TypeError를 던진다.
+  // 박자에는 원천 값이 하한보다 이르면 던지는 시계를 넘긴다.
+  readonly ledgerClock: SharedClock;
   // 끊긴 시간만 재는 단조 시계. 벽시계를 넘기지 않는다.
   readonly monotonic: MonotonicClock;
   // 지금 장부의 복원이 5단계까지 끝났는가. 장부가 실패해 다시 열고 복원하는 동안은 false여야 한다.
@@ -87,8 +90,14 @@ export type Step<R> =
 export type RereadBeat = "link_loss" | "life" | "resend" | "assign";
 
 export type Reread =
-  // 결과 밖의 실행을 대조할 실행 목록. known은 읽었는지다.
-  | { readonly beat: RereadBeat; readonly cause: "threw" | "halted" | "ledger_failed"; readonly read: "runs"; readonly known: boolean }
+  // 결과 밖을 대조할 목록. runs는 실행 목록, waiting_requests는 대기 부탁 목록(배정이 멈췄을 때만)이다. known은 그 목록을 읽었는지까지다:
+  // 끊김 박자 뒤의 known: true도 실행이 unknown_running으로 옮겨졌는지는 말하지 않는다.
+  | {
+      readonly beat: RereadBeat;
+      readonly cause: "threw" | "halted" | "ledger_failed";
+      readonly read: "runs" | "waiting_requests";
+      readonly known: boolean;
+    }
   // 적혔는지 모르는 지시. found는 갱신이면 그 발행 시각의 갱신이 장부에 있는지, 종료면 그 요청 ID가 답을 기다리는 지시로 있는지다.
   // 읽지 못하면 null이다.
   | {
@@ -115,11 +124,12 @@ export type BeatReport =
       readonly rereads: readonly Reread[];
     };
 
-const isTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const isMonotonic = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const isCount = (value: unknown, min: number, max: number): value is number => Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max;
-// 싣지 못한 갱신을 판단에 넘기지 않아야 하는 상태. 이 둘을 떠난 것을 장부에서 확인하면 기억에서 뺀다(life-loop.md "싣지 못한 갱신").
+// 싣지 못한 갱신을 판단에 넘기지 않아야 하는 상태. 장부 행의 state가 유효한 상태 값이고 이 둘을 떠났을 때만 기억에서 뺀다
+// (life-loop.md "싣지 못한 갱신"). 칸이 없거나 모르는 값이면 상태를 확인한 것이 아니다.
 const RENEWABLE: readonly unknown[] = ["preparing", "running"];
+const RUN_STATES: readonly unknown[] = LEDGER_RUN_STATES;
 
 function readPolicy(policy: CyclePolicy): CyclePolicy {
   const { judgeMs, resendEveryMs, assignCallsPerBeat } = policy;
@@ -143,9 +153,13 @@ function bump(memory: Map<string, number>, key: string, at: number): void {
   memory.set(key, before === undefined ? at : Math.max(before, at));
 }
 
+const copyWatch = (entries: readonly WatchEntry[]): WatchEntry[] => entries.map(({ executorId, absentSince }) => ({ executorId, absentSince }));
+
 export function createCycle(deps: CycleDeps): Cycle {
   const policy = readPolicy(deps.policy);
+  if (!isSharedClock(deps.ledgerClock)) throw new TypeError("순서기의 ledgerClock은 createSharedClock이 만든 시계여야 한다");
   const { beats, ledger } = deps;
+  const shared = deps.ledgerClock;
 
   let watch: readonly WatchEntry[] = [];
   const lastQueries = new Map<string, number>();
@@ -154,16 +168,14 @@ export function createCycle(deps: CycleDeps): Cycle {
   // 끊김 박자를 부르는 동안 더해진 candidate. 그 박자의 결과 watch로 바꾼 뒤 다시 더한다(결과가 덮어 지우지 않게).
   let notedDuringLinkLoss: string[] | null = null;
 
-  // 이 프로세스에서 박자에 넘긴 시각의 하한. 그보다 이른 값은 던져서 박자가 시계를 읽지 못한 것으로 다루게 한다.
-  let clockFloor = 0;
+  // 장부 시계의 하한은 공유 시계가 쥔다(다른 소비자가 읽은 값도 들어 있다). 박자에는 하한보다 이른 원천 값을 던지는 시계를 넘겨
+  // 박자가 시계를 읽지 못한 것으로 다루게 한다. 단조 시계의 하한은 끊김 박자에만 넘기므로 여기서 쥔다.
   let monotonicFloor = 0;
   const clock: Clock = {
     now() {
-      const at: unknown = deps.ledgerClock.now();
-      if (!isTime(at)) throw new RangeError("clock_unavailable");
-      if (at < clockFloor) throw new RangeError("clock_regressed");
-      clockFloor = at;
-      return at;
+      const reading = shared.read();
+      if (reading.state === "ok") return reading.at;
+      throw new RangeError(reading.state === "regressed" ? "clock_regressed" : "clock_unavailable");
     },
   };
   const monotonic: MonotonicClock = {
@@ -175,13 +187,7 @@ export function createCycle(deps: CycleDeps): Cycle {
       return at;
     },
   };
-  const readNow = (): { readonly state: "ok"; readonly at: number } | { readonly state: "regressed" | "unavailable" } => {
-    try {
-      return { state: "ok", at: clock.now() };
-    } catch (error) {
-      return { state: error instanceof RangeError && error.message === "clock_regressed" ? "regressed" : "unavailable" };
-    }
-  };
+  const readNow = (): ClockReading => shared.read();
 
   let busy = false;
   let closed = false;
@@ -197,7 +203,9 @@ export function createCycle(deps: CycleDeps): Cycle {
     for (const runId of [...unsentRenews]) {
       try {
         const row = runs.find((item) => (item as { runId?: unknown }).runId === runId) as { state?: unknown } | undefined;
-        if (row !== undefined && !RENEWABLE.includes(row.state)) unsentRenews.delete(runId);
+        if (row === undefined) continue;
+        const state = row.state;
+        if (RUN_STATES.includes(state) && !RENEWABLE.includes(state)) unsentRenews.delete(runId);
       } catch {
         // 그 줄을 읽지 못하면 그대로 둔다(빼는 것만 장부 확인이 필요하다).
       }
@@ -210,6 +218,15 @@ export function createCycle(deps: CycleDeps): Cycle {
       if (answer.known !== true || !Array.isArray(answer.value)) return false;
       pruneUnsent(answer.value);
       return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const readWaiting = (): boolean => {
+    try {
+      const answer = ledger.listWaitingToolRequests();
+      return answer.known === true && Array.isArray(answer.value);
     } catch {
       return false;
     }
@@ -238,8 +255,9 @@ export function createCycle(deps: CycleDeps): Cycle {
   };
 
   const takeLinkLoss = (result: LinkLossTickResult): void => {
-    // ran이면 멈췄어도 결과의 watch가 온전하다. not_run이면 앞 기억을 그대로 쥔다.
-    if (result.kind === "ran") watch = result.watch;
+    // ran이면 멈췄어도 결과의 watch가 온전하다. not_run이면 앞 기억을 그대로 쥔다. 원소까지 복사해 박자가 나중에 결과를 고쳐도
+    // 기억이 따라 바뀌지 않게 한다.
+    if (result.kind === "ran") watch = copyWatch(result.watch);
   };
 
   const takeLife = (result: LifeTickResult, rereads: Reread[]): void => {
@@ -283,20 +301,24 @@ export function createCycle(deps: CycleDeps): Cycle {
     }
     const start = readNow();
 
-    // 한 번 막히면 그 박자의 남은 박자도 막힌다.
+    // 한 번 막히면 그 박자의 남은 박자도 막힌다. 박자를 부르기 직전의 마지막 확인이다: 그 앞의 포트 읽기(장부·시계)는 이것보다 먼저
+    // 끝낸다. 복원 조회도 포트라 그 안에서 closeIssuance()가 불릴 수 있으므로 깃발은 조회가 돌아온 뒤에 한 번 더 본다.
     let stopped: SkipReason | null = null;
+    const blocked = (): boolean => stopped !== null || closed;
     const gate = (): SkipReason | null => {
       if (stopped !== null) return stopped;
-      if (closed) stopped = "issuance_closed";
-      else {
-        let done = false;
-        try {
-          done = deps.restoreDone() === true;
-        } catch {
-          done = false;
-        }
-        if (!done) stopped = "restore_not_done";
+      if (closed) {
+        stopped = "issuance_closed";
+        return stopped;
       }
+      let done = false;
+      try {
+        done = deps.restoreDone() === true;
+      } catch {
+        done = false;
+      }
+      if (!done) stopped = "restore_not_done";
+      else if (closed) stopped = "issuance_closed";
       return stopped;
     };
     const rereadRuns = (beat: RereadBeat, cause: "threw" | "halted" | "ledger_failed"): void => {
@@ -310,7 +332,7 @@ export function createCycle(deps: CycleDeps): Cycle {
       const noted: string[] = [];
       notedDuringLinkLoss = noted;
       try {
-        const result = beats.linkLoss({ clock, monotonic }, { judgeMs: policy.judgeMs }, { watch: [...watch] });
+        const result = beats.linkLoss({ clock, monotonic }, { judgeMs: policy.judgeMs }, { watch: copyWatch(watch) });
         takeLinkLoss(result);
         linkLoss = { kind: "returned", result };
       } catch {
@@ -329,10 +351,11 @@ export function createCycle(deps: CycleDeps): Cycle {
     }
 
     let life: Step<LifeTickResult>;
+    // 수명 직전의 장부 읽기도 포트다(그 안에서 복원이 다시 시작되거나 닫기가 불릴 수 있다). 읽은 뒤에 막힘을 본다.
+    if (!blocked() && unsentRenews.size > 0) readRuns();
     const lifeGate = gate();
     if (lifeGate !== null) life = { kind: "skipped", reason: lifeGate };
     else {
-      if (unsentRenews.size > 0) readRuns();
       try {
         const result = await beats.life(clock, { lastQueries: [...lastQueries].map(([runId, at]) => ({ runId, at })), unsentRenews: [...unsentRenews] });
         takeLife(result, rereads);
@@ -362,16 +385,19 @@ export function createCycle(deps: CycleDeps): Cycle {
     }
 
     const assign: Step<AssignTickResult>[] = [];
+    // 배정이 멈추면 결과에 없는 대기 부탁과 실행 전체를 다시 읽는다(assign-loop.md "박자가 멈출 때"). 대기 부탁은 실행 줄이 생기기
+    // 전부터 있는 별도 목록이라 실행 목록만으로는 대조가 끝나지 않는다.
+    const rereadAssign = (cause: "threw" | "halted"): void => {
+      rereads.push({ beat: "assign", cause, read: "waiting_requests", known: readWaiting() });
+      rereadRuns("assign", cause);
+    };
     for (let call = 0; call < policy.assignCallsPerBeat; call += 1) {
-      const assignGate = trusted();
-      if (assignGate !== null) {
-        assign.push({ kind: "skipped", reason: assignGate });
-        break;
-      }
-      // 배정 박자의 now는 부르기 직전에 읽는다. 앞 박자들의 기다림만큼 흐른 시각을 쓴다.
-      const now = readNow();
-      if (now.state !== "ok") {
-        assign.push({ kind: "skipped", reason: "clock_untrusted" });
+      // 배정 박자의 now는 부르기 직전에 읽는다(앞 박자들의 기다림만큼 흐른 시각). 시계도 포트이므로 읽은 뒤에 막힘을 마지막으로 본다.
+      // 이미 막혔으면 읽지 않는다.
+      const now = blocked() || start.state !== "ok" ? null : readNow();
+      const assignGate = trusted() ?? (now !== null && now.state === "ok" ? null : "clock_untrusted");
+      if (assignGate !== null || now === null || now.state !== "ok") {
+        assign.push({ kind: "skipped", reason: assignGate ?? "clock_untrusted" });
         break;
       }
       let step: Step<AssignTickResult>;
@@ -382,12 +408,12 @@ export function createCycle(deps: CycleDeps): Cycle {
       }
       assign.push(step);
       if (step.kind === "threw") {
-        rereadRuns("assign", "threw");
+        rereadAssign("threw");
         break;
       }
       const result = step.result;
       if (result.kind !== "ran") break;
-      if (result.halted === "threw") rereadRuns("assign", "halted");
+      if (result.halted === "threw") rereadAssign("halted");
       if (result.halted !== null || !result.requests.some((item) => item.outcome === "assigned")) break;
     }
 
@@ -409,6 +435,12 @@ export function createCycle(deps: CycleDeps): Cycle {
       // 박자 안의 동기 구간(서버 tick, 끊김 박자)에서 다시 불려도 잡도록 약속을 만들기 전에 세운다.
       if (busy) return Promise.resolve(report({ kind: "skipped", reason: "beat_in_progress" }));
       busy = true;
+      // 첫 포트(서버 tick, 끊김 박자, 수명 박자의 동기 구간)를 부르기 전에 이 박자의 완료 약속을 게시한다. 그 포트 안에서
+      // closeIssuance()가 불려도 이 약속을 기다리므로 박자보다 먼저 돌아오지 않는다.
+      let settle!: (beat: Promise<BeatReport>) => void;
+      inFlight = new Promise<BeatReport>((resolve) => {
+        settle = resolve;
+      });
       const current = (async () => {
         try {
           return report(await runBeat());
@@ -416,7 +448,7 @@ export function createCycle(deps: CycleDeps): Cycle {
           busy = false;
         }
       })();
-      inFlight = current;
+      settle(current);
       return current;
     },
     async closeIssuance(): Promise<void> {

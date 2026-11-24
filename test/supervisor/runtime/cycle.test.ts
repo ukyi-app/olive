@@ -1,6 +1,10 @@
-// 박자 순서기(src/supervisor/runtime/cycle.ts). 박자 넷·서버 tick·장부 읽기·시계는 모두 가짜이고, 부른 차례와 넘긴 인자를 기록한다.
+// 박자 순서기(src/supervisor/runtime/cycle.ts)와 공유 시계(shared-clock.ts). 박자 넷·서버 tick·장부 읽기·시계는 가짜이고, 부른 차례와
+// 넘긴 인자를 기록한다. "실제 박자 넷과 장부"만 실제 박자 함수·임시 폴더의 실제 장부·실제 내보내기 포트를 쓴다(서버는 가짜).
 // 박자가 기다리는 동안의 일은 시험이 직접 쥔 약속(deferred)으로 차례를 정한다. 실제 시간을 기다리지 않는다.
 import { describe, expect, test } from "bun:test";
+import { generateKeyPairSync, getRandomValues } from "node:crypto";
+import { sealEnvelope } from "../../../src/contract/v1/index.ts";
+import { RESTORE_KEY } from "../../../src/ledger/ledger.ts";
 import type { TickResult as AssignTickResult, AssignLoopPolicy, AssignLoopPorts } from "../../../src/supervisor/dispatch/assign-loop.ts";
 import { assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop.ts";
 import { type LifeLoopPorts, type LifeTickResult, lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
@@ -16,8 +20,11 @@ import {
   CyclePolicyError,
   createCycle,
 } from "../../../src/supervisor/runtime/cycle.ts";
+import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
+import { createWireSink, type WireServer } from "../../../src/supervisor/runtime/sink.ts";
 import type { LifecyclePolicy } from "../../../src/supervisor/scheduler/lifecycle.ts";
 import { readText } from "../../files.ts";
+import { id, must, NOW, open, tempPath, worker } from "../../ledger/helpers.ts";
 
 const W1 = "executor/diagnosis/0/store-b";
 const W2 = "executor/diagnosis/1/store-c";
@@ -71,6 +78,10 @@ function harness(policy: Partial<CycleDeps["policy"]> = {}) {
     runs: [] as { runId: string; state: string }[],
     renewIssuedAt: null as number | null,
     unanswered: [] as { requestId: string }[],
+    // 다음 장부 시계 읽기 한 번에서 부를 일(포트 안에서 상태를 바꾸는 사례).
+    onClock: null as (() => void) | null,
+    // 장부 읽기의 답을 바꿔 끼운다.
+    runsAnswer: null as (() => unknown) | null,
   };
   const seen = {
     linkLoss: [] as { clocks: { clock: Clock; monotonic: { now(): number } }; policy: unknown; input: { watch: readonly WatchEntry[] } }[],
@@ -113,7 +124,12 @@ function harness(policy: Partial<CycleDeps["policy"]> = {}) {
   const ledger = {
     listRuns() {
       calls.push("read:runs");
+      if (state.runsAnswer !== null) return state.runsAnswer();
       return { known: true, value: state.runs.map((run) => ({ ...run })) };
+    },
+    listWaitingToolRequests() {
+      calls.push("read:waiting");
+      return { known: true, value: [] };
     },
     instructionTimes(runId: string) {
       calls.push("read:instruction_times");
@@ -131,7 +147,14 @@ function harness(policy: Partial<CycleDeps["policy"]> = {}) {
     serverTick: () => {
       calls.push("tick");
     },
-    ledgerClock: { now: () => state.wall },
+    ledgerClock: createSharedClock({
+      now: () => {
+        const hook = state.onClock;
+        state.onClock = null;
+        hook?.();
+        return state.wall;
+      },
+    }),
     monotonic: { now: () => state.mono },
     restoreDone: () => (typeof state.restoreDone === "function" ? state.restoreDone() : state.restoreDone),
     ledger,
@@ -496,7 +519,7 @@ describe("시계", () => {
 
   test("장부 시계를 읽지 못하면 재전송·배정을 부르지 않는다", async () => {
     const h = harness();
-    h.deps = { ...h.deps, ledgerClock: { now: () => Number.NaN } } as CycleDeps;
+    h.deps = { ...h.deps, ledgerClock: createSharedClock({ now: () => Number.NaN }) };
     const report = ran(await createCycle(h.deps).beat());
     expect(report.clock).toBe("unavailable");
     expect(h.calls).not.toContain("resend");
@@ -649,34 +672,376 @@ describe("발급 닫기", () => {
   });
 });
 
+const skippedAll = (reason: "restore_not_done" | "issuance_closed" | "clock_untrusted", count: number) =>
+  Array.from({ length: count }, () => ({ kind: "skipped" as const, reason }));
+const renewNotSent = (runId: string) => ({
+  runId,
+  outcome: "renew_recorded_not_sent",
+  requestId: REQ_1,
+  stopGeneration: 0,
+  issuedAt: 2_000_000,
+  leaseUntil: 2_030_000,
+  executorId: W1,
+  reason: "no_connection",
+  delivery: "not_sent",
+});
+
+describe("포트 안에서 바뀐 상태", () => {
+  test("박자 안의 첫 포트(수명 박자의 동기 구간)에서 부른 closeIssuance()도 그 박자가 돌아온 뒤에 끝난다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    const order: string[] = [];
+    const gate = deferred<LifeTickResult>();
+    let closing: Promise<unknown> | null = null;
+    h.next.life = () => {
+      order.push("life:enter");
+      closing = cycle.closeIssuance().then(() => order.push("close:done"));
+      return gate.promise;
+    };
+    const beat = cycle.beat().then((report) => {
+      order.push("beat:returned");
+      return report;
+    });
+    for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+    expect(order).toEqual(["life:enter"]);
+    order.push("life:release");
+    gate.resolve(lifeRan());
+    const report = ran(await beat);
+    await closing;
+    expect(order).toEqual(["life:enter", "life:release", "beat:returned", "close:done"]);
+    expect([report.resend, ...report.assign]).toEqual(skippedAll("issuance_closed", 2));
+  });
+
+  test("복원 조회 안에서 닫기를 부르고 true를 돌려주면 끊김 박자를 부르지 않는다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    let closing: Promise<void> | null = null;
+    h.state.restoreDone = () => {
+      closing ??= cycle.closeIssuance();
+      return true;
+    };
+    const report = ran(await cycle.beat());
+    await closing;
+    expect(h.calls).toEqual(["tick"]);
+    expect([report.linkLoss, report.life, report.resend, ...report.assign]).toEqual(skippedAll("issuance_closed", 4));
+  });
+
+  test("수명 직전의 장부 읽기가 복원을 다시 시작하고 known:false를 돌려주면 수명 박자를 부르지 않는다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    h.next.life = () => lifeRan([renewNotSent(RUN_A)]);
+    await cycle.beat();
+    h.calls.length = 0;
+    h.state.runsAnswer = () => {
+      h.state.restoreDone = false;
+      return { known: false };
+    };
+    const report = ran(await cycle.beat());
+    expect(h.calls).toEqual(["tick", "linkLoss", "read:runs"]);
+    expect([report.life, report.resend, ...report.assign]).toEqual(skippedAll("restore_not_done", 3));
+  });
+
+  test("배정 직전의 시계 읽기 안에서 닫기를 부르면 배정 박자를 부르지 않는다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    let closing: Promise<void> | null = null;
+    h.next.resend = () => {
+      h.state.onClock = () => {
+        closing = cycle.closeIssuance();
+      };
+      return resendRan();
+    };
+    const report = ran(await cycle.beat());
+    await closing;
+    expect(h.calls).toEqual(["tick", "linkLoss", "life", "life:returned", "resend"]);
+    expect(report.assign).toEqual(skippedAll("issuance_closed", 1));
+  });
+});
+
+// 실제 박자 넷·임시 폴더의 실제 장부·실제 내보내기 포트(createWireSink). 서버는 실제 서버의 차례(lastCheck → finalCheck → 쓰기)를
+// 따르는 가짜다. 원천 시계를 공유 시계로 감싸 장부·내보내기 포트·순서기에 같은 객체를 넘긴다(진입점이 할 조립).
+function realWorld() {
+  const source = { wall: NOW, onRead: null as (() => void) | null };
+  const shared = createSharedClock({
+    now: () => {
+      const hook = source.onRead;
+      source.onRead = null;
+      hook?.();
+      return source.wall;
+    },
+  });
+  const ledger = open(tempPath(), { clock: () => shared.now() });
+  must(ledger.applyStop({ generation: 0, stopped: false, now: NOW }));
+  const attempt = ledger.beginRestore(RESTORE_KEY);
+  ledger.pinRestore(RESTORE_KEY, attempt);
+  expect(ledger.grantIntake(RESTORE_KEY, attempt)).toBe(true);
+  const intake = { stopGeneration: () => ledger.syncStopGeneration(attempt), intakeOpen: () => ledger.intakeOpen(attempt) };
+  const inputId = id();
+  must(ledger.enqueueInput({ requestId: inputId, source: "fixture", sourceRef: { ref: `inbox/${id()}`, expiresAt: NOW + 600_000 }, receivedAt: NOW }));
+  const runId = must(ledger.admitRun(worker({ inputRequestId: inputId }))).run.runId;
+  const executorId = worker().executorId as string;
+
+  // 다음 시작 지시의 finalCheck 직전에 원천 시계를 옮길 값.
+  const world = { lateStartAt: null as number | null, sending: null as { action: string; requestId: string } | null };
+  const sent: { action: string; requestId: string }[] = [];
+  const written: { action: string; requestId: string }[] = [];
+  const server: WireServer = {
+    recognized: (principal) => (principal === executorId ? 1 : null),
+    writeFrame(connection, principal, _frame, options) {
+      if (connection !== 1 || principal !== executorId) return { kind: "not_written", reason: "not_recognized" };
+      const verdict = options.lastCheck();
+      if (verdict !== null) return { kind: "not_written", reason: "refused", refusal: verdict };
+      if (world.lateStartAt !== null && world.sending?.action === "task_start") {
+        source.wall = world.lateStartAt;
+        world.lateStartAt = null;
+      }
+      const timing = options.finalCheck === undefined ? null : options.finalCheck();
+      if (timing !== null) return { kind: "not_written", reason: "refused", refusal: timing };
+      if (world.sending !== null) written.push(world.sending);
+      options.settled("flushed");
+      return { kind: "written" };
+    },
+  };
+  const wire = createWireSink({
+    server,
+    restorer: () => intake,
+    withheld: { executors: () => ({ known: true, value: [] }) },
+    clock: shared,
+    queries: { add() {}, remove() {} },
+  });
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const base = {
+    ledger,
+    intake,
+    links: wire.links,
+    random: { bytes: (length: number) => getRandomValues(new Uint8Array(length)) },
+    signer: { seal: (draft: Parameters<typeof sealEnvelope>[0]) => sealEnvelope(draft, privateKey) },
+    sink: {
+      send(envelope: Parameters<typeof wire.sink.send>[0]) {
+        world.sending = { action: envelope.header.action, requestId: envelope.header.request_id };
+        sent.push(world.sending);
+        return wire.sink.send(envelope);
+      },
+    },
+  };
+  const hooks = { afterResend: null as (() => void) | null };
+  const assignPorts = {
+    ...base,
+    connections: { candidates: () => ({ known: true, value: [] }) },
+    withheld: { executors: () => ({ known: true, value: [] }) },
+    facts: { facts: () => ({}) },
+    credentials: { reference: async () => ({ known: false }) },
+  } as unknown as AssignLoopPorts;
+  const assignPolicy = {
+    assignment: { allowed: [], registrations: [], expected: { profile_revision: "profile-1", policy_revision: "policy-1" } },
+    accounts: [],
+    plans: [],
+    queue: { alertMaxWaitMs: 60_000 },
+    originOf: () => "admin",
+  } as unknown as AssignLoopPolicy;
+  const beats: CycleBeats = {
+    linkLoss: (clocks, policy, input) => linkLossTick({ ledger, restorer: intake, connections: { occupancy: () => [] }, ...clocks }, policy, input),
+    life: (clock, input) => lifeTick({ ...base, clock }, { renewEveryMs: 10_000, answerTimeoutMs: 20_000 }, input),
+    resend: async (clock, policy, input) => {
+      const result = await resendTick({ ...base, clock }, policy, input);
+      const hook = hooks.afterResend;
+      hooks.afterResend = null;
+      hook?.();
+      return result;
+    },
+    assign: (now) => assignAndStartTick(assignPorts, assignPolicy, now),
+  };
+  const cycle = createCycle({
+    beats,
+    serverTick: () => {},
+    ledgerClock: shared,
+    monotonic: { now: () => 10 },
+    restoreDone: () => true,
+    ledger,
+    policy: { judgeMs: 30_000, resendEveryMs: 5_000, assignCallsPerBeat: 1 },
+  });
+  return { source, shared, ledger, runId, cycle, hooks, world, sent, written };
+}
+
+describe("실제 박자 넷과 장부", () => {
+  test("배정 직전 시계 읽기 안에서 닫기를 부르면 배정을 부르지 않고 장부에 새 시작 기록이 없다", async () => {
+    const w = realWorld();
+    let closing: Promise<void> | null = null;
+    w.hooks.afterResend = () => {
+      w.source.onRead = () => {
+        closing = w.cycle.closeIssuance();
+      };
+    };
+    const report = ran(await w.cycle.beat());
+    await closing;
+    expect(report.assign).toEqual(skippedAll("issuance_closed", 1));
+    const runs = w.ledger.listRuns();
+    expect(runs.known ? runs.value.map((run) => [run.runId, run.state]) : runs).toEqual([[w.runId, "queued"]]);
+    const unanswered = w.ledger.unansweredInstructions();
+    expect(unanswered.known ? unanswered.value.instructions : unanswered).toEqual([]);
+    expect(w.sent).toEqual([]);
+  });
+
+  test("송신 직전 확인이 +19,001ms로 거절한 시작은 다음 박자의 원천 시계가 +19,000ms여도 같은 요청 ID로 다시 쓰이지 않는다", async () => {
+    const w = realWorld();
+    w.world.lateStartAt = NOW + 19_001;
+    const first = ran(await w.cycle.beat());
+    const step = first.assign[0];
+    expect(step?.kind === "returned" && step.result.kind === "ran" ? step.result.starts.map((start) => [start.outcome, "reason" in start ? start.reason : null]) : step).toEqual([
+      ["recorded_not_sent", "too_late_to_send"],
+    ]);
+    const startIds = w.sent.filter((item) => item.action === "task_start").map((item) => item.requestId);
+    expect([startIds.length, w.written]).toEqual([1, []]);
+
+    // 원천 시계가 송신 확인이 읽은 값보다 1ms 이르다. 하한은 그 읽기까지 들어 있어 후퇴로 보이고 재전송·배정을 부르지 않는다.
+    w.source.wall = NOW + 19_000;
+    const second = ran(await w.cycle.beat());
+    expect([w.sent.filter((item) => item.action === "task_start").map((item) => item.requestId), w.written]).toEqual([startIds, []]);
+    expect(second.clock).toBe("regressed");
+    expect([second.resend, ...second.assign]).toEqual(skippedAll("clock_untrusted", 2));
+    // 장부·내보내기 포트가 읽는 값도 하한 아래로 내려가지 않는다.
+    expect(w.shared.now()).toBe(NOW + 19_001);
+
+    // 원천이 하한을 넘은 뒤에도 같은 시작은 다시 쓰이지 않는다(송신 시한이 지났다).
+    w.source.wall = NOW + 19_002;
+    expect(ran(await w.cycle.beat()).clock).toBe("ok");
+    expect(w.sent.filter((item) => item.action === "task_start").map((item) => item.requestId)).toEqual(startIds);
+    expect(w.written.filter((item) => item.action === "task_start")).toEqual([]);
+  });
+});
+
+describe("공유 시계", () => {
+  test("원천이 하한보다 이르면 now()는 하한을 내고 read()는 regressed다. 읽지 못하면 now()는 던진다", () => {
+    let wall = 1_000;
+    const shared = createSharedClock({ now: () => wall });
+    expect([shared.now(), shared.read()]).toEqual([1_000, { state: "ok", at: 1_000 }]);
+    wall = 2_000;
+    expect(shared.now()).toBe(2_000);
+    wall = 1_999;
+    expect([shared.now(), shared.read()]).toEqual([2_000, { state: "regressed" }]);
+    wall = 2_000;
+    expect(shared.read()).toEqual({ state: "ok", at: 2_000 });
+    for (const bad of [Number.NaN, 0, -1, 1.5]) {
+      wall = bad;
+      expect([bad, shared.read()]).toEqual([bad, { state: "unavailable" }]);
+      expect(() => shared.now()).toThrow(RangeError);
+    }
+    const throwing = createSharedClock({
+      now: () => {
+        throw new Error("시계 없음");
+      },
+    });
+    expect(throwing.read()).toEqual({ state: "unavailable" });
+    expect(() => throwing.now()).toThrow(RangeError);
+  });
+
+  test("순서기는 createSharedClock이 만든 시계만 받는다", () => {
+    const h = harness();
+    expect(() => createCycle({ ...h.deps, ledgerClock: { now: () => 1, read: () => ({ state: "ok", at: 1 }) } })).toThrow(TypeError);
+  });
+});
+
+describe("멈춘 배정과 꼴이 틀린 답", () => {
+  test("배정이 멈추거나 던지면 대기 부탁과 실행 목록을 모두 다시 읽고 각 읽기의 성공 여부를 남긴다", async () => {
+    for (const [cause, arrange] of [
+      ["halted", (h: ReturnType<typeof harness>) => (h.next.assign = () => assignRan([], "threw"))],
+      [
+        "threw",
+        (h: ReturnType<typeof harness>) =>
+          (h.next.assign = () => {
+            throw new Error("묶은 박자가 던짐");
+          }),
+      ],
+    ] as const) {
+      const h = harness();
+      arrange(h);
+      const report = ran(await createCycle(h.deps).beat());
+      expect([cause, report.rereads]).toEqual([
+        cause,
+        [
+          { beat: "assign", cause, read: "waiting_requests", known: true },
+          { beat: "assign", cause, read: "runs", known: true },
+        ],
+      ]);
+      expect([cause, h.calls.slice(-2)]).toEqual([cause, ["read:waiting", "read:runs"]]);
+    }
+
+    const failed = harness();
+    (failed.ledger as unknown as { listWaitingToolRequests: () => unknown }).listWaitingToolRequests = () => {
+      throw new Error("읽지 못함");
+    };
+    failed.next.assign = () => assignRan([], "threw");
+    expect(ran(await createCycle(failed.deps).beat()).rereads).toEqual([
+      { beat: "assign", cause: "halted", read: "waiting_requests", known: false },
+      { beat: "assign", cause: "halted", read: "runs", known: true },
+    ]);
+  });
+
+  test("unsentRenews: 장부 행의 state가 없거나 유효한 상태 값이 아니면 빼지 않는다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    h.next.life = () => lifeRan([renewNotSent(RUN_A)]);
+    await cycle.beat();
+    h.next.life = () => lifeRan();
+    for (const row of [{ runId: RUN_A }, { runId: RUN_A, state: "gone" }, { runId: RUN_A, state: null }, { runId: RUN_A, state: ["finalized"] }]) {
+      h.state.runsAnswer = () => ({ known: true, value: [row] });
+      await cycle.beat();
+      expect([row, h.seen.life.at(-1)?.input.unsentRenews]).toEqual([row, [RUN_A]]);
+    }
+    h.state.runsAnswer = () => ({ known: true, value: [{ runId: RUN_A, state: "finalized" }] });
+    await cycle.beat();
+    expect(h.seen.life.at(-1)?.input.unsentRenews).toEqual([]);
+  });
+
+  test("watch: 박자가 돌려준 배열이나 넘겨받은 원소를 나중에 고쳐도 기억은 바뀌지 않는다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    const returned: WatchEntry[] = [{ executorId: W1, absentSince: 5 }];
+    h.next.linkLoss = () => linkLossRan(returned);
+    await cycle.beat();
+    returned.length = 0;
+    h.next.linkLoss = () => {
+      const input = h.seen.linkLoss.at(-1)?.input.watch as unknown as { absentSince: number | null }[];
+      for (const item of input) item.absentSince = 99;
+      return { kind: "not_run", reason: "clock_unavailable" };
+    };
+    await cycle.beat();
+    h.next.linkLoss = () => linkLossRan();
+    await cycle.beat();
+    expect(h.seen.linkLoss.at(-1)?.input.watch).toEqual([{ executorId: W1, absentSince: 5 }]);
+  });
+});
+
 describe("정적", () => {
-  const SOURCE = "src/supervisor/runtime/cycle.ts";
-  const code = async () =>
-    (await readText(SOURCE))
+  const SOURCES = ["src/supervisor/runtime/cycle.ts", "src/supervisor/runtime/shared-clock.ts"];
+  const code = async (path: string) =>
+    (await readText(path))
       .split("\n")
       .filter((line) => !line.trimStart().startsWith("//"))
       .join("\n");
 
-  test("cycle.ts에는 틀 쓰기·시작 봉투·환경 읽기·시계·난수·타이머의 직접 호출이 없다", async () => {
-    const source = await code();
-    for (const banned of [
-      /(?<![\w$])writeFrame\s*\(/,
-      /\bstartDraft\b/,
-      /task_start/,
-      /process\.env/,
-      /\bprocess\b/,
-      /\bDate\b/,
-      /\bperformance\b/,
-      /\bMath\.random\b/,
-      /\bsetTimeout\b/,
-      /\bsetInterval\b/,
-      /\bsetImmediate\b/,
-      /\bqueueMicrotask\b/,
-      /\bBun\b/,
-      /["']node:/,
-      /["']bun:/,
-    ]) {
-      expect([String(banned), banned.test(source)]).toEqual([String(banned), false]);
+  test("cycle.ts·shared-clock.ts에는 틀 쓰기·시작 봉투·환경 읽기·시계·난수·타이머의 직접 호출이 없다", async () => {
+    for (const path of SOURCES) {
+      const source = await code(path);
+      for (const banned of [
+        /(?<![\w$])writeFrame\s*\(/,
+        /\bstartDraft\b/,
+        /task_start/,
+        /process\.env/,
+        /\bprocess\b/,
+        /\bDate\b/,
+        /\bperformance\b/,
+        /\bMath\.random\b/,
+        /\bsetTimeout\b/,
+        /\bsetInterval\b/,
+        /\bsetImmediate\b/,
+        /\bqueueMicrotask\b/,
+        /\bBun\b/,
+        /["']node:/,
+        /["']bun:/,
+      ]) {
+        expect([path, String(banned), banned.test(source)]).toEqual([path, String(banned), false]);
+      }
     }
   });
 
