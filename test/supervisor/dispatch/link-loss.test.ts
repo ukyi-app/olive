@@ -608,3 +608,43 @@ test("이 모듈은 시계·소켓·타이머를 직접 부르지 않고 markLos
     expect(source).not.toContain(banned);
   }
 });
+
+describe("박자 유효 문(beatValid): 실행기마다 markLostFor 바로 앞에서 본다", () => {
+  test("앞 실행기의 장부 쓰기 안에서 박자 기한이 지나면 다음 실행기는 옮기지 않는다(beat_closed). 대조군(기한 안)은 둘 다 옮긴다", () => {
+    for (const lapse of [true, false]) {
+      const w = world();
+      let valid = true;
+      w.wrap({
+        listRuns: () => ({ known: true, value: [row(WORKER_EXECUTOR), row(OTHER_EXECUTOR)] }) as never,
+        markLostFor: () => {
+          if (lapse) valid = false;
+          return { ok: true, runs: [] };
+        },
+      });
+      w.setClock(NOW + JUDGE + 1);
+      const watch = [
+        { executorId: WORKER_EXECUTOR, absentSince: NOW },
+        { executorId: OTHER_EXECUTOR, absentSince: NOW },
+      ];
+      const result = ran(linkLossTick({ ...w.ports, beatValid: () => valid }, POLICY, { watch }));
+      const moved = (executorId: string) => ({ executorId, outcome: "moved" as const, absentSince: NOW, at: NOW + JUDGE + 1, runs: [] });
+      expect(result.executors).toEqual([moved(WORKER_EXECUTOR), lapse ? { executorId: OTHER_EXECUTOR, outcome: "beat_closed", absentSince: NOW } : moved(OTHER_EXECUTOR)]);
+      expect(w.calls).toEqual(lapse ? [WORKER_EXECUTOR] : [WORKER_EXECUTOR, OTHER_EXECUTOR]);
+      // 기억은 쓰기와 무관하게 그대로 넘어간다(다음 유효한 박자가 다시 판정한다).
+      expect(result.watch).toEqual(watch);
+    }
+  });
+
+  test("실제 장부: 유효 문이 닫혔거나 던지면 markLostFor를 부르지 않고 실행은 running 그대로다", () => {
+    for (const beatValid of [() => false, () => {
+      throw new Error("유효 문 실패");
+    }]) {
+      const w = world();
+      const s = running(w);
+      w.setClock(NOW + JUDGE + 1);
+      const result = ran(linkLossTick({ ...w.ports, beatValid }, POLICY, { watch: [{ executorId: WORKER_EXECUTOR, absentSince: NOW }] }));
+      expect(result.executors).toEqual([{ executorId: WORKER_EXECUTOR, outcome: "beat_closed", absentSince: NOW }]);
+      expect([w.calls, state(w.ledger, s.runId)]).toEqual([[], "running"]);
+    }
+  });
+});

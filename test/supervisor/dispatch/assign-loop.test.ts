@@ -1221,3 +1221,101 @@ describe("송신 표식: 시작 봉투는 표식이 ok인 뒤에만 내보내기
     }
   });
 });
+
+describe("박자 유효 문(beatValid): 장부 쓰기와 송신 표식의 공유 함수 바로 앞에서 본다", () => {
+  // 그 포트의 다음 호출 안에서 박자 기한이 지난다(돌아온 뒤부터 유효 문이 닫힌다).
+  const lapsing = (w: World, on: "random" | "signer" | null) => {
+    let valid = true;
+    const ports: AssignLoopPorts = {
+      ...w.ports,
+      random: { bytes: (length) => ((on === "random" ? (valid = false) : null), w.ports.random.bytes(length)) },
+      signer: { seal: (input) => ((on === "signer" ? (valid = false) : null), w.ports.signer.seal(input)) },
+      beatValid: () => valid,
+    };
+    return ports;
+  };
+
+  test("잇기: 실행 ID를 만드는 사이 박자 기한이 지나면 assignToolRequest를 부르지 않고 beat_closed로 멈춘다. 대조군은 잇는다", async () => {
+    for (const on of ["random", null] as const) {
+      const w = world();
+      const { ref } = w.enqueueRequest();
+      const result = ran(await assignAndStartTick(lapsing(w, on), POLICY, NOW));
+      if (on !== null) {
+        expect(result).toEqual({ kind: "ran", starts: [], requests: [], halted: "beat_closed", haltedAt: { step: "assign", ref } });
+        expect([w.log, runCount(w.ledger)]).toEqual([[], 0]);
+      } else {
+        expect(result.requests).toMatchObject([{ ref, outcome: "assigned" }]);
+        expect(w.log).toEqual(["assignToolRequest"]);
+      }
+    }
+  });
+
+  test("시작: 요청 ID를 만드는 사이 박자 기한이 지나면 startRun을 부르지 않고 beat_closed로 멈춘다(실행은 queued). 대조군은 시작한다", async () => {
+    for (const on of ["random", null] as const) {
+      const w = world();
+      w.enqueueRequest();
+      const assigned = ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests[0];
+      if (assigned?.outcome !== "assigned") throw new Error(JSON.stringify(assigned));
+      w.log.length = 0;
+      const result = ran(await assignAndStartTick(lapsing(w, on), POLICY, NOW));
+      const run = w.ledger.getRun(assigned.runId);
+      if (on !== null) {
+        expect(result).toEqual({ kind: "ran", starts: [], requests: [], halted: "beat_closed", haltedAt: { step: "start", runId: assigned.runId } });
+        expect([w.log, w.sent.length, run.known && run.value?.state]).toEqual([[], 0, "queued"]);
+      } else {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "sent" }]);
+        expect(w.log).toEqual(["startRun", "seal", "send"]);
+      }
+    }
+  });
+
+  test("송신 표식: 공유 함수가 내보내기 포트의 send를 얻는 접근자 안에서 박자 기한이 지나면 표식·송신 0(recorded_not_sent beat_closed). 대조군은 표식 1·송신 1", async () => {
+    for (const lapse of [true, false]) {
+      const w = world();
+      logMarks(w);
+      w.enqueueRequest();
+      const assigned = ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests[0];
+      if (assigned?.outcome !== "assigned") throw new Error(JSON.stringify(assigned));
+      w.log.length = 0;
+      let valid = true;
+      const real = w.ports.sink;
+      const ports: AssignLoopPorts = {
+        ...w.ports,
+        beatValid: () => valid,
+        sink: {
+          get send() {
+            if (lapse) valid = false;
+            return real.send;
+          },
+        } as AssignLoopPorts["sink"],
+      };
+      const result = ran(await assignAndStartTick(ports, POLICY, NOW));
+      if (lapse) {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "recorded_not_sent", reason: "beat_closed", delivery: "not_sent" }]);
+        expect([w.log, marks(w), w.sent.length]).toEqual([["startRun", "seal"], [], 0]);
+      } else {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "sent" }]);
+        expect([w.log, marks(w).length]).toEqual([["startRun", "seal", "markStartDispatch", "send"], 1]);
+      }
+    }
+  });
+
+  test("송신 표식: 봉하기(서명) 사이 박자 기한이 지나면 표식을 적지 않고 싣지 않는다(recorded_not_sent beat_closed, 적힌 시작은 남음)", async () => {
+    for (const on of ["signer", null] as const) {
+      const w = world();
+      logMarks(w);
+      w.enqueueRequest();
+      const assigned = ran(await assignAndStartTick(w.ports, POLICY, NOW)).requests[0];
+      if (assigned?.outcome !== "assigned") throw new Error(JSON.stringify(assigned));
+      w.log.length = 0;
+      const result = ran(await assignAndStartTick(lapsing(w, on), POLICY, NOW));
+      if (on !== null) {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "recorded_not_sent", reason: "beat_closed", delivery: "not_sent" }]);
+        expect([w.log, marks(w), w.sent.length]).toEqual([["startRun", "seal"], [], 0]);
+      } else {
+        expect(result.starts).toMatchObject([{ runId: assigned.runId, outcome: "sent" }]);
+        expect([w.log, marks(w).length]).toEqual([["startRun", "seal", "markStartDispatch", "send"], 1]);
+      }
+    }
+  });
+});

@@ -846,6 +846,34 @@ describe("쓰기 직전의 확인: 연결, 최신 읽기, 칸의 꼴, 싣지 못
     expect(w.sent.map((e) => e.header.action)).toEqual(["status_query", "status_query"]);
   });
 
+  test("갱신의 마지막 여유 판정은 박자 유효 문 뒤에 장부 시계를 한 번 읽는다: 유효 문이 1ms를 쓰면 여유 12,999ms로 싣지 않고, 0ms면 13,000ms로 싣는다", async () => {
+    for (const cost of [0, 1]) {
+      const w = world();
+      const s = started(w);
+      accept(w, s);
+      // 판단·기록 17000, 앞 임대 끝 30000. 장부에 갱신을 적은 뒤의 유효 문(송신 앞) 안에서만 cost가 흐른다.
+      w.setClock(NOW + 17_000);
+      const gates: number[] = [];
+      const ports: LifeLoopPorts = {
+        ...w.ports,
+        beatValid: () => {
+          if (w.log.includes("recordRenewInstruction")) w.setClock(NOW + 17_000 + cost);
+          gates.push(w.ports.clock.now() - NOW);
+          return true;
+        },
+      };
+      const outcome = only(await lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] }), s.runId);
+      expect({ cost, outcome: outcome.outcome, reason: "reason" in outcome ? outcome.reason : null, gates, sends: w.log.filter((step) => step === "send").length, sent: w.sent.length }).toEqual({
+        cost,
+        outcome: cost === 0 ? "renew_sent" : "renew_recorded_not_sent",
+        reason: cost === 0 ? null : "renew_margin_lost",
+        gates: [17_000, 17_000 + cost],
+        sends: cost === 0 ? 1 : 0,
+        sent: cost === 0 ? 1 : 0,
+      });
+    }
+  });
+
   test("요청 ID를 먼저 만들고, 마지막 시계 읽기와 장부 호출 사이에 다른 포트를 부르지 않는다", async () => {
     const w = world();
     const s = started(w);
@@ -1138,4 +1166,189 @@ test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고
   for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process.", "scheduler/tools", "finalizeDraft"]) {
     expect(source).not.toContain(banned);
   }
+});
+
+describe("박자 유효 문(beatValid): 장부에 적기 직전, 마지막 시계 읽기 뒤에 본다", () => {
+  const plain = (ports: LifeLoopPorts) => lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] });
+  // 박자 기한이 n번째 시계 읽기 안에서 지난다(그 읽기가 끝난 뒤부터 유효 문이 닫힌다). 박자 처음이 첫째, 기록 시각이 둘째다.
+  const lapsingAt = (w: World, at: number, nth: number | null): LifeLoopPorts => {
+    let reads = 0;
+    let valid = true;
+    return {
+      ...w.ports,
+      clock: {
+        now: () => {
+          reads += 1;
+          if (reads === nth) valid = false;
+          return at;
+        },
+      },
+      beatValid: () => valid,
+    };
+  };
+
+  test("종료: 기록 시각을 읽는 사이 박자 기한이 지나면 종료를 적지 않고 beat_closed다. 대조군(기한 안)은 적고 내보낸다", async () => {
+    for (const nth of [2, null]) {
+      const w = world();
+      const s = started(w, { deadlineAt: NOW + 20_000 });
+      accept(w, s);
+      w.setClock(NOW + 20_000);
+      const outcome = only(await plain(lapsingAt(w, NOW + 20_000, nth)), s.runId);
+      if (nth !== null) {
+        expect(outcome).toEqual({ runId: s.runId, outcome: "beat_closed", planned: "stop" });
+        expect([writes(w), w.sent.length, unanswered(w).filter((i) => i.action === "task_cancel").length, state(w, s.runId)]).toEqual([[], 0, 0, "preparing"]);
+      } else {
+        expect(outcome).toMatchObject({ outcome: "stop_sent", cancelReason: "deadline" });
+        expect([writes(w), w.sent.length]).toEqual([["recordStopInstruction"], 1]);
+      }
+    }
+  });
+
+  test("갱신: 기록 시각을 읽는 사이 박자 기한이 지나면 갱신을 적지 않고 beat_closed다. 대조군(기한 안)은 적고 내보낸다", async () => {
+    for (const nth of [2, null]) {
+      const w = world();
+      const s = started(w);
+      accept(w, s);
+      w.setClock(NOW + 10_000);
+      const outcome = only(await plain(lapsingAt(w, NOW + 10_000, nth)), s.runId);
+      if (nth !== null) {
+        expect(outcome).toEqual({ runId: s.runId, outcome: "beat_closed", planned: "renew_lease" });
+        expect([writes(w), w.sent.length, times(w, s.runId).renewIssued]).toEqual([[], 0, null]);
+      } else {
+        expect(outcome).toMatchObject({ outcome: "renew_sent", leaseUntil: NOW + 40_000 });
+        expect([writes(w), w.sent.length]).toEqual([["recordRenewInstruction"], 1]);
+      }
+    }
+  });
+
+  test("종료·갱신: 장부 포트 객체를 얻는 접근자 안에서 박자 기한이 지나면 적지 않고 beat_closed다. 대조군은 적고 내보낸다", async () => {
+    for (const planned of ["stop", "renew_lease"] as const) {
+      for (const lapse of [true, false]) {
+        const w = world();
+        const s = planned === "stop" ? started(w, { deadlineAt: NOW + 20_000 }) : started(w);
+        accept(w, s);
+        const at = planned === "stop" ? NOW + 20_000 : NOW + 10_000;
+        w.setClock(at);
+        let reads = 0;
+        let valid = true;
+        const ledger = w.ports.ledger;
+        // 기록 시각(둘째 시계 읽기) 뒤에 장부 포트 객체를 얻으면 그 접근자 안에서 박자 기한이 지난다.
+        const ports: LifeLoopPorts = {
+          ...w.ports,
+          clock: { now: () => ((reads += 1), at) },
+          get ledger() {
+            if (lapse && reads >= 2) valid = false;
+            return ledger;
+          },
+          beatValid: () => valid,
+        };
+        const outcome = only(await plain(ports), s.runId);
+        if (lapse) {
+          expect([planned, outcome]).toEqual([planned, { runId: s.runId, outcome: "beat_closed", planned }]);
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [], 0]);
+        } else {
+          expect(outcome).toMatchObject({ outcome: planned === "stop" ? "stop_sent" : "renew_sent" });
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [planned === "stop" ? "recordStopInstruction" : "recordRenewInstruction"], 1]);
+        }
+      }
+    }
+  });
+
+  test("종료·갱신: 장부 쓰기 메서드를 얻는 접근자 안에서 박자 기한이 지나면 적지 않고 beat_closed다. 대조군은 적고 내보낸다", async () => {
+    for (const planned of ["stop", "renew_lease"] as const) {
+      for (const lapse of [true, false]) {
+        const w = world();
+        const s = planned === "stop" ? started(w, { deadlineAt: NOW + 20_000 }) : started(w);
+        accept(w, s);
+        w.setClock(planned === "stop" ? NOW + 20_000 : NOW + 10_000);
+        let valid = true;
+        const real = w.ports.ledger;
+        const name = planned === "stop" ? "recordStopInstruction" : "recordRenewInstruction";
+        const ledger = { ...real };
+        Object.defineProperty(ledger, name, {
+          get() {
+            if (lapse) valid = false;
+            return real[name];
+          },
+        });
+        const outcome = only(await plain({ ...w.ports, ledger, beatValid: () => valid }), s.runId);
+        if (lapse) {
+          expect([planned, outcome]).toEqual([planned, { runId: s.runId, outcome: "beat_closed", planned }]);
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [], 0]);
+        } else {
+          expect(outcome).toMatchObject({ outcome: planned === "stop" ? "stop_sent" : "renew_sent" });
+          expect([planned, writes(w), w.sent.length]).toEqual([planned, [name], 1]);
+        }
+      }
+    }
+  });
+
+  test("접수가 닫혀도 유효한 박자의 종료는 적는다(접수 문과 박자 유효 문은 다르다). 유효 문이 던지거나 true가 아니면 적지 않는다", async () => {
+    const closed = world();
+    const s = started(closed, { deadlineAt: NOW + 20_000 });
+    accept(closed, s);
+    closed.setClock(NOW + 20_000);
+    closed.setIntake(false);
+    expect(only(await plain({ ...closed.ports, beatValid: () => true }), s.runId)).toMatchObject({ outcome: "stop_sent", cancelReason: "deadline" });
+    for (const beatValid of [() => undefined as unknown as boolean, () => 1 as unknown as boolean, () => { throw new Error("유효 문 실패"); }]) {
+      const w = world();
+      const r = started(w, { deadlineAt: NOW + 20_000 });
+      accept(w, r);
+      w.setClock(NOW + 20_000);
+      expect(only(await plain({ ...w.ports, beatValid }), r.runId)).toEqual({ runId: r.runId, outcome: "beat_closed", planned: "stop" });
+      expect(writes(w)).toEqual([]);
+    }
+  });
+});
+
+describe("싣기: 갱신·취소·조회도 공유 송신 함수로 싣는다(포트의 수신 객체와 send를 얻은 뒤 박자 유효 문 → 쥔 send)", () => {
+  const plain = (ports: LifeLoopPorts) => lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] });
+
+  test("포트의 send를 얻는 접근자 안에서 박자 기한이 지나면 포트를 부르지 않는다. 적은 갱신·종료는 남고 조회는 기다리지 않는다. 대조군은 싣는다", async () => {
+    for (const planned of ["renew", "stop", "query"] as const) {
+      for (const lapse of [true, false]) {
+        const w = world();
+        const s = planned === "stop" ? started(w, { deadlineAt: NOW + 20_000 }) : started(w);
+        if (planned === "query") must(w.ledger.markLost(NOW + 1));
+        else accept(w, s);
+        w.setClock(planned === "stop" ? NOW + 20_000 : NOW + 10_000);
+        let valid = true;
+        let entries = 0;
+        const target = w.ports.sink;
+        // 포트 진입을 따로 센다: 조립의 내보내기 포트는 진입하자마자 조회를 등록부에 넣으므로, 닫힌 박자에서는 진입 자체가 0이어야 한다.
+        const sink = {
+          get send() {
+            if (lapse) valid = false;
+            return (envelope: Envelope): Promise<SendOutcome> => {
+              entries += 1;
+              return target.send(envelope);
+            };
+          },
+        };
+        const result = ran(await plain({ ...w.ports, sink, beatValid: () => valid }));
+        const outcome = only(result, s.runId);
+        const label = `${planned}:${lapse}`;
+        if (lapse) {
+          const kind = { renew: "renew_recorded_not_sent", stop: "stop_recorded_not_sent", query: "query_not_sent" }[planned];
+          expect([label, outcome]).toMatchObject([label, { outcome: kind, reason: "beat_closed", delivery: "not_sent" }]);
+          expect([label, entries, w.sent.length, result.pendingQueries]).toEqual([label, 0, 0, []]);
+          expect([label, writes(w)]).toEqual([label, { renew: ["recordRenewInstruction"], stop: ["recordStopInstruction"], query: [] }[planned]]);
+          if (planned === "renew") expect(unsentOf(result)).toEqual([s.runId]);
+        } else {
+          const kind = { renew: "renew_sent", stop: "stop_sent", query: "query_sent" }[planned];
+          expect([label, outcome]).toMatchObject([label, { outcome: kind }]);
+          expect([label, entries, w.sent.length, result.pendingQueries.length]).toEqual([label, 1, 1, planned === "query" ? 1 : 0]);
+        }
+      }
+    }
+  });
+
+  test("정적: 이 모듈은 내보내기 포트를 직접 부르지 않고 공유 송신 함수 한 자리로만 싣는다", async () => {
+    const source = await Bun.file(new URL("../../../src/supervisor/dispatch/life-loop.ts", import.meta.url)).text();
+    const code = source
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("//"))
+      .join("\n");
+    expect([code.match(/\.send\b/g) ?? [], code.match(/\bsendInstruction\s*\(/g)?.length]).toEqual([[], 1]);
+  });
 });

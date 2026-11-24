@@ -55,6 +55,10 @@ export interface ResendPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 공유 함수(send-gate.ts)가 내보내기 포트의 수신 객체와 send를
+  // 얻은 뒤, 시작의 표식 바로 앞과 모든 송신 바로 앞에서 본다. 거짓·던짐이면 그 뒤를 하지 않는다(withheld beat_closed). 빠지면 늘
+  // 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
+  readonly beatValid?: () => boolean;
 }
 
 export interface ResendPolicy {
@@ -81,7 +85,9 @@ type Head = { readonly requestId: string; readonly runId: string; readonly actio
 // session_run: 세션 실행의 지시. run_unknown: 장부가 모른다고 옮긴(unknown_running) 실행의 시작(조회만 한다, D-92).
 // stop_recorded: 같은 실행에 종료가 적힌 시작(열자마자 닫힐 실행을 열지 않는다).
 // read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸(머리 칸과 본문을 다시 만들 칸)이 처음 읽은 것과 다르다.
-export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown";
+// beat_closed: 공유 함수 안에서 본 박자 유효 문이 닫혀 싣지 않았다. 표식 앞의 문이면 표식이 없고, 시작의 표식 뒤 마지막 판정의 문이면
+// 표식이 남는다.
+export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown" | "beat_closed" | "check_malformed";
 
 export type ResendOutcome =
   // 같은 요청을 새 봉투에 담아 실었다(sent는 받았다는 뜻이 아니다). sealedAt은 봉할 때 읽은 시각이다.
@@ -535,12 +541,42 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
   });
   trace.fallback = () => mayBeLoaded("send_threw", expiresAt);
   // sendInstruction은 포트 호출 전까지 기다리지 않는다(표식·마지막 시계 읽기는 동기). 그래서 마지막 읽기와 포트 호출 사이에 await가 없다.
+  // 공유 함수는 표식 뒤 박자 유효 문을 보고 바로 이 확인을 부른다. 그래서 이 확인이 쓰는 시계 함수는 공유 함수를 부르기 전에 얻어 둔다:
+  // 시계 포트의 접근자(get clock, get now)가 유효 문 뒤에 돌면 그 안에서 흐른 시간을 박자 기한이 보지 못한다. 유효 문과 포트 호출
+  // 사이에 남는 외부 호출은 이 시계 함수의 호출 하나다(두 기한의 시계가 달라 한 읽기로 둘을 볼 수 없다. send-gate.md "차례").
+  // 시작인데 얻지 못했으면 표식을 적지 않고 clock_unavailable이다: 마지막 확인이 시각을 읽을 수 없으니 싣지 않을 것이 정해졌다.
+  // 취소·확정은 마지막 확인이 없으므로 얻지 않는다.
+  let heldNow: (() => unknown) | null = null;
+  if (action === "task_start") {
+    try {
+      const clock = ctx.ports.clock;
+      heldNow = clock.now.bind(clock);
+    } catch {
+      return withheld("clock_unavailable");
+    }
+  }
+  // 마지막 확인이 낸 거절만 공유 함수가 그 결과로 돌려준다(stops). 그 밖의 값은 꼴이 틀린 답(check_malformed)이라 싣지 않는다.
+  const refusals = new WeakSet<object>();
+  const refuse = (outcome: ResendOutcome): ResendOutcome => (refusals.add(outcome), outcome);
+  const stops = (value: unknown): value is ResendOutcome => typeof value === "object" && value !== null && refusals.has(value);
   const lastCheck = (): ResendOutcome | null => {
-    const checked = startStillSealable();
-    return typeof checked === "number" ? null : checked;
+    let checked: number | null = null;
+    try {
+      const read: unknown = heldNow === null ? null : heldNow();
+      checked = isTime(read) && read >= ctx.floor ? read : null;
+    } catch {
+      checked = null;
+    }
+    if (checked === null) return refuse(withheld("clock_unavailable"));
+    ctx.floor = checked;
+    return checked > item.issuedAt + START_LAST_SEAL_MS ? refuse(expired()) : null;
   };
-  const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck } : null);
+  // 시작의 표식은 장부 쓰기다. 박자 유효 문(ctx.ports.beatValid)은 공유 함수가 포트의 수신 객체와 send를 얻은 뒤, 표식과 송신
+  // 바로 앞에서 본다(send-gate.ts의 차례). 여기서 먼저 보면 그 접근자 안에서 흐른 시간을 보지 못한다.
+  const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck, stops } : null);
   if (gate.kind === "stopped") return gate.value;
+  if (gate.kind === "check_malformed") return withheld("check_malformed");
+  if (gate.kind === "beat_closed") return withheld("beat_closed");
   if (gate.kind === "sink_unavailable") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };
   if (gate.kind === "unmarked") return { ...head, outcome: "not_sent", reason: "start_unmarked", delivery: "not_sent", executorId, sealedAt: sealAt, markReason: gate.markReason };
   const threw = gate.kind === "threw";

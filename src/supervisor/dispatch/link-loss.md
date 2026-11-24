@@ -15,6 +15,7 @@ LinkLossPorts = {
   restorer: StopGenerationSource                // 연결 표의 step에 넘기는 바로 그 복원기 객체
   clock: Clock                                  // ports.ts. 장부 시계와 같은 벽시계. markLostFor의 now와 결과의 at에만 쓴다
   monotonic: MonotonicClock                     // { now(): number }. 끊긴 시간을 재는 단조 시계(0 이상의 안전 정수 ms)
+  beatValid?: () => boolean                     // 박자 유효 문. 실행기마다 markLostFor 바로 앞. 빠지면 늘 유효(조립은 반드시 넘긴다)
 }
 LinkLossPolicy = { judgeMs: number }           // RUN_LEASE_MAX_MS 이상의 안전 정수
 LinkLossTickInput = { watch: WatchEntry[] }    // 앞 박자의 결과 watch 그대로
@@ -32,6 +33,7 @@ LinkLossTickResult =
 | `unknown` + `reason` | 판정하지 않았다: `never_seen`(이 프로세스가 그 연결을 본 적이 없다), `clock_regressed`(단조 시계가 `absentSince`보다 이르다), `read_unknown`(그 실행기의 실행 줄의 꼴이 틀리다) |
 | `not_worker` | 세션 실행기. 연결 표가 세션 실행기의 연결을 아직 인정하지 않는다(맞춤 요청은 작업자 주체만 받는다) |
 | `moved` + `absentSince`, `at`, `runs` | `markLostFor`가 옮겼다. `runs`는 장부의 답(`runId`, `runGeneration`, `before`, `after`)이고 `before`는 진행 중 상태(`preparing`·`running`·`stopping`), `after`는 `unknown_running`이다. 빈 목록이면 부르는 순간 옮길 실행이 없었다. `at`은 장부에 넘긴 벽시계 시각이다 |
+| `beat_closed` + `absentSince` | `markLostFor` 바로 앞에서 본 박자 유효 문이 닫혔다. 부르지 않았다 |
 | `ledger_failed` + `absentSince`, `reason` | 옮김으로 세지 않는다. 장부의 거절 이름(`ledger_unwritable` 등), `threw`(장부 포트가 던짐), `malformed_answer`(답이 정의 밖). 뒤의 둘은 옮겼는지 모른다 |
 
 결과의 항목은 종료가 확인되지 않은 실행(`preparing`·`running`·`stopping`이고 `stopReceiptId`가 없음)을 쥔 실행기와 실행 줄의 꼴이 틀린 실행기만이고, 주체 이름 순이다. 결과에는 원문·자격·봉투가 없다.
@@ -69,6 +71,7 @@ LinkLossTickResult =
 ## 장부 쓰기와 실패
 
 - **그 실행기의 정확한 이름으로 한 번만.** 연결 표의 주체 이름과 장부의 지정 실행기를 문자열로 대조한다. 저장소 ID만 다른 이름도 다른 실행기다. `markLost`(전부 옮기기)는 포트에 없다.
+- **부르기 바로 앞에서 박자 유효 문을 본다.** 앞 실행기의 장부 쓰기 안에서 박자 기한이 지났을 수 있으므로 실행기마다 장부 포트 객체를 얻은 뒤 `markLostFor` 바로 앞에서 선택 포트 `beatValid`를 본다(포트 객체의 접근자가 유효 문 뒤에 돌지 않게). `true`가 아니거나 던지면 그 실행기는 부르지 않고 `beat_closed`(+ `absentSince`)이며 기억은 그대로 넘어간다. 그 차례(장부 포트 객체·메서드·인자 → 유효 문 → 호출)는 `send-gate.ts`의 `callAfterGate`가 한다. 포트가 빠지면 늘 유효다(이 부품 단독의 쓰임).
 - **장부의 거절은 그 이름 그대로 `ledger_failed`이다.** 기억의 `absentSince`는 남는다. 다음 박자가 실제로 다시 부르는지는 장부와 복원기의 상태에 달렸다.
   - 장부가 건강한 채 거절만 돌려준 경우: 다음 박자가 다시 판정해 다시 부른다.
   - **실제 장부의 쓰기가 실패한 경우:** 장부는 실패 상태에 들어가고, 부르는 쪽은 장부를 다시 열어 복원하는 경로로 보낸다. 그 뒤 이 박자의 동작은 세 단계로 갈린다(복원기의 세대는 `src/ledger/restore.ts`의 `stopGeneration`).

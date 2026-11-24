@@ -59,10 +59,12 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
   const inventory = Object.fromEntries(files.map((file) => [file, sendSites(src(file))]).filter(([, sites]) => sites.length > 0));
   expect(inventory).toEqual({
     // 시작 봉투가 포트에 닿는 한 자리(표식 → 마지막 확인 → 호출). read는 표식 전에 수신 객체의 send를 얻는 자리다.
-    [GATE]: ["read", "reflect"],
-    // 취소·갱신·조회·확정을 내는 박자. 시작 봉투를 만들 수 없음을 아래 시험이 본다.
+    // reflect 둘: 포트 호출 한 자리와, 쥔 장부·표식 메서드를 박자 유효 문 뒤에 부르는 callAfterGate 한 자리(아래 "callAfterGate" 시험이
+    // 그 본문과 부르는 줄을 글자 그대로 본다).
+    [GATE]: ["read", "reflect", "reflect"],
+    // 취소를 내는 도구 어댑터. 시작 봉투를 만들 수 없음을 아래 시험이 본다. 수명 박자(갱신·취소·조회)와 재전송·배정은 공유 함수로만
+    // 싣으므로 이 목록에 없다: 수명 박자에 직접 송신이 다시 생기면 이 목록이 달라진다.
     "src/supervisor/dispatch/cancel.ts": ["method_call"],
-    "src/supervisor/dispatch/life-loop.ts": ["method_call", "method_call", "method_call"],
     // 실행기 → 감독 연결. 감독 모듈을 import하지 않음을 아래 시험이 본다.
     "src/executor/link.ts": ["method_call", "method_call"],
     "src/executor/worker.ts": ["method_call", "method_call"],
@@ -147,9 +149,38 @@ test("정적: 시작 봉투를 만드는 모듈은 배정·시작 박자와 재�
   ]);
   expect(sendSites(src("src/supervisor/dispatch/envelopes.ts"))).toEqual([]);
   // 감독 안에서 봉투에 서명하는 자리는 봉투 모듈과 정지 동기화의 답(stop_sync_reply만 받는 포트)뿐이다.
+  // 감독 조립의 서명기(signer.ts)는 Signer·ReplyTools 포트의 구현이다: 받은 입력을 감독 키로 sealEnvelope에 그대로 넘기는 두 줄뿐이고
+  // 봉투를 만들거나 싣지 않는다(아래 SIGNER 단언). 봉투가 만들어지는 자리는 그대로 봉투 모듈과 정지 동기화의 답이다.
   const sealing = files.filter((file) => file.startsWith("src/supervisor/") && sealCalls(src(file)) > 0);
-  expect(sealing).toEqual(["src/supervisor/dispatch/envelopes.ts", "src/supervisor/transport/connections.ts"]);
+  expect(sealing).toEqual(["src/supervisor/dispatch/envelopes.ts", SIGNER, "src/supervisor/transport/connections.ts"]);
   expect(src("src/supervisor/transport/connections.ts")).toContain('seal(input: SealInput<"stop_sync_reply">): Envelope;');
+  expect(signerReach(src(SIGNER))).toEqual([]);
+});
+
+const SIGNER = "src/supervisor/runtime/signer.ts";
+// 서명기에서 봉하는 줄은 입력을 그대로 넘기는 이 둘뿐이어야 한다. 초안·시작 글자·송신 포트·표식에 닿는 글자가 있으면 그 이름이 드러난다.
+const SIGNER_SEALS = ["const signer: Signer = { seal: (input) => sealEnvelope(input, key) };", "seal: (input) => sealEnvelope(input, key),"];
+const signerReach = (source: string): string[] => [
+  ...CANNOT_SEND.filter(([name, shape]) => name !== "seal" && shape.test(source)).map(([name]) => name),
+  ...(/\bmarkStartDispatch\b/.test(source) ? ["markStartDispatch"] : []),
+  ...source
+    .split("\n")
+    .filter((line) => sealCalls(line) > 0)
+    .map((line) => line.trim())
+    .filter((line) => !SIGNER_SEALS.includes(line)),
+];
+
+test("대조군: 서명기에 초안·시작 글자·송신 포트나 다른 봉하기를 넣으면 위 단언이 잡는다", () => {
+  expect(sealCalls(src(SIGNER))).toBe(2);
+  for (const [snippet, expected] of [
+    ["const d = startDraft({ run });", ["startDraft"]],
+    ['const a = "task_start";', ["task_start"]],
+    ["readonly sink: InstructionSink;", ["sink"]],
+    ["ledger.markStartDispatch(x);", ["markStartDispatch"]],
+    ["const e = sealEnvelope({ ...input, action: other }, key);", ["const e = sealEnvelope({ ...input, action: other }, key);"]],
+  ] as const) {
+    expect([snippet, signerReach(`${src(SIGNER)}\n${snippet}`)]).toEqual([snippet, [...expected]]);
+  }
 });
 
 const UNRECEIVED = "src/supervisor/dispatch/unreceived.ts";
@@ -226,22 +257,106 @@ test("정적: 공유 함수 밖의 송신 자리는 시작 봉투를 만들 수 
   }
 });
 
-test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례는 표식 → 마지막 확인 → 포트 호출이다", () => {
-  const marking = files.filter((file) => !file.startsWith("src/ledger/") && /\bmarkStartDispatch\s*\(/.test(src(file)));
-  expect(marking).toEqual([GATE]);
+// 표식 메서드에 닿는 자리가 있는 파일. 두 판별을 함께 둔다: 점 속성 읽기(쥔 메서드로 부르는 callAfterGate의 꼴, 다른 파일이 메서드를
+// 쥐어 부르는 꼴)와 원래 이름의 호출(구조 분해해 같은 이름으로 부르는 꼴. 점이 없어 앞 판별이 보지 못한다). 타입의 Pick 글자는
+// 둘 다 아니다.
+const MARK_READ = /\.markStartDispatch\b/;
+const MARK_CALL = /\bmarkStartDispatch\s*\(/;
+const markingFiles = (sources: ReadonlyMap<string, string>) =>
+  [...sources].filter(([file, source]) => !file.startsWith("src/ledger/") && (MARK_READ.test(source) || MARK_CALL.test(source))).map(([file]) => file);
+
+test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례는 입력의 칸 쥐기 → 표식 → 마지막 확인 → 포트 호출이다", () => {
+  expect(markingFiles(sources)).toEqual([GATE]);
   const gate = src(GATE);
   const body = gate.slice(gate.indexOf("export async function sendInstruction"));
   const at = (needle: string) => body.indexOf(needle);
-  expect([at("send = (target as InstructionSink).send"), at("mark(envelope, start)"), at("start.lastCheck?.()"), at("Reflect.apply(")].every((index) => index >= 0)).toBe(true);
-  expect(at("send = (target as InstructionSink).send")).toBeLessThan(at("mark(envelope, start)"));
-  expect(at("mark(envelope, start)")).toBeLessThan(at("start.lastCheck?.()"));
-  expect(at("start.lastCheck?.()")).toBeLessThan(at("Reflect.apply("));
+  const order = [
+    "send = (target as InstructionSink).send",
+    "const gate = holdBeatValid(holder)",
+    "holdStart(start, envelope)",
+    "const marking = callAfterGate(",
+    "if (!gate()) return",
+    "const verdict = verdictOf(check, stops)",
+    "await Reflect.apply(",
+  ];
+  expect(order.map((needle) => [needle, at(needle) >= 0])).toEqual(order.map((needle) => [needle, true]));
+  for (let index = 1; index < order.length; index++) expect([order[index], at(order[index - 1] as string) < at(order[index] as string)]).toEqual([order[index], true]);
+  // 입력 객체(holder·포트·start·봉투)의 칸은 진입 때 한 번만 읽는다. 첫 유효 문(표식의 callAfterGate) 뒤 본문에는 그 칸 읽기가 없다:
+  // 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간을 유효 문도 마지막 확인도 보지 못한다. start의 칸은 holdStart, 유효 문은 holdBeatValid가 읽는다.
+  expect(body.slice(at("const marking = callAfterGate(")).match(/\b(?:holder|start|target|envelope|marker)\s*(?:\?\.|\.)\s*[\w$]+/g) ?? []).toEqual([]);
+  expect(body.match(/\bstart\s*(?:\?\.|\.)\s*[\w$]+/g) ?? []).toEqual([]);
+  expect(body.match(/\bholder\s*(?:\?\.|\.)\s*[\w$]+/g) ?? []).toEqual(["holder.sink"]);
+  const helpers = gate.slice(gate.indexOf("function holdBeatValid("), gate.indexOf("export async function sendInstruction"));
+  for (const read of ["const fn: unknown = holder.beatValid;", "at = start.at;", "lastCheck = start.lastCheck;", "stops = start.stops;", "const marker = start.marker;", "mark = { receiver: marker, fn: marker.markStartDispatch };"]) {
+    expect([read, helpers.includes(read)]).toEqual([read, true]);
+  }
   // 표식과 포트 호출 사이에 기다림이 없다(첫 await가 포트 호출이다). 뒤에 줄바꿈이 오는 await도 낱말로 찾는다.
   // .then( 콜백으로 포트 호출을 미루는 것처럼 await 낱말이 없는 양보는 보지 못한다(send-gate.md "정적 시험").
   expect(body.search(/\bawait\b/)).toBe(at("await Reflect.apply("));
   // 공유 함수는 시계·난수를 직접 부르지 않는다.
   for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process."]) {
     expect([banned, gate.includes(banned)]).toEqual([banned, false]);
+  }
+});
+
+// 쥔 함수를 박자 유효 문 뒤에 부르는 공유 함수(send-gate.ts의 callAfterGate). 본문은 얻기(get) → 유효 문(open) → Reflect.apply 한 번이고,
+// 이 이름이 나오는 줄은 import 셋과 장부 쓰기 다섯·송신 표식 하나의 부르는 줄뿐이다. 이 함수로 송신 포트를 부르거나(다른 줄),
+// 다른 이름에 담아 부르는 자리가 생기면 줄 목록이 달라진다. 부르는 줄은 쥘 메서드 이름까지 글자 그대로 견준다.
+const squash = (text: string) => text.replace(/\s+/g, " ").trim();
+const LIFE = "src/supervisor/dispatch/life-loop.ts";
+const CALL_AFTER_GATE = "export function callAfterGate(get: () => { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }, open: () => boolean): GatedCall { let held: { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }; try { held = get(); } catch { return { kind: \"threw\" }; } const { receiver, fn, args } = held; if (typeof fn !== \"function\") return { kind: \"threw\" }; if (!open()) return { kind: \"closed\" }; try { return { kind: \"called\", value: Reflect.apply(fn, receiver, args) }; } catch { return { kind: \"threw\" }; } }";
+const GATED_LINES = [
+  "src/supervisor/dispatch/assign-loop.ts: const call = callAfterGate(() => { const ledger = (held = ports.ledger); return { receiver: ledger, fn: ledger.startRun, args: [startInput] }; }, () => beatValid(ports));",
+  "src/supervisor/dispatch/assign-loop.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.assignToolRequest, args: [assignInput] }; }, () => beatValid(ports));",
+  "src/supervisor/dispatch/assign-loop.ts: import { callAfterGate, type MarkFailure, sendInstruction } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/life-loop.ts: const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordRenewInstruction, args: [renewInput] }; }, () => beatValid(ctx.ports));",
+  "src/supervisor/dispatch/life-loop.ts: const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordStopInstruction, args: [stopInput] }; }, () => beatValid(ctx.ports));",
+  "src/supervisor/dispatch/life-loop.ts: import { callAfterGate } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/link-loss.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markLostFor, args: [lostInput] }; }, () => beatValid(ports));",
+  "src/supervisor/dispatch/link-loss.ts: import { callAfterGate } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/send-gate.ts: const marking = callAfterGate(() => ({ receiver: mark?.receiver, fn: mark?.fn, args: [input] }), gate);"
+];
+const gatedLines = (sources: ReadonlyMap<string, string>) =>
+  [...sources]
+    .flatMap(([file, source]) =>
+      source
+        .split("\n")
+        .filter((line) => /\bcallAfterGate\b/.test(line) && !line.includes("export function callAfterGate("))
+        .map((line) => `${file}: ${line.trim()}`),
+    )
+    .sort();
+const gatedBody = (source: string) => {
+  const start = source.indexOf("export function callAfterGate(");
+  return start < 0 ? null : squash(source.slice(start, source.indexOf("\n}\n", start) + 2));
+};
+
+test("정적: callAfterGate는 얻기 → 박자 유효 문 → Reflect.apply 한 번이고, 그 이름은 장부 쓰기 다섯·송신 표식 하나를 부르는 줄과 import에만 있다", () => {
+  expect(gatedBody(src(GATE))).toBe(CALL_AFTER_GATE);
+  expect(gatedLines(sources)).toEqual(GATED_LINES);
+});
+
+test("대조군: callAfterGate로 송신 포트를 부르거나 다른 이름에 담거나, 본문에서 얻기를 유효 문 뒤로 옮기면 위 단언이 잡는다", () => {
+  for (const injected of [
+    "const sent = callAfterGate(() => ({ receiver: sink, fn: sink.send, args: [envelope] }), () => true);",
+    "const relay = callAfterGate;",
+  ]) {
+    const changed = new Map(sources);
+    changed.set(LIFE, `${src(LIFE)}\n${injected}`);
+    expect([injected, gatedLines(changed).length]).toEqual([injected, GATED_LINES.length + 1]);
+  }
+  const moved = src(GATE).replace("if (!open()) return { kind: \"closed\" };", "").replace("held = get();", "if (!open()) return { kind: \"closed\" };\n    held = get();");
+  expect([moved !== src(GATE), gatedBody(moved) === CALL_AFTER_GATE]).toEqual([true, false]);
+});
+
+test("대조군: 다른 파일에서 표식 메서드를 점 속성으로 쥐어 부르거나, 구조 분해해 원래 이름으로 부르면 위 판별이 잡는다", () => {
+  const ASSIGN = "src/supervisor/dispatch/assign-loop.ts";
+  for (const [snippet, read, call] of [
+    ["const held = port.markStartDispatch; return held(input);", true, false],
+    ["const { markStartDispatch } = port; return markStartDispatch(input);", false, true],
+  ] as const) {
+    const changed = new Map(sources);
+    changed.set(ASSIGN, `${src(ASSIGN)}\nfunction staticOnly(port: never, input: never) { ${snippet} }\n`);
+    expect([snippet, MARK_READ.test(snippet), MARK_CALL.test(snippet), markingFiles(changed)]).toEqual([snippet, read, call, [ASSIGN, GATE].sort()]);
   }
 });
 
