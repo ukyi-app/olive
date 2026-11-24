@@ -191,6 +191,23 @@ test("줄 수 없음과 무응답이 다른 값: unavailable은 감독의 답이
   expect(noReply.answered).toBe(false);
 });
 
+test("결과 객체는 닫힌 두 꼴이다: 남는 칸이나 두 갈래의 칸이 함께 온 결과는 다른 결과와 무관하게 malformed다", async () => {
+  const digest = candidateDigestOf(SHORT);
+  const [whole] = await fetchAll(SHORT);
+  const answered = whole as { answered: true; reply: CandidateChunkReply };
+  const timeout = { answered: false, cause: "timeout" } as const;
+  const rejected: CandidateAssembly = { kind: "rejected", fault: "malformed" };
+  expect(assembleCandidate(digest, [answered]).kind).toBe("complete");
+  expect(assembleCandidate(digest, [timeout])).toEqual({ kind: "unknown", cause: "timeout" });
+
+  const open = [{ ...answered, note: 1 }, { ...answered, cause: "timeout" }, { ...timeout, note: 1 }, { ...timeout, reply: answered.reply }, { ...timeout, reply: undefined }];
+  for (const bad of open) {
+    expect(assembleCandidate(digest, [bad as never]), Object.keys(bad).join(",")).toEqual(rejected);
+    // 다른 묻기의 무응답·줄 수 없음보다 먼저 거절한다(꼴이 틀린 답이 맨 앞).
+    expect(assembleCandidate(digest, [bad as never, { answered: false, cause: "disconnected" }]), Object.keys(bad).join(",")).toEqual(rejected);
+  }
+});
+
 test("조각 수의 상한: 한 후보는 최대 32조각이다. 32조각은 완성하고 33조각은 too_many_chunks로 거절한다", () => {
   expect(limits.CANDIDATE_MAX_CHUNKS).toBe(32);
   // 위치마다 1바이트 조각으로 답한다(감독이 조각을 꽉 채우지 않은 경우). 같은 위치의 재시도는 결과를 바꿀 뿐 조각 수를 늘리지 않는다.

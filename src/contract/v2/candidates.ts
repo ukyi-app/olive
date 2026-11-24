@@ -28,7 +28,8 @@ export interface CandidateChunkReply {
 }
 
 // 현관이 한 번 물어 얻은 것. 답을 받지 못했으면(시간 초과, 끊김, 받은 답이 거절됨) 내용이 없다는 뜻이 아니다. 그래서 unavailable과
-// 다른 갈래로 둔다.
+// 다른 갈래로 둔다. 두 꼴 모두 닫혀 있다: 칸이 정확히 둘이고, 남는 칸이나 다른 갈래의 칸이 함께 오면 assembleCandidate가 malformed로
+// 거절한다. 현관이 자기 코드로 만드는 값이라 열어 두면 같은 결과를 두 구현이 다르게 판정한다.
 export type CandidateFetchOutcome = { answered: true; reply: CandidateChunkReply } | { answered: false; cause: NoAnswerCause };
 
 export const ASSEMBLY_FAULTS = ["malformed", "other_candidate", "too_many_chunks", "size_mismatch", "order", "overlap", "gap", "digest_mismatch"] as const;
@@ -109,6 +110,7 @@ export function assembleCandidate(candidateDigest: string, outcomes: readonly Ca
   let unanswered: NoAnswerCause | null = null;
   for (const outcome of outcomes as readonly unknown[]) {
     if (!isPlainObject(outcome)) return rejected("malformed");
+    if (Object.keys(outcome).length !== 2) return rejected("malformed");
     if (outcome.answered === false) {
       if (!NO_ANSWER_CAUSES.includes(outcome.cause)) return rejected("malformed");
       unanswered ??= outcome.cause as NoAnswerCause;
