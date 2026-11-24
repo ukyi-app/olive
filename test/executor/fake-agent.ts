@@ -146,4 +146,5 @@ export const realTimers = {
     const timer = setTimeout(fire, ms);
     return () => clearTimeout(timer);
   },
+  now: () => performance.now(),
 };

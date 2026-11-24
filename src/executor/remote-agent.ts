@@ -4,7 +4,7 @@
 // 지키는 것(대조 표와 까닭은 remote-agent.md):
 // - survivors()가 0을 돌려주는 때는 하나다: 믿는 연결에서, 시작 응답을 기다리는 중도 실행 중도 아닌 단계(대기, 또는 끝남)에서 새로 보낸
 //   count의 답이 보낸 때와 같은 단계에서 replyWaitMs 안에 왔고, 그 count보다 먼저 보낸 가장 최근의 terminate도 replyWaitMs 안에 답했고,
-//   그 답이 0이다. 그 밖은 모두 null(모름)이다.
+//   그 답이 0이다. 그 밖은 모두 null(모름)이다. "안에"는 받은 때의 주입 단조 시계로 잰다(타이머 콜백이 늦게 돌아도 같다).
 // - 실행 중(시작을 보낸 뒤 그 실행이 0으로 닫히기 전) 링크가 끊기거나, 연결이 살아 있는데 두 번째 연결이 오거나, 링크가 계약 밖의 말을
 //   하면 이 객체는 대리를 다시 믿지 않는다(잠금). 잠긴 뒤에는 0을 말하지 않고 띄우지도 않는다. 새 hello로 풀리지 않는다.
 //   제어는 새 대리의 hello와 옛 공간에 남은 프로세스가 연 연결을 말로 가를 수 없기 때문이다. 회복은 이 파일 밖의 일이다.
@@ -29,6 +29,9 @@ export interface AgentLinkTransport {
 export interface RemoteAgentRuntime {
   // ms 뒤에 한 번 부른다. 돌려준 함수로 취소한다.
   setTimer(ms: number, fire: () => void): () => void;
+  // 단조 시계(ms). 응답 기한은 이 값으로 판정한다. 타이머 콜백은 기한보다 늦게 돌 수 있어 콜백만으로는 늦은 답을 가르지 못한다.
+  // 함정: setTimer·worker의 상한 타이머와 같은 시간 기준이어야 하고, 벽시계(Date.now, worker의 now)를 넘기면 시각이 뛸 때 판정이 틀린다.
+  now(): number;
 }
 
 // 시작 메시지에 실을 그 실행의 기한·임대 끝(에포크 밀리초). 조립은 실행기 저장소의 기록을 그대로 넘긴다.
@@ -45,7 +48,7 @@ export interface RemoteAgentOptions {
   // 장부에 이 프로세스가 뜨기 전부터 끝을 맺지 못한 실행이 있고, 그 실행의 공간이 사라졌다는 따로 된 확인(파드 전체 재시작의 새 세대 표식 등)이
   // 없으면 true. 처음부터 잠근다: 그 실행을 지금 붙은 대리의 0으로 닫지 않는다.
   inheritedUnverified: boolean;
-  // terminate·count·시작의 답을 증거로 받는 기한(ms). worker의 exitWaitMs와 같은 값을 넘긴다.
+  // terminate·count·시작의 답을 증거로 받는 기한(ms, runtime.now 기준). worker의 exitWaitMs와 같은 값을 넘긴다.
   // 함정: 이보다 worker의 exitWaitMs가 짧으면 worker가 이미 버린 늦은 답을 여기서 증거로 받아 두 판단이 갈라진다.
   replyWaitMs: number;
   // 실행 중 임대 끝을 저장소와 맞춰 대리에게 renew로 보내는 간격.
@@ -88,6 +91,8 @@ export class AgentUnavailable extends Error {
 }
 
 interface Sink {
+  // 시작의 답이 기한 뒤에 왔다. 기한 타이머가 먼저 돈 것과 같게 띄우기를 끝낸다.
+  lapsed(): void;
   spawned(): void;
   output(bytes: Uint8Array): void;
   exited(message: Extract<AgentMessage, { type: "exited" }>): void;
@@ -97,7 +102,7 @@ interface Sink {
 // 시작(start)을 보낸 실행의 단계. 대기(idle)로 돌아오는 길은 끝남 단계에서 새로 보낸 count의 0 하나다.
 type Phase =
   | { readonly kind: "idle" }
-  | { readonly kind: "starting"; readonly runId: RunId; readonly limit: number; sink: Sink | null }
+  | { readonly kind: "starting"; readonly runId: RunId; readonly limit: number; readonly expiresAt: number; sink: Sink | null }
   | { readonly kind: "running"; readonly runId: RunId; readonly limit: number; bytes: number; sink: Sink | null }
   | { readonly kind: "ended"; readonly runId: RunId };
 
@@ -111,6 +116,7 @@ interface Connection {
 // - 요청은 답이 오거나 그 연결이 끝날 때만 놓는다. 기한에서 먼저 놓으면 worker의 물리적 정리 예약이 대리 쪽 정리보다 먼저 풀려
 //   다음 정리가 앞 정리와 겹친다고 볼 수 없게 된다.
 // - 기한(replyWaitMs)이 지나면 late만 표시한다. 그 뒤에 온 답은 요청을 놓을 뿐 0의 근거·단계 전이에 쓰지 않는다.
+//   늦음은 타이머 콜백과 받은 때의 시계(expiresAt) 둘로 본다. 콜백이 아직 돌지 않았어도 시계가 기한을 지났으면 늦은 답이다.
 // 늦은 답도 이 요청의 답으로만 쓰이고 다른 요청의 답이 되지 않는다(seq가 다르다).
 interface Pending {
   readonly kind: "terminate" | "count";
@@ -119,6 +125,8 @@ interface Pending {
   readonly phase: Phase;
   // count만: 이 count보다 먼저 보낸 가장 최근의 terminate. 대리는 차례대로 답하므로 count의 답이 올 때 그 답은 이미 와 있어야 한다.
   readonly after: Pending | null;
+  // 보낸 때의 runtime.now() + replyWaitMs. 이 시각 이상에 받은 답은 늦은 답이다.
+  readonly expiresAt: number;
   late: boolean;
   // terminate만: 답이 왔다(기한과 무관하게).
   answered: boolean;
@@ -209,10 +217,12 @@ export class RemoteAgent {
         return;
       case "spawned":
         if (phase.kind !== "starting" || phase.runId !== message.run_id) return this.lock("out_of_phase");
+        this.startLapsed(phase);
         this.phase = { kind: "running", runId: phase.runId, limit: phase.limit, bytes: 0, sink: phase.sink };
         return phase.sink?.spawned();
       case "not_spawned":
         if (phase.kind !== "starting" || phase.runId !== message.run_id) return this.lock("out_of_phase");
+        this.startLapsed(phase);
         this.phase = { kind: "ended", runId: phase.runId };
         return phase.sink?.failed(new LaunchFailed(message.reason === "aborted" || message.reason === "cleanup_busy" ? message.reason : "spawn_failed"));
       case "output": {
@@ -245,6 +255,8 @@ export class RemoteAgent {
     if (waiting === undefined || waiting.kind !== kind) return this.lock("unknown_reply");
     this.pending.delete(message.seq);
     waiting.cancelDeadline();
+    // 받은 때의 시계로 늦음을 고정한다. 뒤의 count가 이 terminate의 늦음을 볼 때도 이 판정을 쓴다.
+    if (this.options.runtime.now() >= waiting.expiresAt) waiting.late = true;
     if (message.type === "terminated") {
       waiting.answered = true;
       return waiting.settle("done");
@@ -262,6 +274,16 @@ export class RemoteAgent {
     if (waiting.late || this.phase !== waiting.phase) return false;
     const before = waiting.after;
     return before === null || (before.answered && !before.late);
+  }
+
+  // 기한이 지났는가. 답을 받은 요청은 받은 때의 판정(late)이고, 아직 기다리는 요청은 지금 시계로 본다.
+  private lapsed(waiting: Pending): boolean {
+    return waiting.late || (!waiting.answered && this.options.runtime.now() >= waiting.expiresAt);
+  }
+
+  // 시작의 답이 시작 기한 뒤에 왔으면 그 답으로 띄우기를 이어 가지 않는다(sink가 풀린다). 단계 전이는 받은 말대로 한다.
+  private startLapsed(phase: Extract<Phase, { kind: "starting" }>): void {
+    if (phase.sink !== null && this.options.runtime.now() >= phase.expiresAt) phase.sink.lapsed();
   }
 
   // 지금 연결을 닫는다. 시작을 보낸 뒤 0으로 닫히기 전이면 그 실행을 모름으로 두고 잠근다.
@@ -322,6 +344,7 @@ export class RemoteAgent {
         connection,
         phase,
         after: kind === "count" ? this.lastTerminate : null,
+        expiresAt: this.options.runtime.now() + this.options.replyWaitMs,
         late: false,
         answered: false,
         cancelDeadline: () => {},
@@ -350,7 +373,7 @@ export class RemoteAgent {
       // 이 실행의 종료 증거가 아니다(대리가 그 뒤에 띄울 수 있고, 중간 0 뒤에 76으로 닫힐 수 있다).
       if (this.phase.kind === "starting" || this.phase.kind === "running") return null;
       // 가장 최근의 terminate가 이미 기한을 넘겼으면 이 시도의 계수는 0의 근거가 되지 못한다. 묻지 않는다.
-      if (this.lastTerminate?.late) return null;
+      if (this.lastTerminate !== null && this.lapsed(this.lastTerminate)) return null;
       const answer = await this.request("count");
       return typeof answer === "number" || answer === null ? answer : null;
     },
@@ -397,7 +420,14 @@ export class RemoteAgent {
       let cancelRenew: () => void = () => {};
       let markExited!: () => void;
       const exited = new Promise<void>((done) => (markExited = done));
-      const phase: Extract<Phase, { kind: "starting" }> = { kind: "starting", runId, limit: hooks.outputBytes, sink: null };
+      // 시작 기한은 쓰기 전에 잡는다: 쓰는 동안 같은 호출 안에서 온 답도 이 기한으로 판정한다.
+      const phase: Extract<Phase, { kind: "starting" }> = {
+        kind: "starting",
+        runId,
+        limit: hooks.outputBytes,
+        expiresAt: this.options.runtime.now() + this.options.replyWaitMs,
+        sink: null,
+      };
       const finish = (outcome: LaunchOutcome | Error) => {
         if (finished) return;
         finished = true;
@@ -413,7 +443,14 @@ export class RemoteAgent {
       };
       // 원격 자식에는 이 컨테이너의 번호가 없다. 실수로 신호 함수에 넘겨도 던지게 NaN이다. 개별 신호는 보내지 않는다(끝내기는 terminate 하나).
       const child: SpawnedChild = { pid: Number.NaN, exited, signal: () => {} };
+      // 시작의 답이 기한 안에 없었다: 끝내기를 보내고(중단으로 이미 보냈으면 다시 보내지 않는다) 띄웠는지 모르는 채 돌아간다.
+      // 끝내기는 마이크로태스크로 미룬다: 받는 처리(handle) 안에서 불리면 그 안에서 링크에 다시 쓰게 되기 때문이다.
+      const lapse = () => {
+        if (giveUp === undefined) queueMicrotask(() => void hooks.terminate().catch(() => {}));
+        finish(new ExitUnconfirmed());
+      };
       phase.sink = {
+        lapsed: lapse,
         spawned: () => hooks.spawned(child),
         output: (bytes) => {
           chunks.push(bytes);
@@ -442,10 +479,10 @@ export class RemoteAgent {
       if (finished) return;
       // 시작의 답(spawned·not_spawned)도 replyWaitMs 안에 와야 한다. 넘으면 끝내기를 보내고 띄웠는지 모르는 채 돌아간다
       // (worker는 띄우지 않은 실행으로 세고, 단계가 starting이라 계수는 null이다). 단계는 남아 늦은 답을 받는다.
-      cancelStartWait = this.options.runtime.setTimer(this.options.replyWaitMs, () => {
+      // 콜백이 늦게 돌아도 기한 뒤의 답은 startLapsed가 같은 길로 보낸다.
+      cancelStartWait = this.options.runtime.setTimer(Math.max(0, phase.expiresAt - this.options.runtime.now()), () => {
         if (this.phase !== phase) return;
-        if (giveUp === undefined) void hooks.terminate().catch(() => {});
-        finish(new ExitUnconfirmed());
+        lapse();
       });
       cancelRenew = this.renewLoop(runId, window.lease_until);
       signal.addEventListener("abort", stop, { once: true });

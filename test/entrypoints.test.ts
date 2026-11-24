@@ -50,6 +50,12 @@ test("entrypoints: 경로 유닉스 소켓만 듣는다는 확인이 TCP·두 �
   const normal = "Bun.listen({ unix: path, socket: {} });";
   expect(unixOnly(normal)).toBe(true);
   expect(unixOnly(`${normal} ${normal}`)).toBe(false);
+  // 호출 수 규칙만 어기는 꼴: 타입 인자가 있으면 두 번째 호출이 ".listen("에 걸리지 않는다.
+  const typed = "Bun.listen<Data>({ unix: path, socket: {} });";
+  expect(unixOnly(typed)).toBe(true);
+  expect(unixOnly(`${typed} ${typed}`)).toBe(false);
+  // 호출 모양 규칙만 어기는 꼴: 주소 금지어 없이 옵션을 다른 값으로 넘긴다(그 안에 무엇이 있는지 이 확인은 모른다).
+  expect(unixOnly("Bun.listen<Data>(options);")).toBe(false);
   expect(unixOnly('Bun.listen({ hostname: "0.0.0.0", socket: {} });')).toBe(false);
   expect(unixOnly(`${normal} const tcp = { port: 9 };`)).toBe(false);
   expect(unixOnly(`${normal} server.listen(9);`)).toBe(false);

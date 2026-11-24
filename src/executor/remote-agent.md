@@ -13,7 +13,7 @@
 const remote = new RemoteAgent({
   credentialEnv: profile.credentialEnv,
   runWindow: (runId) => store.run(runId),       // 시작 메시지의 deadline_at·lease_until
-  runtime: { setTimer },                        // 주입 타이머(renew 맞춤, 응답 기한, 중단 뒤 끝 기다리기)
+  runtime: { setTimer, now },                   // 주입 타이머(renew 맞춤, 응답 기한, 중단 뒤 끝 기다리기)와 단조 시계(응답 기한의 판정)
   inheritedUnverified,                          // 아래 "뒤 조각"
   replyWaitMs: exitWaitMs,                      // worker에 넘기는 exitWaitMs와 같은 값
 });
@@ -25,7 +25,8 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 - 계획의 환경에서 `credentialEnv`의 값만 떼어 `start` 바로 뒤의 값 틀(`encodeCredentialFrame`)로 보내고, JSON의 `env`에는 싣지 않는다. 두 틀은 한 버퍼로 한 번에 쓴다(사이에 다른 쓰기가 끼지 않는다). 쓴 뒤 값과 틀을 0으로 채운다.
 - 실행 중(`starting`·`running`)에는 `renewEveryMs`(기본 1초)마다 `runWindow`의 임대 끝이 늘었는지 보고 늘었으면 `renew`를 보낸다. 대리의 스스로 집행이 worker의 임대를 따라가게 한다.
 - 중단(취소·기한·임대)이면 `terminate`를 보내고 `exitWaitMs` 안에 끝(`exited`·`unconfirmed`·`not_spawned`)을 듣지 못하면 `ExitUnconfirmed`로 돌아간다. 그 실행의 단계는 그대로 남아 늦게 온 끝을 받는다.
-- 시작을 보낸 뒤 `replyWaitMs` 안에 `spawned`·`not_spawned`가 없으면 `terminate`를 보내고 `ExitUnconfirmed`로 돌아간다. worker는 띄우지 않은 실행으로 세지만 단계가 `starting`이라 계수는 `null`이고 실행은 `unknown_running`이다. 단계는 남아 늦은 답을 받는다.
+- 시작을 보낸 뒤 `replyWaitMs` 안에 `spawned`·`not_spawned`가 없으면 `terminate`를 보내고 `ExitUnconfirmed`로 돌아간다. worker는 띄우지 않은 실행으로 세지만 단계가 `starting`이라 계수는 `null`이고 실행은 `unknown_running`이다. 단계는 남아 늦은 답을 받는다. 기한 타이머가 돌기 전에 기한 뒤의 답이 와도 같은 길이다(아래 "증거의 기한").
+- 이 모듈은 시계를 직접 읽지 않는다. `runtime.now`는 진입점이 넘기는 단조 시계(예: `performance.now`)이고, `setTimer`와 worker의 상한 타이머(전역 `setTimeout`)와 같은 시간 기준이어야 한다. worker의 `now`(벽시계)를 넘기지 않는다.
 
 ## 링크 대조 표
 
@@ -35,8 +36,9 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 |---|---|---|
 | `hello` | 연결의 첫 말 | 그 연결을 쓸 수 있다. 그 전에는 띄우지도 묻지도 않는다 |
 | `hello` 두 번째, `hello` 전의 다른 말 | 아무 때 | 디코더 거절 → 잠금(`link_rejected`) |
-| `spawned(run)` | `starting`, 같은 실행 | `running`. worker의 `spawned` 훅 |
-| `not_spawned(run, 사유)` | `starting`, 같은 실행 | `ended`. `LaunchFailed`(`aborted`·`cleanup_busy`는 그대로, 나머지는 `spawn_failed`) |
+| `spawned(run)` | `starting`, 같은 실행, 시작 기한 안 | `running`. worker의 `spawned` 훅 |
+| `not_spawned(run, 사유)` | `starting`, 같은 실행, 시작 기한 안 | `ended`. `LaunchFailed`(`aborted`·`cleanup_busy`는 그대로, 나머지는 `spawn_failed`) |
+| `spawned(run)`·`not_spawned(run)` | `starting`, 같은 실행, 시작 기한 뒤(타이머가 아직 안 돌았어도) | 띄우기는 `ExitUnconfirmed`로 끝나고 `terminate`를 보낸다(시작 상한과 같은 길). 단계는 받은 말대로 `running`·`ended`가 되지만 worker의 훅은 부르지 않는다 |
 | `output(run)` | `running`, 같은 실행, 합이 시작의 `output_bytes` 이하 | 모은다. 넘으면 잠금(`output_over_limit`) |
 | `exited(run)` | `running`, 같은 실행 | `ended`. 받은 때 worker의 `exited` 훅(제어가 끝을 아는 시각) |
 | `unconfirmed(run)` | `running`, 같은 실행 | `ended`. `ExitUnconfirmed` |
@@ -53,7 +55,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 | 호출 | 단계 | 동작 |
 |---|---|---|
 | `survivors()` | `starting`·`running` | 묻지 않고 `null`(띄우기 보류 중의 0, 프로그램이 끝나기 전의 중간 0은 이 실행의 종료 증거가 아니다) |
-| `survivors()` | `idle`·`ended`, 가장 최근의 `terminate`가 이미 기한을 넘김 | 묻지 않고 `null`(그 정리 시도의 계수는 0의 근거가 아니다) |
+| `survivors()` | `idle`·`ended`, 가장 최근의 `terminate`가 이미 기한을 넘김(답을 늦게 받았거나, 아직 답이 없고 시계가 기한을 지남) | 묻지 않고 `null`(그 정리 시도의 계수는 0의 근거가 아니다) |
 | `survivors()` | `idle`·`ended` | `count`를 새로 보내고 위 표대로 답을 기다린다 |
 | `survivors()`·`terminate()` | 연결 없음, `hello` 전, 잠금 | `null` / `AgentUnavailable`로 거절(worker는 거절을 삼키고 남은 수를 따로 센다) |
 | `launcher.run` | `idle`, 쓸 수 있는 연결, 준비된 실행 ID, `runWindow` 있음 | `start` + 값 틀 |
@@ -62,7 +64,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 응답 상한은 두 가지를 따로 쥔다.
 
-- **증거의 기한:** `terminate`·`count`·시작의 답은 `replyWaitMs` 안에 와야 증거로 쓴다. worker의 `bounded`도 같은 길이(`exitWaitMs`)로 기다리고, 이 객체의 기한 타이머가 먼저 걸리므로 worker가 버린 답을 여기서 받아들이지 않는다. `replyWaitMs`가 worker의 `exitWaitMs`보다 길면 이 보장이 깨진다.
+- **증거의 기한:** `terminate`·`count`·시작의 답은 `replyWaitMs` 안에 와야 증거로 쓴다. 요청마다 보낸 때의 `runtime.now() + replyWaitMs`를 만료 시각으로 쥐고, 답을 받은 때 시계가 그 시각 이상이면 늦은 답이다. 기한 타이머의 콜백은 기한보다 늦게 돌 수 있어(이벤트 루프가 밀리면 100ms 타이머가 100ms를 넘겨 돈다) 콜백만으로는 기한 직후의 답을 가르지 못한다. 만료 시각은 worker가 `bounded`의 타이머를 걸기 전에 잡히므로, 같은 길이(`exitWaitMs`)면 worker가 버린 답을 여기서 받아들이지 않는다. `replyWaitMs`가 worker의 `exitWaitMs`보다 길면 이 보장이 깨진다.
 - **물리적 대기:** 요청은 답이 오거나 그 연결이 끝날 때만 놓는다. 기한에서 먼저 놓으면 worker의 물리적 정리 예약이 대리 쪽 정리보다 먼저 풀린다. 늦은 답은 그 요청을 놓을 뿐이고 다른 요청의 답이 되지 않는다(seq가 다르다).
 
 늦은 `count`의 0은 `ended`를 닫지 않는다. 그 실행은 같은 연결에서 새로 끝내고 센 답이 기한 안에 올 때만 `idle`이 되고, 그 전에 연결이 끊기면 실행 중 끊김으로 잠긴다. 그래서 새 연결의 계수가 옛 실행을 닫지 못한다.
@@ -84,7 +86,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 ## 보장
 
-- `survivors()`가 0을 돌려주는 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle`이나 `ended` 단계에 새로 보낸 `count`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고, 그 `count`보다 먼저 보낸 가장 최근의 `terminate`도 `replyWaitMs` 안에 답했고, 그 값이 0이다.
+- `survivors()`가 0을 돌려주는 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle`이나 `ended` 단계에 새로 보낸 `count`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고, 그 `count`보다 먼저 보낸 가장 최근의 `terminate`도 `replyWaitMs` 안에 답했고, 그 값이 0이다. "안에"는 받은 때의 주입 단조 시계로 잰다.
 - `terminated`는 0으로 쓰이지 않는다. `terminate()`는 값을 돌려주지 않는다.
 - 서명하지 않는다. 대리의 답은 서명 없는 사실이고 영수증은 worker가 자기 키로 낸다.
 - 자격 값은 값 틀 하나에만 실린다. `state()`·`AgentUnavailable`·`AgentListenerRefused`에는 사유 이름만 있다.
@@ -105,13 +107,13 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 ## 뒤 조각이 지켜야 할 것
 
-- **진입점(O-c):** 대리의 `hello`를 기다린 뒤에 감독에 연결한다(상한 안에 없으면 연결 전에 정한 코드로 끝난다). 장부에 기동 전부터 끝을 맺지 못한 실행(`preparing`·`running`·`stopping`·`checking`·`unknown_running`)이 있고 그 공간이 사라졌다는 따로 된 확인이 없으면 `inheritedUnverified: true`로 만든다. 소켓 경로·권한·umask, 지난 소켓 파일의 처리, 실제 타이머를 여기서 정한다. `replyWaitMs`는 worker의 `exitWaitMs`와 같은 값으로 넘긴다. 환경 읽기는 진입점에만 둔다.
+- **진입점(O-c):** 대리의 `hello`를 기다린 뒤에 감독에 연결한다(상한 안에 없으면 연결 전에 정한 코드로 끝난다). 장부에 기동 전부터 끝을 맺지 못한 실행(`preparing`·`running`·`stopping`·`checking`·`unknown_running`)이 있고 그 공간이 사라졌다는 따로 된 확인이 없으면 `inheritedUnverified: true`로 만든다. 소켓 경로·권한·umask, 지난 소켓 파일의 처리, 실제 타이머를 여기서 정한다. `replyWaitMs`는 worker의 `exitWaitMs`와 같은 값으로 넘기고(다르게 조립하면 worker가 포기한 정리의 늦은 계수를 여기서 받아 두 판단이 갈라진다), `runtime.now`에는 worker의 상한 타이머와 같은 시간 기준의 단조 시계를 함께 넘긴다(벽시계를 넘기면 시각이 뛸 때 기한 판정이 worker와 갈라진다). 두 값은 설정 한 곳에서 두 객체에 같이 넘긴다. 환경 읽기는 진입점에만 둔다.
 - **차트(H-split):** 역할 컨테이너는 자기 PID 공간을 가진다(`shareProcessNamespace` 없음). 링크 폴더는 제어에 쓰기, 역할에 읽기 전용. 키·TLS·저장소 볼륨은 제어 컨테이너에만. 역할 컨테이너에 exec·프로브를 두지 않는다. 역할 uid ≠ 제어 uid.
 - **회복(D-104, 이 PR에 없음):** 실행 중 링크가 끊긴 실행, 잠금 뒤의 실행은 파드 전체 재시작과 init의 새 세대 표식으로 스스로 정리하고, 안 되면 관리자 닫기로 간다. 그 확인이 생기면 기동 때 `inheritedUnverified: false`로 넘긴다. 새 `hello`만으로 그 실행을 닫지 않는다.
 - 값 틀을 만드는 자리는 `credential-send.ts`와 이 파일 둘이다(`test/supervisor/dispatch/credential-send.test.ts`). 세 번째를 더하지 않는다.
 
 ## 시험
 
-- `test/executor/remote-agent.test.ts`: 시험이 대리 자리에서 링크의 말을 직접 정해 worker 전체를 지난다. 대조군(0 → `receipt_stopped`), 띄우기 보류, 대리 죽음과 새 `hello`, 늦은 답과 `terminated`만의 답, 늦은 끝내기, 늦은 최종 계수(원격 단계·연결 세대까지), 두 번째 연결(계수 대기 중, 쉬는 동안), 0 아닌 수·모름, 순서 틀림·모르는 말 다섯, 출력 상한, 시작 응답 상한, 잘린 틀, 끝의 시각, 깊은 결과(R16)·끝난 뒤 임대(R11)·nonce 장애(F10), 확인 없는 기동, 자격 값의 자리, renew 맞춤.
+- `test/executor/remote-agent.test.ts`: 시험이 대리 자리에서 링크의 말을 직접 정해 worker 전체를 지난다. 대조군(0 → `receipt_stopped`), 띄우기 보류, 대리 죽음과 새 `hello`, 늦은 답과 `terminated`만의 답, 늦은 끝내기, 늦은 최종 계수(원격 단계·연결 세대까지), 응답 시각(시계만 기한을 넘기고 타이머는 돌지 않은 계수·끝내기·시작의 답, 기한 직전 대조군), 두 번째 연결(계수 대기 중, 쉬는 동안), 0 아닌 수·모름, 순서 틀림·모르는 말 다섯, 출력 상한, 시작 응답 상한, 잘린 틀, 끝의 시각, 깊은 결과(R16)·끝난 뒤 임대(R11)·nonce 장애(F10), 확인 없는 기동, 자격 값의 자리, renew 맞춤.
 - `test/executor/agent-listener.test.ts`: 스크래치 경로 소켓에 실제 대리 핵심(`RoleAgent`, 가짜 launcher·정리 코어)을 붙여 `hello → start → exited → terminate → count 0`이 `receipt_stopped`의 0까지 닿는 것, 실제 대리의 끝내기 응답만·최종 계수만 늦은 경우, 실제 소켓의 두 번째 연결, 경로·권한 거절, 다 못 쓴 바이트의 이어 쓰기와 0 채우기, 이어 쓰기 예외의 정리, 공개 면.
 - `test/executor/remote-{worker,ordering,recovery,hardening,evidence}.test.ts`: 기존 실행기 시험 파일을 원격 구현과 가짜 대리(`fake-agent.ts`)로 한 번 더 돌린다. 링크로 옮길 수 없는 가짜 launcher를 전제한 넷(`support.ts`의 `DIRECT_ONLY`: 끝을 drain 전에 알리는 셋, 출력 상한을 넘기는 하나)만 등록하지 않고 그 이름을 대조한다. 그 넷이 지키던 보장 가운데 링크로 옮길 수 있는 것(깊은 결과의 종료 증거, 끝난 뒤 임대, nonce 장애 뒤의 완료)은 `remote-agent.test.ts`가 제어가 끝을 관측한 뒤를 기준으로 다시 본다. drain 중 임대 만료의 `completed`만 링크에서 성립하지 않는다("끝의 시각").

@@ -12,7 +12,7 @@ import type { ProcessCleanup } from "../../src/executor/containment.ts";
 import { bunLauncher, type Launcher, type SpawnedChild } from "../../src/executor/launcher.ts";
 import { type Connection, ExecutorLink, type Transport } from "../../src/executor/link.ts";
 import type { CredentialSource, RoleProfile } from "../../src/executor/profile.ts";
-import { RemoteAgent } from "../../src/executor/remote-agent.ts";
+import { RemoteAgent, type RemoteAgentRuntime } from "../../src/executor/remote-agent.ts";
 import { ExecutorStore, type StoreIo } from "../../src/executor/store.ts";
 import { type RunSpace, WorkerExecutor } from "../../src/executor/worker.ts";
 import { FakeAgent, realTimers } from "./fake-agent.ts";
@@ -354,7 +354,8 @@ export interface RigOptions {
   exitWaitMs?: number;
   stopWriteWaitMs?: number;
   // 원격 구현을 쓰고 대리 자리를 시험이 정한다(주지 않으면 implementation.remote일 때 FakeAgent).
-  remote?: { attach?: (remote: RemoteAgent) => void; inheritedUnverified?: boolean };
+  // runtime을 주면 원격 구현의 타이머·단조 시계를 시험이 정한다(주지 않으면 실제 타이머와 performance.now).
+  remote?: { attach?: (remote: RemoteAgent) => void; inheritedUnverified?: boolean; runtime?: RemoteAgentRuntime };
 }
 
 export async function rig(options: RigOptions = {}): Promise<Rig> {
@@ -373,7 +374,7 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
     remote = new RemoteAgent({
       credentialEnv: "OLIVE_CREDENTIAL",
       runWindow: (id) => store.run(id),
-      runtime: realTimers,
+      runtime: options.remote?.runtime ?? realTimers,
       inheritedUnverified: options.remote?.inheritedUnverified ?? false,
       // worker의 exitWaitMs와 같은 값(worker의 기본값 포함).
       replyWaitMs: options.exitWaitMs ?? limits.STOP_GRACE_MS + 5_000,

@@ -3,7 +3,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { type AgentMessage, ControlDecoder, encodeAgent, type ReceivedControl } from "../../src/agent/link.ts";
 import { limits } from "../../src/contract/v1/index.ts";
-import type { AgentLinkSession, DistrustReason, RemoteAgent } from "../../src/executor/remote-agent.ts";
+import type { AgentLinkSession, DistrustReason, RemoteAgent, RemoteAgentRuntime } from "../../src/executor/remote-agent.ts";
 import { encodeFrame } from "../../src/transport/framing.ts";
 import { fromSupervisor, pause, type Rig, type RigOptions, rig, scriptedIo, sha256, start, until } from "./support.ts";
 
@@ -71,14 +71,21 @@ afterEach(() => {
 
 async function make(
   agent: ManualAgent,
-  options: { dir?: string; clock?: Rig["clock"]; inheritedUnverified?: boolean; io?: RigOptions["io"]; exitWaitMs?: number } = {},
+  options: {
+    dir?: string;
+    clock?: Rig["clock"];
+    inheritedUnverified?: boolean;
+    io?: RigOptions["io"];
+    exitWaitMs?: number;
+    runtime?: RemoteAgentRuntime;
+  } = {},
 ) {
   const r = await rig({
     exitWaitMs: options.exitWaitMs ?? 100,
     dir: options.dir,
     clock: options.clock,
     io: options.io,
-    remote: { attach: (remote) => void agent.attach(remote), inheritedUnverified: options.inheritedUnverified },
+    remote: { attach: (remote) => void agent.attach(remote), inheritedUnverified: options.inheritedUnverified, runtime: options.runtime },
   });
   rigs.push(r);
   return r;
@@ -407,6 +414,90 @@ test("원격 시작 응답 상한: 시작을 보낸 뒤 replyWaitMs 안에 spawn
   expectUnknown(r, runId);
   expect(agent.types()).toEqual(["start", "terminate"]);
   expect(r.remote!.state()).toMatchObject({ connected: true, phase: "starting", distrusted: null });
+});
+
+// 원격 구현의 단조 시계와 타이머를 따로 움직인다. 타이머는 스스로 돌지 않는다(콜백이 기한보다 늦게 도는 경우).
+// worker의 상한은 실제 타이머(SLOW_MS)라 시험 안에서 울리지 않는다. 원격의 기한도 같은 SLOW_MS다(support.ts가 같은 값을 넘긴다).
+class FrozenRuntime implements RemoteAgentRuntime {
+  t = 1_000;
+  now = () => this.t;
+  setTimer(): () => void {
+    return () => {};
+  }
+}
+const SLOW_MS = 5_000;
+
+async function countAnsweredAt(elapsed: number) {
+  const agent = new ManualAgent();
+  agent.answers = { terminate: true };
+  const runtime = new FrozenRuntime();
+  const r = await make(agent, { exitWaitMs: SLOW_MS, runtime });
+  const { runId } = await launchedAndExited(r, agent);
+  await until(() => agent.types().includes("count"));
+  runtime.t += elapsed;
+  agent.say({ type: "counted", seq: agent.last("count").seq, survivors: 0 });
+  await r.worker.idle();
+  return { r, runId };
+}
+
+test("원격 응답 시각: 기한이 지난 뒤 받은 최종 0은 기한 타이머가 아직 돌지 않았어도 쓰지 않는다(null·ended·종료 0건)", async () => {
+  const { r, runId } = await countAnsweredAt(SLOW_MS);
+  expectUnknown(r, runId);
+  expect(r.transport.of("report_result")).toHaveLength(0);
+  expect(r.remote!.state()).toMatchObject({ connected: true, generation: 1, phase: "ended", distrusted: null });
+});
+
+test("원격 응답 시각 대조군: 기한 직전에 받은 최종 0은 채택해 종료 확인을 낸다", async () => {
+  const { r, runId } = await countAnsweredAt(SLOW_MS - 1);
+  expect(stateOf(r, runId)).toBe("ready_result");
+  expect(r.transport.of("receipt_stopped")).toHaveLength(1);
+  expect(r.remote!.state()).toMatchObject({ phase: "idle", distrusted: null });
+});
+
+test("원격 응답 시각: 기한이 지난 뒤 받은 terminated는 늦은 답이고, 그 시도의 계수는 0의 근거가 되지 못한다", async () => {
+  const agent = new ManualAgent();
+  agent.answers = { count: 0 };
+  const runtime = new FrozenRuntime();
+  const r = await make(agent, { exitWaitMs: SLOW_MS, runtime });
+  const { runId } = await launchedAndExited(r, agent);
+  await until(() => agent.types().includes("terminate"));
+  runtime.t += SLOW_MS;
+  agent.say({ type: "terminated", seq: agent.last("terminate").seq });
+  await r.worker.idle();
+  expectUnknown(r, runId);
+  expect(r.remote!.state()).toMatchObject({ connected: true, generation: 1, phase: "ended", distrusted: null });
+});
+
+test("원격 응답 시각: 답이 없는 terminate의 기한이 시계로 지났으면 타이머가 돌기 전이어도 계수를 묻지 않는다", async () => {
+  const agent = new ManualAgent();
+  const runtime = new FrozenRuntime();
+  const r = await make(agent, { exitWaitMs: SLOW_MS, runtime });
+  const { runId } = await launchedAndExited(r, agent);
+  await until(() => agent.types().includes("terminate"));
+  runtime.t += SLOW_MS;
+  expect(await r.remote!.cleanup.survivors()).toBeNull();
+  expect(agent.types()).toEqual(["start", "terminate"]);
+  // worker의 상한을 기다리지 않고 끝낸다: 답 없는 terminate를 끊김으로 거둔다(시작 뒤 끊김이라 잠금).
+  agent.session!.closed();
+  await r.worker.idle();
+  expectUnknown(r, runId);
+});
+
+test("원격 응답 시각: 시작 기한이 지난 뒤 받은 spawned로는 띄운 실행이 되지 않고 모름이다", async () => {
+  const agent = new ManualAgent();
+  agent.answers = { terminate: true, count: 0 };
+  const runtime = new FrozenRuntime();
+  const r = await make(agent, { exitWaitMs: SLOW_MS, runtime });
+  const { runId } = await start(r);
+  await until(() => agent.types().includes("start"));
+  runtime.t += SLOW_MS;
+  agent.say({ type: "spawned", run_id: runId });
+  await until(() => stateOf(r, runId) === "unknown_running", 1_000);
+  await r.worker.idle();
+  expectUnknown(r, runId);
+  expect(r.transport.of("receipt_started")).toHaveLength(0);
+  expect(agent.types()).toEqual(["start", "terminate"]);
+  expect(r.remote!.state()).toMatchObject({ connected: true, phase: "running", distrusted: null });
 });
 
 test("원격 잘린 틀: 쉬는 동안의 끊김도 틀 중간이면 잠그고, 틀 경계에서의 끊김은 잠그지 않는다", async () => {
