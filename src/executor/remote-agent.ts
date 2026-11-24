@@ -480,10 +480,15 @@ export class RemoteAgent {
       // 시작의 답(spawned·not_spawned)도 replyWaitMs 안에 와야 한다. 넘으면 끝내기를 보내고 띄웠는지 모르는 채 돌아간다
       // (worker는 띄우지 않은 실행으로 세고, 단계가 starting이라 계수는 null이다). 단계는 남아 늦은 답을 받는다.
       // 콜백이 늦게 돌아도 기한 뒤의 답은 startLapsed가 같은 길로 보낸다.
-      cancelStartWait = this.options.runtime.setTimer(Math.max(0, phase.expiresAt - this.options.runtime.now()), () => {
+      // 함정: 타이머는 소수 밀리초를 내림해 기한 직전에 돌 수 있다. 콜백에서 시계를 다시 보고 기한 전이면 남은 시간을 올림해 다시 건다
+      // (그대로 포기하면 기한 안에 온 정상 응답을 버린다). 올림이라 다시 거는 기다림은 1ms 이상이다.
+      const watchStart = () => {
         if (this.phase !== phase) return;
-        lapse();
-      });
+        const left = phase.expiresAt - this.options.runtime.now();
+        if (left > 0) cancelStartWait = this.options.runtime.setTimer(Math.ceil(left), watchStart);
+        else lapse();
+      };
+      cancelStartWait = this.options.runtime.setTimer(Math.max(0, Math.ceil(phase.expiresAt - this.options.runtime.now())), watchStart);
       cancelRenew = this.renewLoop(runId, window.lease_until);
       signal.addEventListener("abort", stop, { once: true });
       if (signal.aborted) stop();
