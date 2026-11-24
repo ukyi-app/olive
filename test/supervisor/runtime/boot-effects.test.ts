@@ -725,3 +725,185 @@ describe("모름과 시각을 읽지 못함(R5·R7)", () => {
     expect(await run.done).toBe(96);
   });
 });
+
+describe("허가 읽기 한 번의 예외와 치명 사유(접수 문의 한 번 읽기, 먼저 붙잡은 사유)", () => {
+  test("배정 박자의 접수 문은 허가를 한 번만 읽는다. 그 한 번이 던지면 답 처리 0·업무 쓰기 0으로 96 intake_unreadable이다", async () => {
+    for (const fault of [false, true]) {
+      const w = world();
+      const commits = countCommits(w);
+      const ticks = w.deps.make!.ticks!;
+      let armed = false;
+      let scoped = false;
+      let reads = 0;
+      const perCall: number[] = [];
+      w.deps = {
+        ...w.deps,
+        make: {
+          ...w.deps.make,
+          ticks: {
+            ...ticks,
+            assign: (ports, policy, now) => {
+              if (!armed) return ticks.assign(ports, policy, now);
+              const intake = {
+                ...ports.intake,
+                intakeOpen: () => {
+                  scoped = true;
+                  reads = 0;
+                  try {
+                    return ports.intake.intakeOpen();
+                  } finally {
+                    scoped = false;
+                    perCall.push(reads);
+                  }
+                },
+              };
+              return ticks.assign({ ...ports, intake }, policy, now);
+            },
+          },
+        },
+      };
+      const run = await running(w);
+      await untilStep(w, 5);
+      const restorer = w.captured.restorer!.value;
+      const read = restorer.intakeOpen.bind(restorer);
+      let thrown = 0;
+      restorer.intakeOpen = () => {
+        if (scoped) reads += 1;
+        if (fault && armed && scoped && thrown === 0) {
+          thrown += 1;
+          throw new Error("허가 읽기 실패");
+        }
+        return read();
+      };
+      const before = commits.length;
+      const pumps = w.captured.pumps;
+      armed = true;
+      await w.time.advance(w.settings.timing.beatEveryMs);
+      await w.time.advance(w.settings.timing.beatEveryMs);
+      const code = await run.stop();
+      if (fault) {
+        expect({ thrown, perCall: perCall.slice(0, 1), pumps: w.captured.pumps - pumps, writes: commits.slice(before), code, fatal: fatals(w) }).toEqual({ thrown: 1, perCall: [1], pumps: 0, writes: [], code: 96, fatal: ["intake_unreadable"] });
+      } else {
+        expect({ calls: perCall.length > 0, perCall: [...new Set(perCall)], code, fatal: fatals(w) }).toEqual({ calls: true, perCall: [1], code: 0, fatal: [] });
+      }
+    }
+  });
+
+  test("허가 읽기 한 번의 예외를 붙잡은 박자가 뒤이어 기한을 넘기면 치명 사유는 먼저 붙잡은 intake_unreadable이고 기한 넘김은 later 칸이다", async () => {
+    for (const late of [true, false]) {
+      const w = world();
+      const commits = countCommits(w);
+      const mono = w.deps.monoNow;
+      const log = w.deps.log;
+      let offset = 0;
+      let armed = false;
+      let thrown = 0;
+      let next = false;
+      w.deps = {
+        ...w.deps,
+        monoNow: () => mono() + offset,
+        log: (name, fields) => {
+          // 예외를 붙잡은 박자의 보고 포트 안에서 박자 기한 + 1ms가 흐른다.
+          if (armed && late && thrown === 1 && name === "beat" && offset === 0) offset += w.settings.timing.beatWaitMs + 1;
+          log(name, fields);
+        },
+      };
+      const run = await running(w);
+      await untilStep(w, 5);
+      const restorer = w.captured.restorer!.value;
+      const read = restorer.intakeOpen.bind(restorer);
+      const tick = w.fake.server.tick.bind(w.fake.server);
+      w.fake.server.tick = () => {
+        tick();
+        if (armed && thrown === 0) next = true;
+      };
+      restorer.intakeOpen = () => {
+        if (next) {
+          next = false;
+          thrown += 1;
+          throw new Error("허가 읽기 실패");
+        }
+        return read();
+      };
+      const before = commits.length;
+      armed = true;
+      await w.time.advance(w.settings.timing.beatEveryMs);
+      await w.time.advance(w.settings.timing.beatEveryMs);
+      expect({ late, thrown, writes: commits.slice(before), code: await run.stop(), fatal: named(w, "fatal").map((e) => e.fields) }).toEqual({
+        late,
+        thrown: 1,
+        writes: [],
+        code: 96,
+        fatal: late ? [{ reason: "intake_unreadable", later: "beat_lapsed" }] : [{ reason: "intake_unreadable" }],
+      });
+    }
+  });
+});
+
+describe("D-90 박자 안의 박자 유효 문", () => {
+  test("진행 중인 D-90 박자 안에서 부른 유효 문은 열림이고 단조 시계를 한 번 읽는다. 그동안 증거 포트·답 줄·서버를 부르지 않고 장부에 쓰지 않는다", async () => {
+    const w = world();
+    const commits = countCommits(w);
+    const mono = w.deps.monoNow;
+    let metering = false;
+    let clockReads = 0;
+    const ticks = w.deps.make!.ticks!;
+    let probe: ((ports: { readonly beatValid?: () => boolean }) => void) | null = null;
+    w.deps = {
+      ...w.deps,
+      monoNow: () => {
+        if (metering) clockReads += 1;
+        return mono();
+      },
+      make: {
+        ...w.deps.make,
+        ticks: {
+          ...ticks,
+          unreceived: (ports, now) => {
+            probe?.(ports);
+            return ticks.unreceived(ports, now);
+          },
+        },
+      },
+    };
+    const run = await running(w);
+    await untilStep(w, 5);
+    const touched: string[] = [];
+    let watching = false;
+    const seen = new WeakSet<object>();
+    const watch = (label: string, target: object) => {
+      if (seen.has(target)) return;
+      seen.add(target);
+      for (const key of Object.keys(target)) {
+        const value: unknown = (target as Record<string, unknown>)[key];
+        if (typeof value === "object" && value !== null) watch(`${label}.${key}`, value);
+        if (typeof value !== "function") continue;
+        (target as Record<string, unknown>)[key] = (...args: unknown[]) => {
+          if (watching) touched.push(`${label}.${key}`);
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+    };
+    watch("evidence", w.deps.evidence);
+    watch("lines", w.captured.lines!.value);
+    watch("server", w.fake.server);
+    const live: unknown[] = [];
+    probe = (ports) => {
+      const reads = clockReads;
+      const writes = commits.length;
+      metering = true;
+      watching = true;
+      try {
+        const value = ports.beatValid?.();
+        live.push({ value, clockReads: clockReads - reads, touched: [...touched], writes: commits.slice(writes) });
+      } finally {
+        metering = false;
+        watching = false;
+      }
+    };
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    probe = null;
+    expect(live).toEqual([{ value: true, clockReads: 1, touched: [], writes: [] }]);
+    expect(await run.stop()).toBe(0);
+  });
+});

@@ -34,6 +34,7 @@ import { newUuid, type RefusalReason as DraftRefusalReason, renewDraft, sealDraf
 import type { Clock, InstructionSink, Random, Signer } from "./ports.ts";
 import type { PendingQuery } from "./receipts.ts";
 import { callAfterGate } from "./send-gate.ts";
+import { sendInstruction } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 확정 기록(recordFinalizeInstruction)은 받지 않는다.
 export type LifeLoopLedger = Pick<Ledger, "listRuns" | "listInputs" | "instructionTimes" | "recordRenewInstruction" | "recordStopInstruction">;
@@ -60,7 +61,8 @@ export interface LifeLoopPorts {
   readonly signer: Signer;
   readonly sink: InstructionSink;
   // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 갱신·종료를 장부에 적기 직전, 마지막 외부 호출(시계 읽기)
-  // 뒤의 같은 동기 구간에서 본다. 거짓·던짐이면 적지 않는다. 접수 문(intake)과 다르다: 종료는 접수가 닫혀도 적지만 무효인 박자에서는
+  // 뒤의 같은 동기 구간에서 본다. 거짓·던짐이면 적지 않는다. 갱신·취소·조회를 싣기 직전에도 공유 송신 함수(send-gate.ts의
+  // sendInstruction)가 포트의 수신 객체와 send를 얻은 뒤 본다. 닫혔으면 싣지 않는다(not_sent, beat_closed). 접수 문(intake)과 다르다: 종료는 접수가 닫혀도 적지만 무효인 박자에서는
   // 적지 않는다. 빠지면 늘 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다: 기한을 넘긴 박자의 기록은 다음 감독의 재전송 대상이 된다.
   readonly beatValid?: () => boolean;
 }
@@ -80,7 +82,9 @@ export interface LifeTickInput {
 export type LifeRead = "runs" | "inputs" | "instruction_times";
 
 // 내보내지 못한 이유. 앞의 넷과 봉하기 거절은 봉투를 만들지 못한 것이고, renew_margin_lost·deadline_within_margin은 싣기 직전에 잰
-// 송신 규칙(갱신)이다. no_connection·too_late_to_send는 내보내기 포트의 거절, send_threw·send_answer_malformed는 포트가 연결에 실었는지 모른다.
+// 송신 규칙(갱신)이다. beat_closed·sink_unavailable은 공유 송신 함수가 포트를 부르지 않은 것이다(박자 유효 문이 닫힘, 포트의 수신
+// 객체나 send를 얻다 던지거나 함수가 아님). no_connection·too_late_to_send는 내보내기 포트의 거절, send_threw·send_answer_malformed는
+// 포트가 연결에 실었는지 모른다.
 export type NotSentReason =
   | "ledger_answer_malformed"
   | "draft_threw"
@@ -89,6 +93,8 @@ export type NotSentReason =
   | DraftRefusalReason
   | "renew_margin_lost"
   | "deadline_within_margin"
+  | "beat_closed"
+  | "sink_unavailable"
   | "no_connection"
   | "too_late_to_send"
   | "send_threw"
@@ -258,6 +264,18 @@ function beatValid(ports: LifeLoopPorts): boolean {
   } catch {
     return false;
   }
+}
+
+// 갱신·취소·조회 봉투를 싣는다. 송신 포트에 닿는 길은 재전송·배정과 같은 공유 함수 하나다: 포트의 수신 객체와 send를 얻고 → 박자
+// 유효 문 → 쥔 send 호출. 여기서 유효 문을 먼저 보거나 ports.sink.send를 직접 부르면 그 접근자 안에서 흐른 시간을 유효 문이 보지 못해
+// 박자 기한 정각 뒤에 포트에 들어간다(조회는 내보내기 포트의 등록부에 들어갔다 철회된다).
+// 이 봉투들은 시작이 아니므로 공유 함수의 unmarked·stopped는 나오지 않는다. 나오면 포트를 부르지 않은 것이라 sink_unavailable로 둔다.
+type Delivered = { readonly kind: "answered"; readonly answer: unknown } | { readonly kind: "threw" } | { readonly kind: "withheld"; readonly reason: "beat_closed" | "sink_unavailable" };
+async function deliver(ports: LifeLoopPorts, envelope: Envelope): Promise<Delivered> {
+  const gate = await sendInstruction(ports, envelope, null);
+  if (gate.kind === "answered") return { kind: "answered", answer: gate.answer };
+  if (gate.kind === "threw") return { kind: "threw" };
+  return { kind: "withheld", reason: gate.kind === "beat_closed" ? "beat_closed" : "sink_unavailable" };
 }
 
 function linkVerdict(links: LinkGate, executorId: string): "no_connection" | "link_unknown" | null {
@@ -659,12 +677,11 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
   if (Math.min(priorEnd, envelope.header.expires_at) - sendAt < RENEW_MARGIN_MS) return notSent("renew_margin_lost");
   if (deadlineAt - sendAt < RENEW_MARGIN_MS) return notSent("deadline_within_margin");
   trace.fallback = () => notSent("send_threw", { delivery: "unknown" });
-  let sent: unknown;
-  try {
-    sent = await ctx.ports.sink.send(envelope);
-  } catch {
-    return notSent("send_threw", { delivery: "unknown" });
-  }
+  // 장부의 갱신은 이미 적혔다. 싣지 않으면 그 기록의 식별값으로 renew_recorded_not_sent다(새 요청 ID로 다시 만들지 않는다).
+  const delivered = await deliver(ctx.ports, envelope);
+  if (delivered.kind === "withheld") return notSent(delivered.reason);
+  if (delivered.kind === "threw") return notSent("send_threw", { delivery: "unknown" });
+  const sent = delivered.answer;
   if (sent === "sent" && leaseUntil !== null) return { runId, outcome: "renew_sent", requestId, issuedAt: recordAt, leaseUntil, executorId };
   if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
   return notSent("send_answer_malformed", { delivery: "unknown" });
@@ -745,12 +762,11 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
     return notSent("draft_threw");
   }
   trace.fallback = () => notSent("send_threw", { delivery: "unknown" });
-  let sent: unknown;
-  try {
-    sent = await ctx.ports.sink.send(envelope);
-  } catch {
-    return notSent("send_threw", { delivery: "unknown" });
-  }
+  // 장부의 종료는 이미 적혔다. 싣지 않으면 그 기록의 식별값으로 stop_recorded_not_sent다.
+  const delivered = await deliver(ctx.ports, envelope);
+  if (delivered.kind === "withheld") return notSent(delivered.reason);
+  if (delivered.kind === "threw") return notSent("send_threw", { delivery: "unknown" });
+  const sent = delivered.answer;
   // 받는 쪽은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과를 읽다 던지지 않는다.
   if (sent === "sent") return { runId, outcome: "stop_sent", requestId, cancelReason, issuedAt: recordAt, executorId: recipient };
   if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
@@ -793,13 +809,11 @@ async function queryOne(ctx: Context, run: RunRow, cause: QueryCause): Promise<R
   // 기다리는 조회와 봉투 시한은 내보내기 전에 확보한다(포트가 넘겨받은 봉투를 고쳐도 바뀌지 않는다).
   const pending: PendingQuery = { requestId: envelope.header.request_id, recipient: envelope.header.recipient, runIds: [runId] };
   const expiresAt = envelope.header.expires_at;
-  let sent: unknown;
-  let threw = false;
-  try {
-    sent = await ctx.ports.sink.send(envelope);
-  } catch {
-    threw = true;
-  }
+  // 포트를 부르지 않았으면 실리지 않았다: 기다리는 조회에 넣지 않는다.
+  const delivered = await deliver(ctx.ports, envelope);
+  if (delivered.kind === "withheld") return notSent(at, delivered.reason);
+  const threw = delivered.kind === "threw";
+  const sent: unknown = delivered.kind === "answered" ? delivered.answer : undefined;
   if (!threw && (sent === "no_connection" || sent === "too_late_to_send")) return notSent(at, sent);
   // 실었거나 실렸을 수 있다. 답을 대조할 수 있게 시계를 읽기 전에 기다리는 조회에 넣는다(시계의 고장과 무관하다).
   ctx.pendingQueries.push(pending);

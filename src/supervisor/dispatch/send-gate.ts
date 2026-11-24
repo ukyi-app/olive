@@ -18,7 +18,8 @@ export interface StartMark<S> {
   // 표식에 적는 시각. 박자가 마지막으로 읽은 시각(장부와 같은 시계)이다.
   readonly at: number;
   // 표식을 커밋한 뒤 포트를 부르기 직전의 마지막 확인. null이면 싣고, 값이면 싣지 않고 그 값을 돌려준다.
-  // 표식은 커밋(fsync)에 시간이 걸리므로 시계로 재는 확인은 표식 뒤에 둔다. 이 확인과 포트 호출 사이에는 박자 유효 문 하나뿐이다.
+  // 표식은 커밋(fsync)에 시간이 걸리므로 시계로 재는 확인은 표식 뒤에 둔다. 박자 유효 문 바로 뒤에 부르고, 이 확인이 포트 호출 전의
+  // 마지막 외부 호출이다: 유효 문 안의 장부 읽기에 쓴 시간을 이 확인의 시계가 잰다.
   // 던지지 않아야 한다: 던지면 포트를 부르지 않은 채 이 함수 밖으로 예외가 나가고, 부르는 쪽은 실렸는지를 가르지 못한다.
   readonly lastCheck?: () => S | null;
 }
@@ -34,7 +35,7 @@ export type GateResult<S> =
   | { readonly kind: "unmarked"; readonly markReason: MarkFailure }
   // 시작의 마지막 확인이 싣지 말라고 했다. 표식이 커밋됐을 수 있다(포트를 얻지 못한 경우는 표식 없이 이 길로 온다).
   | { readonly kind: "stopped"; readonly value: S }
-  // 박자 유효 문이 닫혀 부르지 않았다. 표식 앞에서 닫혔으면 표식이 없고, 시작의 표식 뒤(송신 앞)에서 닫혔으면 표식이 커밋됐을 수 있다.
+  // 박자 유효 문이 닫혀 부르지 않았다. 표식 앞에서 닫혔으면 표식이 없고, 시작의 마지막 판정(표식 뒤)에서 닫혔으면 표식이 커밋됐을 수 있다.
   | { readonly kind: "beat_closed" };
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
@@ -117,9 +118,14 @@ function beatValid(holder: { readonly beatValid?: () => boolean }): boolean {
 }
 
 // 봉투 하나를 holder.sink에 싣는다. 시작이 아니면 표식·마지막 확인 없이 싣는다(start는 보지 않는다).
-// 차례: 포트의 수신 객체와 send를 얻는다 → (시작) 표식의 인자·표식 포트·메서드 → 박자 유효 문 → 표식 → 마지막 확인 → 박자 유효 문 → 포트 호출.
+// 차례: 포트의 수신 객체와 send를 얻는다 → (시작) 표식의 인자·표식 포트·메서드 → 박자 유효 문 → 표식 → 박자 유효 문 → 마지막 확인 → 포트 호출.
+// 시작이 아니면 수신 객체와 send를 얻은 뒤 박자 유효 문 → 포트 호출이다.
 // 박자 유효 문(holder.beatValid, 선택 칸)은 장부 쓰기(표식)와 송신 바로 앞에서 본다. 수신 객체와 send는 그 앞에서 얻는다:
 // 그 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간만큼 유효 문과 마지막 확인이 낡는다.
+// 시작의 송신 앞은 판정 하나다: 유효 문(조립에서는 장부 건강·허가 읽기 뒤 단조 시각) → 마지막 확인(시작 시한의 시계 읽기) → 호출.
+// 유효 문을 마지막 확인 뒤에 두면 그 안의 장부 읽기에 쓴 시간을 시작 시한이 보지 못한다(발행 + 19,001ms에 포트가 불린다).
+// 함정: 마지막 확인의 시계 읽기 자체에 걸린 시간은 박자 기한이 보지 못한다. 두 기한의 시계가 달라(박자는 단조, 시작 시한은 장부 시계)
+// 한 번의 읽기로 둘을 볼 수 없어서, 비용이 큰 장부 읽기를 앞에 두고 시계 읽기 하나를 맨 끝에 둔다.
 // 포트를 얻지 못하면 표식을 적지 않는다. 다만 시작이면 마지막 확인을 먼저 보고(재전송의 결과 차례), 그 확인도 표식 없이 부른다.
 export async function sendInstruction<S = never>(
   holder: { readonly sink: InstructionSink; readonly beatValid?: () => boolean },
@@ -148,12 +154,12 @@ export async function sendInstruction<S = never>(
     if (marking.kind === "closed") return { kind: "beat_closed" };
     const refused = markVerdict(marking);
     if (refused !== null) return { kind: "unmarked", markReason: refused };
+    if (!beatValid(holder)) return { kind: "beat_closed" };
     const stop = start.lastCheck?.() ?? null;
     if (stop !== null) return { kind: "stopped", value: stop };
-  }
-  if (!beatValid(holder)) return { kind: "beat_closed" };
+  } else if (!beatValid(holder)) return { kind: "beat_closed" };
   try {
-    // 박자 유효 문 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
+    // 마지막 판정(시작이 아니면 박자 유효 문) 뒤에는 이 호출 하나뿐이다. Reflect.apply는 함수의 call 같은 속성을 읽지 않고 this를 수신 객체로 둔다.
     return { kind: "answered", answer: await Reflect.apply(send, target, [envelope]) };
   } catch {
     return { kind: "threw" };

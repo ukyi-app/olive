@@ -466,8 +466,10 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const PENDING = { pending: true } as const;
   // 장부 건강과 허가를 읽는다. 모름을 건강·닫힘으로 읽지 않는다: 장부 건강을 읽다 던지면 ledger_unwritable, 허가를 읽다 던지면
   // intake_unreadable이다. 후자는 처음부터 닫힌 판정(기존 실행의 정리를 허락)과 다르다: 허가가 있는지조차 모르므로 끝낸다.
-  const judge = (): string | typeof PENDING | null => {
-    if (halted !== null) return halted;
+  // 판정과 그 판정에서 읽은 허가(open)를 함께 낸다. 접수 문은 이 open을 쓰고 허가를 다시 읽지 않는다: 다시 읽으면 그 둘째 읽기의
+  // 예외가 래치 밖에서 닫힌 접수로만 읽혀(배정 박자는 그냥 다음 주기로 간다) 감독이 계속 돈다.
+  const look = (): { readonly seen: string | typeof PENDING | null; readonly open: boolean } => {
+    if (halted !== null) return { seen: halted, open: false };
     let seen: string | typeof PENDING | null = null;
     let open = false;
     try {
@@ -487,8 +489,9 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     if (seen === null && granted && !open) seen = "intake_discarded";
     if (seen === null && !granted && open) seen = restoring ? PENDING : "intake_unaccepted";
     if (typeof seen === "string") halted = seen;
-    return seen;
+    return { seen, open };
   };
+  const judge = (): string | typeof PENDING | null => look().seen;
   // 끝낼 사유가 이미 생겼는가. 박자 앞뒤와 끝 차례가 본다.
   const haltReason = (): string | null => {
     const seen = judge();
@@ -499,14 +502,21 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   // 새 접수·시작·갱신·자격 값은 아래 접수 문이 따로 막는다. 박자 다섯의 beatValid 포트에 이 함수 그대로를 넘긴다(빠지면 그 부품은
   // 늘 유효로 읽으므로 조립이 빠뜨리면 안 된다: boot-effects.test.ts의 같은 객체 단언). 이 함수는 읽기만 한다(답 줄·증거·연결·장부를
   // 바꾸지 않는다): D-90 박자가 마지막 증거 확인 뒤에 부른다(unreceived.md, boot-effects.test.ts "읽기만 한다").
-  const effectsOpen = (): boolean => {
-    if (exitCode !== 0) return false;
-    if (judge() !== null) return false;
-    return !(beatLimit !== null && pastLimit(deps, beatLimit));
+  const SHUT = { open: false, intake: false } as const;
+  const effects = (): { readonly open: boolean; readonly intake: boolean } => {
+    if (exitCode !== 0) return SHUT;
+    const view = look();
+    if (view.seen !== null) return SHUT;
+    if (beatLimit !== null && pastLimit(deps, beatLimit)) return SHUT;
+    return { open: true, intake: view.open };
   };
-  // 박자 넷이 장부에 발급을 적기 직전에 보는 접수 문. 복원기의 접수에 효과의 문을 더한다. 정지 세대는 복원기 그대로다.
+  const effectsOpen = (): boolean => effects().open;
+  // 박자 넷이 장부에 발급을 적기 직전에 보는 접수 문. 효과의 문과 같은 판정 하나에서 허가를 한 번 읽고 그 값을 쓴다. 정지 세대는 복원기 그대로다.
   const intake = {
-    intakeOpen: (): boolean => effectsOpen() && restorer.intakeOpen() === true,
+    intakeOpen: (): boolean => {
+      const seen = effects();
+      return seen.open && seen.intake;
+    },
     stopGeneration: (): number | null => restorer.stopGeneration(),
   };
   // D-90 박자의 관측 문. 닫기마다 이 칸을 다시 보므로(unreceived.ts의 readGate) 효과의 문이 닫히면 다음 닫기를 적지 않는다.
@@ -691,10 +701,14 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   });
   let lastRestoreFailure = "";
 
+  // 치명 코드를 처음 정할 때 박자 안의 문이 이미 붙잡은 사유(halted)가 있으면 그것을 사유로 적는다. 그 사유를 붙잡은 박자가 뒤이어
+  // 기한을 넘기면 끝 차례는 beat_lapsed로 들어오는데, 그 이름만 적으면 먼저 생긴 원인(허가 읽기 실패 등)이 기록에서 사라진다.
+  // 나중에 온 이름은 later 칸에 남긴다. 이 자리는 halted 변수만 읽는다(장부를 다시 읽지 않는다).
   const markFatal = (why: string) => {
     if (why !== "stop" && exitCode === 0) {
       exitCode = SUPERVISOR_EXIT.fatal;
-      log("fatal", { reason: why });
+      if (halted !== null && halted !== why) log("fatal", { reason: halted, later: why });
+      else log("fatal", { reason: why });
     }
   };
   const finish = (why: string): Promise<number> => {

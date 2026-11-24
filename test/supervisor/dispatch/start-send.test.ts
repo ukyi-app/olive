@@ -62,9 +62,9 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
     // reflect 둘: 포트 호출 한 자리와, 쥔 장부·표식 메서드를 박자 유효 문 뒤에 부르는 callAfterGate 한 자리(아래 "callAfterGate" 시험이
     // 그 본문과 부르는 줄을 글자 그대로 본다).
     [GATE]: ["read", "reflect", "reflect"],
-    // 취소·갱신·조회·확정을 내는 박자. 시작 봉투를 만들 수 없음을 아래 시험이 본다.
+    // 취소를 내는 도구 어댑터. 시작 봉투를 만들 수 없음을 아래 시험이 본다. 수명 박자(갱신·취소·조회)와 재전송·배정은 공유 함수로만
+    // 싣으므로 이 목록에 없다: 수명 박자에 직접 송신이 다시 생기면 이 목록이 달라진다.
     "src/supervisor/dispatch/cancel.ts": ["method_call"],
-    "src/supervisor/dispatch/life-loop.ts": ["method_call", "method_call", "method_call"],
     // 실행기 → 감독 연결. 감독 모듈을 import하지 않음을 아래 시험이 본다.
     "src/executor/link.ts": ["method_call", "method_call"],
     "src/executor/worker.ts": ["method_call", "method_call"],
@@ -257,11 +257,16 @@ test("정적: 공유 함수 밖의 송신 자리는 시작 봉투를 만들 수 
   }
 });
 
+// 표식 메서드에 닿는 자리가 있는 파일. 두 판별을 함께 둔다: 점 속성 읽기(쥔 메서드로 부르는 callAfterGate의 꼴, 다른 파일이 메서드를
+// 쥐어 부르는 꼴)와 원래 이름의 호출(구조 분해해 같은 이름으로 부르는 꼴. 점이 없어 앞 판별이 보지 못한다). 타입의 Pick 글자는
+// 둘 다 아니다.
+const MARK_READ = /\.markStartDispatch\b/;
+const MARK_CALL = /\bmarkStartDispatch\s*\(/;
+const markingFiles = (sources: ReadonlyMap<string, string>) =>
+  [...sources].filter(([file, source]) => !file.startsWith("src/ledger/") && (MARK_READ.test(source) || MARK_CALL.test(source))).map(([file]) => file);
+
 test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례는 표식 → 마지막 확인 → 포트 호출이다", () => {
-  // 표식은 쥔 메서드로 부르므로(callAfterGate) 호출 꼴 대신 메서드 속성을 읽는 자리를 센다. 읽기도 세므로 다른 파일이 메서드를 쥐어
-  // 부르는 자리도 잡는다.
-  const marking = files.filter((file) => !file.startsWith("src/ledger/") && /\.markStartDispatch\b/.test(src(file)));
-  expect(marking).toEqual([GATE]);
+  expect(markingFiles(sources)).toEqual([GATE]);
   const gate = src(GATE);
   const body = gate.slice(gate.indexOf("export async function sendInstruction"));
   const at = (needle: string) => body.indexOf(needle);
@@ -325,6 +330,18 @@ test("대조군: callAfterGate로 송신 포트를 부르거나 다른 이름에
   }
   const moved = src(GATE).replace("if (!open()) return { kind: \"closed\" };", "").replace("held = get();", "if (!open()) return { kind: \"closed\" };\n    held = get();");
   expect([moved !== src(GATE), gatedBody(moved) === CALL_AFTER_GATE]).toEqual([true, false]);
+});
+
+test("대조군: 다른 파일에서 표식 메서드를 점 속성으로 쥐어 부르거나, 구조 분해해 원래 이름으로 부르면 위 판별이 잡는다", () => {
+  const ASSIGN = "src/supervisor/dispatch/assign-loop.ts";
+  for (const [snippet, read, call] of [
+    ["const held = port.markStartDispatch; return held(input);", true, false],
+    ["const { markStartDispatch } = port; return markStartDispatch(input);", false, true],
+  ] as const) {
+    const changed = new Map(sources);
+    changed.set(ASSIGN, `${src(ASSIGN)}\nfunction staticOnly(port: never, input: never) { ${snippet} }\n`);
+    expect([snippet, MARK_READ.test(snippet), MARK_CALL.test(snippet), markingFiles(changed)]).toEqual([snippet, read, call, [ASSIGN, GATE].sort()]);
+  }
 });
 
 test("대조군: 송신 자리의 모양을 실제로 잡는다", () => {

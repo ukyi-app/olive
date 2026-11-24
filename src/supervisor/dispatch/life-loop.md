@@ -84,6 +84,7 @@ LifeTickResult =
 - 다시 부른 판단이 계획한 의도가 아니면 쓰지 않는다. 사실(상태·기한·취소·지시 시각·임대)이 같고 시각만 흘러 갱신이 조회로 바뀌었으면 `margin_lost`, 사실이 바뀌었으면 `superseded`다. 종료는 그 사이 종료 지시가 적혔으면(`lastStopAt`) `superseded`다.
 - **요청 ID를 먼저 만든다.** 순서는 요청 ID → 다시 읽기 → (갱신이면) 접수 → 연결 → 마지막 시계 읽기 → 판단 → 장부 포트 객체·메서드·인자 얻기 → 박자 유효 문 → 장부 호출이다. 마지막 시계 읽기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 `await`도 없으므로 기록 시각은 장부에 들어가는 순간과 같다.
 - **박자 유효 문(`beatValid`)은 장부 호출 바로 앞에서 본다.** 이 박자가 아직 유효한가(조립의 박자 기한·끝 코드·장부 건강·허가 폐기)를 묻는 선택 포트다. `true`가 아니거나 던지면 쓰지 않고 `beat_closed`(`planned`: `renew_lease`·`stop`)다. 접수 문과 다르다: 종료는 접수가 닫혀도 적지만 무효인 박자에서는 적지 않는다. 기한을 넘긴 박자가 적은 종료 지시는 답을 기다리는 지시로 남아 다음 감독의 재전송 대상이 되므로, 마지막 외부 호출(시계 읽기)과 장부 포트 객체 얻기 뒤에 본다(그 접근자가 유효 문 뒤에 돌면 그 안에서 흐른 시간을 보지 못한다). 장부 포트 객체·메서드·인자 얻기 → 유효 문 → 호출은 `send-gate.ts`의 `callAfterGate` 하나가 한다. 포트가 빠지면 늘 유효다(이 부품 단독의 쓰임).
+- **싣기도 같은 유효 문 뒤에 한다.** 갱신·취소·조회는 재전송·배정과 같은 공유 송신 함수(`send-gate.ts`의 `sendInstruction`, 시작이 아닌 봉투)로만 싣는다: 내보내기 포트의 수신 객체와 `send`를 얻고 → 박자 유효 문 → 쥔 `send` 호출. 이 모듈은 `ports.sink.send`를 직접 부르지 않는다(`life-loop.test.ts` "정적"). 직접 부르면 `send` 접근자 안에서 흐른 시간을 아무 문도 보지 못해 박자 기한 정각 뒤에 포트에 들어가고, 조립의 내보내기 포트는 진입하자마자 조회를 등록부에 넣었다가 철회한다. 유효 문이 닫혔거나 포트를 얻지 못했으면 부르지 않는다: 이미 적은 갱신·종료는 그 기록의 식별값으로 `*_recorded_not_sent`(`beat_closed`·`sink_unavailable`, `delivery: "not_sent"`)로 남고, 조회는 `query_not_sent`이며 기다리는 조회에 넣지 않는다.
 - **다시 읽기가 막는 범위.** 앞 항목을 기다리는 동안 끼어든 쓰기(소유자 취소, 다른 경로의 종료 기록, 같은 시각에 겹친 다른 박자의 쓰기)는 막는다. 다른 포트 객체로 겹친 박자(예: 앞 박자가 적고 싣지 못한 갱신을 둘째 박자가 모른 채 다시 갱신), 다시 읽기와 장부 호출 사이의 동기 포트(접수·연결·시계) 안에서 다시 들어온 박자, 마지막 시계 읽기 안에서 일어난 외부 쓰기는 막지 못한다. 박자를 직렬화하고 다른 종료 쓰기와의 순서를 정하는 것은 부르는 쪽의 조건이다(아래 "뒤 조각이 지킬 것"). 코드로 보장하려면 그 쓰기들이 공유하는 직렬화나 장부의 조건부 쓰기가 필요하다.
 
 ## 갱신
@@ -136,7 +137,7 @@ LifeTickResult =
 ## 박자가 멈출 때
 
 - **읽기의 실패는 그 실행의 결과다.** 실행 줄·이력·입력의 칸을 읽다 던지면 그 실행은 `read_unknown`이다(실행 ID를 읽지 못하면 목록 전체가 모름).
-- **포트의 예외는 그 항목의 결과다.** 난수는 `*_failed`의 `random_unavailable`, 쓰기 포트가 던지면 `*_record_unknown`(`threw`), 서명·내보내기는 `*_recorded_not_sent`(`seal_threw`·`send_threw`), 시계는 `clock_unavailable`, 연결 포트는 `link_unknown`. 박자는 다음 실행을 본다.
+- **포트의 예외는 그 항목의 결과다.** 난수는 `*_failed`의 `random_unavailable`, 쓰기 포트가 던지면 `*_record_unknown`(`threw`), 서명·내보내기는 `*_recorded_not_sent`(`seal_threw`·`send_threw`. 내보내기 포트나 그 `send`를 얻다 던지면 부르지 않았으므로 `sink_unavailable`), 시계는 `clock_unavailable`, 연결 포트는 `link_unknown`. 박자는 다음 실행을 본다.
 - **쓰기 뒤의 포트 접근은 예외 처리 안에 있다.** 시계는 포트 묶음에서 시계 객체를 얻는 일까지 `clock_unavailable`로, 서명·난수는 `seal_threw` 등으로, 내보내기는 `send_threw`로 그 항목의 결과가 된다. 종료의 `stop_sent`는 내보내기 전에 확보한 받는 쪽을 쓴다(포트가 넘겨받은 봉투를 고쳐도 다시 읽지 않는다).
 - **그래도 장부 쓰기를 부른 뒤 던지면**(답의 칸 getter 등) 남은 실행을 하지 않고 `halted: "threw"`, `haltedAt`은 그 실행이다. 그 실행의 항목은 쓰기 전에 확보한 식별값(실행 ID, 요청 ID, 정지 세대, 기록 시각, 지정 실행기)으로 결과에 남고, 내보내기의 결과가 정해질 때까지 단계에 맞는 항목을 붙든다: 성공(`ok: true`)을 읽기 전이면 `*_record_unknown`(`threw`), 답의 칸을 읽는 중이면 `*_recorded_not_sent`(`ledger_answer_malformed`, 대기 실행의 종료면 `closed_not_started`), 봉투를 준비하는 중이면 `*_recorded_not_sent`(`draft_threw`, `not_sent`), 내보내기를 부른 뒤면 `*_recorded_not_sent`(`send_threw`, `delivery: "unknown"`). 그래서 갱신은 어느 줄에서 던져도 결과의 두 미송신 종류에 들어가고, 부르는 쪽이 `unsentRenews`를 만들 수 있다. 그 전까지의 결과와 `pendingQueries`는 그대로다.
 
@@ -147,6 +148,7 @@ LifeTickResult =
 | `reason` | `delivery` |
 |---|---|
 | `ledger_answer_malformed`, `draft_threw`, 초안의 거절 이름, `seal_threw`, `sealDraft`의 거절 이름(`field`·`sealReason` 함께), `clock_unavailable`, `renew_margin_lost`, `deadline_within_margin` | `not_sent` |
+| `beat_closed`, `sink_unavailable` | `not_sent`: 공유 송신 함수가 포트를 부르지 않았다(박자 유효 문이 닫힘, 포트의 수신 객체나 `send`를 얻지 못함) |
 | `no_connection`, `too_late_to_send` | `not_sent` |
 | `send_threw`, `send_answer_malformed` | `unknown`: 포트가 연결에 실었는지 모른다 |
 

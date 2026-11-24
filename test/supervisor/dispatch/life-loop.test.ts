@@ -1272,3 +1272,55 @@ describe("박자 유효 문(beatValid): 장부에 적기 직전, 마지막 시�
     }
   });
 });
+
+describe("싣기: 갱신·취소·조회도 공유 송신 함수로 싣는다(포트의 수신 객체와 send를 얻은 뒤 박자 유효 문 → 쥔 send)", () => {
+  const plain = (ports: LifeLoopPorts) => lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] });
+
+  test("포트의 send를 얻는 접근자 안에서 박자 기한이 지나면 포트를 부르지 않는다. 적은 갱신·종료는 남고 조회는 기다리지 않는다. 대조군은 싣는다", async () => {
+    for (const planned of ["renew", "stop", "query"] as const) {
+      for (const lapse of [true, false]) {
+        const w = world();
+        const s = planned === "stop" ? started(w, { deadlineAt: NOW + 20_000 }) : started(w);
+        if (planned === "query") must(w.ledger.markLost(NOW + 1));
+        else accept(w, s);
+        w.setClock(planned === "stop" ? NOW + 20_000 : NOW + 10_000);
+        let valid = true;
+        let entries = 0;
+        const target = w.ports.sink;
+        // 포트 진입을 따로 센다: 조립의 내보내기 포트는 진입하자마자 조회를 등록부에 넣으므로, 닫힌 박자에서는 진입 자체가 0이어야 한다.
+        const sink = {
+          get send() {
+            if (lapse) valid = false;
+            return (envelope: Envelope): Promise<SendOutcome> => {
+              entries += 1;
+              return target.send(envelope);
+            };
+          },
+        };
+        const result = ran(await plain({ ...w.ports, sink, beatValid: () => valid }));
+        const outcome = only(result, s.runId);
+        const label = `${planned}:${lapse}`;
+        if (lapse) {
+          const kind = { renew: "renew_recorded_not_sent", stop: "stop_recorded_not_sent", query: "query_not_sent" }[planned];
+          expect([label, outcome]).toMatchObject([label, { outcome: kind, reason: "beat_closed", delivery: "not_sent" }]);
+          expect([label, entries, w.sent.length, result.pendingQueries]).toEqual([label, 0, 0, []]);
+          expect([label, writes(w)]).toEqual([label, { renew: ["recordRenewInstruction"], stop: ["recordStopInstruction"], query: [] }[planned]]);
+          if (planned === "renew") expect(unsentOf(result)).toEqual([s.runId]);
+        } else {
+          const kind = { renew: "renew_sent", stop: "stop_sent", query: "query_sent" }[planned];
+          expect([label, outcome]).toMatchObject([label, { outcome: kind }]);
+          expect([label, entries, w.sent.length, result.pendingQueries.length]).toEqual([label, 1, 1, planned === "query" ? 1 : 0]);
+        }
+      }
+    }
+  });
+
+  test("정적: 이 모듈은 내보내기 포트를 직접 부르지 않고 공유 송신 함수 한 자리로만 싣는다", async () => {
+    const source = await Bun.file(new URL("../../../src/supervisor/dispatch/life-loop.ts", import.meta.url)).text();
+    const code = source
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("//"))
+      .join("\n");
+    expect([code.match(/\.send\b/g) ?? [], code.match(/\bsendInstruction\s*\(/g)?.length]).toEqual([[], 1]);
+  });
+});
