@@ -16,11 +16,21 @@ const USER_HZ = 100;
 
 const portOf = (address: string) => Number.parseInt(address.split(":")[1]!, 16);
 
+// ipv6.disable=1로 띄운 커널에는 /proc/net/tcp6가 없다. 시험의 루프백은 127.0.0.1이라 없는 파일은 빈 목록으로 본다.
+function procLines(file: string): string[] {
+  try {
+    return readFileSync(file, "utf8").split("\n").slice(1);
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
 // 로컬 포트와 상대 포트가 맞는 ESTABLISHED 줄 하나의 타이머. 없거나 둘 이상이면 던진다.
 export function tcpTimer(localPort: number, remotePort: number): TcpTimer {
   const found: TcpTimer[] = [];
   for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
-    for (const line of readFileSync(file, "utf8").split("\n").slice(1)) {
+    for (const line of procLines(file)) {
       const cells = line.trim().split(/\s+/);
       if (cells.length < 6 || cells[3] !== ESTABLISHED) continue;
       if (portOf(cells[1]!) !== localPort || portOf(cells[2]!) !== remotePort) continue;

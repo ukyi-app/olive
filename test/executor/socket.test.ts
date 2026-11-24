@@ -910,7 +910,8 @@ test("keepalive: 붙은 소켓에 커널 keepalive 타이머가 걸리고 첫 �
   expect(timer.remainingMs).toBeLessThanOrEqual(KEEPALIVE_INITIAL_DELAY_MS);
   expect(timer.remainingMs).toBeGreaterThan(KEEPALIVE_INITIAL_DELAY_MS - 10_000);
   const peer = s.peers[0]!.socket;
-  expect(tcpTimer(peer.localPort!, peer.remotePort!).kind).toBe(0);
+  // 상대 쪽은 keepalive가 아니다(보낼 것이 남았으면 재전송 타이머 1, 없으면 0).
+  expect(tcpTimer(peer.localPort!, peer.remotePort!).kind).not.toBe(2);
 });
 
 test("keepalive: 켜지 못하면(호출이 던짐, 메서드 읽기가 던짐) link에 열지 않고 닫은 뒤 실패로 세어 간격을 두고 다시 붙는다", async () => {
