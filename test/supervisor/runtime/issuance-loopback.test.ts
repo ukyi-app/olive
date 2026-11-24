@@ -99,7 +99,7 @@ test("루프백: 접수 영수증 뒤 자격 값 틀 하나가 그 연결의 실
 
   // 실제 순서기. 박자는 부르지 않는다: 깃발과 닫기의 기다림만 쓴다.
   const idle = (kind: string) => ({ kind: "not_run", reason: kind }) as never;
-  const beats: CycleBeats = { linkLoss: () => idle("l"), life: async () => idle("f"), resend: async () => idle("r"), assign: async () => idle("a") };
+  const beats: CycleBeats = { linkLoss: () => idle("l"), life: async () => idle("f"), resend: async () => idle("r"), unreceived: () => idle("u"), assign: async () => idle("a") };
   const cycle = createCycle({
     beats,
     serverTick: () => {},
