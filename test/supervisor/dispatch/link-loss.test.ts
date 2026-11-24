@@ -647,4 +647,24 @@ describe("박자 유효 문(beatValid): 실행기마다 markLostFor 바로 앞�
       expect([w.calls, state(w.ledger, s.runId)]).toEqual([[], "running"]);
     }
   });
+
+  test("유효 문의 칸은 장부 쓰기마다 한 번 읽고 그 포트 묶음을 this로 한 번 부른다", () => {
+    const w = world();
+    w.wrap({ listRuns: () => ({ known: true, value: [row(WORKER_EXECUTOR)] }) as never, markLostFor: () => ({ ok: true, runs: [] }) });
+    w.setClock(NOW + JUDGE + 1);
+    const seen = { reads: 0, calls: 0, self: [] as boolean[] };
+    const ports = {
+      ...w.ports,
+      get beatValid() {
+        seen.reads += 1;
+        return function (this: unknown) {
+          seen.calls += 1;
+          seen.self.push(this === ports);
+          return true;
+        };
+      },
+    };
+    const result = ran(linkLossTick(ports, POLICY, { watch: [{ executorId: WORKER_EXECUTOR, absentSince: NOW }] }));
+    expect([result.executors.map((e) => e.outcome), w.calls, seen]).toEqual([["moved"], [WORKER_EXECUTOR], { reads: 1, calls: 1, self: [true] }]);
+  });
 });

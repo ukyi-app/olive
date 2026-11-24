@@ -59,9 +59,10 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
   const inventory = Object.fromEntries(files.map((file) => [file, sendSites(src(file))]).filter(([, sites]) => sites.length > 0));
   expect(inventory).toEqual({
     // 시작 봉투가 포트에 닿는 한 자리(표식 → 마지막 확인 → 호출). read는 표식 전에 수신 객체의 send를 얻는 자리다.
-    // reflect 둘: 포트 호출 한 자리와, 쥔 장부·표식 메서드를 박자 유효 문 뒤에 부르는 callAfterGate 한 자리(아래 "callAfterGate" 시험이
-    // 그 본문과 부르는 줄을 글자 그대로 본다).
-    [GATE]: ["read", "reflect", "reflect"],
+    // reflect 셋: 포트 호출 한 자리, 쥔 장부·표식 메서드를 박자 유효 문 뒤에 부르는 callAfterGate 한 자리(아래 "callAfterGate" 시험이
+    // 그 본문과 부르는 줄을 글자 그대로 본다), 박자 유효 문·마지막 확인·거절 판별을 쥔 수신자로 부르는 callHeld 한 자리(아래 "callHeld"
+    // 시험이 본문과 부르는 세 줄을 글자 그대로 본다).
+    [GATE]: ["read", "reflect", "reflect", "reflect"],
     // 취소를 내는 도구 어댑터. 시작 봉투를 만들 수 없음을 아래 시험이 본다. 수명 박자(갱신·취소·조회)와 재전송·배정은 공유 함수로만
     // 싣으므로 이 목록에 없다: 수명 박자에 직접 송신이 다시 생기면 이 목록이 달라진다.
     "src/supervisor/dispatch/cancel.ts": ["method_call"],
@@ -273,7 +274,7 @@ test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례�
   const order = [
     "send = (target as InstructionSink).send",
     "const gate = holdBeatValid(holder)",
-    "holdStart(start, envelope)",
+    "holdStart(start, view.ids)",
     "const marking = callAfterGate(",
     "if (!gate()) return",
     "const verdict = verdictOf(check, stops)",
@@ -304,16 +305,17 @@ test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례�
 // 다른 이름에 담아 부르는 자리가 생기면 줄 목록이 달라진다. 부르는 줄은 쥘 메서드 이름까지 글자 그대로 견준다.
 const squash = (text: string) => text.replace(/\s+/g, " ").trim();
 const LIFE = "src/supervisor/dispatch/life-loop.ts";
-const CALL_AFTER_GATE = "export function callAfterGate(get: () => { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }, open: () => boolean): GatedCall { let held: { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }; try { held = get(); } catch { return { kind: \"threw\" }; } const { receiver, fn, args } = held; if (typeof fn !== \"function\") return { kind: \"threw\" }; if (!open()) return { kind: \"closed\" }; try { return { kind: \"called\", value: Reflect.apply(fn, receiver, args) }; } catch { return { kind: \"threw\" }; } }";
+// 인자 원소는 유효 문 전에 함수 안의 배열로 옮긴다: 받은 배열을 그대로 넘기면 Reflect.apply가 유효 문 뒤에 원소(접근자일 수 있다)를 읽는다.
+const CALL_AFTER_GATE = "export function callAfterGate(get: () => { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }, open: () => boolean): GatedCall { let held: { readonly receiver: unknown; readonly fn: unknown; readonly args: readonly unknown[] }; try { held = get(); } catch { return { kind: \"threw\" }; } const { receiver, fn, args } = held; if (typeof fn !== \"function\") return { kind: \"threw\" }; const copied: unknown[] = []; try { const length = args.length; for (let index = 0; index < length; index += 1) copied[index] = args[index]; } catch { return { kind: \"threw\" }; } if (!open()) return { kind: \"closed\" }; try { return { kind: \"called\", value: Reflect.apply(fn, receiver, copied) }; } catch { return { kind: \"threw\" }; } }";
 const GATED_LINES = [
   "src/supervisor/dispatch/assign-loop.ts: const call = callAfterGate(() => { const ledger = (held = ports.ledger); return { receiver: ledger, fn: ledger.startRun, args: [startInput] }; }, () => beatValid(ports));",
   "src/supervisor/dispatch/assign-loop.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.assignToolRequest, args: [assignInput] }; }, () => beatValid(ports));",
-  "src/supervisor/dispatch/assign-loop.ts: import { callAfterGate, type MarkFailure, sendInstruction } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/assign-loop.ts: import { callAfterGate, holdBeatValid, type MarkFailure, sendInstruction } from \"./send-gate.ts\";",
   "src/supervisor/dispatch/life-loop.ts: const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordRenewInstruction, args: [renewInput] }; }, () => beatValid(ctx.ports));",
   "src/supervisor/dispatch/life-loop.ts: const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordStopInstruction, args: [stopInput] }; }, () => beatValid(ctx.ports));",
-  "src/supervisor/dispatch/life-loop.ts: import { callAfterGate } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/life-loop.ts: import { callAfterGate, holdBeatValid } from \"./send-gate.ts\";",
   "src/supervisor/dispatch/link-loss.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markLostFor, args: [lostInput] }; }, () => beatValid(ports));",
-  "src/supervisor/dispatch/link-loss.ts: import { callAfterGate } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/link-loss.ts: import { callAfterGate, holdBeatValid } from \"./send-gate.ts\";",
   "src/supervisor/dispatch/send-gate.ts: const marking = callAfterGate(() => ({ receiver: mark?.receiver, fn: mark?.fn, args: [input] }), gate);"
 ];
 const gatedLines = (sources: ReadonlyMap<string, string>) =>
@@ -333,6 +335,38 @@ const gatedBody = (source: string) => {
 test("정적: callAfterGate는 얻기 → 박자 유효 문 → Reflect.apply 한 번이고, 그 이름은 장부 쓰기 다섯·송신 표식 하나를 부르는 줄과 import에만 있다", () => {
   expect(gatedBody(src(GATE))).toBe(CALL_AFTER_GATE);
   expect(gatedLines(sources)).toEqual(GATED_LINES);
+});
+
+// 쥔 함수를 쥔 수신자로 부르는 send-gate.ts의 callHeld. 본문은 Reflect.apply 한 번이고, 부르는 줄은 박자 유효 문(holdBeatValid)·마지막
+// 확인·거절 판별(verdictOf)의 세 줄뿐이다. 송신 포트는 이 함수로 부르지 않는다(포트 호출은 sendInstruction의 마지막 줄 하나다).
+const CALL_HELD = "function callHeld(held: Held, args: readonly unknown[]): unknown { return Reflect.apply(held.fn, held.receiver, args); }";
+const HELD_LINES = [
+  "return callHeld(valid, []) === true;",
+  "const answer: unknown = callHeld(check, []);",
+  'return stops !== null && callHeld(stops, [answer]) === true ? { kind: "stopped", value: answer as S } : { kind: "check_malformed" };',
+];
+const heldBody = (source: string) => {
+  const start = source.indexOf("function callHeld(");
+  return start < 0 ? null : squash(source.slice(start, source.indexOf("\n}\n", start) + 2));
+};
+const heldLines = (source: string) =>
+  source
+    .split("\n")
+    .filter((line) => /\bcallHeld\b/.test(line) && !line.includes("function callHeld("))
+    .map((line) => line.trim());
+
+test("정적: callHeld는 Reflect.apply 한 번이고, 박자 유효 문·마지막 확인·거절 판별의 세 줄에서만 부른다(send-gate.ts 밖에는 없다)", () => {
+  expect(heldBody(src(GATE))).toBe(CALL_HELD);
+  expect(heldLines(src(GATE))).toEqual(HELD_LINES);
+  expect([...sources].filter(([file, source]) => file !== GATE && /\bcallHeld\b/.test(source)).map(([file]) => file)).toEqual([]);
+});
+
+test("대조군: callHeld로 송신 포트를 부르거나 본문에 다른 호출을 더하면 위 단언이 잡는다", () => {
+  const gate = src(GATE);
+  const injected = gate.replace("  if (!gate()) return { kind: \"beat_closed\" };", "  if (!gate()) return { kind: \"beat_closed\" };\n  callHeld({ receiver: target, fn: send as never }, [envelope]);");
+  expect(heldLines(injected)).not.toEqual(HELD_LINES);
+  const body = gate.replace("return Reflect.apply(held.fn, held.receiver, args);", "void held.receiver; return Reflect.apply(held.fn, held.receiver, args);");
+  expect(heldBody(body)).not.toBe(CALL_HELD);
 });
 
 test("대조군: callAfterGate로 송신 포트를 부르거나 다른 이름에 담거나, 본문에서 얻기를 유효 문 뒤로 옮기면 위 단언이 잡는다", () => {

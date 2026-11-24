@@ -3,7 +3,7 @@
 // 기한은 1,000(정각 포함 닫힘), 진입 전 시각은 999다.
 import { describe, expect, test } from "bun:test";
 import type { Envelope } from "../../../src/contract/v1/index.ts";
-import { type GateResult, sendInstruction } from "../../../src/supervisor/dispatch/send-gate.ts";
+import { callAfterGate, type GateResult, sendInstruction } from "../../../src/supervisor/dispatch/send-gate.ts";
 
 const LIMIT = 1_000;
 // sendInstruction이 읽는 칸(동작·요청 ID·실행 ID)만 둔 봉투. 서명은 보지 않는다.
@@ -118,6 +118,124 @@ describe("공유 송신 함수: 입력 객체의 칸은 진입 때 한 번 읽�
     ] as [string | null, GateResult<string>, string[]][]) {
       const w = world(null);
       expect({ value, result: await sendInstruction(w.holder, envelope("run_renew"), null, w.plain(value)), trace: w.trace, reads: w.reads }).toEqual({ value, result, trace, reads: once(HOLDER_SPOTS) });
+    }
+  });
+});
+
+describe("공유 송신 함수: 봉투·확인·문 함수를 읽고 부르는 꼴", () => {
+  // 칸마다 읽은 수를 세는 봉투. slow 칸을 얻을 때 1ms를 쓴다.
+  const counted = (action: string, clock: { now: number }, reads: Record<string, number>, slow: "header" | "body" | null) =>
+    ({
+      get header() {
+        reads.header = (reads.header ?? 0) + 1;
+        if (slow === "header") clock.now += 1;
+        return { action, request_id: "request-1" };
+      },
+      get body() {
+        reads.body = (reads.body ?? 0) + 1;
+        if (slow === "body") clock.now += 1;
+        return { run_id: "run-1" };
+      },
+    }) as unknown as Envelope;
+
+  test("봉투의 머리·본문은 한 번씩만 읽는다: 998에 들어와 머리나 본문을 얻는 데 1ms를 쓰면 첫 유효 문은 999에 열리고 표식·송신 1. 시작이 아니면 본문을 읽지 않는다", async () => {
+    for (const slow of ["header", "body"] as const) {
+      const clock = { now: LIMIT - 2 };
+      const reads: Record<string, number> = {};
+      const trace: string[] = [];
+      const holder = { sink: { send: async () => (trace.push(`send@${clock.now}`), "sent") }, beatValid: () => (trace.push(`gate@${clock.now}`), clock.now < LIMIT) };
+      const start = { at: LIMIT - 2, marker: { markStartDispatch: () => (trace.push(`mark@${clock.now}`), { ok: true, created: true }) }, lastCheck: () => (trace.push(`check@${clock.now}`), null) };
+      const result = await sendInstruction(holder as never, counted("task_start", clock, reads, slow), start as never);
+      expect({ slow, result, trace, reads }).toEqual({ slow, result: { kind: "answered", answer: "sent" }, trace: ["gate@999", "mark@999", "gate@999", "check@999", "send@999"], reads: { header: 1, body: 1 } });
+    }
+    const clock = { now: LIMIT - 1 };
+    const reads: Record<string, number> = {};
+    const holder = { sink: { send: async () => "sent" }, beatValid: () => clock.now < LIMIT };
+    const result = await sendInstruction(holder as never, counted("task_cancel", clock, reads, null), null);
+    expect({ result, reads }).toEqual({ result: { kind: "answered", answer: "sent" }, reads: { header: 1 } });
+  });
+
+  test("마지막 확인·거절 판별·박자 유효 문은 그 칸을 읽은 객체를 this로 부른다: 자기 상태를 읽는 클래스 메서드와 bind가 없는 함수도 그대로 불린다", async () => {
+    class Start {
+      readonly at = LIMIT - 1;
+      readonly marker = { markStartDispatch: () => ({ ok: true, created: true }) };
+      readonly #refusal = { outcome: "start_expired" };
+      constructor(readonly answer: "send" | "refuse") {}
+      lastCheck() {
+        return this.answer === "send" ? null : this.#refusal;
+      }
+      stops(value: unknown): value is { outcome: string } {
+        return value === this.#refusal;
+      }
+    }
+    class Margin {
+      readonly #refusal = { outcome: "renew_margin_lost" };
+      constructor(readonly lost: boolean) {}
+      check() {
+        return this.lost ? this.#refusal : null;
+      }
+      stops(value: unknown): value is { outcome: string } {
+        return value === this.#refusal;
+      }
+    }
+    const holder: Record<string, unknown> = { sink: { send: async () => "sent" } };
+    // 상속한 bind·call이 없는 문 함수. 수신자가 holder일 때만 연다.
+    const bare = function (this: unknown) {
+      return this === holder;
+    };
+    Object.setPrototypeOf(bare, null);
+    holder.beatValid = bare;
+    const results: unknown[] = [
+      await sendInstruction(holder as never, envelope("task_start"), new Start("send") as never),
+      await sendInstruction(holder as never, envelope("task_start"), new Start("refuse") as never),
+      await sendInstruction(holder as never, envelope("run_renew"), null, new Margin(false) as never),
+      await sendInstruction(holder as never, envelope("run_renew"), null, new Margin(true) as never),
+    ];
+    expect(results).toEqual([
+      { kind: "answered", answer: "sent" },
+      { kind: "stopped", value: { outcome: "start_expired" } },
+      { kind: "answered", answer: "sent" },
+      { kind: "stopped", value: { outcome: "renew_margin_lost" } },
+    ]);
+  });
+
+  test("마지막 확인 칸의 꼴이 틀리면 표식·송신 전에 check_malformed다: plain의 check·stops가 함수가 아님, 시작의 lastCheck가 함수·undefined·null이 아님", async () => {
+    const isText = (value: unknown): value is string => typeof value === "string";
+    const cases: [string, Envelope, unknown, unknown][] = [
+      ["plain.check undefined", envelope("run_renew"), null, { check: undefined, stops: isText }],
+      ["plain.check null", envelope("run_renew"), null, { check: null, stops: isText }],
+      ["plain.check 42", envelope("run_renew"), null, { check: 42, stops: isText }],
+      ["plain.stops undefined", envelope("run_renew"), null, { check: () => null, stops: undefined }],
+      ["start.lastCheck 42", envelope("task_start"), "start", null],
+    ];
+    for (const [name, sent, start, plain] of cases) {
+      const trace: string[] = [];
+      const holder = { sink: { send: async () => (trace.push("send"), "sent") }, beatValid: () => (trace.push("gate"), true) };
+      const mark = start === null ? null : { at: LIMIT - 1, marker: { markStartDispatch: () => (trace.push("mark"), { ok: true, created: true }) }, lastCheck: 42 };
+      const result = await sendInstruction(holder as never, sent, mark as never, plain as never);
+      expect({ name, result, trace }).toEqual({ name, result: { kind: "check_malformed" }, trace: [] });
+    }
+  });
+
+  test("장부 쓰기 인자 배열의 원소는 박자 유효 문 전에 읽는다: 원소 접근자가 1ms를 쓰면 유효 문이 그 시각을 보고 부르지 않는다. 대조군(0ms)은 부른다", () => {
+    for (const cost of [1, 0]) {
+      let now = LIMIT - 1;
+      const order: string[] = [];
+      const args: unknown[] = [];
+      Object.defineProperty(args, 0, {
+        enumerable: true,
+        get() {
+          now += cost;
+          order.push(`arg@${now}`);
+          return "input";
+        },
+      });
+      const result = callAfterGate(() => ({ receiver: null, fn: (value: unknown) => (order.push(`call:${String(value)}@${now}`), "ok"), args }), () => (order.push(`gate@${now}`), now < LIMIT));
+      expect({ cost, result, order }).toEqual(
+        cost === 1
+          ? { cost, result: { kind: "closed" }, order: [`arg@${LIMIT}`, `gate@${LIMIT}`] }
+          : { cost, result: { kind: "called", value: "ok" }, order: ["arg@999", "gate@999", "call:input@999"] },
+      );
     }
   });
 });
