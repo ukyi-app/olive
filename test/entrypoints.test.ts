@@ -41,6 +41,16 @@ test("entrypoints: role-agent는 OLIVE_AGENT_SOCKET이 없으면 한 줄 찍고 
   expect(result.stderr.toString()).toBe("olive role-agent: 환경 OLIVE_AGENT_SOCKET이(가) 없다\n");
 });
 
+// 대리 설치 진입점(init 컨테이너)은 환경을 읽지 않고 고정 경로만 쓴다. 이미지 밖(이 시험이 도는 곳)에는 원본이 없어 아무것도 쓰기 전에 90으로 끝난다.
+// 복사·모드·대조·덮어쓰기와 다른 코드는 test/agent-install.test.ts가 임시 폴더로 본다.
+test("entrypoints: agent-install은 이미지 밖에서 원본이 없으면 한 줄 찍고 90으로 끝난다", async () => {
+  expect(await Bun.file("/opt/olive/olive-agent").exists()).toBe(false);
+  const result = run("src/main/agent-install.ts");
+  expect(result.exitCode).toBe(90);
+  expect(result.stdout.toString()).toBe("");
+  expect(result.stderr.toString()).toBe("olive agent-install: source 단계에서 멈췄다(/opt/olive/olive-agent → /opt/olive-agent/olive-agent)\n");
+});
+
 test("entrypoints: 이미지 기본 명령(no-role)은 역할을 고르라고 한 줄 찍고 64로 끝난다", () => {
   const result = run("src/main/no-role.ts");
   expect(result.exitCode).toBe(64);
