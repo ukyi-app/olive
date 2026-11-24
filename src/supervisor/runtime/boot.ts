@@ -53,6 +53,7 @@ import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer
 import { createWireSink, type WireSink } from "./sink.ts";
 import { createToolPorts } from "./tools-adapter.ts";
 import type { AdminSources } from "../admin/status.ts";
+import type { TestJobPorts } from "../admin/test-job.ts";
 
 // 종료 코드. 0은 요청된 멈춤(SIGTERM 등)을 끝 차례까지 마쳤을 때뿐이다. 64·69는 이미지의 다른 진입점, 81~89는 작업자 실행기가 쓴다.
 export const SUPERVISOR_EXIT = {
@@ -112,6 +113,8 @@ export interface SupervisorSettings {
   readonly connection: ConnectionSettings;
   readonly maxPendingWriteBytes: number;
   readonly timing: SupervisorTiming;
+  // 시험 작업 넣기(D-98·D-101). 참일 때만 관리 통로에 장부 쓰기 포트를 만든다. 없으면 꺼짐이다. 운영 값에서는 켜지 않는다(README "감독 관리 통로").
+  readonly testJobs?: boolean;
 }
 
 export type LogFields = Readonly<Record<string, string | number | boolean | null>>;
@@ -180,6 +183,8 @@ export interface RunningSupervisor {
   tools(policy: ToolPolicyPort, config: ToolConfig, observe: (event: CancelDelivery) => void): { readonly ports: ToolPorts; readonly now: () => number };
   // 관리 통로(src/supervisor/admin/)의 읽기 포트. 조립 상태, 복원기의 부작용 없는 상태 읽기, 공유 시계의 peek만 담는다(쓰기·송신·래치·하한 갱신 없음).
   readonly admin: AdminSources;
+  // 관리 통로의 시험 작업 넣기 포트(장부 쓰기 recordToolRequest 하나와 그 문). 설정(testJobs)이 켜졌을 때만 있고, 꺼져 있으면 null이다.
+  readonly testJob: TestJobPorts | null;
 }
 
 export type BootResult = { readonly ok: true; readonly running: RunningSupervisor } | { readonly ok: false; readonly step: BootStep; readonly code: number; readonly reason: string };
@@ -870,5 +875,21 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     view: (cap: number) => restorer.statusView(cap),
     now: () => shared.peek(),
   });
-  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools, admin } };
+  // 시험 작업 넣기의 쓰기 포트. 설정이 켜졌을 때만 만든다: 꺼진 감독에는 관리 통로에서 장부 쓰기에 닿는 길이 없다. 장부 객체를 넘기지 않고
+  // recordToolRequest 하나만 담는다. 문은 조립의 변수·박자 기한·요청 기한만 본다: look()·haltReason()을 부르지 않고(래치를 움직이지 않는다)
+  // 장부를 읽지 않는다. 접수 허가·정지는 장부가 쓰기 트랜잭션 안에서 다시 본다(쓰기 모드 start).
+  const testJob: TestJobPorts | null =
+    settings.testJobs === true
+      ? Object.freeze({
+          ledger: Object.freeze({ recordToolRequest: (input: Parameters<Ledger["recordToolRequest"]>[0]) => ledger.recordToolRequest(input) }),
+          gate: (limit: number) => {
+            if (stopping || exitCode !== 0 || halted !== null || stage < 5 || !granted) return "closed";
+            if (beatLimit !== null && pastLimit(deps, beatLimit)) return "closed";
+            // 요청 기한은 맨 끝에 본다: 위 판단에 쓴 시간까지 기한 비교에 든다. 정각이면 late, 시각을 읽지 못해도 late.
+            return pastLimit(deps, limit) ? "late" : "open";
+          },
+          random: deps.random,
+        })
+      : null;
+  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools, admin, testJob } };
 }

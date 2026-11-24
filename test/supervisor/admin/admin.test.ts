@@ -674,7 +674,8 @@ describe("루프백: 실제 경로 유닉스 소켓", () => {
     const run = (...args: string[]) => Bun.spawnSync([process.execPath, "src/main/admin.ts", ...args], { cwd: root, env: { PATH: process.env.PATH ?? "" }, timeout: 10_000 });
     for (const args of [[], ["status", "x"], ["queue"]]) {
       const result = run(...args);
-      expect([result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([64, "", "olive admin: 사용법: bun src/main/admin.ts <status>\n"]);
+      expect([result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([64, "", USAGE.stderr]);
+      expect(USAGE.stderr).toBe("olive admin: 사용법: bun src/main/admin.ts status | test-job <owner> <key> <role> <purpose> <sourceRef> <inputDigest>\n");
     }
     const result = run("status");
     expect([result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([1, "", "olive admin: 상태 모름: 감독에 닿지 못했다(no_socket)\n"]);

@@ -33,6 +33,10 @@ export const SUPERVISOR_ENV = [
   "OLIVE_POLICY_REVISION",
   "OLIVE_RESULT_DIR",
 ] as const;
+// 없어도 되는 환경. README "감독 진입점"의 표에서 필수 이름 뒤에 이 차례로 둔다.
+// OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
+// 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
+export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_TEST_JOBS"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 서명 키의 이름은 차트의 Secret 키 이름과 맞춰야 한다(차트 짝에서 맞춘다).
 const LEDGER_FILE = "supervisor.db";
@@ -95,6 +99,8 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (settingsRejected(registry)) return invalid("OLIVE_TARGETS");
   const policyRevision = value("OLIVE_POLICY_REVISION");
   if (!REVISION.test(policyRevision)) return invalid("OLIVE_POLICY_REVISION");
+  const testJobs = env.OLIVE_TEST_JOBS ?? "";
+  if (testJobs !== "" && testJobs !== "on" && testJobs !== "off") return invalid("OLIVE_TEST_JOBS");
   const tlsDir = value("OLIVE_TLS_DIR");
   const trustDir = value("OLIVE_TRUST_DIR");
   return {
@@ -137,6 +143,7 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       // 같은 박자에 한 연결로 나가는 ack·지시·자격 값 틀 하나씩과 여유 하나.
       maxPendingWriteBytes: limits.MAX_MESSAGE_BYTES * 4,
       timing: TIMING,
+      testJobs: testJobs === "on",
     },
   };
 }
@@ -178,20 +185,22 @@ export const adminFs: AdminFs = {
   chmod: (path, mode) => chmodSync(path, mode),
 };
 
-// 관리 통로(D-60·D-101)를 듣는다. 듣지 못해도 감독은 계속 돈다: 관리 통로는 읽기 전용이라 감독의 일이 그것에 기대지 않고,
-// 상태 조회는 "감독에 닿지 못함(모름)"으로 남는다. 사유는 기록에 남긴다.
+// 관리 통로(D-60·D-101)를 듣는다. 듣지 못해도 감독은 계속 돈다: 감독의 일은 관리 통로에 기대지 않고, 상태 조회는 "감독에 닿지 못함(모름)"으로
+// 남는다(시험 작업도 넣지 못한다). 사유는 기록에 남긴다. 시험 작업 넣기가 켜졌는지는 듣기 시작 기록에 남긴다.
 function startAdmin(running: RunningSupervisor): AdminListening | null {
-  const handlers = createAdminHandlers(running.admin);
+  const handlers = createAdminHandlers(running.admin, running.testJob);
   try {
-    return listenAdmin({
+    const listening = listenAdmin({
       path: ADMIN_SOCKET_PATH,
       mode: ADMIN_SOCKET_MODE,
       fs: adminFs,
       monoNow: productionDeps.monoNow,
       setTimer: productionDeps.setTimer,
-      answer: (line) => answerLine(line, handlers),
+      answer: (line, limit) => answerLine(line, handlers, limit),
       note: (note) => productionDeps.log("admin", { note }),
     });
+    productionDeps.log("admin_listening", { testJobs: running.testJob !== null });
+    return listening;
   } catch (error) {
     productionDeps.log("admin_listen_failed", { reason: error instanceof AdminListenRefused ? error.reason : "threw" });
     return null;

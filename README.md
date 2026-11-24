@@ -117,7 +117,7 @@ src/executor/       # 작업자 실행기의 핵심(환경을 읽지 않는다. 
 ├── launcher.ts     # 역할 프로그램 띄우기(띄우는 곳은 여기 하나)
 ├── containment.ts  # 실제 전체 신호 능력을 만드는 제품 입구(PidSpace.record 한 자리)
 └── containment-core.ts # PID 공간의 스캔·종료·세기 알고리즘(신호 능력을 스스로 만들지 않는다)
-src/supervisor/admin/ # 감독 관리 통로: 경로 유닉스 소켓 하나(/tmp/olive-admin.sock, 0600)의 읽기 전용 상태 조회, 설명은 아래 "감독 관리 통로"
+src/supervisor/admin/ # 감독 관리 통로: 경로 유닉스 소켓 하나(/tmp/olive-admin.sock, 0600)의 읽기 전용 상태 조회와 시험 작업 넣기(시험 값에서만), 설명은 아래 "감독 관리 통로"
 src/ledger/         # 감독 장부(SQLite)와 재시작 복원, 요약은 src/ledger/ledger.md
 contracts/fixtures/v1/  # 계약 사례(accept/, reject/)
 contracts/fixtures/v2/frontdoor/  # v2 표본(accept/, reject/, 후보)
@@ -359,7 +359,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 ### 환경
 
-빈 값은 없는 것과 같다. 경로 칸은 절대 경로여야 한다. 꼴이 틀린 값도 91이다. 차례는 진입점이 보는 차례다(`test/supervisor/runtime/entry.test.ts`가 대조한다).
+빈 값은 없는 것과 같다. 경로 칸은 절대 경로여야 한다. 꼴이 틀린 값도 91이다. 차례는 진입점이 보는 차례다(`test/supervisor/runtime/entry.test.ts`가 대조한다). 마지막 줄(`OLIVE_TEST_JOBS`)만 없어도 된다.
 
 | 이름 | 뜻 | 출처 | 없을 때 |
 |---|---|---|---|
@@ -374,19 +374,37 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | `OLIVE_TARGETS` | 대상 표 JSON 배열 `[{ "target", "namespace", "roles" }]`(등록표와 배정이 같은 배열을 쓴다) | 차트 짝(N5c) | 91 |
 | `OLIVE_POLICY_REVISION` | 실행기의 인사에서 기대하는 정책 revision(v1 revision 꼴). 복원 2단계의 정책 대조 | 차트 짝(N5c) | 91 |
 | `OLIVE_RESULT_DIR` | 결과 보관 폴더(미리 만든 실제 폴더, 그 폴더를 쓰는 감독은 하나). 기동은 마지막 경로 요소만 본다. 상위 경로에 링크가 없는 것은 배포 전제(N5c) | 차트 짝(N5c) | 91, 마지막 요소가 링크이거나 실제 폴더가 아니면 94 |
+| `OLIVE_TEST_JOBS` | 시험 작업 넣기(D-98·D-101). `on`이면 관리 통로의 `test-job`을 받는다. 없거나 빈 값·`off`면 꺼짐이고 그 명령은 늘 `disabled`로 거절된다(장부 쓰기 포트를 만들지 않는다) | 차트(시험 값에서만. 운영 값에서 켜면 CI가 거절한다: 아래 "감독 관리 통로") | 꺼짐. `on`·`off` 밖의 값은 91 |
 
 서명 키는 경로만 환경에서 읽고 PEM 값은 감독에만 붙인 Secret 파일에서 읽는다(아래 "공개 저장소").
 
 ### 감독 관리 통로
 
-`homelab olive status --apply`가 감독 상태를 읽는 길이다(D-60). CLI가 감독 컨테이너에서 `bun src/main/admin.ts status`를 kubectl exec로 부르고, 관리 진입점은 감독 프로세스가 듣는 경로 유닉스 소켓에 붙어 요청 한 줄을 쓰고 답 한 줄을 받는다. 현관이 꺼져 있어도 본다. 코드는 `src/supervisor/admin/`(말 `protocol.ts`, 상태 읽기 `status.ts`, 명령 디스패치 `commands.ts`, 듣기 `listener.ts`, 붙기 `client.ts`)다.
+`homelab olive status --apply`가 감독 상태를 읽는 길이다(D-60). CLI가 감독 컨테이너에서 `bun src/main/admin.ts status`를 kubectl exec로 부르고, 관리 진입점은 감독 프로세스가 듣는 경로 유닉스 소켓에 붙어 요청 한 줄을 쓰고 답 한 줄을 받는다. 현관이 꺼져 있어도 본다. 같은 통로에 시험 클러스터 전용 명령 `test-job`(시험 작업 넣기, D-98·D-101)이 있다(아래). 코드는 `src/supervisor/admin/`(말 `protocol.ts`, 상태 읽기 `status.ts`, 시험 작업 `test-job.ts`, 명령 디스패치 `commands.ts`, 듣기 `listener.ts`, 붙기 `client.ts`)다.
 
 - **소켓:** `/tmp/olive-admin.sock`(코드 상수, 환경으로 받지 않는다). 감독이 기동을 마친 직후, 복원 전부터 듣고 권한을 `0600`으로 둔다. 감독과 exec로 들어온 진입점은 같은 컨테이너의 같은 uid다. 경로에 지난 프로세스의 소켓이 남아 있으면(emptyDir는 컨테이너 재시작에도 남는다) 지우고 듣는다. 소켓이 아닌 파일이면 지우지 않고 듣지 않는다. 듣지 못해도 감독은 계속 돈다: 기록에 `admin_listen_failed`가 남고 상태 조회는 "닿지 못함"(1)이 된다. 정상 끝 차례 뒤에는 소켓 파일이 사라진다.
 - **감독의 두 번째 듣기:** 감독의 듣기는 연결 서버의 TCP와 이 소켓 둘이다. 이 소켓은 실행기 쪽 듣기와 같은 규칙(unix 경로 하나, TCP·abstract 없음)을 지킨다(`test/entrypoints.test.ts`).
 - **상태 한 줄:** homelab CLI가 검사하는 `olive-supervisor-status/v1`의 여덟 칸 그대로다(`schema`, `alive`, `queued`, `running`, `diagnosis`, `stop`, `stopGeneration`, `intakeOpen`). `alive`는 끝 차례에 들지 않았고 끝낼 사유가 없음, `queued`는 배정 전 부탁과 자리를 받기 전 실행(`queued`)의 수, `running`은 자리를 쥔 실행(모름·정리 대기 포함, 복원 2단계가 남긴 장부 밖 실행의 점유 관측 포함, 같은 실행·세대는 하나로 센다)의 수, `diagnosis`는 진단 일시 중지의 끝이 장부 시계보다 뒤면 `paused`, `stop`은 정지가 아니면 `none`·실행 쪽 소멸까지 확인했으면(`runtime_verified`) `stopped`·그 밖의 정지는 `stopping`, `intakeOpen`은 조립이 살아 있고 5단계의 허가를 받아들였고 장부가 같은 읽기에서 열림으로 판정할 때만 참이다.
-- **감독 상태를 바꾸지 않는다:** 조립(`boot.ts`의 `const admin`)이 넘기는 것은 조립 상태(변수 읽기), 복원기의 `statusView`(장부 `peekStatus` 한 번), 공유 시계의 `peek`뿐이다. `peekStatus`는 다른 장부 읽기와 달리 실패해도 장부를 고장으로 표시하지 않고 접수 허가를 버리지 않는다: 그 조회만 `ledger_unreadable`(1)이고 감독의 접수·끝 차례는 그대로다. 장부가 정말 고장이면 감독 자신의 다음 읽기·쓰기가 본다. `peek`는 `now()`가 낼 값을 읽되 공유 하한을 올리지 않아, 조회가 다음 박자의 시계 판정(`regressed`)을 바꾸지 않는다. 장부 쓰기·송신·끝낼 사유의 래치(`look()`)를 부르지 않고, 도구 처리기의 포트(`RunningSupervisor.tools`)를 쓰지 않는다(S42). 상태 읽기는 한 동기 구간이라 읽는 사이에 장부가 바뀌지 않는다. 개수는 줄을 객체로 펼치지 않고 1,000,000에서 멈춰 센다. 함정: 조건에 맞는 줄을 찾는 훑기는 실행 표 크기만큼 돈다(상태 칸에 색인이 없다). 끝난 실행 10만 줄에서 조회 1회 약 8ms, 100만 줄에서 약 91ms였다(메모리 DB, 11회 중앙값). 관리 조회는 사람이 부르는 드문 명령이라 이 비용을 받아들인다. 색인은 장부 판을 올리는 PR에서 더한다.
+- **상태 조회는 감독 상태를 바꾸지 않는다:** 조립(`boot.ts`의 `const admin`)이 넘기는 것은 조립 상태(변수 읽기), 복원기의 `statusView`(장부 `peekStatus` 한 번), 공유 시계의 `peek`뿐이다. `peekStatus`는 다른 장부 읽기와 달리 실패해도 장부를 고장으로 표시하지 않고 접수 허가를 버리지 않는다: 그 조회만 `ledger_unreadable`(1)이고 감독의 접수·끝 차례는 그대로다. 장부가 정말 고장이면 감독 자신의 다음 읽기·쓰기가 본다. `peek`는 `now()`가 낼 값을 읽되 공유 하한을 올리지 않아, 조회가 다음 박자의 시계 판정(`regressed`)을 바꾸지 않는다. 장부 쓰기·송신·끝낼 사유의 래치(`look()`)를 부르지 않고, 도구 처리기의 포트(`RunningSupervisor.tools`)를 쓰지 않는다(S42). 상태 읽기는 한 동기 구간이라 읽는 사이에 장부가 바뀌지 않는다. 개수는 줄을 객체로 펼치지 않고 1,000,000에서 멈춰 센다. 함정: 조건에 맞는 줄을 찾는 훑기는 실행 표 크기만큼 돈다(상태 칸에 색인이 없다). 끝난 실행 10만 줄에서 조회 1회 약 8ms, 100만 줄에서 약 91ms였다(메모리 DB, 11회 중앙값). 관리 조회는 사람이 부르는 드문 명령이라 이 비용을 받아들인다. 색인은 장부 판을 올리는 PR에서 더한다.
 - **이미 생긴 끝낼 사유:** 감독의 박자가 아직 붙잡지 않았어도 장부가 이미 고장으로 표시됐으면 조회는 `ledger_unreadable`(1)이고, 받아들인 접수 허가가 장부에서 사라졌거나 받아들이지 않은 허가가 열려 있으면 `alive:false`다. 래치(`look()`)는 부르지 않고 같은 읽기의 값만 견준다.
-- **명령:** 요청은 `{"command":"status"}` 한 줄이다. 새 명령은 `protocol.ts`의 `ADMIN_COMMANDS`와 `commands.ts`의 처리기 표에 함께 더한다.
+- **명령:** 요청은 `{"command":"status"}` 한 줄, 시험 작업은 `{"command":"test-job","owner":…,"key":…,"role":…,"purpose":…,"sourceRef":…,"inputDigest":…}` 한 줄이다. 새 명령은 `protocol.ts`의 `ADMIN_COMMANDS`와 `commands.ts`의 처리기 표에 함께 더한다.
+
+**시험 작업 넣기(`test-job`).** 본체 세션(O10) 없이 시험 클러스터에서 실제 연결 위의 "작업 한 바퀴"를 보려고 배정 대기 부탁 한 줄을 넣는다. `bun src/main/admin.ts test-job <owner> <key> <role> <purpose> <sourceRef> <inputDigest>`이고 성공하면 stdout에 `{"schema":"olive-test-job/v1","outcome":"created"|"existing","ref":"<부탁 참조>"}` 한 줄이다.
+
+- **켜기:** 감독 환경 `OLIVE_TEST_JOBS=on`일 때만 받는다. 꺼져 있으면 조립(`boot.ts`의 `const testJob`)이 쓰기 포트를 만들지 않고 처리기는 칸을 보지 않고 늘 `disabled`(1)다. 켜졌는지는 감독 기록 `admin_listening testJobs=…`에 남는다.
+- **효과는 장부 쓰기 하나:** 본체의 `start_worker`가 도구 어댑터로 적는 것과 같은 장부 연산 `recordToolRequest` 한 번이다(같은 표 `tool_requests`, 단계 `waiting_assignment`, 세션 칸은 고정 값 `admin-test-job`, 호출 ID·참조 후보는 감독의 CSPRNG, 기록 시각은 공유 시계의 `peek`). 조립이 그 메서드 하나만 담아 넘기고 관리 통로 폴더에서 장부 멤버를 꺼내는 곳은 그 한 자리다(`test/supervisor/admin/static.test.ts`). 송신은 없다.
+- **도구 경로와의 관계:** 도구 처리기(`scheduler/tools.ts`)와 그 포트(`RunningSupervisor.tools`)를 거치지 않는다. 그래서 처리기가 장부 전에 보는 세션(`liveSession`)·입력 고정(`inputPinned`)·정책(`judge`)은 보지 않는다. 장부의 검사는 그대로 지난다: **소유자(`owner`)는 장부가 이미 접수한 입력(`inputs`의 요청 ID)이어야 한다**(외래 키. 아니면 `invariant_violation`(1)이고 아무것도 적히지 않는다). 이 명령은 소유자 입력을 만들지 않는다. 같은 트랜잭션에서 정지·접수 허가를 다시 본다(쓰기 모드 `start`).
+- **배정이 보는 출처:** 시험 작업은 출처를 따로 두지 않는다. 배정 박자는 소유자 입력의 `source`를 정책의 `originOf`로 나누고, 나누지 못한 입력의 일은 보류한다. 지금 진입점의 배정 정책은 닫힌 값(`originOf`는 늘 없음, 등록행·계정·계획 없음)이고 현관이 없어 복원 5단계를 마치지 못하므로, 지금 진입점에서 이 명령은 `restore_not_done`(3)이다.
+- **차례(한 동기 구간):** 칸 검사 → 상태 읽기(`status`와 같은 `readStatus`: 복원·살아 있음·정지·접수·대기 수. 장부를 고장으로 표시하지 않는 `peekStatus`) → 대기 한도 → 참조 후보·호출 ID·시각 → 쓰기 함수 꺼내기 → 문 한 번(`gate(limit)`) → 호출 하나. 문은 조립이 만든 함수 하나로, 끝 차례·끝낼 사유·복원 5단계·받아들인 허가·박자 기한을 변수로 보고(`closed` → `not_alive`) 맨 끝에 단조 시각을 읽어 요청 기한을 본다(정각 이후·시각 모름 → `late`). 래치 `look()`를 부르지 않고 장부를 읽지 않는다. 요청 기한은 관리 소켓이 그 연결에 정한 요청 받기 기한(`serverWaitMs`)이다. 함정: 조립 상태와 기한을 두 포트로 나누면 앞 문을 지난 뒤 둘째 읽기 사이에 생긴 끝 차례를 보지 못한다(하네스 훑기가 찾은 틈).
+- **같은 키로 다시 부르기:** `(owner, key)`가 같고 내용이 같은 줄이 있으면 새로 적지 않고 `existing`(0), 내용이 다르면 `conflict`(1)다. 단 대기 한도를 먼저 보므로, 답을 받지 못한(`timeout`·`write_unknown` 등) 부탁이 아직 대기 중이면 다시 부른 요청은 `limit`(1)이다. 새 줄은 생기지 않는다. 그때는 `status`의 `queued`로 본다.
+
+| 칸 | 꼴(장부의 규칙) |
+|---|---|
+| `owner` | 장부가 접수한 입력의 요청 ID(UUID 소문자) |
+| `key` | 재시도 키(1~200자, 첫 글자 영숫자, `A-Za-z0-9._:/@+=-`) |
+| `role` | 계약 v1의 역할 다섯 중 하나 |
+| `purpose` | 목적 분류 코드(`[a-z][a-z0-9_]{0,63}`) |
+| `sourceRef`·`inputDigest` | 원본 참조(`<종류>/<UUID>`)·입력 SHA-256(소문자 hex 64자) |
 
 **모름 갈래와 종료 코드**(D-61의 CLI 공통 규칙: 0 완료, 1 실패, 3 대기, 64 사용법). 0이 아니면 stdout에 아무것도 쓰지 않고 stderr에 사유 낱말을 실은 한 줄만 쓴다.
 
@@ -398,7 +416,12 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 1 | 감독이 상태를 읽지 못했다 | `ledger_unreadable`(끝 차례 뒤 포함), `stop_unrecorded`, `clock_unavailable`, `out_of_range`, `read_threw` |
 | 1 | 답을 받지 못했다 | `timeout`, `closed`, `too_long`, `malformed`, `write_failed`, `clock` |
 | 1 | 감독이 요청을 거절했다 | `busy`, `malformed`, `unknown_command` |
-| 64 | 인자가 `status` 하나가 아니다 | 사용법 |
+| 0 | 시험 작업: 새로 적었거나(`created`) 같은 줄이 이미 있다(`existing`). stdout에 시험 작업 한 줄 | 없음 |
+| 3 | 시험 작업: 복원 5단계 전. 장부를 읽지 않는다 | `restore_not_done` |
+| 1 | 시험 작업을 거절했다. 장부에 새로 적힌 것이 없다 | `disabled`(설정 꺼짐), `malformed`(칸 수·꼴), `not_alive`(끝 차례·끝낼 사유·문 닫힘), `stopped`, `intake_closed`, `limit`(대기 한도), `late`(요청 기한 정각 이후), `conflict`, `invariant_violation`(소유자가 접수한 입력이 아님 등), `ledger_refused`(그 밖의 장부 거절) |
+| 1 | 시험 작업: 쓰기를 부르기 전에 멈췄다(적힌 것 없음) | `ledger_unreadable`, `stop_unrecorded`, `clock_unavailable`, `out_of_range`, `read_threw`, `random_unavailable` |
+| 1 | 시험 작업: 쓰기를 불렀지만 답이 넘긴 값과 맞지 않거나 던졌다. **적혔는지 모른다** | `write_unknown` |
+| 64 | 인자가 `status` 하나이거나 `test-job`과 값 여섯(빈 값 없음, 요청 한 줄 1,024바이트 이하)이 아니다 | 사용법 |
 
 **기한과 상한.** 기한은 기다림을 시작하기 전에 정하고, 받는 순간의 단조 시각으로 판정한다(정각 이후면 타이머가 아직 불리지 않았어도 만료). 시각을 읽지 못하면 기한이 지난 것으로 본다.
 
@@ -410,12 +433,15 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 요청 한 줄 | 1,024바이트(줄바꿈 포함) | | | 답하지 않고 닫음 |
 | 답 한 줄 | 4,096바이트(CLI가 받는 진입점 출력 상한과 같다) | | | 1(`too_long`) |
 | 동시 관리 연결 | 4 | | 연결을 받는 순간 | `busy`를 답하고 닫음(1) |
+| 시험 작업: 쓰기 | 요청 받기 기한(`serverWaitMs`, 2초) | 연결을 받은 순간 | 쓰기 바로 앞(문 다음) | `late`(1), 적지 않음 |
+| 시험 작업: 대기 | 1(`TEST_JOB_LIMITS.maxQueued`). 상태 한 줄의 `queued`(배정 전 부탁 + 자리를 받기 전 실행, 출처 가리지 않음)가 이 수 이상이면 받지 않는다. 작업 자리는 통틀어 하나다 | | 상태 읽기 | `limit`(1) |
 
 **뒤 조각이 지켜야 할 것.**
 
 - **차트 짝(homelab):** `/tmp` emptyDir는 감독 컨테이너에만 붙이고(다른 컨테이너가 같은 볼륨을 붙이면 그 컨테이너가 소켓에 닿는다), 감독 컨테이너는 uid 하나로 돈다. `/tmp`를 읽기 전용으로 바꾸지 않는다(듣지 못하면 상태가 늘 1이다). 소켓 파일의 권한은 bind 때 umask로 정해지고 `0600`은 그 뒤라, 컨테이너의 umask는 그룹·기타의 쓰기를 막는 값(기본 022)으로 둔다.
 - **homelab CLI:** 지금 CLI는 0이 아닌 코드를 모두 "감독 관리 진입점이 실패했다(exit N)"로 낸다. 3을 "복원 전이라 상태 모름"으로, 1을 "감독에 닿지 못함·읽지 못함"으로 보이는 일은 CLI 쪽 작업이다. stdout은 0일 때만 읽는다.
-- **시험 작업 넣기(M1t, D-101):** 같은 통로에 명령 하나를 더한다(`ADMIN_COMMANDS`와 처리기 표). 그 명령은 쓰기를 내므로 "관리 통로는 읽기만 한다"는 정적 시험(`test/supervisor/admin/static.test.ts`)을 그 명령의 자리만큼 일부러 넓히고, 운영 값에서는 받는 길이 열리지 않게 한다. 도구 처리기의 포트를 그 명령에 다시 쓰지 않는다.
+- **차트 짝(homelab), 시험 작업:** `OLIVE_TEST_JOBS`는 시험 클러스터의 값에서만 `on`으로 둔다. **운영 값에서 `on`이면 CI가 거절한다**(차트 쪽 확인은 그 PR의 일이다. 이 저장소의 기본은 꺼짐이고, `on`·`off` 밖의 값은 감독이 91로 뜨지 않는다). 소유자 입력은 현관(O08)이 장부에 접수한 것만 쓴다: 이 명령이 입력을 만들지 않으므로 현관이 없는 클러스터에서는 한 바퀴를 볼 수 없다.
+- **homelab CLI, 시험 작업:** `homelab olive`의 시험 작업 명령은 `bun src/main/admin.ts test-job …`을 같은 exec로 부르고 0일 때만 stdout의 `olive-test-job/v1` 한 줄을 읽는다. `write_unknown`·`timeout`이면 같은 키로 다시 부르기 전에 `status`의 `queued`를 본다(위 "같은 키로 다시 부르기").
 
 ### 이 진입점에 없는 것
 
@@ -423,7 +449,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 - **새 시작 지시(D-90 자동 닫기와의 관계):** D-90 박자의 증거 포트는 이 진입점에 있다(같은 답 줄의 증거·맡기지 않을 실행기, 프로세스당 증거 장부 하나). 그래도 지금은 장부에 이미 있는 시작(앞 프로세스가 적은 것)이 닫히지 않는다: 순서기는 복원 5단계를 받아들인 뒤에만 박자를 부르는데, 현관(O08)이 없어 복원 1단계를 되풀이하므로 D-90 박자는 늘 `skipped:restore_not_done`이고 그 실행은 그 상태(`preparing` 등) 그대로 남는다. 복원을 마친 뒤에도 닫히는 것은 D-90 조건을 모두 충족한 기존 시작뿐이다: 시한 뒤 반영된 빈 전체 인사가 그 실행을 싣지 않았고, **다른 장부 열기(앞 프로세스)의 송신 표식이 없어야 한다**. 앞 프로세스가 표식을 적고 실었을 수 있는 시작은 장부가 `sent_by_other_open`으로 거절해 닫지 않는다. 이 진입점에서 새로 닫힐 시작이 생기지 않는 것은 증거가 아니라 위 현관이 없어 접수가 열리지 않고, 아래 배정 정책이 닫힌 값이라 새 시작이 적히지 않기 때문이다.
 - **배정의 등록행·계정·실행 계획·자격 참조(역할 프로필 O11·O12):** 배정 정책은 닫힌 값이라 후보가 없고 시작하지 않는다. 새 자격 참조를 만드는 포트는 모름을 내 새 실행이 생기지 않는다. 기존 실행 줄의 값 송신(`borrowCredentialValue`)은 revision을 보지 않고 계정·방식·지문과 실행 상태·접수 문으로 판단한다. 지금은 현관이 없어 접수가 열리지 않으므로 값을 보낼 실행이 생기지 않는다.
 - **도구 처리기를 부르는 길:** 처리기 포트를 만드는 자리(`RunningSupervisor.tools`)만 있다.
-- **시험 작업 넣기(M1t)·차트 짝(N5c).** 연결 하나 닫기(`closeConnection`)를 부르는 자리도 두지 않았다(A6c 뒤 조각).
+- **차트 짝(N5c).** 연결 하나 닫기(`closeConnection`)를 부르는 자리도 두지 않았다(A6c 뒤 조각).
 
 ## 공개 저장소
 
