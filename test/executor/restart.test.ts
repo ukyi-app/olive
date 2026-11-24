@@ -3,12 +3,15 @@
 // 파일·대리·TLS 클라이언트·타이머는 가짜이고 저장소는 스크래치 폴더의 실제 파일이다.
 import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { encodeAgent } from "../../src/agent/link.ts";
 import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, type StartResult, type StartStep, startExecutor } from "../../src/executor/runtime.ts";
 import { ExecutorStore, type RestartRequest, type StoreIo } from "../../src/executor/store.ts";
+import { createFrameDecoder, encodeCredentialFrame, encodeFrame } from "../../src/transport/framing.ts";
 import { TlsConnectError } from "../../src/transport/tls-client.ts";
+import { open as openLedger, startedWorker } from "../ledger/helpers.ts";
 import { makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
 import {
   Clock,
@@ -389,3 +392,146 @@ test("붙기 전의 잠금은 회복을 시작하지 않는다: hello를 기다�
   expect(requestOnDisk(dir)).toBe(false);
   expect(h.connects).toBe(0);
 });
+
+test("붙은 뒤의 잠금은 첫 TLS 연결이 서기 전에도 회복이다: 대리 hello 뒤 감독 소켓을 시작했으면 실행 0건이어도 빈 요청을 적고 94다(hello 전은 위 86)", async () => {
+  const dir = scratch();
+  const h = harness({ marker: MARKER_A });
+  const result = await boot(h, dir);
+  if (!result.ok) throw new Error(result.reason);
+  // 기본 대역의 TLS connect는 멈출 때까지 서지 않는다. 시도가 시작된 것만 기다린다.
+  await until(() => h.connects >= 1);
+  h.remote!.connect({ write: () => {}, close: () => {} });
+  expect(await result.running.done).toBe(EXECUTOR_EXIT.restart_all);
+  expect(result.running.remote.state().distrusted).toBe("second_connection");
+  expect(await reopened(dir)).toEqual({ marker: MARKER_A, runs: [] });
+});
+
+test("기동 회복 대조: 실행 기록 쓰기만 계속 실패하면 새 표식으로 두 번 기동해도 요청을 지우지 않고 87, 대리 듣기·연결 0이다. 쓰기가 돌아오면 같은 영수증으로 맺고 지운다", async () => {
+  const { dir, ids } = await seeded(["unknown_running"], (runs) => ({ marker: MARKER_A, runs }));
+  const runsDown: Partial<StoreIo> = {
+    writeDurable: async (path, data) => {
+      if (path.includes("/runs/")) throw Object.assign(new Error("disk"), { code: "EACCES" });
+      await Bun.write(path, data);
+    },
+  };
+  // 첫 기동은 종료 영수증만 적고 실행 기록을 못 적는다. 둘째 기동은 그 사건이 이미 있어 실행 기록부터 맞춰야 한다.
+  for (const attempt of ["first", "second"]) {
+    const h = harness({ marker: MARKER_B, io: runsDown });
+    expect(await boot(h, dir), attempt).toMatchObject({ ok: false, step: "restart_check", code: EXECUTOR_EXIT.recover, reason: "restart_close_unsaved" });
+    expect(await reopened(dir), attempt).toEqual({ marker: MARKER_A, runs: ids });
+    expect(onDiskRun(dir, ids[0]!).state, attempt).toBe("unknown_running");
+    expect(stoppedReceipts(dir, ids[0]!).map((event) => event.body.remaining_processes), attempt).toEqual([0]);
+    expect(h.calls, attempt).not.toContain("listenAgent");
+    expect(h.connects, attempt).toBe(0);
+  }
+  const healthy = harness({ marker: MARKER_B });
+  const result = await boot(healthy, dir);
+  if (!result.ok) throw new Error(result.reason);
+  expect(onDiskRun(dir, ids[0]!).state).toBe("failed_stopped");
+  expect(stoppedReceipts(dir, ids[0]!)).toHaveLength(1);
+  expect(requestOnDisk(dir)).toBe(false);
+});
+
+interface Seen {
+  header: { action: string; sender: string; body_digest: string; run_generation: number };
+  body: Record<string, unknown>;
+}
+
+// 감독 쪽 틀 인코딩까지 실제로 지나는 대역. 실행기가 보낸 봉투를 풀어 모은다.
+function wired(marker: string) {
+  const h = harness({ marker });
+  const wire = Object.assign(new EventEmitter(), { destroyed: false, write: (_bytes: Uint8Array) => true, destroy: () => {} });
+  const got: Seen[] = [];
+  const decoder = createFrameDecoder();
+  const closed = new Promise<void>((resolve) => wire.once("close", resolve));
+  wire.write = (bytes) => {
+    if (wire.destroyed) throw new Error("closed");
+    for (const envelope of decoder.push(bytes).envelopes) got.push(envelope.value as Seen);
+    return true;
+  };
+  wire.destroy = () => {
+    if (wire.destroyed) return;
+    wire.destroyed = true;
+    wire.emit("close");
+  };
+  h.deps.createTlsClient = (() => ({
+    connect: async () => ({ socket: wire, closed, supervisor: {}, peerNotAfter: T0 + 600_000 }),
+    close: () => wire.destroy(),
+  })) as unknown as ExecutorDeps["createTlsClient"];
+  const send = (value: unknown) => {
+    const encoded = encodeFrame(new TextEncoder().encode(JSON.stringify(value)));
+    if (!encoded.ok) throw new Error("frame");
+    wire.emit("data", encoded.frame);
+  };
+  return { h, wire, got, send };
+}
+
+async function handshake(w: ReturnType<typeof wired>, executor: string): Promise<void> {
+  await until(() => w.got.some((envelope) => envelope.header.action === "stop_sync_request"));
+  const request = w.got.find((envelope) => envelope.header.action === "stop_sync_request")!;
+  w.send(fromSupervisor(new Clock(T0), executor, "stop_sync_reply", { challenge: String(request.body.challenge) }, { stop_generation: 0 }));
+  await until(() => w.got.some((envelope) => envelope.header.action === "hello"));
+}
+
+test("회복: 프로그램이 0으로 끝난 뒤 최종 계수 전에 대리 링크가 끊겨도, 새 표식 뒤 남은 0 영수증 한 건을 exit=failed로 맺어 감독 장부가 확정을 적는다(비교군: 실행 도중 끊김)", async () => {
+  for (const exitedFirst of [true, false]) {
+    const name = exitedFirst ? "exited(0) then link lost" : "link lost mid-run";
+    const dir = scratch();
+    const first = wired(MARKER_A);
+    const booted = await boot(first.h, dir);
+    if (!booted.ok) throw new Error(booted.reason);
+    const executor = booted.running.worker.name;
+    await handshake(first, executor);
+    const ledger = openLedger(join(scratch(), "supervisor.db"));
+    const runId = randomUUID();
+    const admitted = startedWorker(ledger, { runId, executorId: executor });
+    const value = credentialValue();
+    const credential = encodeCredentialFrame(runId, sha256(value), value);
+    if (!credential.ok) throw new Error("credential_frame");
+    first.wire.emit("data", credential.frame);
+    const clock = new Clock(T0);
+    const body = taskStartBody({ clock } as unknown as Rig, runId, sha256(value), { profile_revision: PROFILE.revision });
+    first.send(fromSupervisor(clock, executor, "task_start", body, { stop_generation: 0, run_generation: 1, request_id: admitted.requestId }));
+    await until(() => first.h.writes.some((text) => text.includes('"type":"start"')));
+    first.h.session!.receive(encodeAgent({ type: "spawned", run_id: runId }));
+    await until(() => first.got.some((envelope) => envelope.header.action === "receipt_started"));
+    if (exitedFirst) {
+      const output = Buffer.from(JSON.stringify({ role: "diagnosis", outcome: "completed", summary: "ok", items: [], refs: [] }));
+      first.h.session!.receive(encodeAgent({ type: "output", run_id: runId, data: output.toString("base64") }));
+      first.h.session!.receive(encodeAgent({ type: "exited", run_id: runId, code: 0, signal: null, overflow: false, stdout_bytes: output.length }));
+      // completed가 파일에 남고 최종 정리(terminate → count)가 대리에게 간 뒤, 그 답 전에 끊는다.
+      await until(() => first.h.writes.some((text) => text.includes('"type":"terminate"')));
+      await until(() => {
+        const run = onDiskRun(dir, runId) as { state: string; exit?: string | null };
+        return run.state === "stopping" && run.exit === "completed";
+      });
+    }
+    first.h.session!.closed();
+    expect(await booted.running.done, name).toBe(EXECUTOR_EXIT.restart_all);
+    await booted.running.worker.idle();
+    expect(stoppedReceipts(dir, runId), name).toEqual([]);
+
+    const next = wired(MARKER_B);
+    const restarted = await boot(next.h, dir);
+    if (!restarted.ok) throw new Error(restarted.reason);
+    await handshake(next, executor);
+    await until(() => next.got.some((envelope) => envelope.header.action === "receipt_stopped"));
+    const sent = next.got.filter((envelope) => envelope.header.action === "receipt_stopped");
+    expect(sent, name).toHaveLength(1);
+    expect(stoppedReceipts(dir, runId).map((event) => [event.body.remaining_processes, event.body.exit]), name).toEqual([[0, "failed"]]);
+    expect(onDiskRun(dir, runId).state, name).toBe("failed_stopped");
+    expect(requestOnDisk(dir), name).toBe(false);
+
+    // 감독 장부: 그 영수증을 받아 확정할 수 있는 상태로 가고, 확정 지시를 적는다.
+    const receipt = sent[0]!;
+    const applied = ledger.applyReceipt(
+      { action: "receipt_stopped", runId, receiptId: String(receipt.body.receipt_id), bodyDigest: receipt.header.body_digest, now: T0, exit: "failed" },
+      { sender: receipt.header.sender, runGeneration: receipt.header.run_generation },
+    );
+    expect(receipt.body.exit, name).toBe("failed");
+    expect(applied.ok, name).toBe(true);
+    const supervised = ledger.getRun(runId);
+    expect(supervised.known && supervised.value?.state, name).toBe("failed_stopped");
+    expect(ledger.recordFinalizeInstruction({ runId, requestId: randomUUID(), stopGeneration: 0, now: T0 + 700_000 }), name).toEqual({ ok: true });
+  }
+}, 15_000);

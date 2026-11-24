@@ -13,6 +13,7 @@ import {
   closeSync,
   constants,
   copyFileSync,
+  fchmodSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -164,8 +165,10 @@ export function writeGeneration(target: string, random: (bytes: number) => Uint8
     if (bytes.length !== 32 || !/^[0-9a-f]{64}$/.test(marker)) return { ok: false, reason: "generation_write" };
     removeIfPresent(temp);
     // 읽기 전용 모드로 만든다. 제어는 읽기만 하고, 다시 쓰는 것은 다음 init의 rename이라 모드와 무관하다.
+    // openSync의 모드는 umask를 지나므로 init의 umask에 따라 0400 등이 된다. 제어가 다른 uid여도 읽도록 fchmod로 0444를 정한다.
     const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o444);
     try {
+      fchmodSync(fd, 0o444);
       const data = Buffer.from(marker, "ascii");
       let offset = 0;
       while (offset < data.length) offset += writeSync(fd, data, offset, data.length - offset);

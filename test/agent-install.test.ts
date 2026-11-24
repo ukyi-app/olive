@@ -133,6 +133,19 @@ test("세대 표식: 제어가 읽는 꼴(64자 소문자 16진수, 줄바꿈 �
   expect(readdirSync(folder)).toEqual(["marker"]);
 });
 
+test("세대 표식: init의 umask가 0077이어도 모드는 0444다(umask에 기대지 않는다)", () => {
+  const folder = markerDir();
+  const marker = join(folder, "marker");
+  seed = 4;
+  const previous = process.umask(0o077);
+  try {
+    expect(writeGeneration(marker, counting).ok).toBe(true);
+  } finally {
+    process.umask(previous);
+  }
+  expect(statSync(marker).mode & 0o7777).toBe(0o444);
+});
+
 test("세대 표식: 앞선 init이 남긴 임시 파일은 지우고 새로 쓴다(rename으로만 대상에 들어간다)", () => {
   const folder = markerDir();
   const marker = join(folder, "marker");

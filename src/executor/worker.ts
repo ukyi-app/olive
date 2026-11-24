@@ -807,7 +807,30 @@ export class WorkerExecutor {
     await Promise.all(
       runIds.map((runId) => {
         const record = this.store.run(runId);
-        return record === undefined ? undefined : this.reclaim(runId, record.exit ?? "failed");
+        return record === undefined ? undefined : this.reclaim(runId, this.restartedExit(runId, record));
+      }),
+    );
+  }
+
+  // 재시작으로 원래 출력은 사라졌다. 결과 보고는 종료 영수증과 같은 전이에서만 나므로, 저장된 결과 보고가 없는 completed를 그대로 맺으면
+  // 감독 장부는 오지 않을 결과를 checking에서 기다리며 자리를 쥔다(확정 기록이 거절된다). 그래서 새 종료 영수증은 failed로 맺는다.
+  // 이미 저장된 종료 영수증은 confirmStopped가 같은 ID로 다시 쓰므로 이 값이 닿지 않는다.
+  private restartedExit(runId: string, record: RunRecord): ExitKind {
+    const exit = record.exit ?? "failed";
+    if (exit !== "completed") return exit;
+    return this.store.validEvents(runId).some((entry) => entry.action === "report_result") ? exit : "failed";
+  }
+
+  // 회복 대조가 요청을 지우기 전에 부른다. 종료 영수증은 파일에 있는데 실행 기록이 그 사건을 따라오지 못한 실행(앞선 기동의 실행 기록 쓰기 실패)을
+  // recover와 같은 대조로 그 사건에 맞춰 적는다. 그 영수증이 이미 남은 0의 증거라 다시 세지 않는다. 장부가 설명하지 못하는 실행은 건드리지 않는다.
+  async settleRestarted(runIds: readonly string[]): Promise<void> {
+    if (this.store.ledgerHeld()) return;
+    await Promise.all(
+      runIds.map((runId) => {
+        const record = this.store.run(runId);
+        if (record === undefined || this.store.suspectRun(runId)) return undefined;
+        if (!this.store.validEvents(runId).some((entry) => entry.action === "receipt_stopped")) return undefined;
+        return this.reconcile(record);
       }),
     );
   }

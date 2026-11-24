@@ -5,7 +5,7 @@
 //   재료(프로필·서명 키·감독 공개 키·TLS 파일) → 저장소 열기 → WorkerExecutor(기동 대조) → [회복 요청이 있으면 회복 대조]
 //   → 대리 소켓 듣기 → 대리 hello 기다림 → recover → ExecutorLink 하나 → TLS 클라이언트 → 감독 소켓 하나 start → link.tick·worker.tick 주기
 //
-// 회복(D-104): 감독에 붙은 뒤 원격이 잠기면(실행 중 끊김, 두 번째 연결, 계약 밖의 말) 저장소에 회복 요청(그때 읽은 세대 표식, 끝을 맺지 못한
+// 회복(D-104): 감독 소켓 start 뒤(첫 TLS 연결 성공 전 포함) 원격이 잠기면(실행 중 끊김, 두 번째 연결, 계약 밖의 말) 저장소에 회복 요청(그때 읽은 세대 표식, 끝을 맺지 못한
 // 실행)을 적고 restart_all로 끝난다. 차트의 restartPolicyRules가 이 코드에 RestartAllContainers를 걸어 kubelet이 역할 컨테이너까지 끝내고
 // init부터 다시 띄운다. init은 제어 전용 폴더에 새 세대 표식을 쓴다. 다음 기동의 회복 대조는 표식이 요청 때와 다를 때만 그 실행을 남은 0으로
 // 닫는다(아래 RESTART_EVIDENCE). 같거나(제어만 다시 떴다) 읽지 못하면(모름) 닫지 않고 restart_all로 다시 끝나 전체 재시작을 부른다.
@@ -64,9 +64,10 @@ export const EXECUTOR_EXIT = {
   supervisor_setup: 88,
   // 감독에 붙은 뒤 지시 처리나 주기 처리가 던졌다. 이 WorkerExecutor를 버리고 컨테이너 재시작에 맡긴다.
   fatal: 89,
-  // 파드 전체 재시작을 부른다(D-104). 차트의 restartPolicyRules가 이 값 하나에 RestartAllContainers를 건다.
+  // 파드 전체 재시작을 부른다(D-104). 차트의 restartPolicyRules가 작업자 제어 컨테이너에서만 이 값 하나에 RestartAllContainers를 건다.
   // 함정: 이 컨테이너가 다른 까닭으로 낼 수 있는 코드와 겹치면 그 실패도 역할 컨테이너를 끝낸다. 81~89(위), bun 자체의 1,
-  // 셸의 126·127, 신호의 128+n과 겹치지 않고, 다른 진입점의 코드(64·69·75~82·90~93)와도 겹치지 않는 첫 빈 값이다.
+  // 셸의 126·127, 신호의 128+n과 겹치지 않는 첫 빈 값이다. 유일성은 이 컨테이너 안의 것이다: 감독 진입점도 94를 쓸 수 있어,
+  // 규칙을 다른 컨테이너에 걸면 그 실패가 파드 전체 재시작을 부른다.
   restart_all: 94,
 } as const;
 
@@ -560,6 +561,12 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     const run = store.run(runId);
     return run !== undefined && unverifiedRun(run);
   };
+  // 회복 요청의 실행이 끝을 맺은 것이 파일에도 남았는지: 실행 기록이 끝난 상태이고 그 실행의 사건이 모두 적혔다. 장부에 없는 실행은 닫을 것이 없다.
+  const durablyClosed = (runId: string) => {
+    if (store.run(runId) === undefined) return true;
+    const run = store.durableRun(runId);
+    return run !== undefined && !UNFINISHED.includes(run.state) && store.settled(runId);
+  };
 
   // 세대 표식을 읽는다. 기다림은 settleWaitMs에 묶는다(기동의 다른 기다림과 같다).
   const readGeneration = async (): Promise<string> => {
@@ -611,10 +618,6 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
         }
         if (stop?.aborted) return stopped("restart_check");
         // 메모리에서 닫혔어도 사건과 실행 기록이 파일에 닿지 않았으면 요청을 지우지 않고 끝난다. 다음 기동이 같은 요청으로 다시 닫는다.
-        const durablyClosed = (runId: string) => {
-          const run = store.durableRun(runId);
-          return run !== undefined && !UNFINISHED.includes(run.state) && store.settled(runId);
-        };
         if (pending.some((runId) => !stillOpen(runId) && !durablyClosed(runId))) {
           return { ok: false, step: "restart_check", code: EXECUTOR_EXIT.recover, reason: "restart_close_unsaved" };
         }
@@ -622,6 +625,20 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       }
       if (request.runs.some(stillOpen)) deps.log("회복 대조: 요청의 실행 일부를 닫지 못했다(장부가 설명하지 못함). 요청을 두고 잠근 채 붙는다");
       else {
+        // 요청은 사건과 실행 기록이 모두 파일에 닿은 뒤에만 지운다. 앞선 기동에서 종료 영수증만 적히고 실행 기록을 못 적은 실행은 stillOpen이
+        // 아니므로(사건으로 판단) 위에서 닫지 않는다. 여기서 그 사건으로 실행 기록부터 맞추고, 못 맞추면 지우지 않고 87로 끝나 연결하지 않는다.
+        const unsaved = request.runs.filter((runId) => !durablyClosed(runId));
+        if (unsaved.length > 0) {
+          try {
+            await bounded(() => worker.settleRestarted(unsaved), timing.settleWaitMs, deps);
+          } catch (error) {
+            return fail("restart_check", EXECUTOR_EXIT.recover, error);
+          }
+          if (stop?.aborted) return stopped("restart_check");
+          if (unsaved.some((runId) => !durablyClosed(runId))) {
+            return { ok: false, step: "restart_check", code: EXECUTOR_EXIT.recover, reason: "restart_close_unsaved" };
+          }
+        }
         try {
           await bounded(() => store.clearRestartRequest(), timing.settleWaitMs, deps);
         } catch (error) {
@@ -633,7 +650,8 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   }
 
   const inheritedUnverified = unverified();
-  // 붙은 뒤의 잠금만 회복을 시작한다(아래 restartAll). 그 전의 잠금은 hello 기다림이 86으로 끝낸다.
+  // 붙은 뒤의 잠금만 회복을 시작한다(아래 restartAll). 붙은 뒤는 감독 소켓 start부터라 첫 TLS 연결이 서기 전도 든다: 잠긴 원격은
+  // 이 프로세스에서 다시 쓸 수 없고, 실행이 없을 때의 전체 재시작은 해가 없다. 그 전(hello 기다림)의 잠금은 86으로 끝낸다.
   let onLock: (reason: DistrustReason) => void = () => {};
   const agent = new GreetedRemote(
     {
