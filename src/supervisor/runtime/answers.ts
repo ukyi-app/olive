@@ -30,6 +30,7 @@ import {
   type AnswerSettlement,
   type BacklogOutcome,
   type ExecutorAnswerCopy,
+  type ForwardInput,
   handleForward,
   type ReceiptLedger,
   type ReceiptOutcome,
@@ -66,6 +67,17 @@ export interface AnswerLinePorts {
   readonly observationsSettled: () => boolean;
   // 기록용. 동기 기록기여야 한다. 던져도 무시한다.
   readonly observe?: (note: AnswerNote) => void;
+  // 자격 값 보내기의 두 문. 조립(issuance.ts의 createIssuance)이 같은 서버·장부·시계로 만든 송신기를 감싸 넘긴다. 빠지면 값을 보내지 않는다
+  // (실행기는 그 시작을 띄우지 못하고 실행기 쪽 기한으로 실패한다).
+  readonly credentials?: AnswerCredentials;
+}
+
+// 답 줄이 자격 값 보내기에 넘기는 것. onReceipt는 기다리지 않고 돌려준 것을 보지 않는다(이 파일은 동기다). 둘 다 던지지 않게 감싸 넘긴다.
+export interface AnswerCredentials {
+  // 장부가 받은 영수증(ack·applied_without_ack)마다 handleForward에 넘긴 그 forward와 그 결과를 그대로 넘긴다.
+  onReceipt(forward: ForwardInput["forward"], outcome: ReceiptOutcome): void;
+  // 연결이 철회됐다(서버가 연결을 닫은 때도 withdrawn이 온다).
+  forgetConnection(connection: number): void;
 }
 
 export type AnswerNote =
@@ -138,6 +150,23 @@ function inReplyTo(forward: Extract<Delivered, { kind: "forward" }>): string {
     return isText(value) ? value : "";
   } catch {
     return "";
+  }
+}
+
+// 줄에 선 상태 보고가 이 항목과 대조될 수 있는가. 처리기(receipts.ts의 matchStatus)와 같은 비교다: 받는 쪽이 낸 쪽이고, runs가 배열이며
+// 모든 원소에 실행 ID가 있고, 물은 실행 집합과 답한 실행 집합이 같다. 꼴이 틀리면 처리기도 대조하지 않으므로 거짓이다.
+function couldMatch(query: SentQuery, sender: string, forward: Extract<Delivered, { kind: "forward" }>): boolean {
+  try {
+    if (query.recipient !== sender) return false;
+    const verified: unknown = forward.verified;
+    const body = isRecord(verified) ? verified.body : undefined;
+    const runs = isRecord(body) ? body.runs : undefined;
+    if (!Array.isArray(runs) || runs.some((run: unknown) => !isRecord(run) || !isText(run.run_id))) return false;
+    const asked = new Set(Array.isArray(query.runIds) ? query.runIds : []);
+    const answered = new Set(runs.map((run: { run_id: string }) => run.run_id));
+    return asked.size === answered.size && [...answered].every((runId) => asked.has(runId));
+  } catch {
+    return false;
   }
 }
 
@@ -243,6 +272,15 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       { forward, now, stopGeneration: stopGeneration(), pendingQueries: [], links: ports.wire.answers, backlog: [] },
       { ledger: ports.ledger, random: ports.random, results: ports.results },
     );
+    // 기록보다 먼저 넘긴다: 송신기는 결과의 칸을 부른 그 자리에서 읽으므로 기록기가 결과를 고쳐도 보낼 대상이 바뀌지 않는다.
+    // 무엇에 보낼지(task_start의 접수, (연결, 실행)마다 한 번)는 송신기가 고른다. 장부가 받지 않은 영수증은 넘기지 않는다.
+    if (outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") {
+      try {
+        ports.credentials?.onReceipt(forward, outcome);
+      } catch {
+        // 감싼 송신기는 던지지 않는다. 던져도 ack와 줄은 그대로다.
+      }
+    }
     note({ kind: "receipt", connection: forward.connection, outcome });
     if (outcome.outcome === "ack") writeAck(forward.connection, outcome.ack, now);
   };
@@ -280,20 +318,28 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     return ports.queries.pending().filter((entry) => isRecord(entry) && entry.requestId === wanted && known.has(entry) && !unsettled.has(entry) && !claimed.has(entry));
   };
 
-  // 철회된 연결의 항목 중 남길 것은 처리 중인 답이 쓰는 항목과, 철회 전에 받아 줄에 선 그 연결의 답마다 그 답이 쓸 항목 하나(받은 차례로
-  // 앞 항목부터)다. 나머지를 끝낸다. 남길 것이 없으면 그 연결의 정리를 마친다. 등록부가 던지면 그대로 던진다(연결은 정리할 목록에 남는다).
+  // 철회된 연결의 항목 중 남길 것은 처리 중인 답이 쓰는 항목과, 철회 전에 받아 줄에 선 그 연결의 답마다 그 답이 대조될 수 있는 항목 하나
+  // (받은 차례로 앞 항목부터)다. 나머지를 끝낸다. 물은 실행과 맞지 않는 답에는 남기지 않는다: 그 답은 어느 항목도 끝내지 못하므로 남기면
+  // 복원 대기 동안 쓸 데 없는 항목이 산다. 남길 것이 없으면 그 연결의 정리를 마친다. 등록부가 던지면 그대로 던진다(연결은 정리할 목록에 남는다).
   const reclaim = (connection: number): void => {
     const live = ports.queries.pending();
     const keep = new Set<SentQuery>();
     for (const entry of claimed) if (entry.connection === connection) keep.add(entry);
-    for (const line of lines.values()) {
+    for (const [executorId, line] of lines) {
       for (const item of line.items) {
         if (item.kind !== "status" || item.asked === null || item.forward.connection !== connection) continue;
         const wanted = inReplyTo(item.forward);
         const known = new Set(item.asked);
         const entry = live.find(
           (query) =>
-            isRecord(query) && query.requestId === wanted && query.connection === connection && known.has(query) && !keep.has(query) && !unsettled.has(query) && !claimed.has(query),
+            isRecord(query) &&
+            query.requestId === wanted &&
+            query.connection === connection &&
+            known.has(query) &&
+            !keep.has(query) &&
+            !unsettled.has(query) &&
+            !claimed.has(query) &&
+            couldMatch(query, executorId, item.forward),
         );
         if (entry !== undefined) keep.add(entry);
       }
@@ -451,6 +497,9 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         pumpLine(executorId, line);
         prune(executorId, line);
       }
+      // 정리를 마치지 못한 철회된 연결은 어느 실행기의 답을 처리하든 그 뒤에 다시 정리한다. 답이 온 연결만 다시 보면, 정리 중 등록부가
+      // 던진 옛 연결의 항목은 그 실행기가 새 연결로 답해도 다음 pump()까지 남는다.
+      for (const connection of [...withdrawnLinks]) tryReclaim(connection);
     } catch {
       faulted = true;
       dirty.clear();
@@ -460,15 +509,13 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     }
   };
 
-  // 받은 때 등록돼 있던 같은 요청 ID의 항목. 읽지 못하면 답은 버리지 않고 null로 줄에 세운다(차례를 지키고, 넘길 때 대조 없이
-  // unknown_query로 끝내 그 실행을 다시 묻는다). 뜻밖의 예외라 줄의 상태를 다 안다고 하지 않는다.
+  // 받은 때 등록돼 있던 같은 요청 ID의 항목. 읽지 못하면 null이다: 답은 버리지 않고 null로 줄에 세운다(차례를 지키고, 넘길 때 대조 없이
+  // unknown_query로 끝내 그 실행을 다시 묻는다). 기록은 부르는 쪽이 답을 줄에 넣은 뒤에 한다.
   const askedAt = (forward: Extract<Delivered, { kind: "forward" }>): readonly SentQuery[] | null => {
     const wanted = inReplyTo(forward);
     try {
       return ports.queries.pending().filter((entry) => isRecord(entry) && entry.requestId === wanted);
     } catch {
-      faulted = true;
-      note({ kind: "fault", where: "deliver" });
       return null;
     }
   };
@@ -484,6 +531,12 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         // 철회 전에 받아 줄에 선 그 연결의 답이 쓸 항목은 남긴다. 지우면 받을 때 유효했던 답이 unknown_query로 버려져
         // 그 답의 "안다"는 관측이 밀린 목록에도 남지 않는다. 등록부를 읽기 전에 연결부터 적는다: 정리가 던져도 다음 pump에서 다시 한다.
         withdrawnLinks.add(output.connection);
+        // 등록부 정리보다 먼저 한다: 정리가 던져도 그 연결의 자격 값 기억은 지운다.
+        try {
+          ports.credentials?.forgetConnection(output.connection);
+        } catch {
+          // 감싼 송신기는 던지지 않는다. 지우지 못해도 연결 번호는 다시 쓰이지 않아 정확성에는 영향이 없다.
+        }
         reclaim(output.connection);
         return null;
       }
@@ -502,7 +555,15 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
         const header = isRecord(verified) ? verified.header : undefined;
         const sender = isRecord(header) ? header.sender : undefined;
         if (isRecord(verified) && verified.action === "status_report" && isText(sender)) {
-          lineOf(sender).items.push({ kind: "status", forward: output, asked: askedAt(output) });
+          // 답을 줄에 넣은 뒤에 기록한다. 기록기가 그 안에서 pump()를 부르면 빈 줄은 지워지므로, 넣기 전에 기록하면 답이 지워진 줄에 들어가
+          // 넘겨지지도 다시 묻지도 않는다.
+          const asked = askedAt(output);
+          lineOf(sender).items.push({ kind: "status", forward: output, asked });
+          if (asked === null) {
+            // 뜻밖의 예외라 줄의 상태를 다 안다고 하지 않는다.
+            faulted = true;
+            note({ kind: "fault", where: "deliver" });
+          }
           return sender;
         }
         passReceipt(output);
@@ -524,7 +585,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     pump(): void {
       try {
         settleQueries();
-        for (const connection of [...withdrawnLinks]) tryReclaim(connection);
+        // 정리를 마치지 못한 철회된 연결은 drain의 끝에서 다시 정리한다(줄이 없어도 돈다).
         drain([...lines.keys()]);
       } catch {
         faulted = true;
