@@ -9,6 +9,10 @@ import { fileURLToPath } from "node:url";
 import { PidSpace } from "../../src/executor/containment.ts";
 import { bunLauncher, LaunchFailed, type LaunchHooks } from "../../src/executor/launcher.ts";
 import type { LaunchPlan } from "../../src/executor/profile.ts";
+import { createHash } from "node:crypto";
+import { type AgentRuntime, type AgentTransport, productionParts, RoleAgent } from "../../src/agent/agent.ts";
+import { type AgentMessage, AgentDecoder, encodeControl } from "../../src/agent/link.ts";
+import { encodeCredentialFrame } from "../../src/transport/framing.ts";
 
 const FAKE_ROLE = fileURLToPath(new URL("./fake-role.ts", import.meta.url));
 const PYTHON = "/usr/bin/python3";
@@ -140,6 +144,8 @@ async function joinedFromOutside(self: number): Promise<number[]> {
 async function main() {
   const name = process.argv[2]!;
   if (!insideBwrap()) throw new Error("not_inside_bwrap");
+  // 대리 사례는 정리 코어를 대리가 기록한다(non-dumpable이 먼저다). 여기서 기록하지 않는다.
+  if (name.startsWith("agent-")) return agentMain(name);
   const space = await PidSpace.record({ dedicated: true, graceMs: GRACE_MS, killMs: 3_000 });
   let spawned = 0;
   const hooks: LaunchHooks = {
@@ -224,6 +230,116 @@ async function main() {
   process.stdout.write(
     `${JSON.stringify({ name, pid: process.pid, exit: outcome.exit, stdoutBytes: outcome.stdout.byteLength, before, after, survivors, late, elapsedMs, graceMs: GRACE_MS, witnessBefore, witnessAfter, attestBefore, attestAfter })}\n`,
   );
+}
+
+// ---- 대리(src/agent)를 이 공간의 PID 1로 돌리는 사례(--as-pid-1) ----
+// 이 harness 프로세스 자신이 대리다. 제어 자리는 같은 프로세스 안의 가짜 제어가 맡고, 대리와는 링크 바이트로만 말한다.
+// 신호·/proc·띄우기는 대리의 제품 조립(productionParts: non-dumpable → PidSpace.record → bunLauncher)이 한다.
+const AGENT_CREDENTIAL = "agent-harness-credential";
+const AGENT_RUN = "0b4a9e17-0000-4000-8000-00000000a9e1";
+// 자식이 PID 1의 환경과 루트를 읽을 수 있는지. 읽으면 0이다.
+const PROBE = 'cat /proc/1/environ >/dev/null 2>&1; echo "environ=$?"; ls /proc/1/root/ >/dev/null 2>&1; echo "root=$?"';
+const AGENT_PLANS: Readonly<Record<string, LaunchPlan>> = {
+  "agent-setsid": SCENARIOS.setsid!.plan,
+  "agent-doublefork": SCENARIOS.doublefork!.plan,
+  "agent-termignore": SCENARIOS.termignore!.plan,
+  // 공간의 init에는 같은 공간의 프로세스가 처리기 없는 신호를 보낼 수 없다(kill은 0을 돌려주지만 닿지 않는다).
+  "agent-signals": sh('for s in KILL TERM INT HUP; do kill -s $s 1; echo "$s=$?"; done'),
+  // TERM을 무시하고 증인 파일을 늘리는 후손을 남긴다.
+  "agent-linkdrop": sh(`setsid sh -c 'trap "" TERM HUP INT; while :; do echo x >> "$WITNESS"; sleep 0.05; done' >/dev/null 2>&1 & sleep 0.1`),
+  "agent-nondumpable": sh(PROBE),
+};
+
+// 가짜 제어. 바이트는 다음 틱에 건넨다(스트림처럼 받는 쪽의 처리 중에 다시 들어가지 않게).
+class FakeControl {
+  readonly received: AgentMessage[] = [];
+  private readonly decoder = new AgentDecoder();
+  agent: RoleAgent | null = null;
+  readonly transport: AgentTransport = {
+    write: (bytes) => {
+      const copy = bytes.slice();
+      setTimeout(() => this.received.push(...this.decoder.push(copy)), 0);
+    },
+    close: () => {},
+  };
+  send(bytes: Uint8Array): void {
+    setTimeout(() => this.agent!.receive(bytes), 0);
+  }
+  async next<T extends AgentMessage["type"]>(type: T): Promise<Extract<AgentMessage, { type: T }>> {
+    const until = Date.now() + 15_000;
+    for (;;) {
+      const at = this.received.findIndex((message) => message.type === type);
+      if (at >= 0) return this.received.splice(at, 1)[0] as Extract<AgentMessage, { type: T }>;
+      if (Date.now() > until) throw new Error(`agent_no_${type}`);
+      await sleep(10);
+    }
+  }
+}
+
+async function agentMain(name: string): Promise<void> {
+  const plan = AGENT_PLANS[name];
+  if (!plan) throw new Error("unknown_scenario");
+  // 대조군: 대리가 뜨기 전(dumpable인 이 프로세스)에는 같은 uid의 자식이 읽는다.
+  const beforeHarden = name === "agent-nondumpable" ? Bun.spawnSync(["/bin/sh", "-c", PROBE], { env: ENV }).stdout.toString() : null;
+  const runtime: AgentRuntime = {
+    now: () => Date.now(),
+    setTimer: (ms, fire) => {
+      const timer = setTimeout(fire, ms);
+      return () => clearTimeout(timer);
+    },
+    exit: (code) => process.exit(code),
+  };
+  // linkdrop은 정리를 기다리지 않고 끝나게 해(TERM 무시 → KILL 전) 남은 후손을 커널이 끝내는지 본다.
+  const options = { enforceWaitMs: name === "agent-linkdrop" ? 50 : 5_000 };
+  const agent = await RoleAgent.prepare(runtime, productionParts({ graceMs: GRACE_MS, killMs: 3_000 }), options);
+  if (agent === null) return;
+  const control = new FakeControl();
+  control.agent = agent;
+  agent.attach(control.transport);
+  await control.next("hello");
+  const now = Date.now();
+  const credential = new TextEncoder().encode(AGENT_CREDENTIAL);
+  const digest = createHash("sha256").update(credential).digest("hex");
+  control.send(
+    encodeControl({
+      type: "start",
+      run_id: AGENT_RUN,
+      program: plan.program,
+      argv: [...plan.argv],
+      cwd: plan.cwd,
+      env: { ...plan.env },
+      credential_env: "OLIVE_CREDENTIAL",
+      credential_digest: digest,
+      output_bytes: 4_096,
+      deadline_at: now + 60_000,
+      lease_until: now + 60_000,
+    }),
+  );
+  // start 바로 뒤의 값 틀.
+  const value = encodeCredentialFrame(AGENT_RUN, digest, credential);
+  if (!value.ok) throw new Error(value.reason);
+  control.send(value.frame);
+  await control.next("spawned");
+  const exited = await control.next("exited");
+  const stdout = control.received
+    .filter((message) => message.type === "output")
+    .map((message) => Buffer.from((message as { data: string }).data, "base64").toString())
+    .join("");
+  const before = await independentCount(process.pid);
+  if (name === "agent-linkdrop") {
+    const witnessBefore = await growing(WITNESS);
+    process.stdout.write(`${JSON.stringify({ name, pid: process.pid, exited, before, witnessBefore, witness: WITNESS })}\n`);
+    await sleep(50);
+    // 진입점은 소켓이 닫히면 이것을 부른다. 대리가 이 프로세스를 끝낸다.
+    agent.linkClosed();
+    await new Promise(() => {});
+  }
+  control.send(encodeControl({ type: "terminate", seq: 1 }));
+  await control.next("terminated");
+  control.send(encodeControl({ type: "count", seq: 2 }));
+  const counted = await control.next("counted");
+  const after = await independentCount(process.pid);
+  process.stdout.write(`${JSON.stringify({ name, pid: process.pid, exited, stdout, before, after, survivors: counted.survivors, beforeHarden })}\n`);
 }
 
 main().then(

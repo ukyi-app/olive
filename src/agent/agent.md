@@ -1,0 +1,96 @@
+# 역할 대리 (`src/agent/`)
+
+작업자 실행기 파드는 컨테이너 둘이다(D-100). 제어 컨테이너(지금의 실행기, 키를 가짐)와 다른 uid의 역할 컨테이너. 역할 컨테이너의 PID 1인 이 대리가 역할 프로그램을 띄우고, 끝내고, 남은 프로세스를 지금의 정리 코어로 센다(D-102). 제어와는 유닉스 소켓 하나 위의 링크로 지시와 결과만 주고받는다.
+
+- `link.ts`: 링크 메시지, 인코더, 두 방향의 디코더. 제어 쪽(O-b)도 이 파일을 그대로 import한다.
+- `agent.ts`: 대리 핵심(`RoleAgent`)과 제품 조립(`productionParts`).
+- `dumpable.ts`: `prctl(PR_SET_DUMPABLE, 0)`(`bun:ffi`로 libc를 연다).
+
+이 대리를 부르는 진입점(소켓 연결, 환경 읽기)과 제어 쪽 원격 구현은 아직 없다.
+
+## 링크 메시지
+
+틀은 `transport/framing.ts` 그대로다. 메시지는 봉투 틀(길이 접두 4바이트 + UTF-8 JSON, 64KiB 이하), 자격 값은 값 틀(첫 바이트 0x01, 실행 ID·지문·값, 16KiB 이하)이다. 모든 JSON에 `"v": 1`이 있고, 칸은 정확히 아래와 같다(빠지거나 더 있으면 거절).
+
+| 방향 | `type` | 칸 | 뜻 |
+|---|---|---|---|
+| 제어 → 대리 | `start` | `run_id`, `program`, `argv`, `cwd`, `env`, `credential_env`, `credential_digest`, `output_bytes`, `deadline_at`, `lease_until` | 실행 하나를 연다. **바로 다음 틀은 같은 `run_id`·지문의 값 틀이어야 한다.** 시각은 에포크 밀리초 |
+| 제어 → 대리 | `renew` | `run_id`, `lease_until` | 열린 실행의 임대 끝을 바꾼다 |
+| 제어 → 대리 | `terminate` | `seq` | 실행을 멈추고 공간을 정리한다(`PidSweep.terminate`) |
+| 제어 → 대리 | `count` | `seq` | 남은 수를 묻는다(`PidSweep.survivors`) |
+| 대리 → 제어 | `hello` | 없음 | 링크의 첫 말. non-dumpable·PID 1·기준 기록을 마친 뒤에만 보낸다 |
+| 대리 → 제어 | `spawned` | `run_id` | 프로세스가 생겼다 |
+| 대리 → 제어 | `output` | `run_id`, `data`(base64) | stdout 조각(원 바이트 32KiB 이하). 해석하지 않는다 |
+| 대리 → 제어 | `exited` | `run_id`, `code`, `signal`, `overflow`, `stdout_bytes` | 프로그램이 끝났다. `stdout_bytes`는 앞선 `output` 합, 초과면 0 |
+| 대리 → 제어 | `not_spawned` | `run_id`, `reason` | 띄우지 않았다: `aborted`·`cleanup_busy`·`spawn_failed`·`refused`(자격 값이 다른 칸에 있음 등)·`expired`·`space_not_clean` |
+| 대리 → 제어 | `unconfirmed` | `run_id` | 띄웠지만 끝을 확인하지 못했다(`ExitUnconfirmed`) |
+| 대리 → 제어 | `terminated` | `seq` | `terminate`의 정리가 끝났다 |
+| 대리 → 제어 | `counted` | `seq`, `survivors` | 정리 코어의 답 그대로. `0`은 확인, 수는 그 수, `null`은 모름 |
+
+## 차례와 디코더
+
+- **대리가 받는 쪽(`ControlDecoder`)**: 값 틀은 `start` 바로 뒤에만 온다. 실행 ID·지문이 다르거나 값의 SHA-256이 지문과 다르면 `link_credential_mismatch`. `start` 뒤에 다른 틀이 오거나 입력이 끝나면 `link_out_of_order`.
+- **제어가 받는 쪽(`AgentDecoder`)**: 봉투만 받는다(값 틀은 `frame_too_large`). `hello`가 처음 한 번. 실행 하나의 말은 `spawned → output* → exited|unconfirmed` 또는 `not_spawned` 하나이고 다른 실행의 말과 섞이지 않는다. `output` 합은 상한 이하이고 `exited.stdout_bytes`와 같다. `terminated`·`counted`의 `seq`는 오름차순이다.
+- 둘 다 거절하면 `LinkError(code)`를 던지고 그 뒤로는 같은 오류만 낸다. 오류에는 사유 이름만 있다.
+- 실행의 차례(실행 중의 두 번째 `start`, 열린 실행이 없거나 다른 실행의 `renew`)는 대리의 상태라 `agent.ts`가 본다.
+- `seq`가 어느 요청의 답인지(없는 요청, 늦은 답)는 요청을 아는 제어가 본다.
+
+## 대리의 차례
+
+1. `harden`: 자기를 non-dumpable로 만들고 다시 읽어 0인지 본다. 아니면 78로 끝난다. 다른 무엇보다 먼저다. exec마다 dumpable로 돌아가므로 대리 프로세스 자신이 부른다.
+2. 자기 번호가 1인지 본다. 아니면 79로 끝난다(PID 1이 아니면 대리가 끝나도 공간이 비지 않는다).
+3. `PidSpace.record({ dedicated: true })`: 기준은 자기뿐이다. 거부되면 80으로 끝난다.
+4. `attach`: 링크에 `hello`.
+5. `start`: 값 틀의 값으로 계획을 만들고 값 배열을 0으로 채운다. 기한·임대가 지났거나 공간에 남은 프로세스가 있으면(`survivors() !== 0`) 띄우지 않는다. 그 확인 뒤 `bunLauncher.run`까지 await가 없다.
+6. 실행은 `start`로 열리고, 프로그램이 끝난(또는 띄우지 못한) 뒤 `count`에 0을 답한 때 닫힌다. 닫히기 전의 `start`는 계약 밖이다.
+
+## 스스로 집행 (실패 쪽 닫힘)
+
+다음이면 링크를 닫고, 실행을 멈추고, 정리를 상한(`enforceWaitMs`)까지 기다린 뒤 끝난다.
+
+| 원인 | 종료 코드 |
+|---|---|
+| 링크가 끊김(`linkClosed`), 쓰기 실패 | 75 |
+| 열린 실행이 `min(deadline_at, lease_until) + enforceGraceMs`(기본 25초)를 지나도 닫히지 않음 | 76 |
+| 디코더 거절, 실행 중의 `start`, 맞지 않는 `renew`, 두 번째 `attach` | 77 |
+
+대리는 공간의 PID 1이라 끝나면 커널이 공간의 나머지를 SIGKILL로 끝낸다. 그래서 정리가 멈춰도 상한 뒤에는 공간이 빈다. 끝난 뒤에는 아무 말도 하지 않으므로 제어는 그 실행의 남은 수를 모른다.
+
+## 보장
+
+- 대리는 서명하지 않고 키를 보지 않는다. 내는 것은 서명 없는 사실이다.
+- `counted`는 정리 코어의 답을 바꾸지 않는다. 0이 아니거나 모름이면 그대로 내고, 실행을 닫지 않는다(임대 감시가 이어진다).
+- 역할 프로그램에게서 받는 것은 stdout 바이트뿐이고 해석하지 않는다.
+- 자격 값은 JSON을 지나지 않는다. 디코딩한 값은 `CredentialValue`에 싸여 직렬화·문자열·inspect에 나오지 않고, 한 번 꺼내 쓴 뒤 0으로 채운다. 값이 `program`·`cwd`·`argv`·다른 환경 값에 들어 있으면 띄우지 않는다.
+- 띄우기는 `bunLauncher`, 신호와 `/proc`은 `PidSpace.record`가 만든 정리 코어로만 한다. 대리 코드는 소켓을 열거나 듣지 않고, 시계·타이머·끝내기는 주입받는다(`test/agent/static.test.ts`).
+
+## 대리가 믿는 전제
+
+- 대리가 역할 컨테이너 PID 공간의 PID 1이다(`shareProcessNamespace` 없음). 대리가 이것을 확인하는 것은 자기 번호 1과 기준 스캔뿐이다.
+- 그 공간에 다른 작업이 합류하지 않는다(exec·디버그 컨테이너·exec 프로브 금지). 합류가 보이면 정리 코어가 전체 신호를 멈추고 0을 말하지 않는다.
+- 대리 실행 파일과 이미지는 읽기 전용 루트에 있다. 역할 프로그램이 대리 코드를 바꿀 수 없다.
+- 링크의 상대는 제어 하나다. 소켓은 제어가 듣고, 그 폴더는 역할 컨테이너에 읽기 전용이다.
+- 기반 이미지에 glibc의 `libc.so.6`이 있다(없으면 harden이 실패해 대리가 뜨지 않는다).
+
+## 남는 위험
+
+- **"0"을 모델과 같은 uid의 대리가 센다.** 신호 보호(공간의 init은 같은 공간에서 온 처리기 없는 신호를 받지 않음)와 non-dumpable이 막지만, 커널이나 대리 코드의 버그가 있으면 거짓 0이 나갈 수 있다. 제어는 그 0을 독립으로 확인할 수단이 없다.
+- 대리가 PID 1인 Bun이라 고아가 된 후손을 회수하지 않는다. 정리 뒤 좀비가 공간에 남고(세지 않는다) 실행마다 쌓인다. 대리를 얼마나 오래 살릴지(또는 회수를 넣을지)는 아직 정하지 않았다.
+- 계획 문자열(자격 값이 든 환경)은 대리의 메모리에 남는다. 같은 uid의 `/proc/1/mem` 읽기는 non-dumpable이 막는다.
+- 대리가 보낸 `exited`의 시각은 싣지 않는다. 제어는 받은 시각으로 기한·임대를 대조하므로 실제보다 늦게 본다(완료가 아닌 쪽으로 기운다).
+
+## 뒤 조각이 지켜야 할 것
+
+- **제어(O-b)**: 두 번째 연결, 디코더 거절, 늦은 답·없는 요청의 답, 상한 안에 없는 답, 실행 중 끊김을 모두 "모름"(`null`·`unknown_running`)으로 다룬다. 두 번째 연결을 본 역할 컨테이너 세대는 다시 믿지 않는다. **새 `hello`로 끊긴 실행을 닫지 않는다**(새 hello는 그 뒤의 새 실행에만 쓴다. 끊긴 실행의 회복은 파드 재시작 관문이나 관리자 닫기다).
+- **제어(O-b)**: 값 틀을 만드는 자리가 하나 는다. `src/`에서 `encodeCredentialFrame`을 부르는 곳을 `credential-send.ts` 하나로 묶은 정적 규칙(`test/supervisor/dispatch/credential-send.test.ts`)을 같은 변경에서 다시 정한다. 링크 쓰기 자리가 `.send(` 꼴이면 송신 자리 목록(`start-send.test.ts`)에도 걸린다.
+- **제어(O-b)**: 듣는 소켓은 경로 유닉스 소켓 하나다(TCP·abstract 금지). 대리 쪽 소켓을 대리가 듣는 반대 방향은 쓰지 않는다(같은 uid의 모델이 바꿔치기할 수 있다).
+- **진입점(O-c)**: `RoleAgent.prepare`를 소켓 연결보다 먼저 부른다. 환경 읽기와 소켓은 진입점에만 두고, 소켓이 닫히거나 오류가 나면 `linkClosed()`를 부른다. `runtime.exit`은 실제로 프로세스를 끝내야 한다.
+- **차트(H-split)**: 역할 컨테이너는 자기 PID 공간을 가진다(`shareProcessNamespace` 없음). 링크 폴더는 역할 컨테이너에 읽기 전용, 키·TLS·저장소 볼륨은 제어 컨테이너에만. 역할 컨테이너에 exec·프로브를 두지 않는다.
+- `test/containment-junit.ts`의 기대 목록이 29개가 됐다. README "실행기 시험의 실제 프로세스"의 개수(23)를 다음에 README를 고치는 변경에서 맞춘다.
+
+## 시험
+
+- `test/agent/link.test.ts`: 두 방향의 꼴, 차례, 크기, 자격 값의 가림.
+- `test/agent/agent.test.ts`: 가짜 링크·정리·띄우기·시계로 정상 길, 스스로 집행(끊김·쓰기 실패·계약 밖·임대 끝·정리 멈춤), 0이 아닌 수·모름을 그대로 냄.
+- `test/agent/static.test.ts`: 대리 코드의 금지 API.
+- `test/executor/containment.test.ts`의 "실제 프로세스 대리 …" 6개: bwrap 공간에서 harness 프로세스가 대리로 PID 1이 되고, 같은 프로세스의 가짜 제어가 링크 바이트로만 지시한다(후손 셋, 자식의 신호, 링크 끊김, non-dumpable).
