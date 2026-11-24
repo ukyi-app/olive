@@ -349,7 +349,7 @@ describe("closeConnection", () => {
     const cycle = createCycle({
       policy: { judgeMs: 30_000, resendEveryMs: 5_000, assignCallsPerBeat: 1 },
       ledgerClock: createSharedClock({ now: () => h.t }),
-      beats: { linkLoss() {}, life() {}, resend() {}, assign() {} },
+      beats: { linkLoss() {}, life() {}, resend() {}, unreceived() {}, assign() {} },
     } as never);
     const between: unknown[] = [];
     const issuance = createIssuance({
