@@ -13,8 +13,10 @@
 //    D-90 박자는 2단계를 받아들인 뒤에만 연다.
 // 5. 기한이 있는 기다림은 일을 부르기 전에 절대 기한을 정하고(runBy), 결과를 받아들이는 순간의 단조 시각으로 판정한다(waitUntil).
 //    일의 동기 비용도 기한 안에 든다. 정각 이후면 타이머보다 먼저 처리된 결과여도 만료다. 현관 답은 복원기에 넘기기 전에 단계 기한을 본다.
-// 6. 효과(장부의 발급 기록, 송신·ACK·자격 값, D-90 닫기, 배정)는 쓰기·싣기 직전에 effectsOpen 하나를 본다: 끝 코드가 정해졌거나,
-//    진행 중인 박자의 기한이 지났거나, 장부를 쓸 수 없거나, 받아들인 허가가 사라졌거나 받아들이지 않은 허가가 있으면 닫힘이다.
+// 6. 효과의 문은 둘이다. 박자 유효 문(effectsOpen): 끝 코드가 정해졌거나, 진행 중인 박자의 기한이 지났거나, 장부를 쓸 수 없거나,
+//    받아들인 허가가 사라졌거나 받아들이지 않은 허가가 있으면 닫힘이다. 접수 문(intake): 박자 유효 문에 복원기의 접수를 더한다.
+//    기존 실행의 정리(종료·조회·끊김·D-90·재전송)는 박자 유효 문만, 새 일(접수·시작·갱신·자격 값)은 접수 문을 본다. 박자 다섯은
+//    장부에 쓰기 직전(마지막 외부 호출 뒤의 같은 동기 구간)에 박자 유효 문을 다시 본다(beatValid 포트).
 import { executorName, type Role } from "../../contract/v1/index.ts";
 import {
   type Ledger,
@@ -113,6 +115,15 @@ export interface SupervisorSettings {
 
 export type LogFields = Readonly<Record<string, string | number | boolean | null>>;
 
+// 박자 다섯의 함수. 시험이 각 박자에 넘긴 포트(박자 유효 문)를 보려고 바꿔 끼운다.
+export interface BeatTicks {
+  readonly linkLoss: typeof linkLossTick;
+  readonly life: typeof lifeTick;
+  readonly resend: typeof resendTick;
+  readonly unreceived: typeof unreceivedTick;
+  readonly assign: typeof assignAndStartTick;
+}
+
 // 같은 객체가 넘어가는지 시험이 보려고 바꿔 끼우는 생성자. 운영은 넘기지 않는다(기본값이 실제 생성자다).
 export interface SupervisorMakers {
   readonly sharedClock: typeof createSharedClock;
@@ -122,6 +133,7 @@ export interface SupervisorMakers {
   readonly issuance: typeof createIssuance;
   readonly sink: typeof createWireSink;
   readonly lines: typeof createAnswerLines;
+  readonly ticks: BeatTicks;
 }
 
 const MAKERS: SupervisorMakers = {
@@ -132,6 +144,7 @@ const MAKERS: SupervisorMakers = {
   issuance: createIssuance,
   sink: createWireSink,
   lines: createAnswerLines,
+  ticks: { linkLoss: linkLossTick, life: lifeTick, resend: resendTick, unreceived: unreceivedTick, assign: assignAndStartTick },
 };
 
 export interface SupervisorDeps {
@@ -442,18 +455,20 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   let exitCode: number = 0;
   let granted = false;
   let beatLimit: number | null = null;
-  // 끝낼 사유가 이미 생겼는가. 박자 앞뒤와 끝 차례가 본다. 읽다 던지면 고장·닫힘으로 본다(모름을 건강으로 읽지 않는다).
+  // 끝낼 사유가 이미 생겼는가. 박자 앞뒤와 끝 차례가 본다. 모름을 건강·닫힘으로 읽지 않는다: 장부 건강을 읽다 던지면
+  // ledger_unwritable, 허가를 읽다 던지면 intake_unreadable이다. 후자는 처음부터 닫힌 판정(기존 실행의 정리를 허락)과 다르다:
+  // 허가가 있는지조차 모르므로 끝낸다.
   const haltReason = (): string | null => {
     try {
       if (ledger.health().writable !== true) return "ledger_unwritable";
     } catch {
       return "ledger_unwritable";
     }
-    let open = false;
+    let open: boolean;
     try {
       open = restorer.intakeOpen() === true;
     } catch {
-      open = false;
+      return "intake_unreadable";
     }
     // 받아들인 허가가 사라졌다(새 정지 기록, 장부 고장). 반대로 조립이 받아들이지 않은 허가(기한을 넘겨 끝난 5단계가 장부에 이미 낸 것)도
     // 소비자에게 보이지 않게 닫힘으로 본다.
@@ -461,8 +476,9 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     if (!granted && open) return "intake_unaccepted";
     return null;
   };
-  // 처음부터 닫힌 5단계(받아들인 허가 없음, 장부의 허가도 없음)는 열림이다: 기존 실행의 정지·상태 조회는 나간다. 새 접수·시작·갱신·
-  // 자격 값은 복원기의 접수 문이 따로 막는다.
+  // 박자 유효 문. 처음부터 닫힌 5단계(받아들인 허가 없음, 장부의 허가도 없음)는 열림이다: 기존 실행의 정지·상태 조회는 나간다.
+  // 새 접수·시작·갱신·자격 값은 아래 접수 문이 따로 막는다. 박자 다섯의 beatValid 포트에 이 함수 그대로를 넘긴다(빠지면 그 부품은
+  // 늘 유효로 읽으므로 조립이 빠뜨리면 안 된다: boot-effects.test.ts의 같은 객체 단언).
   const effectsOpen = (): boolean => exitCode === 0 && !(beatLimit !== null && pastLimit(deps, beatLimit)) && haltReason() === null;
   // 박자 넷이 장부에 발급을 적기 직전에 보는 접수 문. 복원기의 접수에 효과의 문을 더한다. 정지 세대는 복원기 그대로다.
   const intake = {
@@ -481,13 +497,18 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   };
   const beats: CycleBeats = {
     linkLoss: (clocks, policy, input) =>
-      linkLossTick({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks }, policy, input),
+      make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
     life: (clock, input) =>
-      lifeTick({ ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink }, settings.life, input),
+      make.ticks.life(
+        { ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen },
+        settings.life,
+        input,
+      ),
     resend: (clock, policy, input) =>
-      resendTick({ ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink }, policy, input),
-    unreceived: (now) => unreceivedTick({ ledger, evidence: deps.evidence, withheld: need(lines).withheld, intake, observationsSettled: unreceivedSettled }, now),
-    assign: (now) => assignAndStartTick(assignPorts(), settings.assign, now),
+      make.ticks.resend({ ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen }, policy, input),
+    unreceived: (now) =>
+      make.ticks.unreceived({ ledger, evidence: deps.evidence, withheld: need(lines).withheld, intake, observationsSettled: unreceivedSettled, beatValid: effectsOpen }, now),
+    assign: (now) => make.ticks.assign(assignPorts(), settings.assign, now),
   };
   // 세대를 모르면 "후보 없음"이 아니라 모름이다(assign-loop.ts의 CandidateSource).
   const candidates: CandidateSource = {
@@ -504,6 +525,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     random: deps.random,
     signer: signing.signer,
     sink: need(wire).sink,
+    beatValid: effectsOpen,
   });
   let cycle: Cycle;
   try {
@@ -646,14 +668,20 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   let restoring = false;
   let lastRestoreFailure = "";
 
-  const finish = (why: string): Promise<number> => {
+  const markFatal = (why: string) => {
     if (why !== "stop" && exitCode === 0) {
       exitCode = SUPERVISOR_EXIT.fatal;
       log("fatal", { reason: why });
     }
-    if (ending !== null) return ending;
-    // 끝 차례의 기한은 기록·깨우기·시계 읽기보다 먼저 정한다. 시각을 읽지 못해도 닫기는 부른다(NaN 기한은 unarmed → 96).
+  };
+  const finish = (why: string): Promise<number> => {
+    if (ending !== null) {
+      markFatal(why);
+      return ending;
+    }
+    // 끝 차례의 기한은 진입 즉시, 치명 기록·깨우기·시계 읽기보다 먼저 정한다. 시각을 읽지 못해도 닫기는 부른다(NaN 기한은 unarmed → 96).
     const limit = deadline(timing.stopWaitMs) ?? Number.NaN;
+    markFatal(why);
     stopping = true;
     wake();
     ending = (async () => {
@@ -672,6 +700,12 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
         log("fatal", { reason: known });
       }
       if (!closeLedger()) exitCode = SUPERVISOR_EXIT.fatal;
+      // 마지막 장부 닫기(동기)도 끝 차례의 상한 안에 든다. 반드시 할 닫기를 모두 마친 뒤의 시각으로 판정한다. 발급 닫기가 이미 만료면
+      // 그 기록이 있으므로 다시 적지 않는다.
+      if (closed.kind === "done" && pastLimit(deps, limit)) {
+        exitCode = SUPERVISOR_EXIT.fatal;
+        log("shutdown_incomplete", { kind: "lapsed" });
+      }
       log("stopped", { code: exitCode });
       return exitCode;
     })();
@@ -738,17 +772,22 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       kickRestore();
       if (stopping) return;
       // 박자의 절대 기한은 박자를 부르기 전에 정한다. 박자 안의 효과 자리(effectsOpen)와 결과 수락이 같은 기한을 본다.
-      const beatStarted = deps.monoNow();
-      beatLimit = beatStarted + timing.beatWaitMs;
-      const waited = await waitUntil(cycle.beat(), beatLimit, deps);
+      // 시각을 읽지 못하면(유한하지 않음 포함) 박자를 부르지 않는다: 기한 없는 박자는 그 안의 쓰기를 막을 기준이 없다.
+      const limit = deadline(timing.beatWaitMs);
+      if (limit === null) return void finish("beat_unarmed");
+      const beatStarted = limit - timing.beatWaitMs;
+      beatLimit = limit;
+      const waited = await waitUntil(cycle.beat(), limit, deps);
       // 거부·기한 넘김은 멈춤 요청보다 먼저 코드에 반영한다. 기한을 넘긴 박자는 계속 돌 수 있으므로 beatLimit을 그대로 둔다.
       if (waited.kind !== "done") return void finish(`beat_${waited.kind}`);
       beatLimit = null;
-      // 답 처리(pump) 전에 다시 본다: 박자 안에서 생긴 장부 고장·허가 폐기 뒤에는 쥔 답을 장부에 넘기지 않는다.
+      // 박자 시간 기록(시계 읽기·기록 포트)은 아래 확인보다 먼저 한다: 확인과 pump 사이에 외부 호출이 없게. 기록 포트 안에서 생긴
+      // 장부 고장·허가 폐기도 아래 확인이 본다.
+      log("beat_time", { startedMs: beatStarted, endedMs: deps.monoNow() });
+      // 답 처리(pump) 바로 앞에서 다시 본다: 박자 안이나 기록 안에서 생긴 장부 고장·허가 폐기 뒤에는 쥔 답을 장부에 넘기지 않는다.
       const after = haltReason();
       if (after !== null) return void finish(after);
       if (stopping) return;
-      log("beat_time", { startedMs: beatStarted, endedMs: deps.monoNow() });
       answerLines.pump();
       const requery = answerLines.takeRequery();
       if (requery.length > 0) log("requery", { count: requery.length });

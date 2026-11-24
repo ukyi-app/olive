@@ -75,6 +75,10 @@ export interface AssignLoopPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 장부 쓰기(startRun·assignToolRequest) 바로 앞과 송신 표식을
+  // 적는 공유 함수를 부르기 바로 앞에서, 마지막 외부 호출 뒤에 본다. 거짓·던짐이면 그 쓰기를 부르지 않는다. 빠지면 늘 유효다(이 부품
+  // 단독의 쓰임). 조립은 반드시 넘긴다.
+  readonly beatValid?: () => boolean;
 }
 
 // 배포가 넣는 값. 코드에 기본값이 없다.
@@ -113,8 +117,9 @@ export type RequestOutcome =
 // 시작은 장부에 적혔지만 지시를 내보내지 못한 이유. 앞의 넷과 봉하기 거절은 봉투를 만들지 못한 것이고, no_connection·too_late_to_send는
 // 내보내기 포트의 거절이다. send_threw·send_answer_malformed는 포트가 연결에 실었는지 모른다(delivery: "unknown").
 // sink_unavailable은 내보내기 포트를 얻지 못해 부르지 않은 것이고(표식도 적지 않았다), start_unmarked는 송신 표식이 ok가 아니어서
-// 포트를 부르지 않은 것이다(markReason에 그 이유).
+// 포트를 부르지 않은 것이다(markReason에 그 이유). beat_closed는 공유 함수 직전에 본 박자 유효 문이 닫혀 표식을 적지 않고 싣지 않은 것이다.
 export type NotSentReason =
+  | "beat_closed"
   | "ledger_answer_malformed"
   | "draft_threw"
   | "seal_threw"
@@ -165,11 +170,12 @@ export type TickResult =
       readonly starts: readonly StartOutcome[];
       readonly requests: readonly RequestOutcome[];
       // 남은 일을 하지 않고 멈춘 이유. intake_closed는 박자 중에 접수가 닫혀 남은 쓰기를 부르지 않은 것이고,
+      // beat_closed는 장부 쓰기(startRun·assignToolRequest) 바로 앞에서 박자 유효 문이 닫혀 그 쓰기와 남은 일을 부르지 않은 것이고,
       // threw는 항목을 처리하다 예상하지 못한 예외가 난 것이다. 목록에는 그 전까지 한 것이 모두 있다.
       // 멈춘 자리의 항목은 목록에 없다. threw이면 그 항목에 장부 쓰기가 있었는지 이 값으로는 모르고, haltedAt이 앞 항목을
       // 가리킬 수 있으므로 부르는 쪽은 결과 목록에 없는 대기 부탁·실행 전체를 장부에서 다시 읽는다.
       // kind와 빈 두 목록은 정상 유휴 박자와 같으므로 완료 여부는 이 값으로 가른다.
-      readonly halted: "intake_closed" | "threw" | null;
+      readonly halted: "intake_closed" | "beat_closed" | "threw" | null;
       readonly haltedAt: HaltedAt | null;
     };
 
@@ -277,6 +283,15 @@ function intakeOpen(intake: IntakeSource): boolean {
   }
 }
 
+// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+function beatValid(ports: AssignLoopPorts): boolean {
+  try {
+    return ports.beatValid === undefined || ports.beatValid() === true;
+  } catch {
+    return false;
+  }
+}
+
 // rows는 listRuns의 행(실행 ID → 행)이다. 시작 직전에 지정 실행기를 읽는 데만 쓴다(대기 실행의 지정 실행기는 배정 뒤 바뀌지 않는다).
 type Snapshot = { stopGeneration: number; waiting: readonly WaitingToolRequest[]; candidates: readonly Candidate[]; view: SchedulerView; rows: ReadonlyMap<string, Run> };
 
@@ -371,7 +386,7 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
   const starts: StartOutcome[] = [];
   const requests: RequestOutcome[] = [];
   let at: HaltedAt | null = null;
-  const halt = (halted: "intake_closed" | "threw"): TickResult => ({ kind: "ran", starts, requests, halted, haltedAt: at });
+  const halt = (halted: "intake_closed" | "beat_closed" | "threw"): TickResult => ({ kind: "ran", starts, requests, halted, haltedAt: at });
   // 시작·잇기에 들어선 뒤에는(따라서 장부에 쓰기가 한 번이라도 성공한 뒤에는) 예외를 박자 밖으로 내지 않는다. 내면 이미 장부에 적은 시작(recorded_not_sent·sent)과 이은 부탁의 결과를
   // 부르는 쪽이 잃고, 그 실행은 아무도 모르는 채 자리를 쥔다. 포트의 예외는 항목 안에서 구별된 결과가 되고, 이 catch는 그 밖의 예외를 받는다.
   try {
@@ -388,12 +403,14 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
         starts.push({ runId: candidate.runId, outcome: "withheld", ...withheld });
         continue;
       }
-      starts.push(await startOne(ports, candidate.runId, snapshot.stopGeneration, now));
+      const started = await startOne(ports, candidate.runId, snapshot.stopGeneration, now);
+      if (started === "beat_closed") return halt("beat_closed");
+      starts.push(started);
     }
     for (const request of snapshot.waiting) {
       at = { step: "assign", ref: request.ref };
       const outcome = await assignOne(ports, policy, snapshot.candidates, request, now);
-      if (outcome === "intake_closed") return halt("intake_closed");
+      if (outcome === "intake_closed" || outcome === "beat_closed") return halt(outcome);
       requests.push(outcome);
     }
   } catch {
@@ -408,7 +425,7 @@ async function assignOne(
   connections: readonly Candidate[],
   request: WaitingToolRequest,
   now: number,
-): Promise<RequestOutcome | "intake_closed"> {
+): Promise<RequestOutcome | "intake_closed" | "beat_closed"> {
   const ref = request.ref;
   let facts: PreAssignFacts;
   try {
@@ -463,7 +480,10 @@ async function assignOne(
   if (runId === null) return { ref, outcome: "assign_failed", failure: "random_unavailable" };
   let answer: unknown;
   try {
-    answer = ports.ledger.assignToolRequest({ ...picked.input, runId });
+    const ledger = ports.ledger;
+    // 마지막 외부 호출(난수, 장부 포트 얻기) 뒤, 장부 호출 바로 앞.
+    if (!beatValid(ports)) return "beat_closed";
+    answer = ledger.assignToolRequest({ ...picked.input, runId });
   } catch {
     return { ref, outcome: "assign_failed", failure: "threw" };
   }
@@ -481,7 +501,7 @@ async function assignOne(
   return { ref, outcome: "assign_failed", failure: "malformed_answer" };
 }
 
-async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: number, now: number): Promise<StartOutcome> {
+async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: number, now: number): Promise<StartOutcome | "beat_closed"> {
   const requestId = freshUuid(ports.random);
   if (requestId === null) return { runId, outcome: "start_failed", failure: "random_unavailable" };
   let answer: unknown;
@@ -489,6 +509,8 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
   let ledger: AssignLoopLedger;
   try {
     ledger = ports.ledger;
+    // 마지막 외부 호출(난수, 장부 포트 얻기) 뒤, 장부 호출 바로 앞.
+    if (!beatValid(ports)) return "beat_closed";
     answer = ledger.startRun({ runId, requestId, stopGeneration, now });
   } catch {
     return { runId, outcome: "start_failed", failure: "threw" };
@@ -538,6 +560,9 @@ async function startOne(ports: AssignLoopPorts, runId: string, stopGeneration: n
   // 송신 표식 → 내보내기는 공유 함수 하나로만 한다(재전송 박자와 같은 자리, send-gate.md). 표식은 봉한 뒤, 포트 호출 직전이다:
   // 그 앞의 실패(초안·봉하기)에는 표식이 남지 않는다. 표식이 ok가 아니면 싣지 않고, 장부에 적힌 시작은 그대로 둔다(재전송이 다시 시도한다).
   // 표식은 이 박자의 now와 장부의 발행 시각 가운데 늦은 값(봉한 시각)으로 적는다. 박자는 시계 포트가 없고 그 뒤의 시각을 읽지 않는다.
+  // 표식도 장부 쓰기다. 공유 함수를 부르기 바로 앞, 마지막 외부 호출(봉하기의 서명·난수) 뒤에 박자 유효 문을 본다. 여기부터 표식까지는
+  // 공유 함수 안의 봉투·포트 묶음 속성 읽기뿐이다(send-gate.ts의 차례). 닫혔으면 적힌 시작은 그대로 두고 표식 없이 남긴다(재전송이 다룬다).
+  if (!beatValid(ports)) return notSent("beat_closed");
   const gate = await sendInstruction(ports, envelope, { marker: ledger, at: sealAt });
   if (gate.kind === "unmarked") return notSent("start_unmarked", { markReason: gate.markReason });
   if (gate.kind === "sink_unavailable") return notSent("sink_unavailable");

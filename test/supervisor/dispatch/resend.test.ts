@@ -1015,3 +1015,38 @@ describe("모른다고 옮긴 실행: 시작은 다시 내지 않고 조회만 �
     third.close();
   });
 });
+
+describe("박자 유효 문(beatValid): 시작의 송신 표식을 적는 공유 함수 바로 앞에서 본다", () => {
+  test("봉하기(서명) 사이 박자 기한이 지나면 표식을 적지 않고 싣지 않는다(withheld beat_closed). 대조군(기한 안)은 표식 1·송신 1", async () => {
+    for (const lapse of [true, false]) {
+      const w = world();
+      const s = started(w);
+      w.setClock(NOW + 6_000);
+      let valid = true;
+      // 마지막 외부 호출(서명) 안에서 박자 기한이 지난다.
+      w.setSigner(() => {
+        if (lapse) valid = false;
+      });
+      const result = await resendTick({ ...w.ports, beatValid: () => valid }, { resendEveryMs: EVERY }, { lastResends: [] });
+      if (lapse) {
+        expect(outcomes(result)).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "beat_closed" }]);
+        expect([marks(w), w.sent.length]).toEqual([[], 0]);
+      } else {
+        expect(outcomes(result)).toMatchObject([{ requestId: s.requestId, outcome: "resent" }]);
+        expect([marks(w).length, w.sent.length]).toEqual([1, 1]);
+      }
+    }
+  });
+
+  test("유효 문이 던지거나 true가 아니면 표식을 적지 않는다", async () => {
+    for (const beatValid of [() => undefined as unknown as boolean, () => { throw new Error("유효 문 실패"); }]) {
+      const w = world();
+      const s = started(w);
+      w.setClock(NOW + 6_000);
+      expect(outcomes(await resendTick({ ...w.ports, beatValid }, { resendEveryMs: EVERY }, { lastResends: [] }))).toEqual([
+        { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "beat_closed" },
+      ]);
+      expect([marks(w), w.sent.length]).toEqual([[], 0]);
+    }
+  });
+});

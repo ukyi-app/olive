@@ -1139,3 +1139,74 @@ test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고
     expect(source).not.toContain(banned);
   }
 });
+
+describe("박자 유효 문(beatValid): 장부에 적기 직전, 마지막 시계 읽기 뒤에 본다", () => {
+  const plain = (ports: LifeLoopPorts) => lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] });
+  // 박자 기한이 n번째 시계 읽기 안에서 지난다(그 읽기가 끝난 뒤부터 유효 문이 닫힌다). 박자 처음이 첫째, 기록 시각이 둘째다.
+  const lapsingAt = (w: World, at: number, nth: number | null): LifeLoopPorts => {
+    let reads = 0;
+    let valid = true;
+    return {
+      ...w.ports,
+      clock: {
+        now: () => {
+          reads += 1;
+          if (reads === nth) valid = false;
+          return at;
+        },
+      },
+      beatValid: () => valid,
+    };
+  };
+
+  test("종료: 기록 시각을 읽는 사이 박자 기한이 지나면 종료를 적지 않고 beat_closed다. 대조군(기한 안)은 적고 내보낸다", async () => {
+    for (const nth of [2, null]) {
+      const w = world();
+      const s = started(w, { deadlineAt: NOW + 20_000 });
+      accept(w, s);
+      w.setClock(NOW + 20_000);
+      const outcome = only(await plain(lapsingAt(w, NOW + 20_000, nth)), s.runId);
+      if (nth !== null) {
+        expect(outcome).toEqual({ runId: s.runId, outcome: "beat_closed", planned: "stop" });
+        expect([writes(w), w.sent.length, unanswered(w).filter((i) => i.action === "task_cancel").length, state(w, s.runId)]).toEqual([[], 0, 0, "preparing"]);
+      } else {
+        expect(outcome).toMatchObject({ outcome: "stop_sent", cancelReason: "deadline" });
+        expect([writes(w), w.sent.length]).toEqual([["recordStopInstruction"], 1]);
+      }
+    }
+  });
+
+  test("갱신: 기록 시각을 읽는 사이 박자 기한이 지나면 갱신을 적지 않고 beat_closed다. 대조군(기한 안)은 적고 내보낸다", async () => {
+    for (const nth of [2, null]) {
+      const w = world();
+      const s = started(w);
+      accept(w, s);
+      w.setClock(NOW + 10_000);
+      const outcome = only(await plain(lapsingAt(w, NOW + 10_000, nth)), s.runId);
+      if (nth !== null) {
+        expect(outcome).toEqual({ runId: s.runId, outcome: "beat_closed", planned: "renew_lease" });
+        expect([writes(w), w.sent.length, times(w, s.runId).renewIssued]).toEqual([[], 0, null]);
+      } else {
+        expect(outcome).toMatchObject({ outcome: "renew_sent", leaseUntil: NOW + 40_000 });
+        expect([writes(w), w.sent.length]).toEqual([["recordRenewInstruction"], 1]);
+      }
+    }
+  });
+
+  test("접수가 닫혀도 유효한 박자의 종료는 적는다(접수 문과 박자 유효 문은 다르다). 유효 문이 던지거나 true가 아니면 적지 않는다", async () => {
+    const closed = world();
+    const s = started(closed, { deadlineAt: NOW + 20_000 });
+    accept(closed, s);
+    closed.setClock(NOW + 20_000);
+    closed.setIntake(false);
+    expect(only(await plain({ ...closed.ports, beatValid: () => true }), s.runId)).toMatchObject({ outcome: "stop_sent", cancelReason: "deadline" });
+    for (const beatValid of [() => undefined as unknown as boolean, () => 1 as unknown as boolean, () => { throw new Error("유효 문 실패"); }]) {
+      const w = world();
+      const r = started(w, { deadlineAt: NOW + 20_000 });
+      accept(w, r);
+      w.setClock(NOW + 20_000);
+      expect(only(await plain({ ...w.ports, beatValid }), r.runId)).toEqual({ runId: r.runId, outcome: "beat_closed", planned: "stop" });
+      expect(writes(w)).toEqual([]);
+    }
+  });
+});

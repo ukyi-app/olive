@@ -3,8 +3,9 @@
 import { describe, expect, test } from "bun:test";
 import { openLedger, type OpenOptions } from "../../../src/ledger/index.ts";
 import type { BootResult, RunningSupervisor } from "../../../src/supervisor/runtime/boot.ts";
+import { createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
 import { type BeatReport, createCycle } from "../../../src/supervisor/runtime/cycle.ts";
-import { digest, must, ready } from "../../ledger/helpers.ts";
+import { digest, id, must, ready, worker } from "../../ledger/helpers.ts";
 import { FILES, WALL, type World, world } from "./boot-world.ts";
 
 function deferred<T>() {
@@ -51,6 +52,23 @@ async function running(w: World): Promise<RunningSupervisor> {
 async function untilStep(w: World, step: number): Promise<void> {
   for (let i = 0; i < 20 && !steps(w).includes(step); i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
   expect(steps(w)).toContain(step);
+}
+
+type Frame = { action: string; requestId: string; refused: string | null };
+
+// 서버의 쓰기 면을 인정된 연결 하나로 바꾸고, 넘기려던 틀의 동작·요청 ID와 내보내기 포트의 두 확인이 낸 거절을 적는다.
+function observeFrames(w: World): Frame[] {
+  const seen: Frame[] = [];
+  const server = w.fake.server as unknown as { recognized: () => number | null; writeFrame: (...args: unknown[]) => unknown };
+  server.recognized = () => 1;
+  server.writeFrame = (_connection, _peer, frame, checks) => {
+    const { header } = JSON.parse(new TextDecoder().decode((frame as Uint8Array).subarray(4))) as { header: { action: string; request_id: string } };
+    const { lastCheck, finalCheck } = checks as { lastCheck: () => string | null; finalCheck?: () => string | null };
+    const refused = lastCheck() ?? finalCheck?.() ?? null;
+    seen.push({ action: header.action, requestId: header.request_id, refused });
+    return refused !== null ? { kind: "not_written", reason: "refused", refusal: refused } : { kind: "written" };
+  };
+  return seen;
 }
 
 describe("기한은 일을 부르기 전에 정한다(F2)", () => {
@@ -305,5 +323,249 @@ describe("D-90 박자의 기록(F6)", () => {
     // 실행이 없으면 D-90은 항목 0으로 돈다.
     expect(last).toMatchObject({ unreceived: "ran", unreceivedOutcomes: "", unreceivedHalted: null, rereadCauses: "" });
     expect(await run.stop()).toBe(0);
+  });
+});
+
+describe("박자 안에서 기한을 넘긴 뒤의 장부 쓰기(R1)", () => {
+  // 기한이 끝난 작업이 하나 있는 장부. 수명 박자 안의 실행 목록 읽기에서 박자 기한 + 1ms를 쓴다. 첫 기동의 송신이 막혀도 장부에 남은
+  // 종료 지시는 다음 감독의 재전송 대상이 되므로, 재기동까지 이어서 본다.
+  test("수명 박자가 기한을 넘기면 종료 지시를 적지 않고, 같은 장부의 새 기동도 그 취소를 다시 넘기지 않는다", async () => {
+    const w = world();
+    const commits = countCommits(w);
+    const frames = observeFrames(w);
+    let offset = 0;
+    const mono = w.deps.monoNow;
+    let armed = false;
+    let inLife = false;
+    const makeCycle = w.deps.make!.cycle!;
+    w.deps = {
+      ...w.deps,
+      monoNow: () => mono() + offset,
+      make: {
+        ...w.deps.make,
+        cycle: (deps) =>
+          makeCycle({
+            ...deps,
+            beats: {
+              ...deps.beats,
+              life: async (clock, input) => {
+                inLife = armed;
+                try {
+                  return await deps.beats.life(clock, input);
+                } finally {
+                  inLife = false;
+                }
+              },
+            },
+          }),
+      },
+    };
+    const run = await running(w);
+    await untilStep(w, 5);
+    const ledger = w.opened!;
+    const admitted = must(ledger.admitRun(worker({ now: WALL, deadlineAt: WALL + 600_000 }))).run;
+    must(ledger.startRun({ runId: admitted.runId, requestId: id(), stopGeneration: 0, now: WALL }));
+    w.wall = WALL + 600_001;
+    const before = commits.length;
+    const list = ledger.listRuns.bind(ledger);
+    let spent = false;
+    ledger.listRuns = () => {
+      const rows = list();
+      if (inLife && !spent) {
+        spent = true;
+        offset += w.settings.timing.beatWaitMs + 1;
+      }
+      return rows;
+    };
+    armed = true;
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    const code = await run.done;
+
+    const check = openLedger(w.ledgerPath, { mode: "reopen", clock: () => w.wall });
+    if (!check.ok) throw new Error(check.reason);
+    const unanswered = check.ledger.unansweredInstructions();
+    const runs = check.ledger.listRuns();
+    check.ledger.close();
+    if (!unanswered.known || !runs.known) throw new Error("reopen read");
+    const recorded = unanswered.value.instructions.filter((item) => item.action === "task_cancel").map((item) => item.requestId);
+
+    const again = world();
+    again.settings = { ...again.settings, ledgerPath: w.ledgerPath };
+    again.wall = w.wall + 6_000;
+    const resent = observeFrames(again);
+    const second = await running(again);
+    await untilStep(again, 5);
+    await again.time.advance(again.settings.timing.beatEveryMs);
+    const secondCode = await second.stop();
+    expect({
+      spent,
+      code,
+      fatal: fatals(w),
+      afterInput: commits.slice(before),
+      firstFrames: frames.map((f) => f.action),
+      recordedCancels: recorded.length,
+      stopping: runs.value.filter((r) => r.state === "stopping").length,
+      resentCancels: resent.filter((f) => f.action === "task_cancel" && recorded.includes(f.requestId)).length,
+      secondCode,
+    }).toEqual({ spent: true, code: 96, fatal: ["beat_lapsed"], afterInput: [], firstFrames: [], recordedCancels: 0, stopping: 0, resentCancels: 0, secondCode: 0 });
+  });
+});
+
+describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", () => {
+  test("박자 다섯은 같은 함수 하나를 beatValid로 받는다. 그 함수는 박자 유효 문이다: 장부를 쓸 수 없게 되면 닫힌다", async () => {
+    const w = world();
+    let inject = false;
+    countCommits(w, (point) => {
+      if (inject && point === "read") {
+        inject = false;
+        throw new Error("read failure");
+      }
+    });
+    const run = await running(w);
+    await untilStep(w, 5);
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    const ports = w.captured.beatPorts ?? {};
+    expect(Object.keys(ports).sort()).toEqual(["assign", "life", "linkLoss", "resend", "unreceived"]);
+    const gates = new Set(Object.values(ports).map((p) => p?.beatValid));
+    expect(gates.size).toBe(1);
+    const gate = [...gates][0];
+    if (typeof gate !== "function") throw new Error("beatValid가 없다");
+    expect(gate()).toBe(true);
+    inject = true;
+    w.opened!.readStop();
+    expect(gate()).toBe(false);
+    expect(await run.stop()).toBe(96);
+  });
+
+  test("처음부터 닫힌 5단계에서도 기존 실행의 정리(종료·조회)는 나간다: 박자 유효 문은 접수 문과 다르다", async () => {
+    const w = world();
+    const seed = openLedger(w.ledgerPath, { mode: "reopen", clock: () => WALL });
+    if (!seed.ok) throw new Error(seed.reason);
+    ready(seed.ledger);
+    const admitted = must(seed.ledger.admitRun(worker({ now: WALL, deadlineAt: WALL + 600_000 }))).run;
+    must(seed.ledger.startRun({ runId: admitted.runId, requestId: id(), stopGeneration: 0, now: WALL }));
+    seed.ledger.close();
+    w.front.stop = async () => ({ generation: 1, stopped: true });
+    w.wall = WALL + 600_001;
+    const frames = observeFrames(w);
+    const run = await running(w);
+    await untilStep(w, 5);
+    for (let i = 0; i < 3; i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
+    expect(named(w, "restore_step").at(-1)?.fields).toMatchObject({ step: 5, intakeMayOpen: false });
+    const sent = frames.filter((f) => f.refused === null).map((f) => f.action);
+    expect(sent.length).toBeGreaterThan(0);
+    expect(sent.every((action) => action === "status_query" || action === "task_cancel")).toBe(true);
+    expect(fatals(w)).toEqual([]);
+    expect(await run.stop()).toBe(0);
+  });
+});
+
+describe("끝 차례의 상한은 마지막 장부 닫기까지(R3)", () => {
+  test("마지막 장부 닫기가 상한 + 1ms를 쓰면 96과 shutdown_incomplete다. 대조군(상한 1ms 전)은 0", async () => {
+    for (const [extra, code, incomplete] of [
+      [1, 96, ["lapsed"]],
+      [-1, 0, []],
+    ] as const) {
+      const w = world();
+      const run = await running(w);
+      const ledger = w.opened!;
+      const close = ledger.close.bind(ledger);
+      ledger.close = () => {
+        w.time.set(w.time.monoNow() + w.settings.timing.stopWaitMs + extra);
+        close();
+      };
+      expect(await run.stop()).toBe(code);
+      expect(named(w, "shutdown_incomplete").map((e) => e.fields.kind)).toEqual([...incomplete]);
+    }
+  });
+
+  test("첫 치명 기록도 끝 차례의 기한 뒤다: 그 기록이 상한 + 1ms를 쓰면 발급 닫기가 만료다", async () => {
+    const beat = deferred<BeatReport>();
+    const w = world({ makers: { cycle: (deps) => ({ ...createCycle(deps), beat: () => beat.promise }) } });
+    const log = w.deps.log;
+    w.deps = {
+      ...w.deps,
+      log: (event, fields) => {
+        log(event, fields);
+        if (event === "fatal") w.time.set(w.time.monoNow() + w.settings.timing.stopWaitMs + 1);
+      },
+    };
+    const run = await running(w);
+    beat.reject(new Error("beat"));
+    expect(await run.done).toBe(96);
+    expect(fatals(w)).toEqual(["beat_failed"]);
+    expect(named(w, "shutdown_incomplete").map((e) => e.fields.kind)).toEqual(["lapsed"]);
+  });
+});
+
+describe("답 처리 직전의 확인과 pump 사이에 외부 호출이 없다(R4)", () => {
+  test("박자 시간 기록 안에서 허가가 버려지면 쥔 답이 있어도 pump를 부르지 않는다(96 intake_discarded)", async () => {
+    const pending: string[] = [];
+    const applied: string[] = [];
+    const w = world({
+      makers: {
+        lines: (ports) => {
+          const real = createAnswerLines(ports);
+          // 쥔 답 하나를 흉내 낸다: pump가 불리면 그 답을 적용한 것으로 센다.
+          return { ...real, withheld: real.withheld, deliver: (output) => real.deliver(output), pump: () => (applied.push(...pending.splice(0)), real.pump()), backlog: (executor) => real.backlog(executor), takeRequery: () => real.takeRequery() };
+        },
+      },
+    });
+    let discard = false;
+    const log = w.deps.log;
+    w.deps = {
+      ...w.deps,
+      log: (event, fields) => {
+        log(event, fields);
+        if (event === "beat_time" && discard) {
+          discard = false;
+          must(w.opened!.applyStop({ generation: 1, stopped: true, now: WALL }));
+        }
+      },
+    };
+    const run = await running(w);
+    await untilStep(w, 5);
+    pending.push("answer");
+    discard = true;
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    expect([applied, pending]).toEqual([[], ["answer"]]);
+    expect(fatals(w)).toEqual(["intake_discarded"]);
+    expect(await run.done).toBe(96);
+  });
+});
+
+describe("모름과 시각을 읽지 못함(R5·R7)", () => {
+  test("허가 읽기가 던지면 처음부터 닫힌 판정과 구별해 intake_unreadable로 끝낸다", async () => {
+    const w = world();
+    const run = await running(w);
+    w.captured.restorer!.value.intakeOpen = () => {
+      throw new Error("허가 읽기 실패");
+    };
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    expect(fatals(w)).toEqual(["intake_unreadable"]);
+    expect(await run.stop()).toBe(96);
+  });
+
+  test("박자를 부르기 전 시각이 유한하지 않으면 박자를 부르지 않고 96이다", async () => {
+    let beats = 0;
+    let broken = false;
+    const w = world({
+      makers: {
+        cycle: (deps) => {
+          const real = createCycle(deps);
+          return { ...real, beat: () => ((beats += 1), real.beat()) };
+        },
+      },
+    });
+    const mono = w.deps.monoNow;
+    w.deps = { ...w.deps, monoNow: () => (broken ? Number.NaN : mono()) };
+    const run = await running(w);
+    await untilStep(w, 5);
+    const before = beats;
+    broken = true;
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    expect(beats).toBe(before);
+    expect(fatals(w)).toEqual(["beat_unarmed"]);
+    expect(await run.done).toBe(96);
   });
 });

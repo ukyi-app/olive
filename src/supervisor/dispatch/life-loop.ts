@@ -58,6 +58,10 @@ export interface LifeLoopPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 갱신·종료를 장부에 적기 직전, 마지막 외부 호출(시계 읽기)
+  // 뒤의 같은 동기 구간에서 본다. 거짓·던짐이면 적지 않는다. 접수 문(intake)과 다르다: 종료는 접수가 닫혀도 적지만 무효인 박자에서는
+  // 적지 않는다. 빠지면 늘 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다: 기한을 넘긴 박자의 기록은 다음 감독의 재전송 대상이 된다.
+  readonly beatValid?: () => boolean;
 }
 
 export interface LifeTickInput {
@@ -107,6 +111,8 @@ export type RunOutcome =
   | { readonly runId: string; readonly outcome: "finalize_withheld" }
   // 쓰기 직전에 다시 읽은 실행 줄·입력 취소·지시 이력으로 판단하니 계획한 의도가 아니었다(그 사이 다른 쓰기가 있었다). 쓰지 않았다.
   | { readonly runId: string; readonly outcome: "superseded"; readonly planned: "renew_lease" | "stop" }
+  // 장부에 적기 직전에 본 박자 유효 문이 닫혔다. 쓰지 않았다.
+  | { readonly runId: string; readonly outcome: "beat_closed"; readonly planned: "renew_lease" | "stop" }
   | { readonly runId: string; readonly outcome: "renew_withheld"; readonly reason: RenewWithheld }
   | { readonly runId: string; readonly outcome: "renew_sent"; readonly requestId: string; readonly issuedAt: number; readonly leaseUntil: number; readonly executorId: string }
   | { readonly runId: string; readonly outcome: "renew_refused"; readonly reason: LedgerRefusal }
@@ -239,6 +245,15 @@ function readList(read: () => unknown): readonly Record<string, unknown>[] | nul
 function intakeOpen(intake: LifeIntake): boolean {
   try {
     return intake.intakeOpen() === true;
+  } catch {
+    return false;
+  }
+}
+
+// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+function beatValid(ports: LifeLoopPorts): boolean {
+  try {
+    return ports.beatValid === undefined || ports.beatValid() === true;
   } catch {
     return false;
   }
@@ -570,7 +585,7 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
   if (link !== null) return withheld(link);
   const recordAt = readClock(ctx.ports, ctx.now);
   if (recordAt === null) return withheld("clock_unavailable");
-  // 여기부터 장부 호출까지 포트를 부르지 않고 await도 없다. 다시 읽기부터 여기까지의 동기 포트(접수·연결·시계) 안에서 일어난 쓰기는
+  // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 다시 읽기부터 여기까지의 동기 포트(접수·연결·시계) 안에서 일어난 쓰기는
   // 막지 못한다(박자의 직렬화와 다른 쓰기와의 순서는 부르는 쪽의 조건이다).
   const view = viewOf(fresh, recordAt, ctx.unsentRenews);
   if (!startAccepted(fresh.run)) return withheld("start_not_accepted");
@@ -582,6 +597,8 @@ async function renewOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunO
   const { executorId, runGeneration, deadlineAt } = fresh.run;
   const stopGeneration = ctx.stopGeneration;
   const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "renew_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, reason });
+  // 마지막 외부 호출(시계 읽기) 뒤, 장부 호출 바로 앞. 그 사이 흐른 시간으로 박자 기한이 지났으면 적지 않는다.
+  if (!beatValid(ctx.ports)) return { runId, outcome: "beat_closed", planned: "renew_lease" };
   let answer: unknown;
   try {
     answer = ctx.ports.ledger.recordRenewInstruction({ runId, requestId, stopGeneration, now: recordAt });
@@ -661,7 +678,7 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   if ("read" in fresh) return { runId, outcome: "read_unknown", read: fresh.read };
   const recordAt = readClock(ctx.ports, ctx.now);
   if (recordAt === null) return { runId, outcome: "stop_failed", failure: "clock_unavailable" };
-  // 여기부터 장부 호출까지 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 종료이고 그 사이 다른 쓰기가 종료를 적지 않았을
+  // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 종료이고 그 사이 다른 쓰기가 종료를 적지 않았을
   // 때만 적는다(장부는 새 요청 ID의 종료를 또 받아 준다). 마지막 시계 읽기 안에서 일어난 외부 쓰기는 보지 못한다.
   if (nextIntent(viewOf(fresh, recordAt, ctx.unsentRenews), ctx.policy).intent !== "stop" || (fresh.times !== null && fresh.times.lastStopAt !== null)) {
     return { runId, outcome: "superseded", planned: "stop" };
@@ -671,6 +688,8 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   const { executorId } = fresh.run;
   const stopGeneration = ctx.stopGeneration;
   const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "stop_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, cancelReason, reason });
+  // 갱신과 같은 자리. 접수 문은 보지 않지만(닫힌 접수에서도 종료는 적는다) 무효인 박자의 종료는 적지 않는다.
+  if (!beatValid(ctx.ports)) return { runId, outcome: "beat_closed", planned: "stop" };
   let answer: unknown;
   try {
     // 사유를 늘 넘긴다. 빼고 적은 종료 지시는 장부가 본문을 다시 만들 수 없음으로 남기고, 같은 요청 ID로 나중에 채울 수도 없다.

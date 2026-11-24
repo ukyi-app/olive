@@ -898,8 +898,9 @@ describe("정적", () => {
     "const { ledger: receiver, close } = held;",
     CALL,
   ];
-  // 확인 뒤에 허용하는 문장: 확인의 답 비교, 답을 담을 자리, 장부 호출. confirmLast는 예외 처리와 원시값 비교 반환뿐이다.
-  const AFTER_CONFIRM = `if (confirmed !== "current") return skip(confirmed); let answer: unknown; try { ${CALL}`;
+  // 확인 뒤에 허용하는 문장: 확인의 답 비교, 박자 유효 문(꺼내 둔 함수를 부르는 한 줄), 답을 담을 자리, 장부 호출.
+  // confirmLast는 예외 처리와 원시값 비교 반환뿐이다.
+  const AFTER_CONFIRM = `if (confirmed !== "current") return skip(confirmed); if (!beatStillValid(held)) return { outcome: null, halt: "beat_closed" }; let answer: unknown; try { ${CALL}`;
   const CONFIRM_TAIL = '} catch { return "link_not_current"; } return answer === "current" || answer === "evidence_changed" || answer === "stop_generation" ? answer : "link_not_current"; }';
 
   test("기다리지 않고, 시계·난수·타이머·환경·파일을 직접 쓰지 않는다", async () => {
@@ -917,6 +918,7 @@ describe("정적", () => {
     expect(reads.map((match) => `${match[1]}.${match[2]}`).sort()).toEqual([
       "ledger.closeUnreceivedRun",
       "ledger.unansweredInstructions",
+      "ports.beatValid",
       "ports.evidence",
       "ports.intake",
       "ports.ledger",
@@ -929,11 +931,11 @@ describe("정적", () => {
     expect([...broken.matchAll(/\bledger\.closeUnreceivedRun\b/g)].length).toBe(2);
   });
 
-  test("confirm이 장부 호출 전의 마지막 외부 호출이고, 그 뒤로는 속성을 읽지 않고 꺼내 둔 함수와 미리 만든 인자만 쓴다", async () => {
+  test("confirm 뒤에는 박자 유효 문 하나만 부르고 장부를 부른다. 그 사이 속성을 읽지 않고 꺼내 둔 함수와 미리 만든 인자만 쓴다", async () => {
     const source = await code(FILE);
     expect([source.indexOf(CONFIRM) > 0, source.indexOf(CALL) > source.indexOf(CONFIRM)]).toEqual([true, true]);
     const between = afterConfirm(source) ?? "";
-    expect([/[.[]/.test(between), [...between.matchAll(/(\w+)\s*\(/g)].map((match) => match[1])]).toEqual([false, ["if", "skip", "apply"]]);
+    expect([/[.[]/.test(between), [...between.matchAll(/(\w+)\s*\(/g)].map((match) => match[1])]).toEqual([false, ["if", "skip", "if", "beatStillValid", "apply"]]);
     expect(squash(between)).toBe(AFTER_CONFIRM);
     // confirmLast는 돌아온 뒤 원시값 비교만 한다.
     const body = source.slice(source.indexOf("function confirmLast("), source.indexOf("\n}\n", source.indexOf("function confirmLast(")));
@@ -945,7 +947,7 @@ describe("정적", () => {
     for (const injected of ["const late = held.close;", "invoke(held.settled, []);"]) {
       const skipLine = 'if (confirmed !== "current") return skip(confirmed);';
       const broken = afterConfirm(source.replace(skipLine, `${skipLine}\n  ${injected}`)) ?? "";
-      expect([injected, /[.[]/.test(broken) || [...broken.matchAll(/(\w+)\s*\(/g)].length !== 3]).toEqual([injected, true]);
+      expect([injected, /[.[]/.test(broken) || [...broken.matchAll(/(\w+)\s*\(/g)].length !== 5]).toEqual([injected, true]);
     }
   });
 
@@ -960,5 +962,41 @@ describe("정적", () => {
     expect([closeLines(twice).length, squash(afterConfirm(twice) ?? "") === AFTER_CONFIRM]).toEqual([CLOSE_LINES.length + 1, true]);
     expect([squash(confirmTail(beforeReturn) ?? "") === CONFIRM_TAIL, closeLines(beforeReturn)]).toEqual([false, CLOSE_LINES]);
     expect([squash(afterConfirm(sameLine) ?? "") === AFTER_CONFIRM, closeLines(sameLine)]).toEqual([false, CLOSE_LINES]);
+  });
+});
+
+describe("박자 유효 문(beatValid): confirm 뒤, 장부 닫기 바로 앞에서 본다", () => {
+  test("confirm 안에서 박자 기한이 지나면 닫지 않고 beat_closed로 멈춘다(장부 0회, 실행은 preparing). 대조군(기한 안)은 닫는다", () => {
+    for (const lapse of [true, false]) {
+      const w = world();
+      const live = started(w.ledger);
+      let valid = true;
+      const confirm = w.state.confirm;
+      // 마지막 증거 호출(confirm) 안에서 박자 기한이 지난다.
+      w.state.confirm = (executorId, connection, version, generation) => {
+        const answer = confirm(executorId, connection, version, generation);
+        if (lapse) valid = false;
+        return answer;
+      };
+      const result = ran(unreceivedTick({ ...w.ports, beatValid: () => valid }, AT));
+      if (lapse) {
+        expect(result).toEqual({ kind: "ran", runs: [], halted: "beat_closed", haltedAt: live.requestId });
+        expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
+      } else {
+        expect(result.runs).toMatchObject([{ runId: live.runId, outcome: "closed" }]);
+        expect([w.calls.length, w.stateOf(live.runId)]).toEqual([1, "not_started"]);
+      }
+    }
+  });
+
+  test("유효 문이 던지거나 true가 아니거나 함수가 아니면 닫지 않는다", () => {
+    for (const beatValid of [() => undefined, () => {
+      throw new Error("유효 문 실패");
+    }, 1]) {
+      const w = world();
+      const live = started(w.ledger);
+      const result = ran(unreceivedTick({ ...w.ports, beatValid } as unknown as UnreceivedPorts, AT));
+      expect([result.halted, w.calls.length, w.stateOf(live.runId)]).toEqual(["beat_closed", 0, "preparing"]);
+    }
   });
 });

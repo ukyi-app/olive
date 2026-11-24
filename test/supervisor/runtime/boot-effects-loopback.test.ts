@@ -3,7 +3,6 @@
 // 입력(실행 준비, 시계 건너뛰기, 정지 기록)은 박자 하나가 끝난 직후의 기록 훅에서 한 동기 구간에 넣는다: 그 실행의 지시는 입력 뒤에만
 // 생길 수 있으므로 실행기가 받은 전체 봉투로 셀 수 있다.
 import { afterEach, expect, test } from "bun:test";
-import { getRandomValues } from "node:crypto";
 import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import { openLedger } from "../../../src/ledger/index.ts";
 import { bootSupervisor, type LogFields, type SupervisorDeps } from "../../../src/supervisor/runtime/boot.ts";
@@ -13,7 +12,20 @@ import { createFrameDecoder, encodeFrame } from "../../../src/transport/framing.
 import { createTlsClient } from "../../../src/transport/tls-client.ts";
 import { id, must, worker } from "../../ledger/helpers.ts";
 import { makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../../transport/certs.ts";
-import { baseSettings, type Captured, capturingMakers, EXECUTOR, executorKey, FILES, FRONT_ROWS, installedLedger, registryDoc, resultDir, supervisorKeyPem } from "./boot-world.ts";
+import {
+  baseSettings,
+  type Captured,
+  capturingMakers,
+  EXECUTOR,
+  executorKey,
+  FILES,
+  FRONT_ROWS,
+  installedLedger,
+  loopbackTime,
+  registryDoc,
+  resultDir,
+  supervisorKeyPem,
+} from "./boot-world.ts";
 
 const HOST = "127.0.0.1";
 const cleanup: (() => unknown)[] = [];
@@ -81,6 +93,7 @@ async function scenario(kind: Scenario) {
   const settings = baseSettings(path, resultDir(), {
     timing: { beatEveryMs: 20, beatWaitMs: 5_000, restoreStepWaitMs: 10_000, startupWaitMs: 10_000, stopWaitMs: 10_000 },
   });
+  const time = loopbackTime();
   let monoOffset = 0;
   let wallOffset = 0;
   let delayNextTick = false;
@@ -124,13 +137,10 @@ async function scenario(kind: Scenario) {
       peers: { contracts: async () => (await peersGate.promise, FRONT_ROWS) },
     },
     evidence: { read: () => ({ known: false }), confirm: () => "link_not_current" },
-    wallNow: () => Date.now() + wallOffset,
-    monoNow: () => performance.now() + monoOffset,
-    setTimer: (ms, fire) => {
-      const handle = setTimeout(fire, ms);
-      return () => clearTimeout(handle);
-    },
-    random: { bytes: (length) => getRandomValues(new Uint8Array(length)) },
+    wallNow: () => time.wall() + wallOffset,
+    monoNow: () => time.mono() + monoOffset,
+    setTimer: time.setTimer,
+    random: time.random,
     log: (event, fields = {}) => {
       log.push({ event, fields });
       if (event === "beat_time" && onBeat !== null) {
@@ -155,7 +165,7 @@ async function scenario(kind: Scenario) {
   const port = (await log.next((e) => e.event === "boot_step" && e.fields.step === "server")).fields.port as number;
 
   const own = pki.executor();
-  const client = createTlsClient({ address: HOST, port, supervisorDnsName: SUPERVISOR_DNS, supervisorUri: SUPERVISOR_URI, material: { certificatePem: own.pem, privateKeyPem: own.keyPem, trustBundlePem: pki.ca.pem }, now: () => Date.now() });
+  const client = createTlsClient({ address: HOST, port, supervisorDnsName: SUPERVISOR_DNS, supervisorUri: SUPERVISOR_URI, material: { certificatePem: own.pem, privateKeyPem: own.keyPem, trustBundlePem: pki.ca.pem }, now: time.wall });
   cleanup.push(() => client.close());
   stopGate.resolve(null);
   await log.next((e) => e.event === "restore_step" && e.fields.step === 1);
@@ -169,7 +179,7 @@ async function scenario(kind: Scenario) {
     for (const decoded of decoder.push(new Uint8Array(chunk)).envelopes) envelopes.push(decoded.value as Envelope);
   });
   const put = (action: string, body: unknown) => {
-    const envelope = sealEnvelope({ sender: EXECUTOR, recipient: "supervisor", action, request_id: uuid(), stop_generation: 0, run_generation: 0, issued_at: Date.now(), nonce: hex32(), body } as never, k1.privateKey);
+    const envelope = sealEnvelope({ sender: EXECUTOR, recipient: "supervisor", action, request_id: uuid(), stop_generation: 0, run_generation: 0, issued_at: time.wall(), nonce: hex32(), body } as never, k1.privateKey);
     const encoded = encodeFrame(new TextEncoder().encode(JSON.stringify(envelope)));
     if (!encoded.ok) throw new Error(encoded.reason);
     socket.write(encoded.frame);
@@ -188,7 +198,7 @@ async function scenario(kind: Scenario) {
   const commitsBefore = { value: 0 };
   onBeat = () => {
     commitsBefore.value = commits.length;
-    const at = Date.now() + wallOffset;
+    const at = time.wall() + wallOffset;
     const run = must(ledger.admitRun(worker({ now: at, deadlineAt: at + 600_000 }))).run;
     const request = id();
     must(ledger.startRun({ runId: run.runId, requestId: request, stopGeneration: 0, now: at }));

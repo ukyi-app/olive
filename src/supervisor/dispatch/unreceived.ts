@@ -10,8 +10,9 @@
 // 2. 근거는 그 실행기의 지금 인정된 연결이 낸 검증된 전체 인사 하나다. 연결 번호·주체·맞춘 정지 세대·서명 시각(answeredAt)·전체 목록을
 //    한 묶음으로 받고, 받은 시각(receivedAt)은 근거 줄에 적을 값으로만 넘긴다.
 // 3. 그 실행기의 앞선 답이 버려진 적이 있거나(tainted) 더 새 답이 줄에 남아 있으면(pending) 닫지 않는다.
-// 4. 증거 포트의 confirm이 장부 호출 전의 마지막 외부 호출이다. 연결의 현재성, 증거를 읽은 뒤 그 실행기 줄의 변화(version),
-//    정지 세대를 한 번에 판정한다. 그 뒤로는 외부 객체의 속성도 읽지 않고, 꺼내 둔 함수와 미리 만든 인자로 장부를 부른다.
+// 4. 증거 포트의 confirm이 장부 호출 전의 마지막 증거 호출이다. 연결의 현재성, 증거를 읽은 뒤 그 실행기 줄의 변화(version),
+//    정지 세대를 한 번에 판정한다. 그 뒤로는 박자 유효 문 하나만 부르고(confirm 안에서 박자 기한이 지났을 수 있다) 외부 객체의
+//    속성도 읽지 않으며, 꺼내 둔 함수와 미리 만든 인자로 장부를 부른다.
 //    증거 읽기부터 장부 호출까지 await가 없다.
 // 5. 장부의 거절·예외·정의 밖의 답은 닫힘으로 세지 않는다. 예외와 정의 밖의 답은 그 자리에서 박자를 멈춘다(장부가 적었는지 모른다).
 import { limits, parsePrincipal, RUN_STATES, type RunState, type RunStatus } from "../../contract/v1/index.ts";
@@ -76,6 +77,9 @@ export interface UnreceivedPorts {
   readonly intake: Pick<Restorer, "stopGeneration">;
   // 답 줄과 같은 신호: 복원 2단계가 붙든 관측을 적었는가.
   readonly observationsSettled: () => boolean;
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). confirm 뒤, 장부 닫기 바로 앞에서 본다(그 사이 다른 호출은
+  // 없다). 거짓·던짐이면 닫지 않고 박자를 멈춘다(beat_closed). 빠지면 늘 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
+  readonly beatValid?: () => boolean;
 }
 
 // 장부의 START_UNREACHABLE_MS와 같은 식이다(장부는 내보내지 않는다). 장부가 같은 트랜잭션에서 다시 보므로 이 값은 부르지 않을 항목을
@@ -93,8 +97,9 @@ export type UnreceivedNotRun =
   // 장부 읽기를 모른다. 장부 포트나 그 두 함수를 꺼내지 못한 것도 여기다.
   | "read_unknown";
 
-// 박자를 멈춘 이유. threw는 장부 호출이 던졌거나 답이 정의 밖이다. 나머지는 항목마다 다시 본 전역 포트가 박자 처음과 달라졌다.
-export type UnreceivedHalt = "threw" | "observations_unsettled" | "stop_generation_unknown" | "stop_generation_mismatch" | "withheld_unknown";
+// 박자를 멈춘 이유. threw는 장부 호출이 던졌거나 답이 정의 밖이다. beat_closed는 장부 닫기 바로 앞에서 본 박자 유효 문이 닫혔다(그 항목은
+// 장부를 부르지 않았다). 나머지는 항목마다 다시 본 전역 포트가 박자 처음과 달라졌다.
+export type UnreceivedHalt = "threw" | "observations_unsettled" | "stop_generation_unknown" | "stop_generation_mismatch" | "withheld_unknown" | "beat_closed";
 
 export type UnreceivedSkip =
   // 닫을 수 있는 상태(preparing·unknown_running)가 아니다.
@@ -185,6 +190,8 @@ interface Held {
   readonly stopGeneration: Bound | null;
   readonly executors: Bound | null;
   readonly settled: Bound | null;
+  // 박자 유효 문. absent는 포트가 없음(늘 유효), null은 꺼내지 못함(늘 무효)이다.
+  readonly beatValid: Bound | "absent" | null;
 }
 
 function take(get: () => { receiver: unknown; fn: unknown }): Bound | null {
@@ -211,6 +218,13 @@ function hold(ports: UnreceivedPorts): Held | null {
     return null;
   }
   if (typeof unanswered !== "function" || typeof close !== "function") return null;
+  let beatValid: Held["beatValid"] = null;
+  try {
+    const fn: unknown = ports.beatValid;
+    beatValid = fn === undefined ? "absent" : typeof fn === "function" ? { receiver: ports, fn: fn as Fn } : null;
+  } catch {
+    beatValid = null;
+  }
   let evidence: Held["evidence"] = null;
   try {
     const port: unknown = ports.evidence;
@@ -236,7 +250,15 @@ function hold(ports: UnreceivedPorts): Held | null {
       return { receiver: source, fn: isObject(source) ? source.executors : undefined };
     }),
     settled: take(() => ({ receiver: ports, fn: ports.observationsSettled })),
+    beatValid,
   };
+}
+
+// 박자 유효 문을 부른다. 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+function beatStillValid(held: Held): boolean {
+  if (held.beatValid === "absent") return true;
+  const answer = invoke(held.beatValid, []);
+  return answer !== null && answer.value === true;
 }
 
 // 던지면 null. 돌려준 값은 그대로 싣는다(꼴은 부른 쪽이 본다).
@@ -272,7 +294,7 @@ interface Gate {
 
 // 전역 포트 셋. 박자 처음과, 항목마다 증거를 읽은 뒤에 다시 본다(앞 항목의 장부 쓰기나 포트가 같은 동기 구간에서 바꿀 수 있다).
 // 복원 대기를 마지막에 본다: 앞의 두 조회 안에서 바뀐 정지 세대·줄은 confirm이 다시 보지만 복원 대기는 다시 보지 않는다.
-function readGate(held: Held): Gate | Exclude<UnreceivedHalt, "threw" | "stop_generation_mismatch"> {
+function readGate(held: Held): Gate | Exclude<UnreceivedHalt, "threw" | "stop_generation_mismatch" | "beat_closed"> {
   const generation = invoke(held.stopGeneration, []);
   if (generation === null || !isGeneration(generation.value)) return "stop_generation_unknown";
   const withheld = readWithheld(held.executors);
@@ -471,8 +493,8 @@ function tickOnce(held: Held, now: number): UnreceivedTickResult {
   return { kind: "ran", runs, halted: null, haltedAt: null };
 }
 
-// 항목 하나의 판단. 외부 호출의 차례는 증거 → 전역 포트(정지 세대·맡기지 않을 실행기·복원 대기) → confirm → 장부이고,
-// 그 사이의 비교는 읽어 둔 값만 쓴다. confirm 뒤에는 꺼내 둔 함수(close)와 미리 만든 인자(closing)로 장부를 부를 뿐이다.
+// 항목 하나의 판단. 외부 호출의 차례는 증거 → 전역 포트(정지 세대·맡기지 않을 실행기·복원 대기) → confirm → 박자 유효 문 → 장부이고,
+// 그 사이의 비교는 읽어 둔 값만 쓴다. 박자 유효 문 뒤에는 꺼내 둔 함수(close)와 미리 만든 인자(closing)로 장부를 부를 뿐이다.
 function judge(held: Held, item: StartItem, ledgerGeneration: number, now: number): Judged {
   const { ledger: receiver, close } = held;
   const head: Head = { requestId: item.requestId, runId: item.runId, executorId: item.executorId };
@@ -507,6 +529,8 @@ function judge(held: Held, item: StartItem, ledgerGeneration: number, now: numbe
   // 들어왔거나, 앞 항목의 장부 쓰기가 복원기의 세대를 바꿨을 수 있다(await가 없어도 바뀐다). 장부를 부를 때마다 그 직전에 다시 본다.
   const confirmed = confirmLast(evidence.confirm, item.executorId, full.connection, evidence.version, gate.generation);
   if (confirmed !== "current") return skip(confirmed);
+  // confirm 안에서 흐른 시간으로 박자 기한이 지났을 수 있다. 장부 호출 바로 앞에서 박자 유효 문을 본다.
+  if (!beatStillValid(held)) return { outcome: null, halt: "beat_closed" };
   let answer: unknown;
   try {
     answer = apply(close, receiver, closing);

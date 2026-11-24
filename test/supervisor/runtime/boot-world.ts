@@ -15,6 +15,11 @@ import {
   type SupervisorSettings,
 } from "../../../src/supervisor/runtime/boot.ts";
 import { type Cycle, type CycleDeps, createCycle } from "../../../src/supervisor/runtime/cycle.ts";
+import { assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop.ts";
+import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
+import { linkLossTick } from "../../../src/supervisor/dispatch/link-loss.ts";
+import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
+import { unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
 import { createIssuance, type IssuancePorts } from "../../../src/supervisor/runtime/issuance.ts";
 import { createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
 import { createQueryBook } from "../../../src/supervisor/runtime/query-book.ts";
@@ -125,6 +130,8 @@ export interface Captured {
   issuance?: { value: ReturnType<typeof createIssuance>; ports: IssuancePorts };
   sink?: { value: ReturnType<typeof createWireSink>; ports: WireSinkPorts };
   lines?: { value: AnswerLines; ports: AnswerLinePorts };
+  // 박자마다 마지막으로 넘긴 포트 묶음(박자 유효 문의 같은 객체 단언).
+  beatPorts?: Partial<Record<"linkLoss" | "life" | "resend" | "unreceived" | "assign", { readonly beatValid?: () => boolean }>>;
   pumps: number;
   delivers: number;
 }
@@ -176,6 +183,28 @@ export function capturingMakers(captured: Captured, trace: Trace, over: Partial<
       };
       captured.lines = { value, ports };
       return value;
+    },
+    ticks: {
+      linkLoss: (ports, policy, input) => {
+        (captured.beatPorts ??= {}).linkLoss = ports;
+        return linkLossTick(ports, policy, input);
+      },
+      life: (ports, policy, input) => {
+        (captured.beatPorts ??= {}).life = ports;
+        return lifeTick(ports, policy, input);
+      },
+      resend: (ports, policy, input) => {
+        (captured.beatPorts ??= {}).resend = ports;
+        return resendTick(ports, policy, input);
+      },
+      unreceived: (ports, now) => {
+        (captured.beatPorts ??= {}).unreceived = ports;
+        return unreceivedTick(ports, now);
+      },
+      assign: (ports, policy, now) => {
+        (captured.beatPorts ??= {}).assign = ports;
+        return assignAndStartTick(ports, policy, now);
+      },
     },
     ...over,
   };
@@ -349,3 +378,17 @@ export function world(over: { settings?: Partial<SupervisorSettings>; makers?: P
 }
 
 export const uuid = () => randomUUID();
+
+// 루프백 시험의 실제 시계·타이머·CSPRNG 한 자리. 실제 소켓과 함께 돌아야 해서 손으로 돌리는 시계를 쓰지 못한다. 루프백 시험 파일은
+// 시계·타이머·난수를 직접 부르지 않고 이것을 조립의 포트, 봉투의 발행 시각, 준비 데이터의 시각에 함께 쓴다(옮김은 시험이 더한다).
+export function loopbackTime() {
+  return {
+    wall: (): number => Date.now(),
+    mono: (): number => performance.now(),
+    setTimer(ms: number, fire: () => void): () => void {
+      const handle = setTimeout(fire, ms);
+      return () => clearTimeout(handle);
+    },
+    random: { bytes: (length: number) => crypto.getRandomValues(new Uint8Array(length)) },
+  };
+}

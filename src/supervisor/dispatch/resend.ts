@@ -55,6 +55,10 @@ export interface ResendPorts {
   readonly random: Random;
   readonly signer: Signer;
   readonly sink: InstructionSink;
+  // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). 시작이면 공유 함수(송신 표식을 적는 자리)를 부르기 바로 앞,
+  // 마지막 외부 호출(봉하기의 서명·난수) 뒤에 본다. 거짓·던짐이면 표식을 적지 않고 싣지 않는다. 빠지면 늘 유효다(이 부품 단독의 쓰임).
+  // 조립은 반드시 넘긴다.
+  readonly beatValid?: () => boolean;
 }
 
 export interface ResendPolicy {
@@ -81,7 +85,8 @@ type Head = { readonly requestId: string; readonly runId: string; readonly actio
 // session_run: 세션 실행의 지시. run_unknown: 장부가 모른다고 옮긴(unknown_running) 실행의 시작(조회만 한다, D-92).
 // stop_recorded: 같은 실행에 종료가 적힌 시작(열자마자 닫힐 실행을 열지 않는다).
 // read_unknown: 싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸(머리 칸과 본문을 다시 만들 칸)이 처음 읽은 것과 다르다.
-export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown";
+// beat_closed: 시작의 송신 표식을 적는 공유 함수 직전에 본 박자 유효 문이 닫혔다(표식을 적지 않았고 싣지 않았다).
+export type Withheld = "session_run" | "run_unknown" | "stop_recorded" | "intake_closed" | "no_connection" | "link_unknown" | "clock_unavailable" | "read_unknown" | "beat_closed";
 
 export type ResendOutcome =
   // 같은 요청을 새 봉투에 담아 실었다(sent는 받았다는 뜻이 아니다). sealedAt은 봉할 때 읽은 시각이다.
@@ -275,6 +280,15 @@ function readClock(ports: { readonly clock: Clock }, floor: number): number | nu
 function intakeOpen(intake: ResendIntake): boolean {
   try {
     return intake.intakeOpen() === true;
+  } catch {
+    return false;
+  }
+}
+
+// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+function beatValid(ports: ResendPorts): boolean {
+  try {
+    return ports.beatValid === undefined || ports.beatValid() === true;
   } catch {
     return false;
   }
@@ -539,6 +553,9 @@ async function resendOne(ctx: Context, planned: Item, trace: Trace): Promise<Res
     const checked = startStillSealable();
     return typeof checked === "number" ? null : checked;
   };
+  // 시작의 표식은 장부 쓰기다. 공유 함수를 부르기 바로 앞에서 박자 유효 문을 본다. 여기부터 표식까지는 공유 함수 안의 봉투·포트 묶음
+  // 속성 읽기(수신 객체와 send 얻기)뿐이고 포트 호출과 await가 없다(send-gate.ts의 차례).
+  if (action === "task_start" && !beatValid(ctx.ports)) return withheld("beat_closed");
   const gate = await sendInstruction(ctx.ports, envelope, action === "task_start" ? { marker: ledger, at: ctx.floor, lastCheck } : null);
   if (gate.kind === "stopped") return gate.value;
   if (gate.kind === "sink_unavailable") return { ...head, outcome: "not_sent", reason: "sink_unavailable", delivery: "not_sent", executorId, sealedAt: sealAt };

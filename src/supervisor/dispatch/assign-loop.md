@@ -17,6 +17,7 @@ AssignLoopPorts = {
   random: Random                // 실행 ID, 시작 지시의 요청 ID, nonce
   signer: Signer
   sink: InstructionSink
+  beatValid?: () => boolean     // 박자 유효 문. 장부 쓰기·표식 공유 함수 바로 앞. 빠지면 늘 유효(조립은 반드시 넘긴다)
 }
 
 AssignLoopPolicy = {
@@ -30,7 +31,7 @@ AssignLoopPolicy = {
 TickResult =
   | { kind: "not_run", reason: "malformed_now" | "intake_closed" | "stop_generation_unknown" | "policy_rejected" }
   | { kind: "not_run", reason: "read_unknown", read: LoopRead }
-  | { kind: "ran", starts: StartOutcome[], requests: RequestOutcome[], halted: "intake_closed" | "threw" | null, haltedAt: HaltedAt | null }
+  | { kind: "ran", starts: StartOutcome[], requests: RequestOutcome[], halted: "intake_closed" | "beat_closed" | "threw" | null, haltedAt: HaltedAt | null }
 
 HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 ```
@@ -88,6 +89,10 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 ### 접수를 다시 보는 자리
 
 포트가 비동기라 박자 중에 접수가 닫힐 수 있다. 쓰기 직전마다 접수를 다시 읽는다: `startRun` 직전, 그리고 `pickAssignment`에 넘기는 `intakeOpen`(고르기가 `intake_closed`를 내면 잇지 않는다). 닫혔으면 남은 쓰기를 부르지 않고 `halted: "intake_closed"`로 그 전까지의 목록을 낸다. 장부도 같은 트랜잭션에서 접수 허가를 다시 본다(`intake_closed`). 맡기지 않을 실행기도 같은 두 자리에서 접수 다음에 다시 읽는다(아래).
+
+### 박자 유효 문을 보는 자리
+
+접수 문 뒤에도 사실·자격·맡기지 않을 실행기·난수 포트 안에서 박자 기한이 지날 수 있다. 장부 쓰기마다 마지막 외부 호출 뒤, 그 호출 바로 앞에서 선택 포트 `beatValid`를 본다: `assignToolRequest`(실행 ID 난수와 장부 포트 얻기 뒤), `startRun`(요청 ID 난수와 장부 포트 얻기 뒤), 송신 표식(봉하기 뒤, 공유 함수를 부르기 바로 앞. 그 사이는 공유 함수 안의 봉투·포트 묶음 속성 읽기뿐이다). `true`가 아니거나 던지면 앞의 둘은 그 쓰기와 남은 일을 부르지 않고 `halted: "beat_closed"`(그 항목은 목록에 없다), 표식은 적힌 시작을 그대로 두고 `recorded_not_sent`(`beat_closed`)로 남긴다(재전송이 다룬다). 포트가 빠지면 늘 유효다(이 부품 단독의 쓰임).
 
 ## 맡기지 않을 실행기
 

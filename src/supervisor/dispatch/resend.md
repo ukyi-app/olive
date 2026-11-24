@@ -17,6 +17,7 @@ ResendPorts = {
   random: Random                               // nonce만
   signer: Signer
   sink: InstructionSink
+  beatValid?: () => boolean                    // 박자 유효 문. 시작의 공유 함수 바로 앞. 빠지면 늘 유효(조립은 반드시 넘긴다)
 }
 ResendPolicy = { resendEveryMs: number }       // 양의 안전 정수
 ResendTickInput = { lastResends: { requestId: string, at: number }[] }
@@ -38,7 +39,7 @@ START_LAST_SEAL_MS = 19000   // 시작을 다시 봉할 수 있는 발행 뒤 �
 | `not_rebuildable` | 장부가 본문을 다시 만들 수 없다(`rebuild: null`). 부르는 쪽은 같은 실행 ID를 조회한다 |
 | `start_expired` + `issuedAt`, `expiresAt` | 시작의 재전송 한도(발행 + 19000ms)가 지났다. `expiresAt`은 그 시작의 모든 봉투가 갖는 시한(발행 + 30000ms) |
 | `stop_generation_mismatch` + `stopGeneration`, `currentStopGeneration` | 항목의 정지 세대가 장부의 지금 세대와 다르다 |
-| `withheld` + `reason` | 내보내기 포트를 부르지 않았다. 대부분 봉하기 전이고, 시작의 마지막 시계 읽기(아래 순서 12·14)에서 난 `clock_unavailable`은 이미 서명한 봉투를 버린 것이다(14에서 났으면 송신 표식은 남는다): `session_run`(세션 실행의 지시), `run_unknown`(장부가 모른다고 옮긴 `unknown_running` 실행의 시작), `stop_recorded`(종료가 적힌 실행의 시작), `intake_closed`(시작만), `no_connection`(연결 포트가 문자열 `reason`과 함께 거절), `link_unknown`(연결 포트가 던지거나 답이 정의 밖), `clock_unavailable`(시계가 던지거나, 양의 안전 정수가 아니거나, 앞서 읽은 시각보다 이름), `read_unknown`(싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸이 처음과 다름. 대조하는 칸은 동작·실행 ID·실행 세대·지정 실행기·정지 세대·발행 시각과 본문을 다시 만들 칸 전부) |
+| `withheld` + `reason` | 내보내기 포트를 부르지 않았다. 대부분 봉하기 전이고, 시작의 마지막 시계 읽기(아래 순서 12·14)에서 난 `clock_unavailable`은 이미 서명한 봉투를 버린 것이다(14에서 났으면 송신 표식은 남는다): `session_run`(세션 실행의 지시), `run_unknown`(장부가 모른다고 옮긴 `unknown_running` 실행의 시작), `stop_recorded`(종료가 적힌 실행의 시작), `intake_closed`(시작만), `no_connection`(연결 포트가 문자열 `reason`과 함께 거절), `link_unknown`(연결 포트가 던지거나 답이 정의 밖), `clock_unavailable`(시계가 던지거나, 양의 안전 정수가 아니거나, 앞서 읽은 시각보다 이름), `read_unknown`(싣기 직전의 다시 읽기가 모름이거나 같은 요청 ID의 칸이 처음과 다름. 대조하는 칸은 동작·실행 ID·실행 세대·지정 실행기·정지 세대·발행 시각과 본문을 다시 만들 칸 전부), `beat_closed`(시작의 공유 함수 바로 앞에서 본 박자 유효 문이 닫힘. 서명한 봉투를 버리고 표식은 적지 않았다) |
 | `not_sealed` + `reason`(`field`, `sealReason`) | 초안·봉하기의 거절 이름, `draft_threw`, `seal_threw`. 실리지 않았다 |
 | `not_sent` + `reason`, `delivery`, `executorId`, `sealedAt` (+ `at`, `markReason`) | `no_connection`·`too_late_to_send`(포트가 싣지 않았다고 답함), `sink_unavailable`(`sink`나 `sink.send`를 얻다 던지거나 함수가 아니어서 포트를 부르지 않음. 이번 시도는 새 표식을 쓰지 않았다. 앞선 시도의 표식은 남아 있을 수 있다), `start_unmarked`(시작의 송신 표식이 `ok`가 아니어서 포트를 부르지 않음. `markReason`에 장부의 거절 이름·`threw`·`malformed_answer`·`envelope_unreadable`. 실제 장부를 표식 포트로 쓰면 이번 시도의 표식은 없지만, 주입한 표식 포트가 커밋한 뒤 던지면 표식 한 줄이 남는다: `send-gate.md` "표식 뒤에 싣지 않고 돌아가는 길"). 이 넷은 `delivery: "not_sent"`, `at` 없음. `send_threw`·`send_answer_malformed`(`delivery: "unknown"`: 실렸을 수 있다. `at`은 `resent`와 같은 규칙) |
 | `malformed` + `field` | 항목의 칸을 읽을 수 없다(`requestId`를 읽지 못했으면 `null`). 같은 요청 ID의 항목이 둘 이상이면 모두 `malformed`(`requestId`) |
@@ -87,6 +88,7 @@ START_LAST_SEAL_MS = 19000   // 시작을 다시 봉할 수 있는 발행 뒤 �
 - **D-90의 조건 (2)의 재료.** 이 박자는 발행 + 19000ms 뒤에 그 시작을 봉하지 않고, 그 시작의 봉투는 다시 봉해도 시한이 모두 발행 + 30000ms다. 그래서 장부의 발행 시각만으로 "더 보내지 않고 마지막 봉투의 시한이 지남"의 시각을 정할 수 있다. `run_unknown`은 그 한도 안의 봉투를 더 줄일 뿐이라 이 시각을 늦추지 않고, 표식도 쓰지 않아 다른 열기의 표식(`sent_by_other_open`)을 새로 만들지 않는다. 다시 읽은 시작의 본문을 다시 만들 수 있고(3) 유효한 시각으로 5의 시한 판정에 닿으면, 한도가 지난 뒤의 결과는 상태와 무관하게 `start_expired`다. 본문을 다시 만들 수 없는 옛 판의 시작(이관 전에 쓴 시작, `rebuild: null`)은 시각과 무관하게 3에서 `not_rebuildable`로 끝나 같은 실행 ID를 조회하고, 장부의 D-90 자동 닫기도 그 실행을 닫지 않는다(`started_before_migration`). 단 배정·시작 박자와 다른 경로가 같은 시작을 더 봉하지 않는다는 것은 각 경로의 조건이다(배정·시작 박자는 `startRun` 직후 한 번만 봉한다). 자리를 푸는 판단(D-90)은 이 PR에 없다.
 - **모른다고 옮긴 실행의 시작은 다시 내지 않는다**(`run_unknown`). 끊김 박자(`markLostFor`)나 복원 3단계(`markLost`)가 `unknown_running`으로 옮긴 실행은 되살리지 않고, 다시 붙은 뒤 같은 실행 ID로 조회만 한다(D-92, `link-loss.md` "옮긴 실행은 다시 붙은 뒤 같은 실행 ID로 조회만 한다"). 처음 봉투를 받지 못한 실행기가 새 연결로 그 시작을 받으면 감독이 갱신하지 않을 실행을 연다. 조회는 수명 박자의 일이다. 이 판정은 5의 시한 판정 뒤라, 시한 판정에 닿은 시작은 발행 + 19000ms가 지났으면 상태와 무관하게 `start_expired`다. 본문을 다시 만들 수 없는 옛 시작은 그 전 3에서 `not_rebuildable`이다(위 "D-90의 조건 (2)의 재료"). 종료·확정은 상태가 `unknown_running`이어도 그대로 다시 낸다(멈춰야 할 실행을 멈춘다). 주로 걸리는 길은 감독이 다시 뜬 뒤다: 복원 3단계는 판정 시간을 기다리지 않고 옮기므로 발행 + 19000ms 안의 시작이 남아 있을 수 있다. 운영 중 끊김은 없음이 판정 시간(`RUN_LEASE_MAX_MS` 이상)을 넘어야 옮기므로 보통 그 안에 들지 않는다.
 - **종료가 적힌 실행의 시작은 다시 내지 않는다**(`stop_recorded`). 장부는 "같은 실행에 시작과 종료가 함께 답이 없으면 어느 쪽을 보낼지는 부르는 쪽이 정한다"고 남겼다(`ledger.md` "시작은 시한 안에서만 다시 보낸다"). 실행기가 시작을 받은 적이 없다면 시작을 다시 보내면 열자마자 닫힐 작업자를 띄우고, 받았다면 시작의 재전송은 영수증을 다시 받는 것뿐이다. 종료는 따로 다시 낸다. 모르는 실행의 종료에 실행기는 답하지 않으므로, 실행기가 시작을 받은 적이 없으면 그 종료는 답 없이 간격마다 다시 나간다(아래 "남는 한계").
+- **박자가 무효면 표식을 적지 않는다**(`withheld`·`beat_closed`). 송신 표식은 이 박자의 유일한 장부 쓰기다. 시작이면 공유 함수(`sendInstruction`)를 부르기 바로 앞, 마지막 외부 호출(봉하기의 서명·난수) 뒤에 선택 포트 `beatValid`를 본다. 여기부터 표식까지는 공유 함수 안의 봉투·포트 묶음 속성 읽기(수신 객체와 `send` 얻기)뿐이고 포트 호출·`await`가 없다. `true`가 아니거나 던지면 표식을 적지 않고 싣지 않는다. 취소·확정은 장부를 쓰지 않으므로 이 문을 보지 않고, 송신은 내보내기 포트의 발급 깃발이 본다. 포트가 빠지면 늘 유효다(이 부품 단독의 쓰임).
 - **접수가 닫히면 시작을 다시 내지 않는다**(`intake_closed`). 시작은 새 일을 연다. 정지(세대가 오름)는 6의 대조가 막고, 복원 중·사본 보류 같은 다른 닫힘은 이 확인이 막는다. 종료·확정은 접수와 무관하게 다시 낸다(장부도 정지 중에 종료를 적는다).
 
 ## 정지 세대
