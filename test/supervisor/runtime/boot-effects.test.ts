@@ -449,8 +449,9 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     expect(await run.stop()).toBe(0);
   });
 
-  test("D-90 박자의 새 인사 포트: 기억은 박자마다 같은 값, closeConnection은 그 서버로 가고, 문은 읽기만 하며 끝 차례(발급 닫기) 뒤에는 닫힌다", async () => {
-    const w = world();
+  test("D-90 박자의 새 인사 포트: 기억은 박자마다 같은 값, 창은 서버의 재접속 창, closeConnection은 그 서버로 가고, 문은 읽기만 하며 발급만 닫혀도 닫힌다", async () => {
+    // 기본 세계의 재접속 제한은 null이라 창 칸을 빼도 null끼리 같아진다. 값이 있는 창을 줘야 조립이 그 값을 넘기는지 갈린다.
+    const w = world({ settings: { connection: { reconnect: { windowMs: 60_000, max: 2 } } } });
     const commits = countCommits(w);
     const shut: number[] = [];
     const server = w.fake.server as unknown as { closeConnection: (connection: number) => unknown };
@@ -466,7 +467,7 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     await w.time.advance(w.settings.timing.beatEveryMs);
     const second = rehelloOf();
     if (first === undefined || second === undefined) throw new Error("rehello 포트가 없다");
-    expect([first === second, first.memory === second.memory, first.reconnectWindowMs]).toEqual([true, true, w.settings.connection.reconnect?.windowMs ?? null]);
+    expect([first === second, first.memory === second.memory, first.reconnectWindowMs]).toEqual([true, true, 60_000]);
     expect([first.closeConnection(9), shut]).toEqual([{ kind: "not_open" }, [9]]);
     // 문을 부르는 동안 증거 포트·답 줄·서버의 함수를 부르지 않고 장부에 쓰지 않는다.
     const touched: string[] = [];
@@ -493,8 +494,12 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     const open = first.valid();
     watching = false;
     expect({ open, touched, writes: commits.slice(before) }).toEqual({ open: true, touched: [], writes: [] });
+    // 발급만 닫고 박자 유효 문은 열린 채로 둔다. 끝 차례는 둘을 함께 닫으므로 발급 깃발의 몫은 이 구간에서만 갈린다.
+    await w.captured.cycle!.value.closeIssuance();
+    const beatValid = w.captured.beatPorts?.unreceived?.beatValid;
+    if (typeof beatValid !== "function") throw new Error("beatValid가 없다");
+    expect([beatValid(), first.valid(), shut]).toEqual([true, false, [9]]);
     expect(await run.stop()).toBe(0);
-    // 끝 차례가 발급을 닫았다(서버는 발급 깃발을 모른다).
     expect([first.valid(), shut]).toEqual([false, [9]]);
   });
 
