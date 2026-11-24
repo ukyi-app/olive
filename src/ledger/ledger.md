@@ -223,12 +223,13 @@
 
 ## 스케줄러가 쓰는 읽기
 
-스케줄러의 판단(`src/supervisor/scheduler/`의 `planNext`·`nextIntent`)은 상태를 갖지 않고 장부에서 읽은 것을 인자로 받는다. 그 입력은 공개 읽기 `queueView`·`listRuns`·`slotHolds`와 아래 둘로 조립한다. 둘 다 장부를 바꾸지 않고, 원문·원문 참조·자격 값을 싣지 않는다.
+스케줄러의 판단(`src/supervisor/scheduler/`의 `planNext`·`nextIntent`)은 상태를 갖지 않고 장부에서 읽은 것을 인자로 받는다. 그 입력은 공개 읽기 `queueView`·`listRuns`·`slotHolds`와 아래 셋으로 조립한다. 셋 다 장부를 바꾸지 않고, 원문·원문 참조·자격 값을 싣지 않는다.
 
 | 공개 함수 | 돌려주는 것 | 쓰는 곳 |
 |---|---|---|
 | `listInputs()` | `Read<InputEntry[]>`. 접수한 입력 전부를 순번대로: `requestId`, `seq`, `source`(접수 때 받은 출처 이름 그대로), `receivedAt`, `expiresAt`(원문 만료), `cancelled`. 처리 위치(`processedSeq`)를 지난 입력도 낸다 | `planNext`의 입력(`origin`·`receivedAt`·`expiresAt`·`cancelled`), 시작한 실행의 `cancelRequested` |
 | `instructionTimes(runId)` | `Read<InstructionTimes \| null>`. 없는 실행이면 `null`. `lease`(판단이 살아 있는 임대로 쓰는 값: 임대를 준 지시의 `issuedAt`과 장부가 믿는 임대 끝 `expiresAt`), `renewIssued`(발급 기록: `issuedAt`은 기록된 갱신 발행 시각의 최댓값, `leaseUntil`은 아래 "발급 기록"의 검사를 통과한 마지막 발급의 끝이고 그 밖에는 모름. 판단에 넘기지 않는다), `lastStopAt`(`task_cancel`·`session_stop`의 기록된 발행 시각 최댓값), `lastFinalizeAt`(`result_finalize`의 기록된 발행 시각 최댓값) | `nextIntent`의 `lease`·`lastInstructionAt` |
+| `settledResult(runId)` | `Read<SettledResult \| null>`. 실행 줄에 결과 digest가 있고, 그 실행의 결과 보고 가운데 반영됐고(`applied_at`) 저장 자리(`storedRef`)가 있고 digest가 실행 줄의 `result_digest`와 같은 것이 있을 때만 `{ runId, resultDigest, storedRef, storedAt }`, 아니면(없는 실행, 보고 없음, 반영 전, digest 다름) `null`. 같은 결과의 보고가 둘이면 먼저 적은 것이고, `storedAt`은 그 보고의 `deliveries.received_at`이다: 결과 보고 처리기가 보관소와 장부에 함께 넘긴 시각이라, 첫 전달이면 보관소 머리의 `storedAt`과 같고 장부가 거절·모름으로 답해 같은 보고가 다시 오면 보관소의 값보다 늦다. 상태는 보지 않는다. 있는 칸만 읽어 판 번호는 그대로다 | 수명 박자의 `resultSettled`와 확정 지시의 `result_digest`·`stored_at`(`src/supervisor/dispatch/life-loop.md` "확정") |
 
 - **요청 예산의 예약(`listRuns`의 `reservedBudget`, D-105·D-106 후보):** 한 요청(입력 ID)의 작업자 실행들이 시작할 때 잡은 예산의 합은 출처(관리자·경보)별 요청 한도를 넘지 못한다. 한도 숫자는 스케줄러 설정(`SchedulerPolicy.requestBudget`, 배포가 넣는다)에 있고 장부에는 없다. 장부는 작업자 줄마다 예약을 실행 줄과 같은 읽기(한 동기 호출, 장부를 쥔 연결 하나)에서 싣는다. 세션 줄과 다른 읽기에는 이 칸이 없다. 새 표·칸·인덱스·트리거는 없고 판 번호도 그대로다.
 

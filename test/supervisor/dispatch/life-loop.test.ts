@@ -10,7 +10,7 @@ import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, tempPath, W
 // 정책 숫자와 키는 이 시험이 지어 넣는 자료다. 운영값이 아니다.
 const POLICY: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 20_000 };
 const keys = generateKeyPairSync("ed25519");
-const WRITES = ["recordRenewInstruction", "recordStopInstruction"] as const;
+const WRITES = ["recordRenewInstruction", "recordStopInstruction", "recordFinalizeInstruction"] as const;
 
 interface World {
   ledger: Ledger;
@@ -62,8 +62,10 @@ function world(): World {
       listRuns: port("listRuns"),
       listInputs: port("listInputs"),
       instructionTimes: port("instructionTimes"),
+      settledResult: port("settledResult"),
       recordRenewInstruction: port("recordRenewInstruction"),
       recordStopInstruction: port("recordStopInstruction"),
+      recordFinalizeInstruction: port("recordFinalizeInstruction"),
     },
     intake: { intakeOpen: () => intake && ledger.intakeOpen(), stopGeneration: () => stopGeneration },
     links: { mayIssue: (executorId) => link(executorId) as never },
@@ -285,23 +287,21 @@ describe("보장 1: 의도 하나, 장부에 적은 뒤에만 지시", () => {
     accept(w, s);
     must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "failed", bodyDigest: digest("stopped"), now: NOW + 1 }, s.from));
     expect(state(w, s.runId)).toBe("failed_stopped");
-    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld" });
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "not_ready_result" });
     expect(w.log).toEqual([]);
     expect(times(w, s.runId).lastFinalizeAt).toBeNull();
   });
 
-  // 장부에 "그 실행의 결과 보고가 저장 자리와 함께 반영됐다"를 읽는 공개 읽기가 없어 resultSettled는 false로 넘긴다(닫는 쪽).
-  // 결과 보고가 받아들여지고 판정까지 끝나도 확정 의도가 나오지 않고, 자리는 쥔 채다(보고의 수락은 종료 증명·게시 허가가 아니다).
-  test("결과 보고가 저장 자리와 함께 반영된 ready_result도 확정 의도를 내지 않고 자리를 풀지 않는다", async () => {
+  // 결과 보고가 받아들여지고 판정이 끝나도 보고가 저장 자리와 함께 반영되지 않았으면(markResult는 보고 없이도 판정한다) 확정 의도가
+  // 나오지 않고 자리는 쥔 채다(보고의 수락은 종료 증명·게시 허가가 아니다). 반영된 실행의 확정은 아래 "확정".
+  test("보고 없이 판정된 ready_result는 확정 의도를 내지 않고 자리를 풀지 않는다", async () => {
     const w = world();
     const s = started(w);
     accept(w, s);
     must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "completed", bodyDigest: digest("stopped ok"), now: NOW + 1 }, s.from));
-    const reportId = id();
-    const resultDigest = digest("result body");
-    must(w.ledger.recordReport({ reportId, action: "report_result", runId: s.runId, bodyDigest: digest("report"), storedRef: `results/${id()}`, resultDigest, signal: null, now: NOW + 2 }, s.from));
-    must(w.ledger.markResult({ runId: s.runId, resultDigest, reportId, now: NOW + 3 }));
+    must(w.ledger.markResult({ runId: s.runId, resultDigest: digest("result body"), now: NOW + 3 }));
     expect(state(w, s.runId)).toBe("ready_result");
+    expect(w.ledger.settledResult(s.runId)).toEqual({ known: true, value: null });
     expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "wait" });
     expect(w.log).toEqual([]);
     expect(times(w, s.runId).lastFinalizeAt).toBeNull();
@@ -1041,10 +1041,15 @@ describe("쓰기 전의 검증과 쓰기 뒤의 결과 보존", () => {
     expect(only(result, s.runId)).toEqual({ runId: s.runId, outcome: "stop_sent", requestId: stopLine?.requestId as string, cancelReason: "requested", issuedAt: NOW + 2_000, executorId: WORKER_EXECUTOR });
   });
 
-  test("쓰기가 성공한 뒤의 어느 포트 접근이 던져도 그 항목이 결과에 남는다(갱신·종료의 접근 자리 훑기)", async () => {
+  test("쓰기가 성공한 뒤의 어느 포트 접근이 던져도 그 항목이 결과에 남는다(갱신·종료·확정의 접근 자리 훑기)", async () => {
     for (const write of WRITES) {
       const make = () => {
         const w = world();
+        if (write === "recordFinalizeInstruction") {
+          const s = settledRun(w);
+          w.setClock(NOW + 10_000);
+          return { w, s };
+        }
         const owner = input(w);
         const s = started(w, { inputRequestId: owner });
         accept(w, s);
@@ -1054,10 +1059,12 @@ describe("쓰기 전의 검증과 쓰기 뒤의 결과 보존", () => {
       };
       const probe = make();
       const clean = afterWrite(probe.w, write, null);
-      expect(only(await plain(clean.ports), probe.s.runId).outcome).toBe(write === "recordRenewInstruction" ? "renew_sent" : "stop_sent");
+      const name = { recordRenewInstruction: "renew", recordStopInstruction: "stop", recordFinalizeInstruction: "finalize" }[write];
+      expect(only(await plain(clean.ports), probe.s.runId).outcome).toBe(`${name}_sent` as RunOutcome["outcome"]);
       const points = [...new Set(clean.seen)];
-      expect(points).toEqual(expect.arrayContaining(["answer.ok", "ports.signer", "ports.random", "ports.sink", "ports.sink.send", ...(write === "recordRenewInstruction" ? ["answer.leaseUntil", "ports.clock", "ports.clock.now"] : ["answer.run", "answer.run.executorId"])]));
-      const kinds = write === "recordRenewInstruction" ? ["renew_recorded_not_sent", "renew_record_unknown"] : ["stop_recorded_not_sent", "stop_record_unknown"];
+      const extra = { recordRenewInstruction: ["answer.leaseUntil", "ports.clock", "ports.clock.now"], recordStopInstruction: ["answer.run", "answer.run.executorId"], recordFinalizeInstruction: [] }[write];
+      expect(points).toEqual(expect.arrayContaining(["answer.ok", "ports.signer", "ports.random", "ports.sink", "ports.sink.send", ...extra]));
+      const kinds = [`${name}_recorded_not_sent`, `${name}_record_unknown`];
       for (const point of points) {
         const { w, s } = make();
         const trap = afterWrite(w, write, point);
@@ -1161,11 +1168,15 @@ describe("쓰기 전의 검증과 쓰기 뒤의 결과 보존", () => {
   });
 });
 
-test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고 확정 초안을 쓰지 않는다", async () => {
+test("이 모듈은 시계·난수·소켓·타이머를 직접 부르지 않고, 확정 초안과 확정 기록은 한 자리씩이다", async () => {
   const source = await Bun.file(new URL("../../../src/supervisor/dispatch/life-loop.ts", import.meta.url)).text();
-  for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process.", "scheduler/tools", "finalizeDraft"]) {
+  for (const banned of ["Date.now", "new Date", "performance.now", "Math.random", "randomUUID", "getRandomValues", "setTimeout", "setInterval", "node:", "bun:", "Bun.", "process.", "scheduler/tools"]) {
     expect(source).not.toContain(banned);
   }
+  // 확정은 finalizeOne 한 자리에서만 적고 봉한다: 장부 기록은 callAfterGate 안, 초안은 기록 뒤.
+  expect(source.split("finalizeDraft(").length - 1).toBe(1);
+  expect(source.split("ledger.recordFinalizeInstruction").length - 1).toBe(1);
+  expect(source).toContain("fn: ledger.recordFinalizeInstruction, args: [finalizeInput] }; }, () => beatValid(ctx.ports));");
 });
 
 describe("박자 유효 문(beatValid): 장부에 적기 직전, 마지막 시계 읽기 뒤에 본다", () => {
@@ -1350,5 +1361,216 @@ describe("싣기: 갱신·취소·조회도 공유 송신 함수로 싣는다(�
       .filter((line) => !line.trimStart().startsWith("//"))
       .join("\n");
     expect([code.match(/\.send\b/g) ?? [], code.match(/\bsendInstruction\s*\(/g)?.length]).toEqual([[], 1]);
+  });
+});
+
+// 결과 보고를 저장 자리와 함께 적고 같은 digest로 판정한 실행(ready_result, 결과 보관이 장부에 반영됨). 보고는 NOW + 2에 적는다.
+function settledRun(w: World) {
+  const s = started(w);
+  accept(w, s);
+  must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "completed", bodyDigest: digest("stopped ok"), now: NOW + 1 }, s.from));
+  const reportId = id();
+  const resultDigest = digest("result body");
+  const storedRef = `results/${id()}`;
+  must(w.ledger.recordReport({ reportId, action: "report_result", runId: s.runId, bodyDigest: digest("report"), storedRef, resultDigest, signal: null, now: NOW + 2 }, s.from));
+  must(w.ledger.markResult({ runId: s.runId, resultDigest, reportId, now: NOW + 3 }));
+  return { ...s, resultDigest, storedRef };
+}
+
+const finalizes = (w: World) => unanswered(w).filter((item) => item.action === "result_finalize");
+
+describe("확정: 결과 보관이 장부에 반영된 ready_result만 적고 내보낸다", () => {
+  test("확정을 장부에 적은 뒤 같은 요청 ID로 지정 실행기에 내보낸다(본문: succeeded, 실행 줄의 digest, 보고를 적은 시각)", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.setClock(NOW + 10_000);
+    const outcome = only(await tick(w), s.runId);
+    expect(outcome).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 10_000, executorId: WORKER_EXECUTOR });
+    expect(w.log).toEqual(["recordFinalizeInstruction", "seal", "send"]);
+    const [envelope] = w.sent as [Envelope];
+    expect(envelope.header).toMatchObject({ action: "result_finalize", recipient: WORKER_EXECUTOR, issued_at: NOW + 10_000, stop_generation: 0, request_id: (outcome as { requestId: string }).requestId });
+    expect(envelope.body).toEqual({ run_id: s.runId, outcome: "succeeded", result_digest: s.resultDigest, stored_at: NOW + 2 });
+    expect(times(w, s.runId).lastFinalizeAt).toBe(NOW + 10_000);
+    // 재전송 박자가 같은 요청 ID로 다시 만들 수 있게 본문 세 칸이 함께 적혔다.
+    expect(finalizes(w)).toEqual([expect.objectContaining({ requestId: (outcome as { requestId: string }).requestId, rebuild: { action: "result_finalize", outcome: "succeeded", resultDigest: s.resultDigest, storedAt: NOW + 2 } })]);
+    // 확정은 자리를 풀지 않는다(정리 영수증이 풀어 준다).
+    expect(state(w, s.runId)).toBe("ready_result");
+  });
+
+  test("보관이 반영되지 않았다는 답(null)이면 기다리고 아무것도 적지 않는다", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.wrap({ settledResult: () => ({ known: true, value: null }) as never });
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "wait" });
+    expect(w.log).toEqual([]);
+    expect(finalizes(w)).toEqual([]);
+  });
+
+  test("결과 보관 읽기가 모름·던짐·꼴 틀림·다른 실행·다른 digest면 그 실행은 read_unknown(result)이고 아무것도 적지 않는다", async () => {
+    const variants: [string, (runId: string, real: { runId: string; resultDigest: string; storedRef: string; storedAt: number }) => unknown][] = [
+      ["모름", () => ({ known: false, reason: "db_error" })],
+      ["던짐", () => {
+        throw new Error("읽기 실패");
+      }],
+      ["답이 객체 아님", () => "x"],
+      ["값이 객체 아님", () => ({ known: true, value: 7 })],
+      ["다른 실행", (_, real) => ({ known: true, value: { ...real, runId: id() } })],
+      ["digest가 실행 줄과 다름", (_, real) => ({ known: true, value: { ...real, resultDigest: digest("other") } })],
+      ["digest 꼴 틀림", (_, real) => ({ known: true, value: { ...real, resultDigest: "ABC" } })],
+      ["저장 자리 빔", (_, real) => ({ known: true, value: { ...real, storedRef: "" } })],
+      ["저장 자리 없음", (_, real) => ({ known: true, value: { ...real, storedRef: null } })],
+      ["보관 시각 틀림", (_, real) => ({ known: true, value: { ...real, storedAt: 0 } })],
+    ];
+    for (const [name, answer] of variants) {
+      const w = world();
+      const s = settledRun(w);
+      const real = w.ledger.settledResult(s.runId);
+      if (!real.known || real.value === null) throw new Error("보관을 읽지 못함");
+      const value = real.value;
+      w.wrap({ settledResult: ((runId: string) => answer(runId, value)) as never });
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId), name).toEqual({ runId: s.runId, outcome: "read_unknown", read: "result" });
+      expect(finalizes(w), name).toEqual([]);
+      expect(w.log, name).toEqual([]);
+    }
+  });
+
+  test("결과 보관은 ready_result 실행에만 읽는다: 그 읽기가 던져도 진행 중 실행의 갱신을 막지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    let reads = 0;
+    w.wrap({
+      settledResult: (() => {
+        reads += 1;
+        throw new Error("읽기 실패");
+      }) as never,
+    });
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId).outcome).toBe("renew_sent");
+    expect(reads).toBe(0);
+  });
+
+  test("확정이 이미 적힌 실행에는 답을 기다린 뒤에도 새 요청 ID의 확정을 또 적지 않는다", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+    w.setClock(NOW + 10_000 + POLICY.answerTimeoutMs - 1);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "wait" });
+    w.setClock(NOW + 10_000 + POLICY.answerTimeoutMs);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "already_recorded" });
+    expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+    expect(finalizes(w)).toHaveLength(1);
+  });
+
+  test("접수가 닫혔으면(정지 포함) 확정을 적지 않고, 정지 세대를 모르면(복원 전) 박자가 돌지 않는다", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.setIntake(false);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "intake_closed" });
+    w.setIntake(true);
+    w.setStopGeneration(null);
+    expect(await tick(w)).toEqual({ kind: "not_run", reason: "stop_generation_unknown" });
+    // 장부가 정지를 적용하면 접수가 닫힌다(장부의 접수 판정).
+    w.setStopGeneration(0);
+    must(w.ledger.applyStop({ generation: 1, stopped: true, now: NOW + 5 }));
+    w.setStopGeneration(1);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "intake_closed" });
+    expect(writes(w)).toEqual([]);
+    expect(finalizes(w)).toEqual([]);
+  });
+
+  test("박자 유효 문이 닫혔으면 확정을 적지 않는다. 던져도 같다", async () => {
+    for (const gate of [() => false, () => {
+      throw new Error("문 실패");
+    }]) {
+      const w = world();
+      const s = settledRun(w);
+      const ports = { ...w.ports, beatValid: gate };
+      const result = await lifeTick(ports, POLICY, { lastQueries: [], unsentRenews: [] });
+      expect(only(result, s.runId)).toEqual({ runId: s.runId, outcome: "beat_closed", planned: "finalize" });
+      expect(writes(w)).toEqual([]);
+      expect(finalizes(w)).toEqual([]);
+    }
+  });
+
+  test("쓰기 직전에 확정이 적혔거나 결과 보관이 바뀌었으면 쓰지 않는다(superseded)", async () => {
+    {
+      const w = world();
+      const s = settledRun(w);
+      let calls = 0;
+      const other = id();
+      w.wrap({
+        instructionTimes: ((runId: string) => {
+          calls += 1;
+          // 박자 처음의 읽기 뒤, 쓰기 직전의 다시 읽기 전에 다른 경로가 확정을 적었다.
+          // 그 확정의 발행 시각은 answerTimeoutMs보다 오래돼 판단만으로는 막지 못한다(이력 확인이 막는다).
+          if (calls === 2) must(w.ledger.recordFinalizeInstruction({ runId, requestId: other, stopGeneration: 0, now: NOW + 5, outcome: "succeeded", resultDigest: s.resultDigest, storedAt: NOW + 2 }));
+          return w.ledger.instructionTimes(runId);
+        }) as never,
+      });
+      w.setClock(NOW + 5 + POLICY.answerTimeoutMs);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "superseded", planned: "finalize" });
+      expect(writes(w)).toEqual([]);
+      expect(finalizes(w).map((item) => item.requestId)).toEqual([other]);
+    }
+    for (const change of [{ storedRef: `results/${id()}` }, { storedAt: NOW + 4 }]) {
+      const w = world();
+      const s = settledRun(w);
+      let calls = 0;
+      w.wrap({
+        settledResult: ((runId: string) => {
+          calls += 1;
+          const real = w.ledger.settledResult(runId);
+          return calls === 2 && real.known && real.value !== null ? { known: true, value: { ...real.value, ...change } } : real;
+        }) as never,
+      });
+      expect(only(await tick(w), s.runId), JSON.stringify(change)).toEqual({ runId: s.runId, outcome: "superseded", planned: "finalize" });
+      expect(writes(w)).toEqual([]);
+    }
+  });
+
+  test("적었는지 모르는 확정(쓰기 포트가 적은 뒤 던짐)은 다음 박자가 장부의 이력을 보고 새 요청 ID로 다시 적지 않는다", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.wrap({
+      recordFinalizeInstruction: ((input: Parameters<Ledger["recordFinalizeInstruction"]>[0]) => {
+        must(w.ledger.recordFinalizeInstruction(input));
+        throw new Error("적은 뒤 실패");
+      }) as never,
+    });
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId)).toMatchObject({ outcome: "finalize_record_unknown", reason: "threw", issuedAt: NOW + 10_000 });
+    w.wrap({});
+    w.setClock(NOW + 10_000 + POLICY.answerTimeoutMs);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "already_recorded" });
+    expect(finalizes(w)).toHaveLength(1);
+    expect(w.sent).toEqual([]);
+  });
+
+  test("장부의 거절·던짐·정의 밖의 답, 적은 뒤의 서명·내보내기 실패는 그 항목의 결과다", async () => {
+    const cases: [string, (w: World) => void, Record<string, unknown>, number][] = [
+      ["거절", (w) => w.wrap({ recordFinalizeInstruction: (() => ({ ok: false, reason: "stop_generation_mismatch" })) as never }), { outcome: "finalize_refused", reason: "stop_generation_mismatch" }, 0],
+      ["쓰기가 던짐", (w) => w.wrap({ recordFinalizeInstruction: (() => {
+        throw new Error("쓰기 실패");
+      }) as never }), { outcome: "finalize_record_unknown", reason: "threw" }, 0],
+      ["답이 정의 밖", (w) => w.wrap({ recordFinalizeInstruction: (() => ({ ok: "yes" })) as never }), { outcome: "finalize_record_unknown", reason: "malformed_answer" }, 0],
+      ["서명 실패", (w) => w.failSigner(true), { outcome: "finalize_recorded_not_sent", reason: "seal_threw", delivery: "not_sent" }, 1],
+      ["연결 없음", (w) => w.setSend(async () => "no_connection"), { outcome: "finalize_recorded_not_sent", reason: "no_connection", delivery: "not_sent" }, 1],
+      ["내보내기가 던짐", (w) => w.setSend(async () => {
+        throw new Error("송신 실패");
+      }), { outcome: "finalize_recorded_not_sent", reason: "send_threw", delivery: "unknown" }, 1],
+    ];
+    for (const [name, arrange, expected, recorded] of cases) {
+      const w = world();
+      const s = settledRun(w);
+      arrange(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId), name).toMatchObject({ runId: s.runId, ...expected });
+      expect(writes(w), name).toEqual(["recordFinalizeInstruction"]);
+      expect(finalizes(w), name).toHaveLength(recorded);
+      expect(w.sent, name).toEqual([]);
+    }
   });
 });
