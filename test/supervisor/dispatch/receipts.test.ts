@@ -88,6 +88,9 @@ const untouchable: ReceiptLedger = {
   applyExecutorAnswer: () => {
     throw new Error("applyExecutorAnswer를 부르면 안 된다");
   },
+  recordAnswerSightings: () => {
+    throw new Error("recordAnswerSightings를 부르면 안 된다");
+  },
 };
 
 // 받은 입력·from을 적고 정한 답을 돌려주는 장부.
@@ -104,6 +107,7 @@ function spyLedger(answer: (id: string) => unknown = (x) => ({ ok: true, deliver
       return answer(input.reportId) as ReturnType<Ledger["recordReport"]>;
     },
     applyExecutorAnswer: untouchable.applyExecutorAnswer,
+    recordAnswerSightings: untouchable.recordAnswerSightings,
   };
   return ledger;
 }

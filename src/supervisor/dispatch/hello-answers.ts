@@ -7,7 +7,8 @@
 //    서명 시각이 없으면 받은 시각으로 대신하지 않고 장부를 부르지 않는다.
 // 2. 넘기는 순간 그 출력이 그 실행기의 지금 인정된 연결의 인사인지 연결 표로 다시 본다. 접수가 닫혀 있으면 넘기지 않는다.
 // 3. 장부의 답을 지우거나 합치지 않고 돌려준다. 반영하지 못했으면 같은 값을 다시 넘길 값과 "새 일을 맡기지 않을 실행기"를 낸다.
-// 4. 자리를 풀거나 실행을 닫는 길이 없다. 장부 연산은 applyExecutorAnswer 하나만 부른다.
+// 4. 자리를 풀거나 실행을 닫는 길이 없다. 장부 연산은 applyExecutorAnswer와, 인정이 끝난 연결의 인사에서 관측만 적는
+//    recordAnswerSightings(receipts.ts의 recordSighting)뿐이다.
 import type { RunStatus } from "../../contract/v1/index.ts";
 import {
   type DeferredLoss,
@@ -21,9 +22,10 @@ import {
   type Restorer,
 } from "../../ledger/index.ts";
 import type { Connections } from "../transport/connections.ts";
+import { type AnswerLinks, recordSighting, type SightingOutcome } from "./receipts.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는다. 자리를 푸는 연산이 이 포트에 없다.
-export type HelloAnswerLedger = Pick<Ledger, "applyExecutorAnswer">;
+export type HelloAnswerLedger = Pick<Ledger, "applyExecutorAnswer" | "recordAnswerSightings">;
 
 // 접수와 정지 세대. 실제로는 재시작 복원기(Restorer)이고, 연결 판단의 맞춤에 답한 그 객체여야 한다:
 // 연결 표의 candidates(source)는 객체 동일성으로 "이번 복원의 인사"를 가른다.
@@ -35,6 +37,8 @@ export type HelloConnectionTable = Pick<Connections, "get" | "candidates">;
 export interface HelloAnswerPorts {
   readonly ledger: HelloAnswerLedger;
   readonly intake: HelloIntake;
+  // 지금 인정된 연결인가(내보내기 포트의 answers). not_current인 인사의 관측을 적기 직전에만 묻는다. 동기여야 한다.
+  readonly links: AnswerLinks;
 }
 
 export interface HelloAnswerInput {
@@ -98,7 +102,8 @@ export type HelloAnswerOutcome =
     }
   // 접수가 열려 있지 않다(복원 중, 정지 중 등). 장부를 부르지 않았다. 같은 출력을 접수가 열린 뒤 다시 넘길 수 있다(연결을 다시 본다).
   | { readonly kind: "held"; readonly executorId: string; readonly connection: number; readonly withhold: string }
-  | { readonly kind: "not_current"; readonly executorId: string; readonly connection: number; readonly why: NotCurrentWhy }
+  // sighting은 그 인사의 안다는 항목을 관측만 적는 연산의 결과다(applyExecutorAnswer는 부르지 않았다). saved가 아니면 그 관측은 장부에 없다.
+  | { readonly kind: "not_current"; readonly executorId: string; readonly connection: number; readonly why: NotCurrentWhy; readonly sighting: SightingOutcome }
   | { readonly kind: "refused"; readonly why: RefusedWhy };
 
 // 이 모듈이 낸 다시 넘길 값. 메모리에만 있다(프로세스가 다시 뜨면 사라진다: hello-answers.md "남는 한계").
@@ -111,10 +116,21 @@ export function passHelloAnswer(input: HelloAnswerInput, ports: HelloAnswerPorts
   const { connection, executorId, runs, issuedAt } = read;
   if (!isTime(input.now)) return { kind: "refused", why: "malformed_now" };
   const why = notCurrent(input.table, ports.intake, read);
-  if (why !== null) return { kind: "not_current", executorId, connection, why };
+  if (why !== null) return { kind: "not_current", executorId, connection, why, sighting: notCurrentSighting(why, read, ports, input.now) };
   // 접수가 열리기 전의 인사는 복원 2단계가 occupancy(source)로 읽는 몫이다. 여기서 장부를 부르면 복원의 판정 전에 상태를 옮긴다.
   if (!readIntake(ports.intake)) return { kind: "held", executorId, connection, withhold: executorId };
   return apply(ports.ledger, Object.freeze({ executorId, connection, runs: frozenRuns(runs), answeredAt: issuedAt }), input.now);
+}
+
+// 인정이 끝난 연결의 인사로 볼 수 있는 까닭. other_principal·other_greeting은 출력이 그 연결의 인사와 다르다는 뜻이라, 장부가 그대로 믿을
+// 낸 쪽·목록을 연결 판단이 인정한 값이라고 할 수 없다(관측을 적지 않는다).
+const SIGHTABLE: readonly NotCurrentWhy[] = ["no_connection", "not_greeted", "other_restore", "stop_generation_changed"];
+
+// not_current인 인사의 안다는 항목을 관측만 적는다(full 그대로, 서명 시각과 함께). 연결은 부르기 직전에 links로 다시 본다(recordSighting):
+// 인정이 끝났다고 확인될 때만 부른다. 지금도 인정된 연결이면(정지 세대만 오름 등) 적지 않는다.
+function notCurrentSighting(why: NotCurrentWhy, read: FullOutput, ports: HelloAnswerPorts, now: number): SightingOutcome {
+  if (!SIGHTABLE.includes(why)) return { sighting: "skipped", why: "output_mismatch" };
+  return recordSighting({ sender: read.executorId, connection: read.connection, coverage: "full", runs: read.runs, answeredAt: read.issuedAt }, ports.ledger, ports.links, now);
 }
 
 // 반영하지 못한 인사를 같은 값으로 다시 넘긴다. 연결과 접수를 다시 보지 않는다: 처음 넘길 때 지금의 인사였고, 같은 값을 다시 적어야

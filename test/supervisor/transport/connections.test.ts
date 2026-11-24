@@ -705,6 +705,10 @@ describe("조회의 답은 영수증 처리기가 대조할 수 있는 꼴로도
         answers.push({ input, from });
         return { ok: true, moved: [], deferred: [], outsideLedger: [] };
       },
+      recordAnswerSightings: () => {
+        ledgerCalls.push("recordAnswerSightings");
+        throw new Error("인정된 연결의 상태 보고가 관측만 적는 연산을 불렀다");
+      },
     },
     random: { bytes: (length) => new Uint8Array(length) },
   };

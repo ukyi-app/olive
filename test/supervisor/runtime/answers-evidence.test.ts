@@ -1,6 +1,7 @@
 // 답 줄(answers.ts)의 D-90 증거 포트를 실제 닫기 박자(unreceived.ts의 unreceivedTick)와 함께 돌린다. 장부는 임시 폴더의 실제 장부이고
 // 공개 함수로만 준비한다. 연결 표는 가짜(greet한 연결이 그 실행기의 지금 인정된 연결)이고 처리기(receipts.ts, hello-answers.ts)는 실제 것이다.
 // 박자의 포트는 조립(N5)이 묶을 그대로 같은 답 줄의 evidence·withheld, 답 줄에 넘긴 복원기, 같은 복원 대기 신호다.
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
@@ -77,8 +78,9 @@ class FakeTable {
 function world(options: { book?: AnswerEvidenceBook; results?: boolean } = {}) {
   // 답 저장의 실패는 장부 포트에서 던져 낸다. 실제 장부의 쓰기 실패는 장부를 고장(broken)으로 두어 닫기(start 모드)까지 거절하므로
   // 증거 포트가 막았는지 가를 수 없다. 영수증의 실패는 장부에 닿기 전의 것(답 줄의 시계, 결과 보관소의 디렉터리 fsync)만 낸다.
-  const fault = { failAnswers: 0, failClock: 0, failDirSync: 0 };
-  const real = ready(open(tempPath()));
+  const fault = { failAnswers: 0, failClock: 0, failDirSync: 0, failSightings: 0 };
+  const path = tempPath();
+  const real = ready(open(path));
   let owner: string | undefined;
   if (options.results === true) {
     owner = id();
@@ -124,6 +126,7 @@ function world(options: { book?: AnswerEvidenceBook; results?: boolean } = {}) {
     backend = made.backend;
   }
   const answerCalls: string[] = [];
+  const sightCalls: string[] = [];
   const ledger: ReceiptLedger = {
     applyReceipt: (input, from) => real.applyReceipt(input, from),
     recordReport: (input, from) => real.recordReport(input, from),
@@ -135,6 +138,15 @@ function world(options: { book?: AnswerEvidenceBook; results?: boolean } = {}) {
         throw new Error("장부 포트 실패");
       }
       return real.applyExecutorAnswer(input, from);
+    },
+    // 관측만 적는 연산(인정이 끝난 연결의 안다는 답). 실패는 applyExecutorAnswer와 같이 포트에서 던져 낸다.
+    recordAnswerSightings(input, from) {
+      sightCalls.push(`${input.coverage}:${input.runs.map((r) => r.state).join(",")}`);
+      if (fault.failSightings > 0) {
+        fault.failSightings -= 1;
+        throw new Error("장부 포트 실패");
+      }
+      return real.recordAnswerSightings(input, from);
     },
   };
   const published = { stopGeneration: () => 0, intakeOpen: () => true };
@@ -244,6 +256,8 @@ function world(options: { book?: AnswerEvidenceBook; results?: boolean } = {}) {
   };
   const live = { requestId, runId, executorId: R1 };
   return {
+    path,
+    sightCalls,
     real,
     lines,
     queries,
@@ -318,7 +332,7 @@ describe("박자 + 실제 답 줄", () => {
     expect(w.runOf().state).not.toBe("not_started");
   });
 
-  test("버린 옛 인사가 양성일 수 있으면(not_known 밖의 항목) 오염이라 닫지 않는다. 확인된 빈 목록이면 잃는 양성 관측이 없어 오염이 아니고 닫는다(대조군)", () => {
+  test("버린 옛 인사가 양성일 수 있고 그 관측을 적지 못하면(not_known 밖의 항목) 오염이라 닫지 않는다. 확인된 빈 목록이면 잃는 양성 관측이 없어 오염이 아니고 닫는다(대조군)", () => {
     // 오염은 버린 답이 양성 관측을 실었을 수 있을 때만이다(answers.ts의 mayBePositive). 빈 목록·전부 not_known인 목록을 버려도
     // 장부가 모르는 "안다"는 관측이 생기지 않는다.
     for (const oldRuns of ["positive", "empty"] as const) {
@@ -330,8 +344,11 @@ describe("박자 + 실제 답 줄", () => {
       w.table.greet(2, R1, [], SIGNED);
       w.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
       w.hello(2, []);
+      // 옛 인사의 양성 관측을 적는 연산이 실패한다(빈 목록은 부르지 않는다).
+      w.fault.failSightings = 1;
       w.gate.settled = true;
       w.lines.pump();
+      expect([oldRuns, w.sightCalls]).toEqual([oldRuns, oldRuns === "positive" ? ["full:preparing"] : []]);
       const read = w.lines.evidence.read(R1);
       const result = ran(w.tick()).runs;
       expect([oldRuns, result[0]?.outcome]).toEqual([oldRuns, oldRuns === "positive" ? "skipped" : "closed"]);
@@ -344,6 +361,65 @@ describe("박자 + 실제 답 줄", () => {
         expect(result).toEqual([closedOutcome(w, 2)]);
         expect(w.runOf().state).toBe("not_started");
       }
+    }
+  });
+
+  test("버린 옛 인사의 양성 관측이 적히면 오염이 아니고, 닫기는 장부가 그 관측으로 거절한다(run_sighted, 상태·임대 그대로)", () => {
+    const w = world();
+    w.gate.settled = false;
+    w.hello(1, [{ run_id: w.live.runId, state: "preparing", run_generation: w.runOf().runGeneration, last_receipt_id: null }]);
+    w.table.greet(2, R1, [], SIGNED);
+    w.lines.deliver({ kind: "withdrawn", connection: 1, principal: R1 });
+    w.hello(2, []);
+    const lease = w.real.instructionTimes(w.live.runId);
+    w.gate.settled = true;
+    w.lines.pump();
+    expect(w.sightCalls).toEqual(["full:preparing"]);
+    expect(w.answerCalls).toEqual(["full:"]);
+    expect(w.lines.evidence.read(R1)).toMatchObject({ known: true, tainted: false, pending: false, lastFull: { connection: 2 } });
+    expect(w.real.hasRunSighting(w.live.runId)).toEqual({ known: true, value: true });
+    const result = ran(w.tick()).runs;
+    expect(result).toMatchObject([{ outcome: "refused", reason: "run_sighted" }]);
+    expect(w.runOf().state).toBe("preparing");
+    expect(w.real.instructionTimes(w.live.runId)).toEqual(lease);
+  });
+
+  test("막힘 예(answers.md): 복원 대기 중 받은 연결 1의 양성 답 뒤 연결 2·3이 조회에 답하고 철회되고 현 연결이 4여도, 관측 1행·밀린 사본 0·맡기지 않을 실행기 0이다", () => {
+    const w = world();
+    const lease = w.real.instructionTimes(w.live.runId);
+    w.gate.settled = false;
+    w.hello(1, []);
+    w.status(1, w.running());
+    for (const connection of [2, 3]) {
+      w.table.greet(connection, R1, [], SIGNED);
+      w.lines.deliver({ kind: "withdrawn", connection: connection - 1, principal: R1 });
+      w.hello(connection, []);
+      w.status(connection, w.running());
+    }
+    w.table.greet(4, R1, [], SIGNED);
+    w.lines.deliver({ kind: "withdrawn", connection: 3, principal: R1 });
+    w.hello(4, []);
+    w.gate.settled = true;
+    for (let i = 0; i < 3; i += 1) w.lines.pump();
+    // 옛 연결의 답 셋은 관측만 적고(applyExecutorAnswer 0회), 현 연결 4의 인사만 반영된다.
+    expect(w.sightCalls).toEqual(["partial:running", "partial:running", "partial:running"]);
+    expect(w.answerCalls).toEqual(["full:"]);
+    expect(w.lines.backlog(R1)).toEqual([]);
+    expect(w.lines.withheld.executors()).toEqual({ known: true, value: [] });
+    // 답하고 철회된 연결의 등록 항목도 남지 않는다.
+    expect(w.queries.pending()).toEqual([]);
+    // 오염·대기가 없고, 닫기는 장부가 관측으로 거절한다. 상태·임대는 그대로다.
+    expect(w.lines.evidence.read(R1)).toMatchObject({ known: true, tainted: false, pending: false, lastFull: { connection: 4 } });
+    expect(ran(w.tick()).runs).toMatchObject([{ outcome: "refused", reason: "run_sighted" }]);
+    expect(w.runOf().state).toBe("preparing");
+    expect(w.real.instructionTimes(w.live.runId)).toEqual(lease);
+    // 같은 실행의 관측은 첫 줄 하나다(세 번 적어도 1행). 장부를 닫은 뒤 원 SQL로 본다.
+    w.real.close();
+    const raw = new Database(w.path, { readonly: true });
+    try {
+      expect(raw.query("SELECT run_id, executor_id, reported_state, coverage FROM run_sightings").all()).toEqual([{ run_id: w.live.runId, executor_id: R1, reported_state: "running", coverage: "partial" }]);
+    } finally {
+      raw.close();
     }
   });
 
