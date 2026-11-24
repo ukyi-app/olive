@@ -181,6 +181,7 @@ function cycleWith(wait: () => Promise<void>) {
   const done = (kind: string) => ({ kind: "not_run", reason: kind }) as never;
   const beats: CycleBeats = {
     linkLoss: () => done("link_loss"),
+    resultCheck: () => done("result_check"),
     async life() {
       await wait();
       return done("life");
