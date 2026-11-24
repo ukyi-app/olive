@@ -1,25 +1,27 @@
 // 작업자 실행기(제어 컨테이너)의 기동 조립. 환경을 읽지 않는다: 진입점(src/main/executor.ts)이 환경을 값(ExecutorSettings)으로 바꾸고
 // 실제 파일·시계·타이머·소켓을 ExecutorDeps로 넘긴다. 시험은 같은 자리에 가짜를 넣는다.
 //
-// 기동 순서(어느 단계든 실패하면 감독에 붙기 전에 EXECUTOR_EXIT의 정한 코드로 끝난다):
+// 기동 순서(감독 소켓 start 전의 단계가 실패하면 감독에 붙기 전에 EXECUTOR_EXIT의 정한 코드로 끝난다):
 //   재료(프로필·서명 키·감독 공개 키·TLS 파일) → 저장소 열기 → WorkerExecutor(기동 대조) → 대리 소켓 듣기 → 대리 hello 기다림
 //   → recover → ExecutorLink 하나 → TLS 클라이언트 → 감독 소켓 하나 start → link.tick·worker.tick 주기
 //
 // - 대리의 hello 전에는 감독에 붙지 않는다. 대리 없이 붙으면 받은 시작을 띄우지 못하고 not_started로 버리게 된다.
 //   예외는 물려받은 실행이 있어 원격이 처음부터 잠긴 기동이다(아래 inheritedUnverified). 그 원격은 어떤 hello도 받지 않으므로
 //   기다리면 매번 상한에 걸려 감독에게 그 실행(unknown_running)을 알릴 길이 없다. 띄우기는 잠금이 막는다.
-//   이 예외는 기동 대조(WorkerExecutor 생성자의 auditRuns)를 지난 장부로만 정한다. 그래서 원격을 worker 뒤에 만든다.
+//   이 예외는 기동 대조(WorkerExecutor 생성자의 auditRuns)를 지난 장부와 recover가 쓰는 같은 유효한 사건(store.validEvents)으로만 정한다.
+//   그래서 원격을 worker 뒤에 만든다.
 // - hello는 받은 때(단조 시계)와 그 연결 세대로 판정한다. recover를 기다리는 사이 대리 연결이 바뀌면, 감독 소켓 start 전에
-//   처음 상한의 남은 시간 안에서 새 세대의 hello를 다시 기다린다.
+//   처음 상한의 남은 시간 안에서 새 세대의 hello를 다시 기다린다. 기다림에서 돌아올 때마다 지금 세대를 다시 본다.
 // - worker의 exitWaitMs와 원격의 replyWaitMs는 같은 값(timing.replyWaitMs) 하나에서 넘긴다. 원격의 시계(runtime.now)는 단조 시계이고
 //   worker의 상한 타이머(전역 setTimeout)와 같은 시간 기준이어야 한다(deps.monoNow·deps.setTimer). worker의 now는 벽시계다.
 // - 감독 소켓은 이 ExecutorLink에 하나만 붙인다. 우편함 하나를 소켓(inbox)과 worker(credentials)에 함께 넘긴다.
 // - 연결 뒤 지시 처리(Connection.receive)가 던지면(첫 접수·재정리 종료 영수증의 로컬 서명 실패 등) 이 WorkerExecutor를 더 쓰지 않는다.
 //   프로세스 안에서 다시 열지 않고 소켓을 멈춘 뒤 fatal 코드로 끝내 컨테이너 재시작에 맡긴다(같은 저장소를 두 객체가 쥐지 않는다).
 //   그 거절은 연결의 닫힘 사유와 따로 끝내기로 잇는다(아래 fatal). 끝내기는 예약기(setTimer)에 기대지 않는다.
+//   앞 연결에서 시작한 지시 처리가 끝나기 전에는 다시 붙지 않는다(아래 gatedClient): 그 결과가 거절이면 끝내야 할 worker다.
 // - 끝낼 때 소켓 stop()을 기다린 뒤 TLS 클라이언트를 닫는다. stop이 상한(stopWaitMs) 안에 끝나지 않거나 상한을 걸지 못하면 기다리지 않고 닫는다.
 import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
-import { encodeControl, OUTPUT_MAX_BYTES } from "../agent/link.ts";
+import { encodeControl } from "../agent/link.ts";
 import { type Role, ROLES } from "../contract/v1/index.ts";
 import type { TlsClient, TlsClientOptions } from "../transport/tls-client.ts";
 import type { RawTlsMaterial } from "../transport/tls-policy.ts";
@@ -173,11 +175,16 @@ export const REVISION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 // 공개 부분을 꺼내므로, 그 꼴로 잘못 넣은 파일도 기동하게 된다.
 const PUBLIC_KEY_PEM = /^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/;
 
-// 대리 링크의 start에서 실행마다 달라지는 칸의 자리값. 꼴이 맞고 인코딩이 가장 긴 쪽을 넣어, 프로필이 실제 start에 실리는지 본다.
+// worker가 원격에 넘기는 실행마다의 출력 상한(start의 output_bytes). 프로필 검사(LINK_PROBE)도 이 값으로 start를 인코딩한다.
+// 링크가 받는 최댓값(OUTPUT_MAX_BYTES, 6자리)으로 재면 실제 start(5자리)에는 실리는 경계 프로필을 거절한다.
+export const RUN_OUTPUT_BYTES = 64 * 1024;
+
+// 대리 링크의 start에서 실행마다 달라지는 칸의 자리값. 실제 start와 같은 출력 상한, 꼴이 맞고 인코딩이 가장 긴 ID·시각을 넣어
+// 프로필이 실제 start에 실리는지 본다.
 const LINK_PROBE = {
   run_id: "00000000-0000-0000-0000-000000000000",
   credential_digest: "0".repeat(64),
-  output_bytes: OUTPUT_MAX_BYTES,
+  output_bytes: RUN_OUTPUT_BYTES,
   deadline_at: Number.MAX_SAFE_INTEGER,
   lease_until: Number.MAX_SAFE_INTEGER,
 } as const;
@@ -349,8 +356,15 @@ function waitForHello(remote: GreetedRemote, limit: number, timing: ExecutorTimi
 // 감독에 붙지 않고 연 대리 소켓을 닫은 뒤 코드 0으로 돌려준다. 기동을 마친 뒤의 멈춤은 RunningExecutor.stop이다.
 export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDeps, stop?: AbortSignal): Promise<StartResult> {
   const step = (name: StartStep) => deps.onStep?.(name);
-  const fail = (at: StartStep, code: number, error: unknown): StartResult => ({ ok: false, step: at, code, reason: reasonOf(error) });
   const stopped = (at: StartStep): StartResult => ({ ok: false, step: at, code: 0, reason: "stop_requested" });
+  // 멈춤 요청이 단계 실패보다 앞선다: 요청을 받은 뒤 끝난 기다림이 실패여도 0이다(요청된 멈춤이다). 실패의 사유 이름은 기록만 한다.
+  // 부르는 자리는 그 전에 연 대리 소켓을 이미 닫았다.
+  const fail = (at: StartStep, code: number, error: unknown): StartResult => {
+    const reason = reasonOf(error);
+    if (!stop?.aborted) return { ok: false, step: at, code, reason };
+    deps.log(`멈춤 요청 뒤 ${at} 단계가 실패했다(${reason}). 멈춤이 앞서 0으로 끝낸다`);
+    return stopped(at);
+  };
   const timing = settings.timing;
 
   step("material");
@@ -410,6 +424,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       launcher,
       now: deps.wallNow,
       exitWaitMs: timing.replyWaitMs,
+      outputBytes: RUN_OUTPUT_BYTES,
     });
   } catch (error) {
     return fail("worker", EXECUTOR_EXIT.startup_audit, error);
@@ -419,7 +434,13 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 원격을 처음부터 잠근다: 그 실행을 지금 붙을 대리의 0으로 닫지 않는다.
   // 함정: 장부는 worker 생성자의 기동 대조(auditRuns)를 지난 뒤에 본다. 그 전의 장부에는 접수가 아닌 최초 preparing(사건·영수증 없음)이 남아,
   // 물려받은 실행이 없는데도 대리를 잠그고 감독에 빈 목록으로 인사한 뒤 새 작업을 띄우지 못한다.
-  const inheritedUnverified = store.ledgerHeld() || store.runs().some((run) => UNFINISHED.includes(run.state));
+  // 함정: 상태 이름만 보지 않는다. 종료 영수증은 저장되고 실행 기록 쓰기만 실패한 실행은 checking 등으로 남지만, recover는 그 유효한 사건으로
+  // 맺고 남은 수를 세지 않는다(worker.reconcile: 보류되지 않은 실행의 같은 세대 receipt_stopped·receipt_cleaned). 대리의 계수를 쓰지 않는
+  // 실행으로 잠그면 recover 뒤에도 잠금이 풀리지 않아, 정상 대리를 거절하고 새 작업을 띄우지 못한다. 그래서 같은 사건으로 판단한다.
+  const settledByEvent = (runId: string) =>
+    !store.suspectRun(runId) && store.validEvents(runId).some((entry) => entry.action === "receipt_stopped" || entry.action === "receipt_cleaned");
+  const unverified = () => store.ledgerHeld() || store.runs().some((run) => UNFINISHED.includes(run.state) && !settledByEvent(run.run_id));
+  const inheritedUnverified = unverified();
   const agent = new GreetedRemote(
     {
       credentialEnv: material.profile.credentialEnv,
@@ -463,9 +484,18 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     return fail("recover", EXECUTOR_EXIT.recover, error);
   }
 
+  // 잠그지 않은 판단은 recover가 남은 실행을 모두 사건으로 맺는다는 예상이었다. recover 뒤에 그와 달리 끝을 맺지 못한 실행이 남거나 장부가
+  // 보류됐으면 잠기지 않은 원격으로 그 실행을 감독에 알리게 된다. 붙지 않고 끝내 다음 기동이 잠금을 다시 정하게 한다.
+  if (!inheritedUnverified && unverified()) {
+    listener.stop();
+    if (stop?.aborted) return stopped("recover");
+    return { ok: false, step: "recover", code: EXECUTOR_EXIT.recover, reason: "unverified_after_recover" };
+  }
+
   // recover를 기다리는 사이 대리 연결이 바뀌었을 수 있다(끊기고 새 세대가 붙음). 인사한 그 세대가 아직 연결·인사·신뢰 상태인지 다시 보고,
-  // 아니면 처음 상한의 남은 시간 안에서 지금 세대의 hello를 기다린다. 여기부터 감독 소켓 start까지는 await가 없다.
-  if (!inheritedUnverified && agent.greeting()?.generation !== greeted) {
+  // 아니면 처음 상한의 남은 시간 안에서 지금 세대의 hello를 기다린다. 다시 기다린 뒤에도 그 사이 또 바뀌었을 수 있어, 기다림에서 돌아올 때마다
+  // 다시 본다. 상한이 고정이라 계속 바뀌면 waitForHello가 null(86)로 끝난다. 이 반복을 나온 뒤 감독 소켓 start까지는 await가 없다.
+  while (!inheritedUnverified && agent.greeting()?.generation !== greeted) {
     deps.log("복원 중 대리 연결이 바뀌어 새 연결의 hello를 기다린다");
     step("agent_hello");
     greeted = await waitForHello(agent, helloLimit, timing, deps, stop);
@@ -503,6 +533,8 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   let cancelTick: () => void = () => {};
   let socket: ExecutorSocket | undefined;
   let fatalReason: string | null = null;
+  // 감독 연결에서 시작해 아직 끝나지 않은 지시 처리(Connection.receive)의 끝. 거절이면 fatal을 정한 뒤에 풀리므로 이 약속 자체는 거절되지 않는다.
+  const inFlight = new Set<Promise<void>>();
 
   // 닫는 쪽 효과는 하나가 실패해도 나머지를 막지 않는다. 예약기가 고장 나 상한을 걸지 못하면 stop을 기다리지 않고 닫는다
   // (끝나지 않을 수 있는 stop에 프로세스를 묶지 않는다).
@@ -562,7 +594,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 감독 소켓이 여는 연결마다 지시 처리(Connection.receive)의 거절을 fatal로 바로 잇는다. 소켓도 그 거절을 receive_failed 닫힘으로 알리지만,
   // 연결이 먼저 닫혔으면(상대가 끊음 등) 그 연결의 닫힘 사건은 이미 나갔고 다시 나오지 않는다(socket.ts의 shut은 한 연결에 한 번).
   // 연결 객체는 감싸지 않는다: 소켓이 link.isCurrent로 같은 객체인지 본다. 거절 반응은 소켓의 await보다 먼저 걸리므로 fatal의 끝내기는
-  // 소켓이 그 거절을 처리한 뒤에 돈다.
+  // 소켓이 그 거절을 처리한 뒤에 돈다. 처리마다 끝을 inFlight에 두어 다시 붙기가 기다린다(아래 gatedClient).
   const guardedLink: Pick<ExecutorLink, "open" | "isCurrent" | "epoch"> = {
     open: (transport) => {
       if (fatalReason !== null || ending !== undefined) throw new Error("executor_stopping");
@@ -570,7 +602,12 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       const receive = connection.receive.bind(connection);
       connection.receive = (raw) => {
         const handled = receive(raw);
-        handled.catch(() => fatal("receive_failed"));
+        const settled = handled.then(
+          () => {},
+          () => fatal("receive_failed"),
+        );
+        inFlight.add(settled);
+        void settled.then(() => inFlight.delete(settled));
         return handled;
       };
       return connection;
@@ -579,8 +616,31 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     epoch: () => current.epoch(),
   };
 
+  // 감독 소켓이 붙을 때마다(처음과 다시 붙기) 앞 연결에서 시작한 지시 처리가 모두 끝난 뒤에만 TCP를 연다. 그 처리가 거절되면 fatal이
+  // 정해져 붙지 않는다. 함정: 소켓은 연결이 닫히면 그 연결의 처리를 기다리지 않고 다시 붙기를 건다. 기다리지 않으면 재정리 응답이 다시 붙기
+  // 간격보다 늦고 응답 상한보다 이를 때, 곧 끝낼 worker가 감독과 다시 맞추고 인사·영수증 재전송을 한 뒤에야 89로 끝난다.
+  // 처리는 worker의 상한(exitWaitMs 등)으로 끝난다. 소켓의 멈춤(중단 신호)이면 기다리지 않고 거절한다.
+  const settledInFlight = (signal: AbortSignal | undefined) =>
+    new Promise<void>((resolve) => {
+      if (signal?.aborted) return resolve();
+      signal?.addEventListener("abort", () => resolve(), { once: true });
+      void Promise.all([...inFlight]).then(() => resolve());
+    });
+  const gatedClient: Pick<TlsClient, "connect" | "close"> = {
+    connect: async (signal) => {
+      while (inFlight.size > 0 && !signal?.aborted) {
+        deps.log("앞 연결의 지시 처리가 끝나기를 기다린 뒤 다시 붙는다");
+        await settledInFlight(signal);
+      }
+      if (signal?.aborted) throw new Error("connect_aborted");
+      if (fatalReason !== null || ending !== undefined) throw new Error("executor_stopping");
+      return client.connect(signal);
+    },
+    close: () => client.close(),
+  };
+
   const created = createExecutorSocket({
-    client,
+    client: gatedClient,
     link: guardedLink,
     inbox,
     policy: settings.reconnect,

@@ -181,3 +181,14 @@ test("실행기 진입점: 환경의 폴더에서 차트가 붙이는 파일 이
   // worker와 원격에 넘기는 응답 상한은 하나다.
   expect(parsed.settings.timing.replyWaitMs).toBeGreaterThan(0);
 });
+
+test("실행기 진입점: 감독 DNS 이름은 대문자가 섞여도 받고 원래 문자열 그대로 TLS 정책에 넘긴다(정책은 인증서 SAN과 그대로 견준다)", () => {
+  const name = "Supervisor.Olive-Control.svc";
+  const parsed = settingsFromEnv({ ...FULL, OLIVE_SUPERVISOR_SERVER_NAME: name });
+  if (!parsed.ok) throw new Error(parsed.name);
+  expect(parsed.settings.supervisor.serverName).toBe(name);
+  // 대조군: 글자 규칙(밑줄, 칸 머리의 하이픈)은 대소문자와 상관없이 그대로 거절한다.
+  for (const bad of ["Super_visor.svc", "-Supervisor.svc"]) {
+    expect(settingsFromEnv({ ...FULL, OLIVE_SUPERVISOR_SERVER_NAME: bad })).toMatchObject({ ok: false, name: "OLIVE_SUPERVISOR_SERVER_NAME" });
+  }
+});

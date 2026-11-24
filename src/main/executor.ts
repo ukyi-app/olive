@@ -55,9 +55,10 @@ const isIpv4 = (host: string) => {
   const parts = host.split(".");
   return parts.length === 4 && parts.every((part) => IPV4_OCTET.test(part) && Number(part) <= 255);
 };
-// 감독 인증서의 DNS SAN(SNI로도 보낸다). RFC 1123 호스트 이름의 소문자 꼴이고, 칸의 글자 규칙은 tls-policy.ts의 LABEL과 같다.
-// 이 꼴이 아니면 감독 인증서의 DNS SAN과 같을 수 없어 TLS 상대 확인에서 매번 거절된다.
-const DNS_NAME = /^(?=.{1,253}$)[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$/;
+// 감독 인증서의 DNS SAN(SNI로도 보낸다). RFC 1123 호스트 이름의 꼴이다. 이 꼴이 아니면 감독 인증서의 DNS SAN과 같을 수 없어
+// TLS 상대 확인에서 매번 거절된다. 함정: 대문자를 막지 않는다. TLS 정책(tls-policy.ts)은 설정 문자열을 인증서 SAN과 글자 그대로 견주므로
+// 대문자가 섞인 SAN의 인증서에는 같은 대문자 설정이 맞는다. 값은 바꾸지 않고(소문자로 접지 않고) 그대로 넘긴다.
+const DNS_NAME = /^(?=.{1,253}$)[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$/i;
 // 인스턴스 이름은 실행기 이름(executor/<역할>/<인스턴스>/<저장소 ID>)의 한 칸이다. 저장소 ID 자리에 꼴이 맞는 자리값을 넣고 계약의 규칙(parsePrincipal)으로 본다.
 // 저장소를 만들기 전에 거른다: worker가 이름을 만들 때 걸리면 그 전에 저장소 ID가 이미 생긴다.
 const instanceOk = (role: Role, instance: string) => parsePrincipal(`executor/${role}/${instance}/0`)?.kind === "worker_executor";
