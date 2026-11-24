@@ -9,7 +9,10 @@ import { type Envelope, limits, type NonceStore, rawPublicKey, type RunStatus, s
 import { sealDraft, statusQueryDraft } from "../../../src/supervisor/dispatch/envelopes.ts";
 import type { ReceiptLedger } from "../../../src/supervisor/dispatch/receipts.ts";
 import { createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
+import { createCycle } from "../../../src/supervisor/runtime/cycle.ts";
+import { createIssuance, type IssuanceNote } from "../../../src/supervisor/runtime/issuance.ts";
 import { createQueryBook } from "../../../src/supervisor/runtime/query-book.ts";
+import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
 import { createWireSink } from "../../../src/supervisor/runtime/sink.ts";
 import { RegistryState } from "../../../src/supervisor/transport/registry.ts";
 import { type ConnectionServer, type Delivered, type SendEnd, type ServerNote, startConnectionServer } from "../../../src/supervisor/transport/server.ts";
@@ -297,6 +300,72 @@ describe("closeConnection", () => {
     expect(lateEnds).toEqual([]);
     expect(h.withdrawnOf(two.id).length).toBe(1);
   });
+
+  // 판단이 행을 closed로 바꾸고 withdrawn → close 차례로 내는 사이에는 서버의 링크 표에 옛 번호가 남는다. 그 구간의 부름이
+  // 닫기를 가로채면 닫힘 사유가 바뀌고, 묶음 철회에서는 그 번호의 withdrawn이 closed를 돌려준 뒤에야 온다.
+  test("같은 주체의 새 맞춤이 옛 연결을 닫는 중, 그 철회 안에서 옛 번호를 부르면 not_open이고 판단의 닫기가 끝난다", async () => {
+    const h = await start();
+    const old = await greet(h, K1, R1);
+    const order: string[] = [];
+    h.onDeliver = (output) => {
+      if (output.kind !== "withdrawn") return;
+      order.push(`withdrawn ${output.connection}`);
+      if (output.connection === old.id) order.push(`inner ${old.id} ${h.server.closeConnection(old.id).kind}`);
+    };
+    h.onNote = (note) => {
+      if (note.kind === "closed") order.push(`closed ${note.connection} ${note.cause}`);
+    };
+    const newer = await greet(h, K1, R1);
+    expect(order).toEqual([`withdrawn ${old.id}`, `inner ${old.id} not_open`, `closed ${old.id} judgment`]);
+    expect(h.withdrawnOf(old.id).length).toBe(1);
+    expect(h.server.recognized(R1)).toBe(newer.id);
+    expect(h.server.closeConnection(old.id)).toEqual({ kind: "not_open" });
+  });
+
+  test("판단이 두 연결을 한 묶음으로 철회하는 중, 첫 철회 안에서 둘째 번호를 부르면 not_open이고 둘째의 철회는 원래 차례에 한 번 온다", async () => {
+    const h = await start();
+    const one = await greet(h, K1, R1);
+    const two = await greet(h, K2, R2);
+    const order: string[] = [];
+    h.onDeliver = (output) => {
+      if (output.kind !== "withdrawn") return;
+      order.push(`withdrawn ${output.connection}`);
+      if (output.connection === one.id) order.push(`inner ${two.id} ${h.server.closeConnection(two.id).kind}`);
+    };
+    h.onNote = (note) => {
+      if (note.kind === "closed") order.push(`closed ${note.connection} ${note.cause}`);
+    };
+    // 읽을 수 없는 판은 아무도 믿지 않아 판단이 맞춘 연결을 한 묶음으로 닫는다.
+    h.server.applyRegistry({ kind: "unreadable" });
+    expect(order).toEqual([`withdrawn ${one.id}`, `inner ${two.id} not_open`, `closed ${one.id} judgment`, `withdrawn ${two.id}`, `closed ${two.id} judgment`]);
+    expect(h.withdrawnOf(two.id).length).toBe(1);
+  });
+
+  // 서버는 발급 깃발을 모른다. 발급을 닫은 뒤 서버 close() 전의 거절은 부르는 쪽(D-90 박자)이 issuanceOpen()을 보고 한다.
+  test("발급을 닫은 뒤 서버 close() 전에는 closed이고, close()를 시작한 뒤에는 stopping이다", async () => {
+    const h = await start();
+    const one = await greet(h, K1, R1);
+    const two = await greet(h, K2, R2);
+    const cycle = createCycle({
+      policy: { judgeMs: 30_000, resendEveryMs: 5_000, assignCallsPerBeat: 1 },
+      ledgerClock: createSharedClock({ now: () => h.t }),
+      beats: { linkLoss() {}, life() {}, resend() {}, assign() {} },
+    } as never);
+    const between: unknown[] = [];
+    const issuance = createIssuance({
+      cycle,
+      server: h.server,
+      observe: (note: IssuanceNote) => {
+        if (note.kind === "shutdown" && note.step === "issuance_closed") between.push(cycle.issuanceOpen(), h.server.closeConnection(one.id));
+      },
+    } as never);
+    await issuance.shutdown();
+    expect(between).toEqual([false, { kind: "closed" }]);
+    expect(h.closedNotes(one.id)).toEqual([{ kind: "closed", connection: one.id, cause: "requested" }]);
+    expect(h.withdrawnOf(one.id).length).toBe(1);
+    expect(h.closedNotes(two.id)).toEqual([{ kind: "closed", connection: two.id, cause: "shutdown" }]);
+    expect(h.server.closeConnection(two.id)).toEqual({ kind: "stopping" });
+  });
 });
 
 // ---- 실제 답 줄·조회 등록부·장부에 이은 루프백 ----
@@ -389,7 +458,8 @@ test("루프백: 닫은 연결의 철회가 답 줄·조회 등록부·자격 �
 
   const queries = createQueryBook();
   const wire = createWireSink({ server, restorer, withheld: { executors: () => ({ known: true, value: [] }) }, clock: { now: () => now }, queries });
-  const hellos = events<string>();
+  // 인사의 반영은 연결 번호와 함께 적는다. 결과 이름만 적으면 첫 연결의 applied가 두 번째 인사의 기다림도 채운다.
+  const hellos = events<{ kind: string; connection: number | null }>();
   const forgotten: number[] = [];
   const lines = createAnswerLines({
     table: () => server.table(),
@@ -404,7 +474,7 @@ test("루프백: 닫은 연결의 철회가 답 줄·조회 등록부·자격 �
     cycle: { noteCandidate: () => {} },
     observationsSettled: () => true,
     observe: (note) => {
-      if (note.kind === "hello") hellos.push(note.outcome.kind);
+      if (note.kind === "hello") hellos.push({ kind: note.outcome.kind, connection: note.outcome.kind === "applied" ? note.outcome.connection : null });
     },
     // 발급 문이 자격 값 송신기의 forgetConnection에 잇는 자리다(issuance.ts). 여기서는 부른 번호만 적는다.
     credentials: { onReceipt: () => {}, forgetConnection: (connection) => forgotten.push(connection) },
@@ -449,14 +519,15 @@ test("루프백: 닫은 연결의 철회가 답 줄·조회 등록부·자격 �
   one.put("hello", { profile_revision: "profile-1", policy_revision: "policy-1", runs: runs("preparing"), unacked_ids: [] });
   const c1 = await candidates.next(() => true);
   expect(c1).toBe(one.connection);
-  await hellos.next((kind) => kind === "applied");
+  await hellos.next((note) => note.kind === "applied" && note.connection === c1);
   const q1 = await ask();
   await one.frames.next((e) => e.header.action === "status_query" && e.header.request_id === q1);
   expect(queries.pending().map((q) => [q.requestId, q.connection])).toEqual([[q1, c1]]);
 
-  // 2. 감독이 그 연결을 닫는다. 철회가 답 줄을 지나 송신기 포트와 조회 등록부에 닿고, 실행기 쪽 소켓이 닫힌다.
+  // 2. 감독이 그 연결을 닫는다. 돌아온 때 이미 철회가 답 줄을 지나 송신기 포트와 조회 등록부에 닿았다(기다리기 전에 본다:
+  // 기다린 뒤에 보면 소켓 파기 뒤 늦게 온 close 사건의 철회로도 통과한다). 그다음 실행기 쪽 소켓이 닫힌다.
   expect(server.closeConnection(c1)).toEqual({ kind: "closed" });
-  await withdrawn.next((connection) => connection === c1);
+  expect(withdrawn.all()).toEqual([c1]);
   expect(forgotten).toEqual([c1]);
   expect(queries.pending()).toEqual([]);
   expect(server.recognized(R)).toBeNull();
@@ -467,7 +538,7 @@ test("루프백: 닫은 연결의 철회가 답 줄·조회 등록부·자격 �
   expect(two.connection).not.toBe(c1);
   two.put("hello", { profile_revision: "profile-1", policy_revision: "policy-1", runs: runs("preparing"), unacked_ids: [] });
   const c2 = await candidates.next((connection) => connection === two.connection);
-  await hellos.next((kind) => kind === "applied" && server.recognized(R) === c2);
+  await hellos.next((note) => note.kind === "applied" && note.connection === c2);
   expect(server.recognized(R)).toBe(c2);
   // 새 연결은 재접속 제한에 걸려 닫히지 않았다. 닫힘 기록은 감독이 닫은 첫 연결 하나뿐이다.
   expect(closedNotes).toEqual([{ kind: "closed", connection: c1, cause: "requested" }]);

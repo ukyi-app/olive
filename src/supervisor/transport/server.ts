@@ -187,7 +187,7 @@ export type StartResult = { readonly ok: true; readonly server: ConnectionServer
 export type CloseConnectionResult =
   // 지금 쥔 연결이었고 정상 끊김과 같은 길로 닫았다. 돌아올 때 판단의 closed와 그 철회(withdrawn)의 전달이 이미 끝났다.
   | { readonly kind: "closed" }
-  // 그 번호의 연결을 쥐고 있지 않다(번호 없음, 이미 닫혀 빠짐, 지금 닫히는 중). 아무것도 하지 않았다.
+  // 그 번호의 연결을 쥐고 있지 않다(번호 없음, 이미 닫혀 빠짐, 지금 닫히는 중, 판단이 이미 닫기로 정해 철회가 진행 중). 아무것도 하지 않았다.
   | { readonly kind: "not_open" }
   // 서버를 닫기 시작했다. 아무것도 하지 않았다(남은 연결은 close()가 shutdown으로 닫는다).
   | { readonly kind: "stopping" };
@@ -650,10 +650,12 @@ class Server implements ConnectionServer {
 
   // 닫기는 closeLink 하나로 간다: 상대가 끊었을 때와 같이 대기열·늦은 check·답 쓰기 대기·넘긴 틀을 정리하고 판단에 closed를 넣는다.
   // 닫는 중인 연결은 closeLink가 첫머리에서 links에서 빼므로 여기서 not_open이다(닫힘 안의 전달에서 다시 불려도 두 번 닫지 않는다).
+  // 판단이 행을 closed로 바꾼 연결도 not_open이다: 판단은 withdrawn → close 차례로 내고, 그 사이(앞 withdrawn의 전달 안)에는
+  // 링크가 아직 links에 있다. 여기서 닫으면 닫힘 사유를 가로채고, 묶음 철회에서는 그 번호의 withdrawn이 closed를 돌려준 뒤에 온다.
   closeConnection(connection: number): CloseConnectionResult {
     if (this.stopping) return { kind: "stopping" };
     const link = this.links.get(connection);
-    if (link === undefined || link.dead) return { kind: "not_open" };
+    if (link === undefined || link.dead || this.current.get(connection)?.phase === "closed") return { kind: "not_open" };
     this.closeLink(link, "requested");
     return { kind: "closed" };
   }
