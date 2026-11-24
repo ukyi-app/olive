@@ -1,7 +1,7 @@
 // 유효한 상태의 한 자리, 판정의 지속, 닫는 동작의 독립, 장애 중의 송신, 요청 대조의 시험.
 // 규칙: 불확실하면 슬롯을 쥔 채 권한을 주는 동작을 닫고, 이미 맡은 실행을 멈추는 일은 장부 쓰기와 독립적으로 시작한다.
 // 순서는 고정 장벽(쓰기에 실제로 들어갔다는 신호)으로 만든다. 다시 열기는 같은 폴더를 새 저장소로 여는 것으로 재시작을 흉내 낸다.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect } from "bun:test";
 import { type KeyObject, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -31,6 +31,7 @@ import {
   stopWrite,
   supervisorKeys,
   syncReply,
+  test,
   until,
 } from "./support.ts";
 

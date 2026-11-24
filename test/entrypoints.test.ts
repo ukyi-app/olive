@@ -31,9 +31,25 @@ test("entrypoints: 이미지 기본 명령(no-role)은 역할을 고르라고 �
   expect(result.stderr.toString()).toMatch(/^olive \S+: 역할을 고르지 않았다\. [^\n]*\n$/);
 });
 
-// 실행기는 감독에 먼저 붙는 쪽이라 듣는 API를 부르지 않는다. 실행기 진입점에서 닿는 로컬 모듈 전체를 본다.
-test("entrypoints: 실행기에서 닿는 코드에 듣는 API가 없다", async () => {
-  const listening = /\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\.listen\(/;
+// 실행기는 감독에 먼저 붙는 쪽이다. 듣는 곳은 역할 컨테이너의 대리가 붙는 경로 유닉스 소켓 한 파일(agent-listener.ts)뿐이다(D-102).
+// TCP·abstract 소켓은 듣지 않는다. 실행기 진입점에서 닿는 로컬 모듈 전체를 본다.
+const LISTENER = "src/executor/agent-listener.ts";
+const listening = /\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\.listen\(/;
+// 그 한 파일의 듣기: Bun.listen 하나이고 unix 경로만 넘긴다(hostname·port 없음).
+const unixOnly = (source: string) =>
+  [...source.matchAll(/\bBun\.listen\b/g)].length === 1 &&
+  !/\bBun\.(serve|udpSocket)\b|\bcreateServer\b|\.listen\(/.test(source) &&
+  /\bBun\.listen\s*(?:<[^>]*>)?\s*\(\s*\{\s*unix\s*:\s*path\s*,\s*socket\s*:/.test(source) &&
+  !/\b(hostname|port)\s*:/.test(source);
+
+test("entrypoints: 경로 유닉스 소켓만 듣는다는 확인이 TCP·두 번 듣기를 잡는다", async () => {
+  expect(unixOnly(await Bun.file(join(root, LISTENER)).text())).toBe(true);
+  expect(unixOnly("Bun.listen({ unix: path, socket: {} }); Bun.listen({ unix: path, socket: {} });")).toBe(false);
+  expect(unixOnly('Bun.listen({ hostname: "0.0.0.0", port: 9, socket: {} });')).toBe(false);
+  expect(unixOnly("Bun.listen({ unix: path, port: 9, socket: {} });")).toBe(false);
+});
+
+test("entrypoints: 실행기에서 닿는 코드에 듣는 API는 agent-listener.ts의 경로 유닉스 소켓 하나뿐이다", async () => {
   const transpiler = new Bun.Transpiler({ loader: "ts" });
   const seen = new Set<string>();
   const queue = [join(root, "src/main/executor.ts")];
@@ -42,7 +58,8 @@ test("entrypoints: 실행기에서 닿는 코드에 듣는 API가 없다", async
     if (seen.has(file)) continue;
     seen.add(file);
     const source = await Bun.file(file).text();
-    expect(listening.test(source), relative(root, file)).toBe(false);
+    if (relative(root, file) === LISTENER) expect(unixOnly(source), LISTENER).toBe(true);
+    else expect(listening.test(source), relative(root, file)).toBe(false);
     for (const { path } of transpiler.scanImports(source)) {
       if (path.startsWith(".") && path.endsWith(".ts")) queue.push(join(dirname(file), path));
     }
