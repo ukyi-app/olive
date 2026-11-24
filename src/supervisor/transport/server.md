@@ -21,7 +21,7 @@
 
 ## 틀 쓰기 면 (`recognized`, `writeFrame`)
 
-감독이 실행기에 지시 봉투와 자격 값을 내보내는 문이다. 봉투용과 값용을 따로 두지 않는다: 서버는 틀의 종류를 모르고, 부르는 쪽이 `encodeFrame` 등으로 이미 만든 틀의 바이트를 받는다. 지금 이 면을 부르는 곳은 `src/`에 없다(내보내기 포트, 자격 값 보내기, 박자 순환기와 진입점은 뒤 조각이다).
+감독이 실행기에 지시 봉투와 자격 값을 내보내는 문이다(연결 하나를 닫는 문은 아래 "연결 하나 닫기"). 봉투용과 값용을 따로 두지 않는다: 서버는 틀의 종류를 모르고, 부르는 쪽이 `encodeFrame` 등으로 이미 만든 틀의 바이트를 받는다. 지금 `writeFrame`을 부르는 곳은 내보내기 포트(`runtime/sink.ts`)와 자격 값 보내기(`dispatch/credential-send.ts`)다.
 
 ```ts
 recognized(principal: string): number | null
@@ -52,19 +52,48 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 
    한 연결의 쓰기는 다른 연결이나 `tick()`·`applyRegistry()`·`close()`를 기다리게 하지 않는다(`writeFrame`은 동기이고 완료를 기다리지 않는다). `tick()`은 이 면으로 넘긴 틀의 완료 대기를 만료로 닫지 않는다(아래 "남는 한계").
 
+## 연결 하나 닫기 (`closeConnection`)
+
+```ts
+closeConnection(connection: number): { kind: "closed" } | { kind: "not_open" } | { kind: "stopping" }
+```
+
+감독이 실행기 하나에게 새 `hello`를 받게 하는 문이다. 계약 v1에는 감독이 실행기에게 "다시 인사하라"고 알리는 메시지가 없다(감독 → 실행기의 전송 메시지는 `stop_sync_reply`·`status_query`·`ack`뿐이고, `status_query`의 답 `status_report`는 전체 목록(`full`)이 아니다). 연결이 살아 있는 동안 실행기는 다시 인사하지 않으므로, 연결을 닫아 실행기가 다시 붙어 맞추고 인사하게 한다. 지금 이 면을 부르는 곳은 `src/`에 없다.
+
+1. **지금 쥔 연결만 닫는다.** 서버를 닫기 시작했으면(`close()`를 부른 뒤) 아무것도 하지 않고 `stopping`이다. 그 번호의 연결을 쥐고 있지 않으면(번호 없음, 이미 닫혀 빠짐, 지금 닫히는 중) 아무것도 하지 않고 `not_open`이다: 기록·판단 사건·전달이 없다. 판단이 이미 그 연결의 행을 `closed`로 바꿨으면(같은 주체의 새 맞춤이 옛 연결을 닫음, 등록표 변경이나 박자가 여러 연결을 한 묶음으로 닫음) 링크가 아직 남아 있어도 `not_open`이다. 판단은 `withdrawn` → `close` 차례로 내므로 앞 `withdrawn`의 전달 안에서는 그 링크가 남는데, 여기서 닫으면 닫힘 사유를 가로채고 묶음에서는 그 번호의 `withdrawn`이 `closed`를 돌려준 뒤에 온다. `not_open`이면 원래 닫기가 끝까지 간다. 같은 번호를 두 번 불러도 닫기는 한 번이다(두 번째는 `not_open`).
+2. **정상 끊김과 같은 길이다.** 닫기는 상대가 끊었을 때와 같은 내부 닫기 하나로 간다: 소켓 파기, 대기열 버림, 기록 `closed`(사유 `requested`), 판단에 `closed` 한 번, 인사를 마친 연결이면 판단이 낸 `withdrawn`을 `deliver`로 전달, 넘긴 틀의 `settled("closed")`. 철회를 받는 쪽(답 줄의 연결 철회 → 자격 값 송신기의 `forgetConnection` → 조회 등록부의 `dropConnection`, `runtime/answers.ts`)은 이 `withdrawn` 하나로 알므로 닫기만 따로 가는 길이 없다. 이 모두가 `closeConnection`이 돌아오기 전에 끝난다(소켓의 `close` 사건을 기다리지 않는다). 늦게 온 소켓 사건은 두 번째 닫힘을 만들지 않는다.
+3. **동기이고 시계·복원기를 읽지 않는다.** 판단의 닫힘 처리와 같다(보장 3).
+
+닫기와 겹칠 수 있는 일과 그 처리:
+
+| 겹치는 일 | 처리 |
+|---|---|
+| 그 연결로 오는 바이트(인사·영수증·보고) | 닫힌 연결의 `data`는 받지 않고 대기열은 버린다. 검증을 기다리던 봉투의 결과는 판단에 넘기지 않는다(`late_dropped`). 그 연결의 `forward`·`occupancy`가 나가지 않는다 |
+| 넘긴 지시·ack·자격 값 틀의 완료 대기 | `settled("closed")` 한 번. 늦은 완료 콜백은 다시 부르지 않는다(틀 쓰기 면 4) |
+| `writeFrame`의 `lastCheck`·`finalCheck` 안에서 그 연결을 닫음 | 넘긴 바이트 0, `settled` 0번. 바깥 쓰기의 결과는 이 차례로 정해진다: (1) 확인 함수가 던지면 `check_failed`. (2) `lastCheck`가 `null`이 아닌 값을 돌려주면 그 값으로 정한다(문자열은 `refused`와 그 이름, 그 밖은 `check_failed`). (3) 그다음 닫힘을 보아 `closed`. (4) `finalCheck`의 반환값은 닫힘 뒤에 보므로 `finalCheck` 안에서 닫으면 `null`이든 문자열이든 `closed`다 |
+| 맞춤 답의 완료 대기 | 늦은 완료는 `reply_sent`를 넣지 않는다(보장 2) |
+| 닫힘이 전하는 `withdrawn` 안에서 같은 번호를 다시 부름 | `not_open`. 닫힘·철회는 한 번 |
+| 같은 실행기의 새 연결이 맞춰 옛 연결을 판단이 닫음 | 그 뒤의 옛 번호는 `not_open`. 연결 번호는 다시 쓰지 않으므로 옛 번호로 새 연결을 닫지 않는다. 판단의 `withdrawn` 전달 안에서 옛 번호를 불러도 `not_open`이고 닫힘 사유는 `judgment` 그대로다 |
+| 판단이 여러 연결을 한 묶음으로 닫는 중, 앞 연결의 `withdrawn` 안에서 뒤 번호를 부름 | `not_open`. 뒤 번호의 `withdrawn`과 닫힘(`judgment`)은 원래 차례에 한 번 온다 |
+| 발급을 닫은 뒤 서버 `close()` 전 | 서버는 발급 깃발을 모르므로 `closed`로 닫는다. 이 구간의 거절은 부르는 쪽의 일이다("뒤 조각이 지켜야 할 것") |
+| 서버 `close()` | 시작한 뒤에는 `stopping`. 남은 연결은 `shutdown`으로 닫힌다 |
+
+시험은 `test/supervisor/transport/close-connection.test.ts`다. 루프백 시험은 서버를 실제 답 줄·조회 등록부·임시 장부에 잇고, `closed`가 돌아온 그 자리에서(기다리기 전에) 옛 번호의 철회가 송신기 포트와 조회 등록부에 닿은 것을 보고, 닫은 뒤 실행기 흉내가 재접속 제한(`windowMs: 60000`, `max: 2`) 안에서 다시 붙어 보낸 새 `hello`를 답 줄이 새 연결 번호로 반영한 것(반영 결과의 연결 번호)을 본다.
+
 ## 공개 면
 
 | 이름 | 꼴 |
 |---|---|
 | `startConnectionServer(options)` | `ConnectionServerOptions` → `Promise<StartResult>`. 실패는 `bad_settings`(먼저 서버 자체의 시작 검사: `maxPendingWriteBytes`가 1부터 `Number.MAX_SAFE_INTEGER`까지의 정수가 아니다(빠짐 포함). 그다음 연결 판단이 받지 않는 설정), `no_material`(자기 TLS 재료, 사유 그대로), `listen_failed` |
-| `ConnectionServer` | `port`, `table()`(지금의 연결 표: `get`·`candidates`·`occupancy`를 읽는다), `registry()`(지금 판), `applyRegistry(input)`(적용 결과 그대로), `tick()`, `recognized(principal)`(부를 때마다 복원기 포트와 그 `stopGeneration()`을 읽는다), `writeFrame(connection, principal, frame, options)`(인정을 볼 때 복원기 포트와 그 `stopGeneration()`을 읽는다. `lastCheck`가 쓴다고 답하고 연결이 열려 있으면 그 객체의 `stopGeneration()`을 다시 읽고, 그것으로 인정될 때만 마지막으로 복원기 포트를 다시 읽는다. 그 앞에서 돌아가면 다시 읽지 않는다. 재확인을 통과하면 넘긴 `finalCheck`를 부르고 포트를 더 읽지 않고 쓴다. 위 "틀 쓰기 면" 2), `close()` |
+| `ConnectionServer` | `port`, `table()`(지금의 연결 표: `get`·`candidates`·`occupancy`를 읽는다), `registry()`(지금 판), `applyRegistry(input)`(적용 결과 그대로), `tick()`, `recognized(principal)`(부를 때마다 복원기 포트와 그 `stopGeneration()`을 읽는다), `writeFrame(connection, principal, frame, options)`(인정을 볼 때 복원기 포트와 그 `stopGeneration()`을 읽는다. `lastCheck`가 쓴다고 답하고 연결이 열려 있으면 그 객체의 `stopGeneration()`을 다시 읽고, 그것으로 인정될 때만 마지막으로 복원기 포트를 다시 읽는다. 그 앞에서 돌아가면 다시 읽지 않는다. 재확인을 통과하면 넘긴 `finalCheck`를 부르고 포트를 더 읽지 않고 쓴다. 위 "틀 쓰기 면" 2), `closeConnection(connection)`(`closed`·`not_open`·`stopping`. 위 "연결 하나 닫기"), `close()` |
+| `CloseConnectionResult` | `closed`(정상 끊김과 같은 길로 닫았다), `not_open`(그 번호의 연결을 쥐고 있지 않다), `stopping`(서버를 닫기 시작했다). 뒤의 둘은 아무것도 하지 않았다 |
 | `WriteFrameOptions` | `lastCheck: () => string \| null`(동기, 서버 확인 뒤), `finalCheck?: () => string \| null`(동기, 선택. 인정의 재확인 뒤 `write` 바로 앞), `settled: (end: SendEnd) => void`(넘긴 틀마다 정확히 한 번). `lastCheck`와 `settled`는 꼭 넘긴다 |
 | `SendEnd` | `flushed`(로컬 쓰기가 오류 없이 끝남), `failed`(로컬 쓰기 오류 또는 `write`가 던짐, 연결은 `send_failed`로 닫힘), `closed`(완료 전에 연결이 닫힘) |
 | `WriteFrameResult` | `written`(틀 전부를 한 번의 `write`로 넘겼다. 상대가 받았다는 뜻이 아니다), `not_written`(넘긴 바이트 0: `reason`이 `NOT_WRITTEN_REASONS` 가운데 하나, `refused`면 `refusal`에 `lastCheck`나 `finalCheck`의 이름), `unknown`(`write`가 던졌다. 연결을 닫았고, 돌아오기 전에 `settled`를 이미 한 번 불렀다) |
 | `NOT_WRITTEN_REASONS` | `not_recognized`(`lastCheck`가 쓴다고 답한 뒤의 재확인에서 인정을 잃은 때도 여기다. 이때 `lastCheck`는 불렸고 `finalCheck`는 불리지 않았다), `closed`, `backlog`(그 연결을 `send_backlog`로 닫았다), `refused`(`lastCheck` 또는 `finalCheck`의 이름), `check_failed`(둘 가운데 하나가 던졌거나 꼴 아닌 값), `reentered`. `backlog` 밖에는 연결을 닫지 않는다 |
 | `Delivered` | 부르는 쪽에 넘기는 출력 넷(`occupancy`·`candidate`·`withdrawn`·`forward`), 연결 판단의 `Output` 그대로 |
 | `ServerNote` | 기록용: `opened`, `rejected_tls`(TLS 판정 사유), `closed`(`cause`, 틀 거절이면 `frame`), `reply_not_sent`(`deadline`, `at`), `reply_written`(`at`은 넘긴 시각, `done`은 완료를 안 시각), `late_dropped` |
-| `LINK_CLOSE_CAUSES` | `judgment`, `peer`, `frame`, `before_reply`, `check_failed`, `judgment_failed`, `write_failed`, `write_busy`(답을 넘기려는 때 쓰기 버퍼가 비지 않았거나 묶였다. 넘긴 바이트 0), `write_late`, `reply_late`, `deliver_failed`, `clock_failed`, `send_backlog`(`writeFrame`이 넘기려는 때 묶였거나 대기량이 상한을 넘었다. 그 틀은 넘기지 않았다), `send_failed`(`writeFrame`으로 넘긴 틀의 로컬 쓰기가 오류로 끝났거나 `write`가 던졌다), `shutdown` |
+| `LINK_CLOSE_CAUSES` | `judgment`, `peer`, `frame`, `before_reply`, `check_failed`, `judgment_failed`, `write_failed`, `write_busy`(답을 넘기려는 때 쓰기 버퍼가 비지 않았거나 묶였다. 넘긴 바이트 0), `write_late`, `reply_late`, `deliver_failed`, `clock_failed`, `send_backlog`(`writeFrame`이 넘기려는 때 묶였거나 대기량이 상한을 넘었다. 그 틀은 넘기지 않았다), `send_failed`(`writeFrame`으로 넘긴 틀의 로컬 쓰기가 오류로 끝났거나 `write`가 던졌다), `shutdown`, `requested`(부르는 쪽이 `closeConnection`으로 닫았다) |
 
 서버가 받는 포트(`ConnectionServerOptions`):
 
@@ -107,7 +136,7 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 | `withdrawn` | 부르는 쪽 | 그 연결의 주체가 후보에서 빠짐 |
 | `forward` | 부르는 쪽 | `dispatch/receipts.ts`의 `handleForward` |
 
-서버가 판단에 넣는 사건: 인증된 연결마다 `open`, 봉투마다 `check` → `envelope`, 답의 로컬 쓰기가 끝난 뒤 `reply_sent`, `tick()`과 늦은 답마다 `tick`, 닫힘마다 `closed`, `applyRegistry`마다 `registry`.
+서버가 판단에 넣는 사건: 인증된 연결마다 `open`, 봉투마다 `check` → `envelope`, 답의 로컬 쓰기가 끝난 뒤 `reply_sent`, `tick()`과 늦은 답마다 `tick`, 닫힘마다(`closeConnection` 포함) `closed`, `applyRegistry`마다 `registry`.
 
 ## 정한 것
 
@@ -156,6 +185,10 @@ writeFrame(connection: number, principal: string, frame: Uint8Array, options: { 
 - **`nonces`는 동시에 불려도, 재시작을 지나도 한 번만 성공한다.** `reply`의 요청 ID·nonce는 암호학적 난수이고 `seal`은 키를 내주지 않는다(계약 v1 구현 인수 조건 2).
 - **인증서를 교체한 뒤의 재인증을 정한다.** 이 서버는 맺은 연결의 인증서를 다시 보지 않는다.
 - **키 유출 때의 순서(정지 → 폐기 판 → `registry().readout().revision` 대조 → 옛 연결 차단 확인 → 풀기)는 런북의 일이다.** 이 서버는 `applyRegistry`가 돌아오기 전에 믿지 않는 연결을 닫는다.
+- **`closeConnection`은 그 실행기에 임대를 믿는 실행이 없을 때만 부른다.** 받은 적 없는 실행을 닫으려고 새 인사가 필요한 박자(D-90)가 부르는 쪽이다. 닫으면 그 실행기는 다시 붙어 맞출 때까지 후보에서 빠지고 지시·값을 받지 못한다: 임대를 믿고 도는 실행이 있으면 그 연장·지시가 끊긴다. 번호는 `recognized(주체)`로 그 박자에 얻고, 결과가 `not_open`·`stopping`이면 아무 일도 없었던 것으로 다룬다.
+- **닫은 뒤 같은 박자에 그 실행기를 다시 판단하지 않는다.** `closed`가 돌아온 때 그 실행기는 판단에서 빠졌고 새 `hello`는 아직 없다. 새 인사의 판단은 실행기가 다시 붙어 인사한 뒤의 박자에서 한다. 한 실행기에 박자마다 닫지 않는다: 새 연결이 맞추기도 전에 다시 닫게 된다.
+- **재접속 제한과 간격을 맞춘다.** `settings.reconnect`를 쓰면 같은 상대 인증서 URI의 받아들인 연결이 `windowMs` 안에 `max`개를 넘지 못한다(`connections.ts`의 `open`). 서버는 받아들인 시각을 URI마다 세고, 닫기는 그 기록을 지우지 않는다(닫힌 연결도 연 때부터 `windowMs` 동안 한 칸이다). 닫은 뒤 다시 붙을 수 있는지는 닫는 횟수가 아니라 **다시 붙는 그 시각에 창 안에 남은 그 URI 전체의 접속 여유**로 정해진다: 다시 붙는 시각을 `t`라 하면 `t - windowMs`보다 뒤(정각은 빼고)부터 `t`까지 받아들인 그 URI의 연결이 `max`개 미만이어야 한다(`throttled`로 막힌 시도는 세지 않는다). 같은 인증서 URI를 쓰는 실행기가 여럿이면 그 여유를 함께 쓴다. 오래 열려 있던 연결은 창 밖이라 세지 않는다: `windowMs: 60000`, `max: 1`에서 0ms에 연 연결을 60000ms에 닫고 곧바로 다시 붙으면 받아들인다. 반대로 `max: 2`에서 같은 URI가 0ms·20000ms에 이미 열었으면 40000ms에 닫고 다시 붙은 연결은 `throttled`다. 넘으면 다시 붙은 연결이 `throttled`로 곧바로 닫혀 새 인사가 오지 않는다. 실행기별 닫기 상한(예: 창 안에서 한 실행기를 닫는 횟수를 `max - 1` 이하로, 망 끊김의 몫을 남김)이 필요하면 그것은 이 서버의 경계가 아니라 부르는 쪽의 보수적 정책으로 정한다. 실행기가 닫힌 뒤 다시 붙는 간격은 실행기 진입점의 값이고 이 서버가 정하지 않는다: 그 간격과 박자의 주기로 "닫은 뒤 새 인사를 기다리는 시간"을 정한다.
+- **부르는 쪽(D-90 박자)은 `closeConnection` 직전에 순서기의 `issuanceOpen()`을 보고 닫혔으면 부르지 않는다. 서버 `close()` 시작 뒤에는 서버가 `stopping`으로 거절한다.** 서버는 발급 깃발을 모른다. 발급을 닫은 뒤(`runtime/issuance.ts`의 `closeIssuance`) 서버 `close()` 전 구간에서 불리면 서버는 `closed`로 닫는다(시험이 지킨다). 그 구간의 거절은 서버가 아니라 부르는 쪽의 책임이다. 발급을 닫는 순서에서 진행 중인 박자가 먼저 끝나므로 박자 안의 부름은 정상 조립에서 이 구간과 겹치지 않는다.
 
 ## 남는 한계
 
