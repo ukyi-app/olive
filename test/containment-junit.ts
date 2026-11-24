@@ -33,6 +33,12 @@ const EXPECTED: readonly string[] = [
   "실제 프로세스 clean: 남은 것이 없으면 유예를 기다리지 않는다",
   "실제 프로세스: 실행기가 PID 1이어도 후손을 끝내고, 회수되지 않은 좀비는 세지 않는다",
   "실제 프로세스: 이미 취소된 실행과 없는 실행 파일은 띄우지 않고, 띄운 직후의 취소도 0개로 끝난다",
+  "실제 프로세스 대리 setsid: PID 1 대리가 띄운 역할의 후손이 있다가 끝내기 뒤 대리가 남은 수 0을 답하고 독립 계수도 0이다",
+  "실제 프로세스 대리 doublefork: PID 1 대리가 띄운 역할의 후손이 있다가 끝내기 뒤 대리가 남은 수 0을 답하고 독립 계수도 0이다",
+  "실제 프로세스 대리 termignore: PID 1 대리가 띄운 역할의 후손이 있다가 끝내기 뒤 대리가 남은 수 0을 답하고 독립 계수도 0이다",
+  "실제 프로세스 대리 signals: 자식이 PID 1 대리에게 KILL·TERM·INT·HUP을 보내도 대리가 살아 끝내기·세기에 답한다",
+  "실제 프로세스 대리 linkdrop: 링크가 끊기면 대리가 link_closed 코드로 끝나고, TERM을 무시하던 후손도 함께 끝난다(파일 증인)",
+  "실제 프로세스 대리 nondumpable: 대리가 뜬 뒤에는 같은 uid의 자식이 /proc/1/environ·/proc/1/root를 읽지 못한다(뜨기 전에는 읽었다)",
 ];
 const PREFIX = "실제 프로세스";
 const FILE = "test/executor/containment.test.ts";

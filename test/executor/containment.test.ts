@@ -394,4 +394,60 @@ if (problem !== null) {
     expect(result.survivors).toBe(0);
     expect(result.after.alive).toBe(0);
   });
+
+  // ---- 대리(src/agent)가 공간의 PID 1이다(--as-pid-1). harness 안의 가짜 제어가 링크 바이트로만 지시한다 ----
+  interface AgentResult {
+    pid: number;
+    exited: { code: number | null; signal: string | null };
+    stdout: string;
+    before: Counted;
+    after: Counted;
+    survivors: number | null;
+    beforeHarden: string | null;
+  }
+  const AS_PID_1 = ["--as-pid-1"];
+  const fileGrowing = async (path: string) => {
+    const before = Bun.file(path).size;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return Bun.file(path).size > before;
+  };
+
+  for (const scenario of ["setsid", "doublefork", "termignore"]) {
+    test(`실제 프로세스 대리 ${scenario}: PID 1 대리가 띄운 역할의 후손이 있다가 끝내기 뒤 대리가 남은 수 0을 답하고 독립 계수도 0이다`, () => {
+      const result = runScenario<AgentResult>(`agent-${scenario}`, AS_PID_1);
+      expect(result.pid).toBe(1);
+      expect(result.before.alive, "끝내기 전에 살아 있는 후손이 있어야 시험이 뜻을 가진다").toBeGreaterThan(0);
+      expect(result.survivors).toBe(0);
+      expect(result.after.alive).toBe(0);
+    });
+  }
+
+  test("실제 프로세스 대리 signals: 자식이 PID 1 대리에게 KILL·TERM·INT·HUP을 보내도 대리가 살아 끝내기·세기에 답한다", () => {
+    const result = runScenario<AgentResult>("agent-signals", AS_PID_1);
+    expect(result.pid).toBe(1);
+    expect(result.exited.code).toBe(0);
+    // kill은 성공을 돌려주지만 공간의 init에는 닿지 않는다.
+    expect(result.stdout).toBe("KILL=0\nTERM=0\nINT=0\nHUP=0\n");
+    expect(result.survivors).toBe(0);
+    expect(result.after.alive).toBe(0);
+  });
+
+  test("실제 프로세스 대리 linkdrop: 링크가 끊기면 대리가 link_closed 코드로 끝나고, TERM을 무시하던 후손도 함께 끝난다(파일 증인)", async () => {
+    const result = runHarness("agent-linkdrop", [...MARK, ...AS_PID_1]);
+    // 75 = AGENT_EXIT.link_closed
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(75);
+    const report = JSON.parse(result.stdout.trim().split("\n")[0]!) as { pid: number; before: Counted; witnessBefore: boolean; witness: string };
+    expect(report.pid).toBe(1);
+    expect(report.before.alive).toBeGreaterThan(0);
+    expect(report.witnessBefore, "끊기 전에 후손이 증인 파일을 늘리고 있어야 한다").toBe(true);
+    expect(await fileGrowing(report.witness), "대리가 끝난 뒤에도 후손이 돈다").toBe(false);
+  });
+
+  test("실제 프로세스 대리 nondumpable: 대리가 뜬 뒤에는 같은 uid의 자식이 /proc/1/environ·/proc/1/root를 읽지 못한다(뜨기 전에는 읽었다)", () => {
+    const result = runScenario<AgentResult>("agent-nondumpable", AS_PID_1);
+    expect(result.pid).toBe(1);
+    expect(result.beforeHarden, "대조군: 뜨기 전에는 읽혀야 시험이 뜻을 가진다").toBe("environ=0\nroot=0\n");
+    expect(result.stdout).toMatch(/^environ=[1-9]\d*\nroot=[1-9]\d*\n$/);
+    expect(result.survivors).toBe(0);
+  });
 }
