@@ -202,7 +202,7 @@ describe("한 줄: 결과 보고 → 판정 → 확정", () => {
       halted: null,
       haltedAt: null,
     });
-    // 판정에 그 보고의 reportId를 넘겼다(넘기지 않으면 settledResult가 null이라 확정이 열리지 않는다).
+    // 판정에 그 보고의 reportId를 넘겼다(장부가 그 보고와 digest를 대조한다. 확정이 열리는 것은 reportId와 상관없이 장부가 판정에서 보고를 반영해서다).
     expect(marks).toEqual([{ runId: run.runId, resultDigest: result.resultDigest, reportId: result.reportId, now: NOW + 10_000 }]);
     expect(ledger.settledResult(run.runId)).toEqual({ known: true, value: { runId: run.runId, resultDigest: result.resultDigest, storedRef: result.storedRef, storedAt: NOW + 2 } });
     expect(beat.life.result.runs).toEqual([expect.objectContaining({ runId: run.runId, outcome: "finalize_sent" })]);
