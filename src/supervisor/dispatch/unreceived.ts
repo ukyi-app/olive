@@ -1,11 +1,12 @@
 // D-90 자동 닫기의 한 박자. 실행기가 받은 적 없는 작업자 실행을 고르고, 그 실행기의 마지막 반영 인사(증거 포트)가 조건을 모두 채울 때만
 // 장부의 closeUnreceivedRun을 부른다. 닫는 판단은 장부가 한 트랜잭션에서 다시 한다. 이 박자는 후보를 고르고 부를 뿐이다.
 // 장부·증거·맡기지 않을 실행기·정지 세대·복원 대기는 포트로, 닫는 시각(now)은 순서기가 다시 읽은 장부 시계로 받는다.
-// 소켓·타이머·시계·난수를 직접 부르지 않는다. 쥐는 것은 같은 장부 포트로 박자가 진행 중이라는 표시 하나다(돌아오면 지운다).
+// 소켓·타이머·시계·난수를 직접 부르지 않는다. 쥐는 것은 이 모듈의 박자가 진행 중이라는 표시 하나다(돌아오면 지운다).
 //
 // 지키는 것(unreceived.md "판단의 차례"):
 // 1. 모름은 닫지 않는다. 포트가 던지거나 꼴이 틀리거나 known: false면 그 항목(전역 포트면 박자 전체)은 장부를 부르지 않는다.
-//    포트 객체와 그 함수는 박자 처음에 한 번 꺼낸다(hold). 꺼내기의 예외·함수 아님은 그 포트를 불러 던진 것과 같게 친다.
+//    포트 객체와 그 함수는 박자 처음에 한 번 꺼낸다(hold). 꺼내기의 예외·함수 아님은 그 포트를 쓸 수 없는 것으로 친다.
+//    부른 뒤의 예외는 다르다: confirm이 던지면 확인하지 못한 것(link_not_current), 장부 닫기가 던지면 적었는지 모르는 것(멈춤)이다.
 // 2. 근거는 그 실행기의 지금 인정된 연결이 낸 검증된 전체 인사 하나다. 연결 번호·주체·맞춘 정지 세대·서명 시각(answeredAt)·전체 목록을
 //    한 묶음으로 받고, 받은 시각(receivedAt)은 근거 줄에 적을 값으로만 넘긴다.
 // 3. 그 실행기의 앞선 답이 버려진 적이 있거나(tainted) 더 새 답이 줄에 남아 있으면(pending) 닫지 않는다.
@@ -49,6 +50,7 @@ export interface UnreceivedFull {
 // tainted: 이 프로세스·이 장부 열기에서 그 실행기의 인사·답이 반영되지 않고 버려진 적이 있다(옛 연결의 not_current, 서버를 새로 만들며
 // 버린 밀린 사본, 내용을 모르는 버림 포함). pending: 그 실행기 줄에 아직 넘기지 않은 답이 있다(held 인사, retry, 밀린 사본).
 // version: 그 실행기 줄의 변경 번호. 이 읽기 뒤에 그 줄에 변화가 있으면 confirm이 evidence_changed를 낸다(unreceived.md "뒤 조각").
+// 네 칸(version·tainted·pending·lastFull)은 한 시점의 값이어야 한다. 이 박자는 번호를 먼저·마지막에 다시 읽어 그 사이의 변화만 잡는다.
 export type UnreceivedEvidenceRead =
   | { readonly known: false }
   | { readonly known: true; readonly tainted: boolean; readonly pending: boolean; readonly version: number; readonly lastFull: UnreceivedFull | null };
@@ -113,6 +115,7 @@ export type UnreceivedSkip =
   // confirm이 그 인사의 연결이 지금 인정된 연결이 아니라고 냈다. 던짐·정의 밖의 답도 여기다(확인하지 못했다).
   | "link_not_current"
   // confirm이 증거를 읽은 뒤 그 실행기 줄에 변화가 있었다고 냈다(접수·버림·넘김·고장·맡기지 않을 실행기에 듦).
+  // 증거를 옮기는 도중 변경 번호가 바뀐 것도 여기다.
   | "evidence_changed";
 
 type Head = { readonly requestId: string; readonly runId: string; readonly executorId: string };
@@ -143,6 +146,13 @@ const CLOSABLE: readonly LedgerRunState[] = ["preparing", "unknown_running"];
 // 계약의 실행 상태 항목의 칸(transport.ts의 runStatus). 장부의 answerRuns도 이 칸만 받는다.
 const RUN_STATUS_KEYS: readonly string[] = ["run_id", "state", "run_generation", "last_receipt_id"];
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+// 계약의 일반 객체(src/contract/v1/schema.ts의 object가 받는 값): 배열이 아니고 원형이 Object.prototype이나 null이다.
+// 계약 모듈은 이 판정을 내보내지 않아 같은 식을 둔다.
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!isObject(value) || Array.isArray(value)) return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
 const isTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const isGeneration = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 const isUuid = (value: unknown): value is string => typeof value === "string" && UUID.test(value);
@@ -187,6 +197,7 @@ function take(get: () => { receiver: unknown; fn: unknown }): Bound | null {
 }
 
 // 장부를 꺼내지 못하면 박자 전체가 read_unknown이다. 다른 포트는 꺼내지 못해도 그 포트의 모름으로 이어 간다.
+// 진행 표시를 세운 뒤에 부른다: 이 안의 접근자는 모두 외부 코드라 그 안에서 박자를 다시 부를 수 있다.
 function hold(ports: UnreceivedPorts): Held | null {
   let ledger: unknown;
   let unanswered: unknown;
@@ -238,19 +249,19 @@ function invoke(bound: Bound | null, args: readonly unknown[]): { readonly value
   }
 }
 
-// 같은 장부 포트로 진행 중인 박자. 박자 안에 await가 없으므로 겹치는 길은 포트 안에서 다시 부르는 것뿐이다.
-const RUNNING = new WeakSet<object>();
+// 진행 중인 박자. 박자 안에 await가 없으므로 겹치는 길은 포트 안에서 다시 부르는 것뿐이다. 장부 객체로 가르지 않고 이 모듈 단위로
+// 세운다: 장부 객체를 얻는 ports.ledger 접근자도 외부 코드이고, 감싼 다른 포트 객체가 같은 장부로 위임할 수도 있다.
+let running = false;
 
 export function unreceivedTick(ports: UnreceivedPorts, now: number): UnreceivedTickResult {
-  const held = hold(ports);
-  if (held === null) return { kind: "not_run", reason: "read_unknown" };
-  const key = held.ledger;
-  if (RUNNING.has(key)) return { kind: "not_run", reason: "tick_in_progress" };
-  RUNNING.add(key);
+  if (running) return { kind: "not_run", reason: "tick_in_progress" };
+  running = true;
   try {
+    const held = hold(ports);
+    if (held === null) return { kind: "not_run", reason: "read_unknown" };
     return tickOnce(held, now);
   } finally {
-    RUNNING.delete(key);
+    running = false;
   }
 }
 
@@ -362,7 +373,7 @@ function copyRuns(value: unknown): RunStatus[] | null {
   const seen = new Set<string>();
   for (let i = 0; i < length; i += 1) {
     const item: unknown = value[i];
-    if (!isObject(item) || Array.isArray(item)) return null;
+    if (!isPlainObject(item)) return null;
     const keys = Object.keys(item);
     if (keys.length !== RUN_STATUS_KEYS.length || !keys.every((key) => RUN_STATUS_KEYS.includes(key))) return null;
     const runId: unknown = item.run_id;
@@ -384,30 +395,39 @@ function copyRuns(value: unknown): RunStatus[] | null {
 
 // 증거를 한 번 읽어 칸마다 옮긴다. 목록은 원소까지 새로 만든다: 뒤의 포트(confirm)가 넘겨준 객체를 고쳐도 장부에 넘기는 값은 읽은 그대로다.
 // 칸 하나라도 틀리면(꼴이 아닌 깃발 포함) 모름이다.
-function readEvidence(port: Held["evidence"], executorId: string): Evidence | null {
+// 변경 번호를 다른 칸보다 먼저 읽고, 다 옮긴 뒤 다시 읽는다. 칸의 접근자는 외부 코드라 읽는 도중에 그 실행기 줄에 답이 들어올 수 있다.
+// 번호를 나중에 읽으면 앞서 옮긴 대기·오염 값(변화 전)과 변화 뒤의 번호가 한 쌍이 되어 confirm이 번호끼리 같다고 본다.
+// 다시 읽은 번호가 다르면 changed다(그 시도는 닫지 않는다). 번호 칸의 접근자 자체나 read 안에서 생긴 변화는 여기서 가를 수 없어
+// read가 모든 칸을 한 시점의 값으로 내야 한다(unreceived.md "뒤 조각").
+function readEvidence(port: Held["evidence"], executorId: string): Evidence | "changed" | null {
   if (port === null) return null;
   const read = invoke(port.read, [executorId]);
   if (read === null) return null;
   try {
     const answer: unknown = read.value;
-    if (!isObject(answer) || answer.known !== true) return null;
+    if (!isObject(answer)) return null;
+    const version: unknown = answer.version;
+    if (answer.known !== true || !isGeneration(version)) return null;
     const tainted: unknown = answer.tainted;
     const pending: unknown = answer.pending;
-    const version: unknown = answer.version;
     const lastFull: unknown = answer.lastFull;
-    if (typeof tainted !== "boolean" || typeof pending !== "boolean" || !isGeneration(version)) return null;
-    if (lastFull === null) return { tainted, pending, version, full: null, confirm: port.confirm };
-    if (!isObject(lastFull)) return null;
-    const connection: unknown = lastFull.connection;
-    const principal: unknown = lastFull.principal;
-    const stopGeneration: unknown = lastFull.stopGeneration;
-    const runs: unknown = lastFull.runs;
-    const answeredAt: unknown = lastFull.answeredAt;
-    const receivedAt: unknown = lastFull.receivedAt;
-    if (!isGeneration(connection) || typeof principal !== "string" || !isGeneration(stopGeneration) || !isTime(answeredAt) || !isTime(receivedAt)) return null;
-    const copied = copyRuns(runs);
-    if (copied === null) return null;
-    return { tainted, pending, version, full: { connection, principal, stopGeneration, runs: copied, answeredAt, receivedAt }, confirm: port.confirm };
+    if (typeof tainted !== "boolean" || typeof pending !== "boolean") return null;
+    let full: UnreceivedFull | null = null;
+    if (lastFull !== null) {
+      if (!isObject(lastFull)) return null;
+      const connection: unknown = lastFull.connection;
+      const principal: unknown = lastFull.principal;
+      const stopGeneration: unknown = lastFull.stopGeneration;
+      const runs: unknown = lastFull.runs;
+      const answeredAt: unknown = lastFull.answeredAt;
+      const receivedAt: unknown = lastFull.receivedAt;
+      if (!isGeneration(connection) || typeof principal !== "string" || !isGeneration(stopGeneration) || !isTime(answeredAt) || !isTime(receivedAt)) return null;
+      const copied = copyRuns(runs);
+      if (copied === null) return null;
+      full = { connection, principal, stopGeneration, runs: copied, answeredAt, receivedAt };
+    }
+    if (answer.version !== version) return "changed";
+    return { tainted, pending, version, full, confirm: port.confirm };
   } catch {
     return null;
   }
@@ -468,6 +488,7 @@ function judge(held: Held, item: StartItem, ledgerGeneration: number, now: numbe
   if (item.stopGeneration !== gate.generation) return skip("stop_generation");
   if (gate.withheld.has(item.executorId)) return skip("withheld");
   if (evidence === null) return skip("evidence_unknown");
+  if (evidence === "changed") return skip("evidence_changed");
   if (evidence.tainted) return skip("tainted");
   if (evidence.pending) return skip("pending");
   const full = evidence.full;

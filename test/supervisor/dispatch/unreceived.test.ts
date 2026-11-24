@@ -507,6 +507,49 @@ describe("판단의 테두리", () => {
     expect(inner).toEqual([{ kind: "not_run", reason: "tick_in_progress" }]);
     expect(w.calls.length).toBe(0);
   });
+
+  test("포트를 꺼내는 접근자 안에서 박자를 다시 부르면 안쪽은 tick_in_progress이고 바깥 박자가 닫는다(장부 객체를 얻는 접근자 포함)", () => {
+    for (const key of ["ledger", "evidence", "withheld", "intake", "observationsSettled"] as const) {
+      const w = world();
+      const live = started(w.ledger);
+      const base = w.ports as unknown as Record<string, unknown>;
+      const ports = { ...base };
+      const inner: UnreceivedTickResult[] = [];
+      Object.defineProperty(ports, key, {
+        get() {
+          inner.push(unreceivedTick(w.ports, AT));
+          return base[key];
+        },
+      });
+      const outer = ran(unreceivedTick(ports as unknown as UnreceivedPorts, AT));
+      expect([key, inner, outer.runs.map((item) => item.outcome), w.calls.length, w.stateOf(live.runId)]).toEqual([
+        key,
+        [{ kind: "not_run", reason: "tick_in_progress" }],
+        ["closed"],
+        1,
+        "not_started",
+      ]);
+    }
+    // 진행 표시는 장부 객체가 아니라 이 모듈의 박자 단위다: 다른 장부의 포트로 부른 안쪽 박자도 돌지 않는다.
+    const w = world();
+    const other = world();
+    const otherRun = started(other.ledger);
+    started(w.ledger);
+    const inner: UnreceivedTickResult[] = [];
+    w.state.withheld = () => {
+      inner.push(unreceivedTick(other.ports, AT));
+      return { known: true, value: [] };
+    };
+    expect(ran(w.tick()).runs.map((item) => item.outcome)).toEqual(["closed"]);
+    expect([inner, other.calls.length, other.stateOf(otherRun.runId)]).toEqual([
+      [
+        { kind: "not_run", reason: "tick_in_progress" },
+        { kind: "not_run", reason: "tick_in_progress" },
+      ],
+      0,
+      "preparing",
+    ]);
+  });
 });
 
 // 박자가 쓰는 시계로 순서기를 한 번 돌리고, 같은 박자의 배정이 본 작업자 자리를 함께 돌려준다.
@@ -631,10 +674,93 @@ describe("마지막 확인 뒤의 외부 코드", () => {
   });
 });
 
+describe("증거를 복사하는 도중의 외부 코드", () => {
+  // 증거 답의 칸을 읽는 순간 같은 실행기 줄에 양성 상태 보고가 들어온다(변경 번호가 늘고 넘기지 않은 답이 남는다).
+  // version: live는 지금 번호를, snapshot은 read를 부른 때의 번호를 낸다. pending: live는 지금 줄을, sampled는 read를 부른 때의 줄을 낸다.
+  function copying(w: ReturnType<typeof world>, trigger: string, version: "live" | "snapshot", pending: "live" | "sampled") {
+    const queue = { submitted: false };
+    const submit = () => {
+      if (queue.submitted) return;
+      queue.submitted = true;
+      w.state.version += 1;
+    };
+    w.state.evidence = () => {
+      const atRead = { version: w.state.version, pending: queue.submitted };
+      const answer = { known: true };
+      const field = (name: string, value: () => unknown) =>
+        Object.defineProperty(answer, name, {
+          enumerable: true,
+          get() {
+            if (name === trigger) submit();
+            return value();
+          },
+        });
+      field("tainted", () => false);
+      field("pending", () => (pending === "live" ? queue.submitted : atRead.pending));
+      field("version", () => (version === "live" ? w.state.version : atRead.version));
+      field("lastFull", () => full());
+      return answer as UnreceivedEvidenceRead;
+    };
+  }
+
+  test("칸 접근자 안에서 양성 답이 들어오면 현재 번호를 내는 포트·읽은 때의 번호를 내는 포트 둘 다 닫지 않고, 같은 박자의 배정은 자리가 찬 것을 본다", async () => {
+    const cases = [
+      // 리뷰의 입력: 번호 칸의 접근자 안에서 들어오고 대기 칸은 지금 줄을 낸다.
+      { trigger: "version", pending: "live", reason: "pending" },
+      // 번호보다 먼저 읽히던 칸. 대기 칸이 read 때의 값이라 번호를 먼저 고정하고 다시 읽어야 잡힌다.
+      { trigger: "tainted", pending: "sampled", reason: "evidence_changed" },
+      { trigger: "pending", pending: "sampled", reason: "evidence_changed" },
+      { trigger: "lastFull", pending: "sampled", reason: "evidence_changed" },
+    ] as const;
+    for (const version of ["live", "snapshot"] as const) {
+      for (const { trigger, pending, reason } of cases) {
+        const w = world();
+        const live = started(w.ledger);
+        copying(w, trigger, version, pending);
+        const beat = await beatWithAssign(w);
+        expect([version, trigger, beat.runs, beat.freeAtAssign, w.calls.length, w.stateOf(live.runId)]).toEqual([
+          version,
+          trigger,
+          [skipped(live, reason)],
+          false,
+          0,
+          "preparing",
+        ]);
+      }
+    }
+  });
+
+  test("복사 도중 바뀐 번호는 confirm에 기대지 않고 복사를 마친 그 자리에서 잡는다", () => {
+    const w = world();
+    const live = started(w.ledger);
+    copying(w, "lastFull", "live", "sampled");
+    // 번호를 보지 않는 confirm. 복사 뒤의 다시 읽기만 남는다.
+    w.state.confirm = () => "current";
+    expect(ran(w.tick()).runs).toEqual([skipped(live, "evidence_changed")]);
+    expect([w.calls.length, w.stateOf(live.runId)]).toEqual([0, "preparing"]);
+    // 대조군: 복사 도중 아무것도 들어오지 않으면 같은 포트로 닫는다.
+    const quiet = world();
+    const closed = started(quiet.ledger);
+    copying(quiet, "none", "live", "sampled");
+    quiet.state.confirm = () => "current";
+    expect(ran(quiet.tick()).runs.map((item) => item.outcome)).toEqual(["closed"]);
+    expect([quiet.calls.length, quiet.stateOf(closed.runId)]).toEqual([1, "not_started"]);
+  });
+});
+
 describe("포트와 응답의 꼴", () => {
   test("전체 목록의 원소가 계약의 실행 상태 항목이 아니면 그 항목만 evidence_unknown이고 다른 실행기의 닫기는 간다", () => {
     const valid = { run_id: id(), state: "running", run_generation: 1, last_receipt_id: null };
+    // 네 칸과 값이 맞아도 원형이 Object.prototype·null이 아니면 계약의 일반 객체가 아니다(src/contract/v1/schema.ts의 object).
+    class RunEntry {
+      run_id = id();
+      state = "running";
+      run_generation = 1;
+      last_receipt_id = null;
+    }
     const broken: unknown[][] = [
+      [new RunEntry()],
+      [Object.assign(Object.create({ inherited: true }), valid)],
       [{ run_id: id() }],
       [{ ...valid, extra: 1 }],
       [{ ...valid, state: "made_up" }],
@@ -667,16 +793,20 @@ describe("포트와 응답의 꼴", () => {
       ]);
       expect([index, w.calls.map((call) => call.runId)]).toEqual([index, [live.runId]]);
     }
-    // 대조군: 꼴이 맞는 목록은 장부에 그대로 간다(not_known 포함).
+    // 대조군: 꼴이 맞는 목록은 장부에 그대로 간다(not_known, 원형이 null인 객체 포함).
     const w = world();
     const live = started(w.ledger);
-    const known = [valid, { run_id: id(), state: "not_known", run_generation: null, last_receipt_id: null }];
+    const known = [
+      valid,
+      { run_id: id(), state: "not_known", run_generation: null, last_receipt_id: null },
+      Object.assign(Object.create(null), { run_id: id(), state: "running", run_generation: 2, last_receipt_id: null }),
+    ];
     w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full({ runs: known as unknown as UnreceivedFull["runs"] }) });
     expect(ran(w.tick()).runs.map((item) => item.outcome)).toEqual(["closed"]);
     expect([w.calls[0]?.runs, w.stateOf(live.runId)] as unknown[]).toEqual([known, "not_started"]);
   });
 
-  test("포트 속성을 꺼내다 던지면 그 포트를 불러 던진 것과 같다: 증거는 항목마다 evidence_unknown, 전역 포트는 그 이유로 not_run", () => {
+  test("포트 속성을 꺼내다 던지면 그 포트를 쓸 수 없는 것이다: 증거는 항목마다 evidence_unknown, 전역 포트는 그 이유로 not_run", () => {
     const throwing = (w: ReturnType<typeof world>, key: string) => {
       const ports = { ...(w.ports as unknown as Record<string, unknown>) };
       Object.defineProperty(ports, key, {
@@ -733,13 +863,44 @@ describe("정적", () => {
       .filter((line) => !line.trimStart().startsWith("//"))
       .join("\n");
   const FILE = "src/supervisor/dispatch/unreceived.ts";
-  const CONFIRM = "const confirmed = confirmLast(";
+  const CONFIRM = "const confirmed = confirmLast(evidence.confirm, item.executorId, full.connection, evidence.version, gate.generation);";
   const CALL = "answer = apply(close, receiver, closing);";
-  // confirm 호출문 다음 줄부터 장부 호출까지.
+  const CONFIRM_CALL = "answer = apply(port.fn, port.receiver, [executorId, connection, version, generation]);";
+  const squash = (text: string) => text.replace(/\s+/g, " ").trim();
+  // confirm 호출문의 끝(같은 줄 포함)부터 장부 호출까지.
   const afterConfirm = (source: string) => {
-    const from = source.indexOf("\n", source.indexOf(CONFIRM));
-    return source.slice(from, source.indexOf(CALL, from) + CALL.length);
+    const at = source.indexOf(CONFIRM);
+    if (at < 0 || source.indexOf(CONFIRM, at + 1) >= 0) return null;
+    const from = at + CONFIRM.length;
+    const to = source.indexOf(CALL, from);
+    return to < 0 ? null : source.slice(from, to + CALL.length);
   };
+  // confirmLast 안에서 confirm 호출 뒤부터 함수 끝까지.
+  const confirmTail = (source: string) => {
+    const start = source.indexOf("function confirmLast(");
+    const body = source.slice(start, source.indexOf("\n}\n", start) + 2);
+    const at = body.indexOf(CONFIRM_CALL);
+    return at < 0 ? null : body.slice(at + CONFIRM_CALL.length);
+  };
+  // 꺼내 둔 닫기 함수(close)라는 낱말이 나오는 줄 전부. 꺼내는 hold·담는 Held·판단의 구조 분해·장부 호출 한 줄 밖에 나오면
+  // 두 번째 호출 자리나 다른 이름에 담는 자리다.
+  const closeLines = (source: string) =>
+    source
+      .split("\n")
+      .filter((line) => /\bclose\b/.test(line))
+      .map((line) => line.trim());
+  const CLOSE_LINES = [
+    "readonly close: Fn;",
+    "let close: unknown;",
+    "close = ledger.closeUnreceivedRun;",
+    'if (typeof unanswered !== "function" || typeof close !== "function") return null;',
+    "close: close as Fn,",
+    "const { ledger: receiver, close } = held;",
+    CALL,
+  ];
+  // 확인 뒤에 허용하는 문장: 확인의 답 비교, 답을 담을 자리, 장부 호출. confirmLast는 예외 처리와 원시값 비교 반환뿐이다.
+  const AFTER_CONFIRM = `if (confirmed !== "current") return skip(confirmed); let answer: unknown; try { ${CALL}`;
+  const CONFIRM_TAIL = '} catch { return "link_not_current"; } return answer === "current" || answer === "evidence_changed" || answer === "stop_generation" ? answer : "link_not_current"; }';
 
   test("기다리지 않고, 시계·난수·타이머·환경·파일을 직접 쓰지 않는다", async () => {
     const source = await code(FILE);
@@ -771,16 +932,33 @@ describe("정적", () => {
   test("confirm이 장부 호출 전의 마지막 외부 호출이고, 그 뒤로는 속성을 읽지 않고 꺼내 둔 함수와 미리 만든 인자만 쓴다", async () => {
     const source = await code(FILE);
     expect([source.indexOf(CONFIRM) > 0, source.indexOf(CALL) > source.indexOf(CONFIRM)]).toEqual([true, true]);
-    const between = afterConfirm(source);
+    const between = afterConfirm(source) ?? "";
     expect([/[.[]/.test(between), [...between.matchAll(/(\w+)\s*\(/g)].map((match) => match[1])]).toEqual([false, ["if", "skip", "apply"]]);
+    expect(squash(between)).toBe(AFTER_CONFIRM);
     // confirmLast는 돌아온 뒤 원시값 비교만 한다.
     const body = source.slice(source.indexOf("function confirmLast("), source.indexOf("\n}\n", source.indexOf("function confirmLast(")));
     expect(/[.[]/.test(body.slice(body.indexOf("apply(") + "apply(".length).split("\n").slice(1).join("\n"))).toBe(false);
+    expect(squash(confirmTail(source) ?? "")).toBe(CONFIRM_TAIL);
+    // 꺼내 둔 닫기 함수를 부르는 자리는 모듈 전체에서 한 줄이다.
+    expect(closeLines(source)).toEqual(CLOSE_LINES);
     // 대조군: 사이에서 속성을 읽거나 포트를 부르면 잡는다.
     for (const injected of ["const late = held.close;", "invoke(held.settled, []);"]) {
       const skipLine = 'if (confirmed !== "current") return skip(confirmed);';
-      const broken = afterConfirm(source.replace(skipLine, `${skipLine}\n  ${injected}`));
+      const broken = afterConfirm(source.replace(skipLine, `${skipLine}\n  ${injected}`)) ?? "";
       expect([injected, /[.[]/.test(broken) || [...broken.matchAll(/(\w+)\s*\(/g)].length !== 3]).toEqual([injected, true]);
     }
+  });
+
+  test("대조군: 닫기 호출을 두 번 두거나, confirmLast의 반환 직전이나 확인문과 같은 줄에 호출을 넣으면 위 단언이 잡는다", async () => {
+    const source = await code(FILE);
+    const ret = 'return answer === "current" ||';
+    const twice = source.replace(CALL, `${CALL}\n      ${CALL}`);
+    const beforeReturn = source.replace(ret, `observe();\n  ${ret}`);
+    const sameLine = source.replace(CONFIRM, `${CONFIRM} observe();`);
+    // 각 입력이 실제로 바뀌었는지 먼저 본다.
+    expect([twice, beforeReturn, sameLine].map((text) => text !== source)).toEqual([true, true, true]);
+    expect([closeLines(twice).length, squash(afterConfirm(twice) ?? "") === AFTER_CONFIRM]).toEqual([CLOSE_LINES.length + 1, true]);
+    expect([squash(confirmTail(beforeReturn) ?? "") === CONFIRM_TAIL, closeLines(beforeReturn)]).toEqual([false, CLOSE_LINES]);
+    expect([squash(afterConfirm(sameLine) ?? "") === AFTER_CONFIRM, closeLines(sameLine)]).toEqual([false, CLOSE_LINES]);
   });
 });

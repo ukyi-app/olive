@@ -438,7 +438,8 @@ export function createCycle(deps: CycleDeps): Cycle {
       } catch {
         unreceived = { kind: "threw" };
       }
-      // 장부가 닫았는지 모르는 끝(던짐, 장부 호출이 던지거나 답이 정의 밖이어서 멈춤)만 다시 읽는다. 전역 포트로 멈춘 것은 장부를 부르지 않았다.
+      // 장부가 닫았는지 모르는 끝(던짐, 장부 호출이 던지거나 답이 정의 밖이어서 멈춤)만 다시 읽는다. 전역 포트로 멈춘 박자는
+      // 멈춘 그 항목의 장부 호출이 0회이고, 앞 항목의 결과(닫힘 포함)는 장부가 답한 그대로 확정이라 다시 읽지 않는다.
       if (unreceived.kind === "threw") rereadRuns("unreceived", "threw");
       else if (unreceived.result.kind === "ran" && unreceived.result.halted === "threw") rereadRuns("unreceived", "halted");
     }

@@ -1,5 +1,5 @@
-// 박자 순서기(src/supervisor/runtime/cycle.ts)와 공유 시계(shared-clock.ts). 박자 넷·서버 tick·장부 읽기·시계는 가짜이고, 부른 차례와
-// 넘긴 인자를 기록한다. "실제 박자 넷과 장부"만 실제 박자 함수·임시 폴더의 실제 장부·실제 내보내기 포트를 쓴다(서버는 가짜).
+// 박자 순서기(src/supervisor/runtime/cycle.ts)와 공유 시계(shared-clock.ts). 박자 다섯·서버 tick·장부 읽기·시계는 가짜이고, 부른 차례와
+// 넘긴 인자를 기록한다. "실제 박자 다섯과 장부"만 실제 박자 함수·임시 폴더의 실제 장부·실제 내보내기 포트를 쓴다(서버는 가짜).
 // 박자가 기다리는 동안의 일은 시험이 직접 쥔 약속(deferred)으로 차례를 정한다. 실제 시간을 기다리지 않는다.
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
@@ -880,7 +880,7 @@ describe("포트 안에서 바뀐 상태", () => {
   });
 });
 
-// 실제 박자 넷·임시 폴더의 실제 장부·실제 내보내기 포트(createWireSink). 서버는 실제 서버의 차례(lastCheck → finalCheck → 쓰기)를
+// 실제 박자 다섯·임시 폴더의 실제 장부·실제 내보내기 포트(createWireSink). 서버는 실제 서버의 차례(lastCheck → finalCheck → 쓰기)를
 // 따르는 가짜다. 원천 시계를 공유 시계로 감싸 장부·내보내기 포트·순서기에 같은 객체를 넘긴다(진입점이 할 조립).
 function realWorld() {
   const source = { wall: NOW, onRead: null as (() => void) | null };
@@ -997,7 +997,7 @@ function realWorld() {
   return { source, shared, ledger, runId, cycle, hooks, world, sent, written };
 }
 
-describe("실제 박자 넷과 장부", () => {
+describe("실제 박자 다섯과 장부", () => {
   test("배정 직전 시계 읽기 안에서 닫기를 부르면 배정을 부르지 않고 장부에 새 시작 기록이 없다", async () => {
     const w = realWorld();
     let closing: Promise<void> | null = null;
