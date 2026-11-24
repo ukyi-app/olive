@@ -8,7 +8,7 @@
 // 지키는 것:
 // 1. 박자를 겹쳐 부르지 않는다. 박자가 진행 중이면 beat()는 기다리지 않고 거절한다(박자 안의 포트에서 다시 부른 것도 같다).
 // 2. 복원이 끝나기 전에는 서버 tick만 부르고 박자 넷은 부르지 않는다. 박자를 부르기 직전마다, 그 앞의 포트 읽기를 마친 뒤에 다시 본다.
-//    박자 함수는 만들 때 꺼내 쥔 것을 부르므로 그 확인과 함수 진입 사이에 외부 객체를 읽지 않는다.
+//    박자 함수는 만들 때 꺼내 쥔 것을 부르고 인자는 확인 전에 만들므로, 그 확인과 함수 진입 사이에 외부 코드가 돌지 않는다.
 //    한 번 막히면 그 박자의 남은 박자도 부르지 않는다(끊김 박자 없이 수명 박자만 도는 박자를 만들지 않는다).
 // 3. 장부 시계는 공유 비후퇴 시계(shared-clock.ts)다. 원천 값이 그 하한(장부·내보내기 포트·서버가 읽은 값 포함)보다 이르면 박자에는
 //    읽지 못한 시계로 보인다. 박자 처음의 읽기가 그러면 그 박자의 재전송·배정을 부르지 않는다. 끊김 박자의 단조 시계도 하한을 둔다.
@@ -155,17 +155,26 @@ function bump(memory: Map<string, number>, key: string, at: number): void {
   memory.set(key, before === undefined ? at : Math.max(before, at));
 }
 
-const copyWatch = (entries: readonly WatchEntry[]): WatchEntry[] => entries.map(({ executorId, absentSince }) => ({ executorId, absentSince }));
+// 두 칸만 옮긴 새 일반 배열. map은 하위 타입 배열이면 그 생성자(species)를 부르므로 인덱스로 옮긴다.
+function copyWatch(entries: readonly WatchEntry[]): WatchEntry[] {
+  if (!Array.isArray(entries)) throw new TypeError("watch는 배열이어야 한다");
+  const length = entries.length;
+  const copy: WatchEntry[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const { executorId, absentSince } = entries[index] as WatchEntry;
+    copy.push({ executorId, absentSince });
+  }
+  return copy;
+}
 
 // 박자 함수를 한 번 꺼내 쥔다. 박자마다 beats에서 다시 읽으면 그 읽기(접근자)가 마지막 확인 뒤에 사용자 코드를 돌린다.
-// 수신자는 beats로 묶는다(메서드가 this를 쓸 수 있다). 묶은 함수는 부를 때 아무 속성도 읽지 않고, bind를 사용자 함수에서 찾지 않으려고
-// Function.prototype의 것을 쓴다. 함정: Reflect.apply는 송신 자리 정적 시험(start-send.test.ts)이 송신으로 센다.
-const bindTo = Function.prototype.bind;
+// 수신자는 beats다(메서드가 this를 쓸 수 있다). 부를 때 아무 속성도 읽지 않는다: bind는 함수의 name·length를 읽어 그 접근자가 던지면
+// 만들기가 실패하므로 쥔 함수와 수신자를 Reflect.apply로 부른다. 송신 자리 정적 시험(start-send.test.ts)이 이 한 자리를 목록에 둔다.
 function takeBeats(beats: CycleBeats): CycleBeats {
   const take = <K extends keyof CycleBeats>(name: K): CycleBeats[K] => {
     const fn: unknown = beats[name];
     if (typeof fn !== "function") throw new TypeError(`순서기의 beats.${name}는 함수여야 한다`);
-    return bindTo.call(fn, beats) as CycleBeats[K];
+    return ((...args: unknown[]) => Reflect.apply(fn, beats, args)) as CycleBeats[K];
   };
   return Object.freeze({ linkLoss: take("linkLoss"), life: take("life"), resend: take("resend"), assign: take("assign") });
 }
@@ -343,14 +352,21 @@ export function createCycle(deps: CycleDeps): Cycle {
       rereads.push({ beat, cause, read: "runs", known: readRuns() });
     };
 
+    // 박자마다 인자는 마지막 확인(gate) 전에 만든다. 확인과 박자 진입 사이에는 이 객체가 쥔 값만 쓴다(외부 객체의 속성·접근자·배열 생성자를
+    // 부르지 않는다). 인자를 만든 뒤 더해진 candidate는 확인 중(복원 조회 안)에 온 것도 결과 watch로 바꾼 뒤 다시 더한다.
     let linkLoss: Step<LinkLossTickResult>;
+    const linkLossClocks = { clock, monotonic };
+    const linkLossPolicy: LinkLossPolicy = { judgeMs: policy.judgeMs };
+    const linkLossInput: LinkLossTickInput = { watch: copyWatch(watch) };
+    const noted: string[] = [];
+    notedDuringLinkLoss = noted;
     const linkLossGate = gate();
-    if (linkLossGate !== null) linkLoss = { kind: "skipped", reason: linkLossGate };
-    else {
-      const noted: string[] = [];
-      notedDuringLinkLoss = noted;
+    if (linkLossGate !== null) {
+      notedDuringLinkLoss = null;
+      linkLoss = { kind: "skipped", reason: linkLossGate };
+    } else {
       try {
-        const result = beats.linkLoss({ clock, monotonic }, { judgeMs: policy.judgeMs }, { watch: copyWatch(watch) });
+        const result = beats.linkLoss(linkLossClocks, linkLossPolicy, linkLossInput);
         takeLinkLoss(result);
         linkLoss = { kind: "returned", result };
       } catch {
@@ -371,11 +387,12 @@ export function createCycle(deps: CycleDeps): Cycle {
     let life: Step<LifeTickResult>;
     // 수명 직전의 장부 읽기도 포트다(그 안에서 복원이 다시 시작되거나 닫기가 불릴 수 있다). 읽은 뒤에 막힘을 본다.
     if (!blocked() && unsentRenews.size > 0) readRuns();
+    const lifeInput: LifeTickInput = { lastQueries: [...lastQueries].map(([runId, at]) => ({ runId, at })), unsentRenews: [...unsentRenews] };
     const lifeGate = gate();
     if (lifeGate !== null) life = { kind: "skipped", reason: lifeGate };
     else {
       try {
-        const result = await beats.life(clock, { lastQueries: [...lastQueries].map(([runId, at]) => ({ runId, at })), unsentRenews: [...unsentRenews] });
+        const result = await beats.life(clock, lifeInput);
         takeLife(result, rereads);
         life = { kind: "returned", result };
       } catch {
@@ -388,11 +405,13 @@ export function createCycle(deps: CycleDeps): Cycle {
     const trusted = (): SkipReason | null => gate() ?? (start.state === "ok" ? null : "clock_untrusted");
 
     let resend: Step<ResendTickResult>;
+    const resendPolicy: ResendPolicy = { resendEveryMs: policy.resendEveryMs };
+    const resendInput: ResendTickInput = { lastResends: [...lastResends].map(([requestId, at]) => ({ requestId, at })) };
     const resendGate = trusted();
     if (resendGate !== null) resend = { kind: "skipped", reason: resendGate };
     else {
       try {
-        const result = await beats.resend(clock, { resendEveryMs: policy.resendEveryMs }, { lastResends: [...lastResends].map(([requestId, at]) => ({ requestId, at })) });
+        const result = await beats.resend(clock, resendPolicy, resendInput);
         takeResend(result);
         resend = { kind: "returned", result };
       } catch {
@@ -414,14 +433,15 @@ export function createCycle(deps: CycleDeps): Cycle {
       // 배정 박자의 now는 부르기 직전에 읽는다(앞 박자들의 기다림만큼 흐른 시각). 시계도 포트이므로 읽은 뒤에 막힘을 마지막으로 본다.
       // 이미 막혔으면 읽지 않는다.
       const now = blocked() || start.state !== "ok" ? null : readNow();
-      const assignGate = trusted() ?? (now !== null && now.state === "ok" ? null : "clock_untrusted");
-      if (assignGate !== null || now === null || now.state !== "ok") {
+      const at = now !== null && now.state === "ok" ? now.at : null;
+      const assignGate = trusted() ?? (at === null ? "clock_untrusted" : null);
+      if (assignGate !== null || at === null) {
         assign.push({ kind: "skipped", reason: assignGate ?? "clock_untrusted" });
         break;
       }
       let step: Step<AssignTickResult>;
       try {
-        step = { kind: "returned", result: await beats.assign(now.at) };
+        step = { kind: "returned", result: await beats.assign(at) };
       } catch {
         step = { kind: "threw" };
       }

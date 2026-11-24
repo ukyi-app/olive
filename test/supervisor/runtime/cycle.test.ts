@@ -1043,6 +1043,53 @@ describe("박자 함수와 완료 신호", () => {
     }
   });
 
+  test("박자의 인자는 마지막 확인 전에 만든다: 끊김 박자가 배열 하위 타입을 돌려줘도 확인 뒤 곧바로 박자 함수에 들어간다", async () => {
+    const h = harness();
+    // 생성자(species)가 불리면 그 차례를 남기는 배열. 원소는 올바르다.
+    class Logged<T> extends Array<T> {
+      constructor(...items: T[]) {
+        super(...items);
+        h.calls.push("array.constructor");
+      }
+    }
+    const returned = new Logged<WatchEntry>();
+    returned.push({ executorId: W1, absentSince: null });
+    h.calls.length = 0;
+    h.state.restoreDone = () => {
+      h.calls.push("gate");
+      return true;
+    };
+    const cycle = createCycle(h.deps);
+    h.next.linkLoss = () => linkLossRan(returned);
+    await cycle.beat();
+    h.next.linkLoss = () => linkLossRan();
+    h.calls.length = 0;
+    await cycle.beat();
+    expect(h.calls).toEqual(["tick", "gate", "linkLoss", "gate", "life", "life:returned", "gate", "resend", "gate", "assign"]);
+    const input = h.seen.linkLoss.at(-1)?.input.watch;
+    expect([Object.getPrototypeOf(input), input]).toEqual([Array.prototype, [{ executorId: W1, absentSince: null }]]);
+  });
+
+  test("박자 함수의 name·length를 읽을 수 없어도 순서기를 만들고 박자를 부른다(함수 메타데이터를 읽지 않는다)", async () => {
+    for (const field of ["name", "length"]) {
+      const h = harness();
+      const audit: string[] = [];
+      const linkLoss = function (this: unknown, ...args: unknown[]) {
+        audit.push(this === methods ? "enter.receiver" : "enter.other");
+        return (h.deps.beats.linkLoss as (...input: unknown[]) => LinkLossTickResult)(...args);
+      };
+      Object.defineProperty(linkLoss, field, {
+        get() {
+          audit.push(`read.${field}`);
+          throw new Error("메타데이터 없음");
+        },
+      });
+      const methods = { ...h.deps.beats, linkLoss };
+      const report = ran(await createCycle({ ...h.deps, beats: methods as unknown as CycleBeats }).beat());
+      expect([field, audit, report.linkLoss.kind, report.life.kind, h.calls.filter((call) => call === "linkLoss").length]).toEqual([field, ["enter.receiver"], "returned", "returned", 1]);
+    }
+  });
+
   test("끊김 함수를 얻지 못하면 순서기를 만들지 않아 수명 박자도 돌지 않고, 얻은 끊김 함수가 던지면 수명 박자는 돈다", async () => {
     const h = harness();
     const unavailable = {
