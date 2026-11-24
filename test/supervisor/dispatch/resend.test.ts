@@ -930,3 +930,88 @@ describe("송신 표식: 재전송의 시작도 표식이 ok인 뒤에만 내보
     }
   });
 });
+
+describe("모른다고 옮긴 실행: 시작은 다시 내지 않고 조회만 한다(D-92)", () => {
+  // 끊김 박자처럼 지정 실행기의 끊김을 at에 적는다. 시험의 연결 포트는 기본이 ok라 실행기가 다시 붙은 것과 같다.
+  function lost(w: World, s: Started, at: number): void {
+    expect(must(w.ledger.markLostFor({ executorId: s.run.executorId, now: at })).runs).toEqual([expect.objectContaining({ runId: s.runId, before: "preparing", after: "unknown_running" })]);
+    expect(unanswered(w).instructions).toEqual([expect.objectContaining({ requestId: s.requestId, action: "task_start", runState: "unknown_running" })]);
+  }
+
+  test("다시 붙은 실행기에도 시작을 봉하지 않고 run_unknown으로 끝난다(표식·봉투 0)", async () => {
+    const w = world();
+    const s = started(w);
+    lost(w, s, NOW + 1_000);
+    const before = snapshot(w);
+    for (const at of [NOW + 6_000, NOW + START_LAST_SEAL_MS]) {
+      w.setClock(at);
+      expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "run_unknown" }]);
+    }
+    expect([w.log, w.sent.length]).toEqual([[], 0]);
+    expect(snapshot(w)).toEqual(before);
+    expect(marks(w)).toEqual([]);
+  });
+
+  test("발행 + 19000ms가 지난 시작은 run_unknown이 아니라 start_expired다(D-90의 재료)", async () => {
+    const w = world();
+    const s = started(w);
+    lost(w, s, NOW + 1_000);
+    w.setClock(NOW + START_LAST_SEAL_MS + 1);
+    expect(outcomes(await tick(w))).toEqual([{ requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "start_expired", issuedAt: NOW, expiresAt: NOW + 30_000 }]);
+    expect(w.log).toEqual([]);
+  });
+
+  test("같은 실행의 취소는 그대로 다시 낸다", async () => {
+    const w = world();
+    const s = started(w);
+    // 취소를 적은 뒤(stopping) 끊겨 옮겨졌다: 시작과 취소 항목이 모두 unknown_running이다.
+    const c = cancel(w, s, NOW + 1_000, "requested");
+    expect(must(w.ledger.markLostFor({ executorId: s.run.executorId, now: NOW + 2_000 })).runs).toEqual([expect.objectContaining({ runId: s.runId, before: "stopping", after: "unknown_running" })]);
+    expect(unanswered(w).instructions.map((i) => [i.action, i.runState])).toEqual([
+      ["task_start", "unknown_running"],
+      ["task_cancel", "unknown_running"],
+    ]);
+    w.setClock(NOW + 8_000);
+    expect(outcomes(await tick(w))).toEqual([
+      { requestId: s.requestId, runId: s.runId, action: "task_start", outcome: "withheld", reason: "run_unknown" },
+      { requestId: c.requestId, runId: s.runId, action: "task_cancel", outcome: "resent", executorId: s.run.executorId, sealedAt: NOW + 8_000, at: NOW + 8_000 },
+    ]);
+    expect(w.sent.map((e) => e.header.action)).toEqual(["task_cancel"]);
+    expectSameRequest(c.first as Envelope, w.sent[0] as Envelope);
+  });
+
+  test("감독이 다시 떠 복원이 옮긴 실행의 시작도 새 연결로 다시 내지 않고, 다시 연 장부의 자동 닫기는 그 실행을 닫을 수 있다", async () => {
+    const path = tempPath();
+    const first = ready(open(path));
+    const live = startedWorker(first);
+    first.close();
+    // 감독이 다시 떴다: 복원 3단계처럼 진행 중 실행을 모른다고 옮긴다.
+    const second = ready(open(path));
+    expect(must(second.markLost(NOW + 1_000)).runIds).toEqual([live.runId]);
+    const sent: Envelope[] = [];
+    const ports: ResendPorts = {
+      ledger: second,
+      intake: { intakeOpen: () => true },
+      links: { mayIssue: () => ({ ok: true }) },
+      clock: { now: () => NOW + 6_000 },
+      random: { bytes: (n) => getRandomValues(new Uint8Array(n)) },
+      signer: { seal: (input) => sealEnvelope(input, keys.privateKey) },
+      sink: {
+        send: async (envelope) => {
+          sent.push(envelope);
+          return "sent";
+        },
+      },
+    };
+    expect(outcomes(await resendTick(ports, { resendEveryMs: EVERY }, { lastResends: [] }))).toEqual([
+      { requestId: live.requestId, runId: live.runId, action: "task_start", outcome: "withheld", reason: "run_unknown" },
+    ]);
+    expect([sent.length, marks({ ledger: second, path })]).toEqual([0, []]);
+    // 새 열기의 표식이 없으므로 D-90의 닫기 입력(시작 발행 + 30000ms 뒤의 전체 답에 그 실행이 없음)이 그 실행을 닫는다.
+    const third = ready(open(path));
+    expect(third.closeUnreceivedRun({ runId: live.runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_005, now: NOW + 30_010 }, { sender: WORKER_EXECUTOR })).toEqual(
+      expect.objectContaining({ ok: true }),
+    );
+    third.close();
+  });
+});
