@@ -11,7 +11,10 @@
 // 3. 서버가 돌려준 뒤의 같은 동기 구간에서 발급·내보내기 포트·답 줄을 만든다. 그 전의 deliver는 던져 그 연결을 닫는다(받지 않는다).
 // 4. 복원 단계는 주기마다 하나씩 부르고(이미 도는 단계가 있으면 부르지 않는다), 받아들인 단계만 센다. 순서기는 5단계를, 답 줄과
 //    D-90 박자는 2단계를 받아들인 뒤에만 연다.
-// 5. 기한이 있는 기다림은 결과를 받아들이는 순간의 단조 시각으로 판정한다(waitUntil). 정각 이후면 타이머보다 먼저 처리된 결과여도 만료다.
+// 5. 기한이 있는 기다림은 일을 부르기 전에 절대 기한을 정하고(runBy), 결과를 받아들이는 순간의 단조 시각으로 판정한다(waitUntil).
+//    일의 동기 비용도 기한 안에 든다. 정각 이후면 타이머보다 먼저 처리된 결과여도 만료다. 현관 답은 복원기에 넘기기 전에 단계 기한을 본다.
+// 6. 효과(장부의 발급 기록, 송신·ACK·자격 값, D-90 닫기, 배정)는 쓰기·싣기 직전에 effectsOpen 하나를 본다: 끝 코드가 정해졌거나,
+//    진행 중인 박자의 기한이 지났거나, 장부를 쓸 수 없거나, 받아들인 허가가 사라졌거나 받아들이지 않은 허가가 있으면 닫힘이다.
 import { executorName, type Role } from "../../contract/v1/index.ts";
 import {
   type Ledger,
@@ -31,7 +34,7 @@ import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import { resendTick } from "../dispatch/resend.ts";
-import { type UnreceivedEvidence, unreceivedTick } from "../dispatch/unreceived.ts";
+import { type UnreceivedEvidence, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
 import type { ToolConfig, ToolPolicyPort, ToolPorts } from "../scheduler/tools.ts";
@@ -39,7 +42,7 @@ import type { ConnectionSettings } from "../transport/connections.ts";
 import { RegistryState, type RegistrySettings } from "../transport/registry.ts";
 import type { ConnectionServer, ConnectionServerOptions, Delivered, StartResult } from "../transport/server.ts";
 import { type AnswerLines, createAnswerLines } from "./answers.ts";
-import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle } from "./cycle.ts";
+import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
 import { createQueryBook } from "./query-book.ts";
@@ -251,10 +254,28 @@ function summarize(report: BeatReport): LogFields {
     linkLoss: step(report.linkLoss),
     life: step(report.life),
     resend: step(report.resend),
-    unreceived: report.unreceived.kind === "returned" ? `returned:${report.unreceived.result.kind}` : step(report.unreceived),
+    ...unreceivedFields(report.unreceived),
     assign: report.assign.map(step).join(","),
     rereads: report.rereads.length,
+    rereadCauses: tally(report.rereads.map((item) => `${item.beat}:${item.cause}`)),
   };
+}
+
+// 이름별 건수를 "이름=수" 꼴로 정렬해 한 칸에 싣는다. 이름은 박자 결과의 정해진 갈래뿐이다(실행 ID·요청 ID를 싣지 않는다).
+function tally(names: readonly string[]): string {
+  const counts = new Map<string, number>();
+  for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+  return [...counts].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([name, count]) => `${name}=${count}`).join(",");
+}
+
+// D-90 박자의 결과. 항목마다 닫힘·거절·건너뜀(사유)·장부 고장을 세고, 멈춘 이유를 따로 싣는다. M1a가 이 기록으로 닫았는지를 가른다.
+function unreceivedFields(value: Step<UnreceivedTickResult>): LogFields {
+  if (value.kind === "skipped") return { unreceived: `skipped:${value.reason}` };
+  if (value.kind === "threw") return { unreceived: "threw" };
+  const result = value.result;
+  if (result.kind === "not_run") return { unreceived: `not_run:${result.reason}` };
+  const names = result.runs.map((run) => (run.outcome === "skipped" || run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome));
+  return { unreceived: "ran", unreceivedOutcomes: tally(names), unreceivedHalted: result.halted };
 }
 
 export async function bootSupervisor(settings: SupervisorSettings, deps: SupervisorDeps, signal: AbortSignal): Promise<BootResult> {
@@ -273,15 +294,27 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const aborted = (reason: string): BootResult => fail("aborted", 0, reason);
   const timing = settings.timing;
   for (const field of TIMING_FIELDS) if (!isPositive(timing?.[field])) return fail("config", SUPERVISOR_EXIT.config, `timing.${field}`);
-  const bounded = <T>(begin: () => Promise<T>): Promise<Waited<T>> => {
+  // 기한은 일을 부르기 전에 정한다. 부른 뒤에 정하면 일의 동기 비용(파일 읽기, 장부 조회)이 상한에서 빠진다.
+  const deadline = (waitMs: number): number | null => {
+    try {
+      const at = deps.monoNow();
+      return Number.isFinite(at) ? at + waitMs : null;
+    } catch {
+      return null;
+    }
+  };
+  // limit이 null이면(시각을 읽지 못함) 일을 부르지 않는다. 닫기처럼 반드시 불러야 하는 일은 NaN을 넘긴다: 부르되 unarmed로 끝난다.
+  const runBy = <T>(limit: number | null, begin: () => Promise<T>, abort?: AbortSignal): Promise<Waited<T>> => {
+    if (limit === null) return Promise.resolve({ kind: "unarmed" });
     let work: Promise<T>;
     try {
       work = begin();
     } catch (error) {
       work = Promise.reject(error);
     }
-    return waitUntil(work, deps.monoNow() + timing.startupWaitMs, deps, signal);
+    return waitUntil(work, limit, deps, abort);
   };
+  const bounded = <T>(begin: () => Promise<T>): Promise<Waited<T>> => runBy(deadline(timing.startupWaitMs), begin, signal);
   const readText = async (path: string): Promise<{ ok: true; text: string } | { ok: false; reason: string }> => {
     const read = await bounded(() => deps.readFile(path));
     if (read.kind !== "done") return { ok: false, reason: read.kind === "failed" ? "unreadable" : read.kind };
@@ -365,12 +398,30 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     if (server === null) throw new Error("server_not_started");
     return server.table();
   };
+  // 지금 도는 복원 단계의 절대 기한. 단계를 부르기 전에 정한다(kickRestore). 현관 답은 복원기가 장부에 반영하기 전에 이 기한을 본다:
+  // 정각 이후의 답은 복원기에 모름(거부)으로 넘긴다. 4단계의 여러 게시도 이 기한 하나를 함께 쓴다(각자 새 기한을 얻지 않는다).
+  let stepLimit: number | null = null;
+  const inStep = <T>(ask: () => Promise<T>): Promise<T> => {
+    const limit = stepLimit;
+    if (limit === null || pastLimit(deps, limit)) return Promise.reject(new Error("restore_step_lapsed"));
+    let pending: Promise<T>;
+    try {
+      pending = ask();
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return Promise.resolve(pending).then((value) => {
+      if (pastLimit(deps, limit)) throw new Error("restore_step_lapsed");
+      return value;
+    });
+  };
+  const front = deps.frontDoor;
   let restorer: Restorer;
   try {
     const ports: RestorePorts = {
-      stopAuthority: deps.frontDoor.stopAuthority,
-      publications: deps.frontDoor.publications,
-      peers: createPeers({ front: deps.frontDoor.peers, table, get restorer() { return restorer; }, expectedPolicy: settings.expectedPolicyRevision }),
+      stopAuthority: { latestStop: () => inStep(() => front.stopAuthority.latestStop()) },
+      publications: { lookup: (frontJobId) => inStep(() => front.publications.lookup(frontJobId)) },
+      peers: createPeers({ front: { contracts: () => inStep(() => front.peers.contracts()) }, table, get restorer() { return restorer; }, expectedPolicy: settings.expectedPolicyRevision }),
       occupancy: { occupancy: async () => table().occupancy(restorer) },
     };
     restorer = make.restorer(ledger, ports, ledgerClock, requiredPeers);
@@ -386,6 +437,41 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   let stage = 0;
   const observationsSettled = () => stage >= 2;
 
+  // 효과의 문. 끝 차례가 정한 코드, 진행 중인 박자의 절대 기한, 받아들인 5단계의 허가를 한 판단으로 본다.
+  let stopping = false;
+  let exitCode: number = 0;
+  let granted = false;
+  let beatLimit: number | null = null;
+  // 끝낼 사유가 이미 생겼는가. 박자 앞뒤와 끝 차례가 본다. 읽다 던지면 고장·닫힘으로 본다(모름을 건강으로 읽지 않는다).
+  const haltReason = (): string | null => {
+    try {
+      if (ledger.health().writable !== true) return "ledger_unwritable";
+    } catch {
+      return "ledger_unwritable";
+    }
+    let open = false;
+    try {
+      open = restorer.intakeOpen() === true;
+    } catch {
+      open = false;
+    }
+    // 받아들인 허가가 사라졌다(새 정지 기록, 장부 고장). 반대로 조립이 받아들이지 않은 허가(기한을 넘겨 끝난 5단계가 장부에 이미 낸 것)도
+    // 소비자에게 보이지 않게 닫힘으로 본다.
+    if (granted && !open) return "intake_discarded";
+    if (!granted && open) return "intake_unaccepted";
+    return null;
+  };
+  // 처음부터 닫힌 5단계(받아들인 허가 없음, 장부의 허가도 없음)는 열림이다: 기존 실행의 정지·상태 조회는 나간다. 새 접수·시작·갱신·
+  // 자격 값은 복원기의 접수 문이 따로 막는다.
+  const effectsOpen = (): boolean => exitCode === 0 && !(beatLimit !== null && pastLimit(deps, beatLimit)) && haltReason() === null;
+  // 박자 넷이 장부에 발급을 적기 직전에 보는 접수 문. 복원기의 접수에 효과의 문을 더한다. 정지 세대는 복원기 그대로다.
+  const intake = {
+    intakeOpen: (): boolean => effectsOpen() && restorer.intakeOpen() === true,
+    stopGeneration: (): number | null => restorer.stopGeneration(),
+  };
+  // D-90 박자의 관측 문. 닫기마다 이 칸을 다시 보므로(unreceived.ts의 readGate) 효과의 문이 닫히면 다음 닫기를 적지 않는다.
+  const unreceivedSettled = (): boolean => observationsSettled() && effectsOpen();
+
   // 5. 순서기를 서버보다 먼저 만든다: 정책이 범위 밖이면 소켓을 열기 전에 끝낸다. 박자 다섯은 아래에서 만드는 객체에 부를 때 위임한다.
   let wire: WireSink | null = null;
   let lines: AnswerLines | null = null;
@@ -397,10 +483,10 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     linkLoss: (clocks, policy, input) =>
       linkLossTick({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks }, policy, input),
     life: (clock, input) =>
-      lifeTick({ ledger, intake: restorer, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink }, settings.life, input),
+      lifeTick({ ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink }, settings.life, input),
     resend: (clock, policy, input) =>
-      resendTick({ ledger, intake: restorer, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink }, policy, input),
-    unreceived: (now) => unreceivedTick({ ledger, evidence: deps.evidence, withheld: need(lines).withheld, intake: restorer, observationsSettled }, now),
+      resendTick({ ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink }, policy, input),
+    unreceived: (now) => unreceivedTick({ ledger, evidence: deps.evidence, withheld: need(lines).withheld, intake, observationsSettled: unreceivedSettled }, now),
     assign: (now) => assignAndStartTick(assignPorts(), settings.assign, now),
   };
   // 세대를 모르면 "후보 없음"이 아니라 모름이다(assign-loop.ts의 CandidateSource).
@@ -410,7 +496,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   // 배정 전 사실과 자격 참조는 그 조각(역할 프로필·계정) 전까지 모름으로 닫는다: 고르기가 보류하고 시작하지 않는다.
   const assignPorts = () => ({
     ledger,
-    intake: restorer,
+    intake,
     connections: candidates,
     withheld: need(lines).withheld,
     facts: { facts: () => ({}) },
@@ -426,7 +512,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       serverTick: () => need(server).tick(),
       ledgerClock: shared,
       monotonic: { now: () => Math.floor(deps.monoNow()) },
-      restoreDone: () => stage >= 5,
+      // 순서기가 박자 다섯을 부르기 직전마다 본다. 5단계를 받아들였고 효과의 문이 열렸을 때만 참이다(기한을 넘긴 박자의 남은 박자를 막는다).
+      restoreDone: () => stage >= 5 && effectsOpen(),
       ledger,
       policy: settings.cycle,
       observe: (report) => log("beat", summarize(report)),
@@ -444,9 +531,11 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   let deliver: (output: Delivered) => void = () => {
     throw new Error("not_ready");
   };
-  let startWork: Promise<StartResult>;
-  try {
-    startWork = deps.startServer({
+  const start: { work: Promise<StartResult> | null } = { work: null };
+  const started = await runBy(
+    deadline(timing.startupWaitMs),
+    () =>
+      (start.work = deps.startServer({
       host: settings.listen.host,
       port: settings.listen.port,
       material,
@@ -460,15 +549,14 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       deliver: (output) => deliver(output),
       observe: (note) => log("server", note.kind === "closed" ? { kind: note.kind, cause: note.cause } : note.kind === "rejected_tls" ? { kind: note.kind, reason: note.reason } : { kind: note.kind }),
       maxPendingWriteBytes: settings.maxPendingWriteBytes,
-    });
-  } catch (error) {
-    startWork = Promise.reject(error);
-  }
-  const started = await waitUntil(startWork, deps.monoNow() + timing.startupWaitMs, deps, signal);
+      })),
+    signal,
+  );
   if (started.kind !== "done" || !started.value.ok) {
     // 받아들이지 않은 시작(기한 넘김·멈춤·타이머 없음)이 서버를 세웠으면 그 서버를 닫는다. 기다리지 않는다: 프로세스가 곧 끝난다.
-    if (started.kind !== "done" && started.kind !== "failed") {
-      void startWork.then(
+    const late = start.work;
+    if (late !== null && started.kind !== "done" && started.kind !== "failed") {
+      void late.then(
         (late) => {
           if (late.ok) late.server.close().catch(() => {});
         },
@@ -487,10 +575,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
 
   // 7. 서버가 돌려준 이 동기 구간에서 발급·내보내기 포트·답 줄을 만든다. 사이에 await가 없어 소켓 사건이 끼지 않는다.
   let issuance: Issuance;
+  let madeIssuance: Issuance | null = null;
   try {
     const queries = make.queries();
     issuance = make.issuance({
-      cycle,
+      // 발급 깃발은 순서기의 깃발에 효과의 문을 더한 것이다. 내보내기 포트의 lastCheck와 자격 값의 두 문이 이 깃발을 맨 앞에서 본다.
+      // 닫기는 순서기 그대로다.
+      cycle: { issuanceOpen: () => cycle.issuanceOpen() && effectsOpen(), closeIssuance: () => cycle.closeIssuance() },
       server: live,
       restorer: published,
       ledger,
@@ -500,6 +591,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       observe: (note) =>
         log("issuance", note.kind === "credential" ? { kind: note.note.kind, outcome: note.note.kind === "attempt" ? note.note.outcome : null } : note.kind === "shutdown" ? { kind: "shutdown", step: note.step } : { kind: note.kind }),
     });
+    madeIssuance = issuance;
     const holder: { lines: AnswerLines | null } = { lines: null };
     wire = make.sink({
       server: live,
@@ -533,8 +625,9 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     const ready = lines;
     deliver = (output) => ready.deliver(output);
   } catch {
-    // 발급을 만들지 못했으면 서버를 직접 닫는다(닫을 발급 문이 없다).
-    const closed = await waitUntil(live.close(), deps.monoNow() + timing.stopWaitMs, deps);
+    // 발급 문을 만들었으면 그 문으로 닫는다(깃발 → 서버). 만들기 전에 실패했으면 서버를 직접 닫는다. 닫기는 시각을 읽지 못해도 부른다.
+    const made = madeIssuance;
+    const closed = await runBy(deadline(timing.stopWaitMs) ?? Number.NaN, () => (made !== null ? made.shutdown() : live.close()));
     const ledgerClosed = closeLedger();
     log("boot_cleanup", { serverClosed: closed.kind === "done", ledgerClosed });
     return fail("server", SUPERVISOR_EXIT.server, "wiring");
@@ -543,8 +636,6 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
 
   // 8. 주기와 끝 차례.
   const answerLines: AnswerLines = lines;
-  let stopping = false;
-  let exitCode: number = 0;
   let wake: () => void = () => {};
   let ending: Promise<number> | null = null;
   // done은 끝 차례가 시작될 때(stop() 또는 치명 실패) 그 약속을 따른다.
@@ -552,7 +643,6 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const settled = new Promise<number>((resolve) => {
     settle = resolve;
   });
-  let granted = false;
   let restoring = false;
   let lastRestoreFailure = "";
 
@@ -562,16 +652,24 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       log("fatal", { reason: why });
     }
     if (ending !== null) return ending;
+    // 끝 차례의 기한은 기록·깨우기·시계 읽기보다 먼저 정한다. 시각을 읽지 못해도 닫기는 부른다(NaN 기한은 unarmed → 96).
+    const limit = deadline(timing.stopWaitMs) ?? Number.NaN;
     stopping = true;
     wake();
     ending = (async () => {
       // shutdown()을 부른 시점. 자격 값 쪽 intake_closed가 깃발 때문인지 진짜 접수 닫힘인지 가르는 기준이다.
       const reading = shared.read();
       log("shutdown_called", { reason: why, at: reading.state === "ok" ? reading.at : null });
-      const closed = await waitUntil(issuance.shutdown(), deps.monoNow() + timing.stopWaitMs, deps);
+      const closed = await runBy(limit, () => issuance.shutdown());
       if (closed.kind !== "done") {
         exitCode = SUPERVISOR_EXIT.fatal;
         log("shutdown_incomplete", { kind: closed.kind });
+      }
+      // 장부를 닫기 전에 이미 생긴 고장·허가 폐기를 코드에 반영한다. 멈춤 요청이 먼저 왔어도 0으로 덮지 않는다.
+      const known = haltReason();
+      if (known !== null && exitCode === 0) {
+        exitCode = SUPERVISOR_EXIT.fatal;
+        log("fatal", { reason: known });
       }
       if (!closeLedger()) exitCode = SUPERVISOR_EXIT.fatal;
       log("stopped", { code: exitCode });
@@ -584,29 +682,30 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const restoreSteps = [() => restorer.step1(), () => restorer.step2(), () => restorer.step3(), () => restorer.step4(), () => restorer.step5()] as const;
   const kickRestore = () => {
     if (restoring || stage >= 5 || stopping) return;
-    restoring = true;
     const index = stage;
-    let work: Promise<unknown>;
-    try {
-      work = restoreSteps[index]!();
-    } catch (error) {
-      work = Promise.reject(error);
-    }
-    void waitUntil(work, deps.monoNow() + timing.restoreStepWaitMs, deps).then((waited) => {
+    // 단계의 기한은 부르기 전에 정한다: 5단계의 판정·허가는 첫 호출 안에서 동기로 끝나므로, 부른 뒤에 정하면 그 비용이 상한에서 빠진다.
+    const limit = deadline(timing.restoreStepWaitMs);
+    if (limit === null) return void finish("restore_unarmed");
+    restoring = true;
+    stepLimit = limit;
+    const step: () => Promise<unknown> = restoreSteps[index]!;
+    void runBy(limit, step).then((waited) => {
       restoring = false;
-      if (stopping) return;
+      // 기한 안에 받은 단계는 멈춤 중이어도 센다: 5단계가 장부에 낸 허가를 받아들인 허가로 맞춰야 끝 차례의 haltReason이 그 허가를
+      // "받아들이지 않은 허가"로 읽지 않는다. 멈춤 중에는 기록만 남기지 않는다. 실패·기한 넘김은 멈춤보다 먼저 96이다.
       if (waited.kind === "done") {
         stage = index + 1;
         lastRestoreFailure = "";
-        if (stage === 5) {
-          const step5 = waited.value as { intakeMayOpen: boolean; closedBecause: readonly string[] };
-          granted = step5.intakeMayOpen === true;
-          log("restore_step", { step: 5, intakeMayOpen: granted, closedBecause: step5.closedBecause.join(",") });
-        } else log("restore_step", { step: stage });
+        const step5 = stage === 5 ? (waited.value as { intakeMayOpen: boolean; closedBecause: readonly string[] }) : null;
+        if (step5 !== null) granted = step5.intakeMayOpen === true;
+        if (stopping) return;
+        if (step5 !== null) log("restore_step", { step: 5, intakeMayOpen: granted, closedBecause: step5.closedBecause.join(",") });
+        else log("restore_step", { step: stage });
         return;
       }
       // 모름(현관 없음 등)이면 같은 복원기로 같은 단계를 다음 주기에 다시 부른다. 재시작하지 않는다: 되풀이 재기동이 생기지 않게.
       if (waited.kind === "failed" && waited.error instanceof RestoreStepError) {
+        if (stopping) return;
         const reason = `${index + 1}`;
         if (reason !== lastRestoreFailure) log("restore_retry", { step: index + 1 });
         lastRestoreFailure = reason;
@@ -633,24 +732,27 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
 
   const loop = async (): Promise<void> => {
     while (!stopping) {
+      // 박자 전에 끝낼 사유를 본다: 장부 고장·허가 폐기 뒤에는 서버 tick도 박자도 부르지 않는다.
+      const before = haltReason();
+      if (before !== null) return void finish(before);
       kickRestore();
-      const beatStarted = deps.monoNow();
-      const waited = await waitUntil(cycle.beat(), beatStarted + timing.beatWaitMs, deps);
       if (stopping) return;
+      // 박자의 절대 기한은 박자를 부르기 전에 정한다. 박자 안의 효과 자리(effectsOpen)와 결과 수락이 같은 기한을 본다.
+      const beatStarted = deps.monoNow();
+      beatLimit = beatStarted + timing.beatWaitMs;
+      const waited = await waitUntil(cycle.beat(), beatLimit, deps);
+      // 거부·기한 넘김은 멈춤 요청보다 먼저 코드에 반영한다. 기한을 넘긴 박자는 계속 돌 수 있으므로 beatLimit을 그대로 둔다.
       if (waited.kind !== "done") return void finish(`beat_${waited.kind}`);
+      beatLimit = null;
+      // 답 처리(pump) 전에 다시 본다: 박자 안에서 생긴 장부 고장·허가 폐기 뒤에는 쥔 답을 장부에 넘기지 않는다.
+      const after = haltReason();
+      if (after !== null) return void finish(after);
+      if (stopping) return;
       log("beat_time", { startedMs: beatStarted, endedMs: deps.monoNow() });
       answerLines.pump();
       const requery = answerLines.takeRequery();
       if (requery.length > 0) log("requery", { count: requery.length });
       if (stopping) return;
-      let writable = false;
-      try {
-        writable = ledger.health().writable === true;
-      } catch {
-        writable = false;
-      }
-      if (!writable) return void finish("ledger_unwritable");
-      if (granted && restorer.intakeOpen() !== true) return void finish("intake_discarded");
       await sleep(timing.beatEveryMs);
     }
   };

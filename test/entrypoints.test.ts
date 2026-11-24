@@ -128,6 +128,28 @@ test("entrypoints: src/에서 환경을 읽는 파일은 src/main/executor.ts·s
 
 // 감독이 듣는 곳은 실행기를 받는 연결 서버의 TCP 하나(tls-server.ts)뿐이다. 감독 진입점에서 닿는 로컬 모듈 전체를 본다.
 const SUPERVISOR_LISTENER = "src/supervisor/transport/tls-server.ts";
+// 그 한 파일에서 허용한 세 자리(TLS 서버 만들기, 그 서버의 listen, 감싼 자기 메서드의 호출)를 각각 정확히 한 번 찾아 지운 뒤, 남은 글에서
+// 다른 종류의 듣기 API를 찾는다. 횟수만 세면 같은 파일에 붙인 Bun.serve·net.createServer·dgram 같은 두 번째 종류를 놓친다.
+const SUPERVISOR_ALLOWED = [/\btls\.createServer\(/, /\bthis\.server\.listen\(this\.options\.port, this\.options\.host,/, /\bawait server\.listen\(\);/];
+const anyListening = /\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\bcreateSocket\b|\.listen\(|\.bind\(\s*\d/;
+const supervisorTcpOnly = (source: string): boolean => {
+  let rest = source;
+  for (const allowed of SUPERVISOR_ALLOWED) {
+    if ([...source.matchAll(new RegExp(allowed.source, "g"))].length !== 1) return false;
+    rest = rest.replace(allowed, "");
+  }
+  return !anyListening.test(rest);
+};
+
+test("entrypoints: 감독 듣기 확인이 허용 파일 안의 두 번째 종류 듣기를 잡는다", async () => {
+  const source = await Bun.file(join(root, SUPERVISOR_LISTENER)).text();
+  expect(supervisorTcpOnly(source)).toBe(true);
+  // 음성 대조군: 허용 파일에 다른 종류의 듣기 하나를 붙이거나 허용한 자리를 하나 더 두면 실패한다.
+  for (const extra of ["Bun.serve({ fetch: () => new Response() });", "Bun.listen({ hostname: h, port: 1, socket: {} });", "net.createServer().listen(1);", "dgram.createSocket('udp4');", "tls.createServer({});", "await server.listen();"]) {
+    expect(supervisorTcpOnly(`${source}\n${extra}\n`), extra).toBe(false);
+  }
+});
+
 test("entrypoints: 감독에서 닿는 코드에 듣는 API는 tls-server.ts 하나뿐이다", async () => {
   const files = await reachable("src/main/supervisor.ts");
   const listeners = [...files].filter(([, source]) => listening.test(source)).map(([file]) => relative(root, file));
@@ -137,6 +159,7 @@ test("entrypoints: 감독에서 닿는 코드에 듣는 API는 tls-server.ts 하
   expect([...source.matchAll(/\bcreateServer\(/g)].length).toBe(1);
   expect([...source.matchAll(/\btls\.createServer\(/g)].length).toBe(1);
   expect([...source.matchAll(/\bthis\.server\.listen\(/g)].length).toBe(1);
+  expect(supervisorTcpOnly(source)).toBe(true);
   expect(files.size).toBeGreaterThan(1);
 });
 

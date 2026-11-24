@@ -115,7 +115,8 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
         dir: value("OLIVE_ACCOUNTS_DIR"),
         keys: { subscription: "CLAUDE_CODE_OAUTH_TOKEN" },
         maxBytes: CREDENTIAL_MAX_BYTES,
-        // 자격 revision의 출처(계정 Secret의 판)가 정해지기 전이라 모름이다. 모르면 값을 보내지 않는다(credential-ref.md).
+        // 자격 revision의 출처(계정 Secret의 판)가 정해지기 전이라 모름이다. 모르면 새 자격 참조를 만들지 않는다(credential-ref.md).
+        // 이미 접수된 실행의 값 송신(borrowCredentialValue)은 revision을 보지 않고 계정·방식·지문과 실행 상태·접수 문으로 판단한다.
         revisionOf: () => null,
       },
       // 배정 정책은 닫힌 값이다. 등록행·계정·실행 계획이 없어 후보가 없고 시작하지 않는다(역할 프로필 조각 전까지).
@@ -149,7 +150,7 @@ const productionDeps: SupervisorDeps = {
   startServer: startConnectionServer,
   credentialFiles: nodeCredentialFiles,
   frontDoor: { stopAuthority: { latestStop: absent }, publications: { lookup: absent }, peers: { contracts: absent } },
-  // 증거 포트(A6c-2) 전: 모든 실행기가 모름이라 D-90 박자는 장부를 부르지 않는다.
+  // 증거 포트(A6c-2) 전: 모든 실행기가 모름이라 D-90 박자는 자동 닫기를 기록하지 않는다(후보를 알려고 장부를 읽기는 한다).
   evidence: { read: () => ({ known: false }), confirm: () => "link_not_current" },
   wallNow: Date.now,
   monoNow: () => performance.now(),

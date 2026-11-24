@@ -138,8 +138,10 @@ describe("같은 객체(S1~S9)", () => {
     expect(c.sink!.ports.server).toBe(w.fake.server);
     expect(c.lines!.ports.table()).toBe(w.fake.server.table());
     expect(c.sink!.ports.queries).toBe(c.queries!);
+    expect(options.maxPendingWriteBytes).toBe(w.settings.maxPendingWriteBytes);
     expect(c.lines!.ports.queries).toBe(c.queries!);
-    expect(c.issuance!.ports.cycle).toBe(c.cycle!.value);
+    // 발급의 순서기 칸은 같은 순서기의 깃발에 효과의 문을 더한 보기다(닫기는 같은 순서기로 간다). 아래 멈춤 뒤에 둘 다 닫힘이다.
+    expect(c.issuance!.ports.cycle.issuanceOpen()).toBe(true);
     expect(c.lines!.ports.cycle).toBe(c.cycle!.value);
     // 발급 깃발과 자격 값의 두 문(S8·S9). 깃발 칸이 빠지면 늘 열린 것으로 보는 선택 칸이다.
     expect(c.sink!.ports.issuanceOpen).toBe(c.issuance!.value.issuanceOpen);

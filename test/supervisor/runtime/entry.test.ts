@@ -1,6 +1,7 @@
 // 감독 진입점의 환경 → 값(settingsFromEnv). 이름마다 없음·틀림이 첫 걸린 이름 하나로 돌아오고(값은 싣지 않는다), 다 있으면 경로와
 // 등록표 설정을 그대로 옮긴다. 진입점을 실제로 띄워 91로 끝나는 것은 test/entrypoints.test.ts가 본다.
 import { expect, test } from "bun:test";
+import { limits } from "../../../src/contract/v1/index.ts";
 import { SUPERVISOR_ENV, settingsFromEnv } from "../../../src/main/supervisor.ts";
 import { readText } from "../../files.ts";
 
@@ -37,6 +38,8 @@ test("환경이 모두 있으면 경로·등록표 설정·정책 revision을 �
   expect(s.otherPeers).toEqual(["front-door", "observation-relay"]);
   expect(s.credentials.dir).toBe("/etc/olive/accounts");
   expect(s.credentials.maxBytes).toBeLessThanOrEqual(16_384);
+  // 서버의 송신 대기 상한(S35): 틀 하나의 최대 크기 네 배. 서버로 그대로 넘기는 것은 boot.test.ts "같은 객체"가 본다.
+  expect(s.maxPendingWriteBytes).toBe(limits.MAX_MESSAGE_BYTES * 4);
   // 배정은 닫힌 값이다: 등록행·계정·실행 계획이 없다.
   expect([s.assign.assignment.registrations.length, s.assign.accounts.length, s.assign.plans.length]).toEqual([0, 0, 0]);
 });
