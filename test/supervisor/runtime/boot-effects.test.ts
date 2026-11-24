@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { openLedger, type OpenOptions } from "../../../src/ledger/index.ts";
 import type { BootResult, RunningSupervisor } from "../../../src/supervisor/runtime/boot.ts";
+import type { UnreceivedRehello } from "../../../src/supervisor/dispatch/unreceived.ts";
 import { createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
 import { type BeatReport, createCycle } from "../../../src/supervisor/runtime/cycle.ts";
 import { digest, id, must, ready, worker } from "../../ledger/helpers.ts";
@@ -446,6 +447,55 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     const ports = w.captured.beatPorts as { unreceived?: { evidence?: unknown; withheld?: unknown }; assign?: { withheld?: unknown } };
     expect([ports.unreceived?.evidence === lines.evidence, ports.unreceived?.withheld === lines.withheld, ports.assign?.withheld === lines.withheld]).toEqual([true, true, true]);
     expect(await run.stop()).toBe(0);
+  });
+
+  test("D-90 박자의 새 인사 포트: 기억은 박자마다 같은 값, closeConnection은 그 서버로 가고, 문은 읽기만 하며 끝 차례(발급 닫기) 뒤에는 닫힌다", async () => {
+    const w = world();
+    const commits = countCommits(w);
+    const shut: number[] = [];
+    const server = w.fake.server as unknown as { closeConnection: (connection: number) => unknown };
+    server.closeConnection = (connection) => {
+      shut.push(connection);
+      return { kind: "not_open" };
+    };
+    const run = await running(w);
+    await untilStep(w, 5);
+    const rehelloOf = () => (w.captured.beatPorts?.unreceived as { rehello?: UnreceivedRehello } | undefined)?.rehello;
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    const first = rehelloOf();
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    const second = rehelloOf();
+    if (first === undefined || second === undefined) throw new Error("rehello 포트가 없다");
+    expect([first === second, first.memory === second.memory, first.reconnectWindowMs]).toEqual([true, true, w.settings.connection.reconnect?.windowMs ?? null]);
+    expect([first.closeConnection(9), shut]).toEqual([{ kind: "not_open" }, [9]]);
+    // 문을 부르는 동안 증거 포트·답 줄·서버의 함수를 부르지 않고 장부에 쓰지 않는다.
+    const touched: string[] = [];
+    let watching = false;
+    const seen = new WeakSet<object>();
+    const watch = (label: string, target: object) => {
+      if (seen.has(target)) return;
+      seen.add(target);
+      for (const key of Object.keys(target)) {
+        const value: unknown = (target as Record<string, unknown>)[key];
+        if (typeof value === "object" && value !== null) watch(`${label}.${key}`, value);
+        if (typeof value !== "function") continue;
+        (target as Record<string, unknown>)[key] = (...args: unknown[]) => {
+          if (watching) touched.push(`${label}.${key}`);
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+    };
+    watch("evidence", w.captured.lines!.value.evidence);
+    watch("lines", w.captured.lines!.value);
+    watch("server", w.fake.server);
+    const before = commits.length;
+    watching = true;
+    const open = first.valid();
+    watching = false;
+    expect({ open, touched, writes: commits.slice(before) }).toEqual({ open: true, touched: [], writes: [] });
+    expect(await run.stop()).toBe(0);
+    // 끝 차례가 발급을 닫았다(서버는 발급 깃발을 모른다).
+    expect([first.valid(), shut]).toEqual([false, [9]]);
   });
 
   // 처음부터 닫힌 5단계(현관의 정지 기록)와 시작된 작업 하나. 박자 유효 문은 접수 문과 달라 기존 실행의 정리는 나간다.

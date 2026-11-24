@@ -43,6 +43,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | 배정: 시작 기록 | `assign-loop.ts`의 (1) → 맡기지 않을 실행기 → 난수 → 인자(`startInput`) → `callAfterGate`(장부 포트 객체·`startRun` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
 | 배정: 시작의 송신 표식 | `assign-loop.ts`의 봉하기 → 공유 함수 → `send-gate.ts`의 칸 쥐기 → `const marking = callAfterGate(` | (2) | 재전송과 같음. 막히면 적힌 시작은 표식 없이 남아 재전송이 다룬다 | 없음 | 박자 기한 |
 | D-90 닫기 | `unreceived.ts`의 `readGate`(2단계 `&&` (2)) → `confirm` → (2) → `closeUnreceivedRun` | (2) 두 번 | 박자 유효 문 하나(읽기만 한다는 조건, 정한 것 8) | 없음(박자 처음에 쥔 함수·수신자를 `Reflect.apply`로) | 박자 기한 |
+| D-90 새 인사: 연결 하나 닫기 | `unreceived.ts`의 `readGate`(2단계 `&&` (2)) → 임대 읽기(장부 `listRuns`·`instructionTimes`) → `confirm` → `rehello.valid`(순서기 발급 깃발 `&&` (2)) → 기억 적기 → `closeConnection` | 발급 깃발 `&&` (2) | 닫기 문 하나(읽기만 한다는 조건, `boot-effects.test.ts` "D-90 박자의 새 인사 포트") | 없음(박자 처음에 쥔 함수·수신자를 `Reflect.apply`로) | 박자 기한 |
 | 실행기로의 송신(지시·조회·재전송)·ACK | 내보내기 포트의 `lastCheck`가 맨 앞에서 발급 깃발 | 발급 깃발(640) = 순서기 깃발 `&&` (2) | 서버의 인정 재확인, `finalCheck`(시계로 봉투·작업 시한). 그 뒤 박자 기한은 다시 보지 않는다 | 사이 칸과 같다(뒤 조각, 남는 한계) | 박자 안이면 박자 기한 |
 | 자격 값 읽기·송신 | 자격 송신기의 두 문(읽기 앞, `lastCheck`) | 같은 발급 깃발 `&&` 복원기 접수 | 계정 파일 읽기(비동기, 두 번째 문이 다시 본다) | 해당 없음(박자 밖) | 박자 밖(영수증마다) |
 | 5단계 허가를 소비자에 보이기 | `kickRestore`의 수락(`granted`, 777) | 단계 결과를 기한 안에 받아들임. 받기 전은 닫힘(붙잡지 않음), 기한 넘김은 `intake_unaccepted` | 없음 | 해당 없음 | 단계를 부르기 전(764) |
@@ -151,7 +152,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 
 - **차트 짝(N5c, homelab):** README 환경 표의 "차트 짝" 다섯(`OLIVE_REGISTRY_FILE`, `OLIVE_ENVIRONMENT`, `OLIVE_TARGETS`, `OLIVE_POLICY_REVISION`, `OLIVE_RESULT_DIR`)을 더하고, `OLIVE_TLS_DIR`·`OLIVE_TRUST_DIR`을 감독에는 늘 준다. 서명 키 Secret의 키 이름을 `supervisor-signing.key`로 맞춘다(지금 차트의 이름은 확인하지 않았다). 결과 폴더를 장부 PVC 아래에 둘지 정하고, 그 상위 경로에 링크를 두지 않는다(기동은 마지막 요소만 본다).
 - **현관(O08):** `FrontDoorPorts` 셋을 채운다. 권위 정지 기록은 모르면 던지고 "기록 없음"을 지어내지 않는다. 이웃 행은 현관(`front-door`, v2)과 관측 중계(이름을 진입점의 `observation-relay`와 맞춘다)를 그 연결이 실제로 쓰는 판과 인사에서 확인한 정책으로 낸다. 한 단계의 모든 답이 30초(`restoreStepWaitMs`) 안에 와야 한다(4단계는 게시 전부가 이 기한 하나를 나눠 쓴다). 넘기면 그 답은 모름이고 96이다.
-- **연결 하나 닫기(A6c 뒤):** `closeConnection`을 부르는 자리는 두지 않았다. 둘 때는 박자 밖(주기)에서, 같은 서버로 부른다.
+- **연결 하나 닫기:** `closeConnection`은 D-90 박자의 새 인사 갈래만 부른다. 조립은 그 박자 포트의 `rehello`에 같은 서버의 `closeConnection`, 닫기 문(`cycle.issuanceOpen() && effectsOpen()`), 프로세스에 하나인 기억, 서버에 넘긴 재접속 제한 창을 넘긴다(`dispatch/unreceived.md` "새 인사를 부르는 갈래"). 다른 자리에서 부르려면 같은 기억과 닫기 문을 거친다.
 - **관리 통로(M1a):** 상태는 조립의 기록(`restore_step`, `beat`의 D-90 건수·사유, `fatal`)과 같은 값을 읽는다. 도구 처리기 포트(`tools`)를 관리 명령에 다시 쓰지 않는다. 감독의 두 번째 듣기라 `test/entrypoints.test.ts`의 "감독에서 닿는 코드" 단언에 한 칸과 까닭을 더한다.
 - **시험 작업 넣기(M1t):** 운영 값에서 켜면 거절한다. 받는 길은 박자와 겹치지 않게 주기에서 부른다. 접수 판단(`intake`)은 지금 조립의 지역 객체이고 공개 면(`RunningSupervisor`)에 없다. M1t를 연결할 때 같은 판단을 읽는 포트를 공개 면에 더한다. 복원기를 직접 읽지 않는다: 기한을 넘긴 5단계의 허가는 장부에 남아 있을 수 있다.
 - **도구 처리기를 부르는 길(O10):** `RunningSupervisor.tools`로만 포트를 만들고 처리기 문맥의 `now`도 거기서 읽는다. 처리기 호출을 박자와 겹치지 않게 부른다.

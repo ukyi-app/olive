@@ -15,7 +15,8 @@
 //    일의 동기 비용도 기한 안에 든다. 정각 이후면 타이머보다 먼저 처리된 결과여도 만료다. 현관 답은 복원기에 넘기기 전에 단계 기한을 본다.
 // 6. 효과의 문은 둘이다. 박자 유효 문(effectsOpen): 끝 코드가 정해졌거나, 진행 중인 박자의 기한이 지났거나, 장부를 쓸 수 없거나,
 //    받아들인 허가가 사라졌거나 받아들이지 않은 허가가 있으면 닫힘이다. 접수 문(intake): 박자 유효 문에 복원기의 접수를 더한다.
-//    기존 실행의 정리(종료·조회·끊김·D-90·재전송)는 박자 유효 문만, 새 일(접수·시작·갱신·자격 값)은 접수 문을 본다. 박자 다섯은
+//    기존 실행의 정리(종료·조회·끊김·D-90·재전송)는 박자 유효 문만, 새 일(접수·시작·갱신·자격 값)은 접수 문을 본다. D-90의 새 인사
+//    닫기(연결 하나 닫기)는 발급 깃발과 박자 유효 문을 함께 본다(서버는 발급 깃발을 모른다). 박자 다섯은
 //    장부에 쓰기 직전(마지막 외부 호출 뒤의 같은 동기 구간)에 박자 유효 문을 다시 본다(beatValid 포트).
 import { executorName, type Role } from "../../contract/v1/index.ts";
 import {
@@ -36,7 +37,7 @@ import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import { resendTick } from "../dispatch/resend.ts";
-import { type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
+import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
 import type { ToolConfig, ToolPolicyPort, ToolPorts } from "../scheduler/tools.ts";
@@ -293,7 +294,9 @@ function unreceivedFields(value: Step<UnreceivedTickResult>): LogFields {
   if (value.kind === "threw") return { unreceived: "threw" };
   const result = value.result;
   if (result.kind === "not_run") return { unreceived: `not_run:${result.reason}` };
-  const names = result.runs.map((run) => (run.outcome === "skipped" || run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome));
+  const names = result.runs.map((run) =>
+    run.outcome === "skipped" || run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome === "rehello" ? `rehello:${run.result}` : run.outcome,
+  );
   return { unreceived: "ran", unreceivedOutcomes: tally(names), unreceivedHalted: result.halted };
 }
 
@@ -527,6 +530,15 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   };
   // D-90 박자의 관측 문. 닫기마다 이 칸을 다시 보므로(unreceived.ts의 readGate) 효과의 문이 닫히면 다음 닫기를 적지 않는다.
   const unreceivedSettled = (): boolean => observationsSettled() && effectsOpen();
+  // D-90 박자가 새 인사를 부르려고 연결 하나를 닫는 포트. 기억은 프로세스에 하나다: 박자마다 새로 만들면 같은 연결을 박자마다 닫는다.
+  // 문은 발급 깃발과 같은 판정(순서기의 발급 && 박자 유효 문)이다. 서버는 발급 깃발을 모르므로 발급을 닫은 뒤에는 이 문이 막는다
+  // (transport/server.md "뒤 조각이 지켜야 할 것"). 순서기·서버는 아래에서 만들고, 박자가 부를 때 읽는다.
+  const rehello: UnreceivedRehello = {
+    closeConnection: (connection) => need(server).closeConnection(connection),
+    valid: () => cycle.issuanceOpen() && effectsOpen(),
+    memory: createRehelloMemory(),
+    reconnectWindowMs: settings.connection.reconnect?.windowMs ?? null,
+  };
 
   // 5. 순서기를 서버보다 먼저 만든다: 정책이 범위 밖이면 소켓을 열기 전에 끝낸다. 박자 다섯은 아래에서 만드는 객체에 부를 때 위임한다.
   let wire: WireSink | null = null;
@@ -551,7 +563,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     // 읽는다(박자 함수 본문에서 위임한다).
     unreceived: (now) => {
       const answered = need(lines);
-      return make.ticks.unreceived({ ledger, evidence: answered.evidence, withheld: answered.withheld, intake, observationsSettled: unreceivedSettled, beatValid: effectsOpen }, now);
+      return make.ticks.unreceived({ ledger, evidence: answered.evidence, withheld: answered.withheld, intake, observationsSettled: unreceivedSettled, beatValid: effectsOpen, rehello }, now);
     },
     assign: (now) => make.ticks.assign(assignPorts(), settings.assign, now),
   };

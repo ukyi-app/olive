@@ -65,10 +65,12 @@ interface EnvelopeView {
 // 원래 봉투는 이 뒤로 다시 읽지 않는다. 받은 봉투를 포트에 그대로 넘기면 포트(내보내기 포트는 직렬화부터 한다)가 머리·본문의
 // 접근자를 유효 문 뒤에 다시 돌리고, 읽을 때마다 값이 바뀌는 접근자면 표식에 적은 ID와 실제로 실리는 ID가 갈린다.
 // 정규 직렬화는 칸마다 한 번 읽고, 포트도 같은 직렬화를 하므로 여기서 읽지 못한 봉투는 포트도 싣지 못한다.
-// 사본을 만들지 못하거나(정규 직렬화가 던짐) 머리가 객체가 아니면 시작으로 친다(ids가 null이라 envelope_unreadable, 표식 없이 싣지 않는다).
-// 머리는 있는데 동작이 task_start가 아니면(동작 칸이 없는 봉투 포함) 시작이 아니다: 문과 송신 포트를 한 번씩 부른다. 동작이 계약의
-// 값인지는 포트 쪽이 본다(실제 송신기 runtime/sink.ts는 그런 봉투를 서버에 넘기기 전에 unsendable로 거절한다). 시작인데 두 ID를
-// 읽지 못하면 ids가 null이다(envelope_unreadable).
+// 사본을 만들지 못하거나(정규 직렬화가 던짐) 머리가 객체가 아니면 시작으로 친다. 표식을 적지 않고 포트도 부르지 않는다: start가
+// null이면 marker_missing, 그 밖에는 앞 검사에 걸리지 않는 한 envelope_unreadable이다(ids·사본이 null).
+// 머리는 있는데 동작이 task_start가 아니면(동작 칸이 없는 봉투 포함) 시작이 아니다: start를 넘겨도 표식은 적지 않고, 문과 송신 포트를
+// 한 번씩 부른다. 동작이 계약의 값인지는 포트 쪽이 본다. 실제 송신기(runtime/sink.ts)는 그 봉투를 서버에 넘기지 않고(unsendable)
+// 거절된 약속을 돌려주므로 이 함수의 결과는 threw다. 그대로 답하는 대역 포트면 answered다.
+// 시작인데 두 ID를 읽지 못하면 ids가 null이다(envelope_unreadable).
 function readEnvelope(envelope: Envelope): EnvelopeView {
   let copy: unknown;
   try {

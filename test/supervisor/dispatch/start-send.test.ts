@@ -72,9 +72,18 @@ test("정적: src/의 송신 자리는 이 목록뿐이다. 새 송신 자리를
     // 박자 순서기가 만들 때 쥔 박자 함수를 그 수신자로 부르는 한 자리(함수의 name·length를 읽지 않으려고 bind 대신 쓴다).
     // 송신 포트를 받거나 시작 봉투를 만들 수 없음을 아래 시험이 본다.
     "src/supervisor/runtime/cycle.ts": ["reflect"],
-    // D-90 닫기 박자가 Reflect.apply를 apply에 담고(reflect_read), 박자 처음에 꺼내 쥔 포트·장부 함수를 그 수신자로 부르는 네 자리
-    // (포트가 준 함수 객체의 call 속성을 읽지 않으려고 쓴다). 네 줄이 무엇을 부르는지와 시작 봉투에 닿을 수 없음은 아래 "D-90 닫기 박자" 시험이 본다.
-    [UNRECEIVED]: ["reflect_alias_call", "reflect_alias_call", "reflect_alias_call", "reflect_alias_call", "reflect_read"],
+    // D-90 닫기 박자가 Reflect.apply를 apply에 담고(reflect_read), 박자 처음에 꺼내 쥔 포트·장부 함수를 그 수신자로 부르는 일곱 자리
+    // (포트가 준 함수 객체의 call 속성을 읽지 않으려고 쓴다). 일곱 줄이 무엇을 부르는지와 시작 봉투에 닿을 수 없음은 아래 "D-90 닫기 박자" 시험이 본다.
+    [UNRECEIVED]: [
+      "reflect_alias_call",
+      "reflect_alias_call",
+      "reflect_alias_call",
+      "reflect_alias_call",
+      "reflect_alias_call",
+      "reflect_alias_call",
+      "reflect_alias_call",
+      "reflect_read",
+    ],
   });
 });
 
@@ -187,7 +196,8 @@ test("대조군: 서명기에 초안·시작 글자·송신 포트나 다른 봉
 const UNRECEIVED = "src/supervisor/dispatch/unreceived.ts";
 // D-90 닫기 박자가 시작 봉투에 닿을 수 있는 글자. task_start 글자는 항목을 고르는 한 줄에만 있어야 한다: 초안을 손으로 꾸미려면
 // action·recipient를 적는 줄에 그 글자를 더 써야 하므로 여기서 걸린다.
-// Reflect.apply를 담는 한 줄과 그 이름으로 꺼내 쥔 포트·장부 함수를 부르는 네 줄(증거·전역 포트, 장부 읽기, 마지막 확인, 장부 닫기).
+// Reflect.apply를 담는 한 줄과 그 이름으로 꺼내 쥔 포트·장부 함수를 부르는 일곱 줄(증거·전역 포트, 장부 읽기, 마지막 확인, 장부 닫기,
+// 새 인사 갈래의 장부 읽기 둘(실행 목록·지시 시각)과 서버의 연결 닫기). 뒤의 셋은 연결 번호·실행 ID만 넘기고 봉투를 받지 않는다.
 // 다른 줄에서 apply를 쓰거나 부르는 대상을 바꾸면 그 줄이 그대로 드러난다.
 const UNRECEIVED_APPLY = [
   "const apply = Reflect.apply;",
@@ -195,6 +205,9 @@ const UNRECEIVED_APPLY = [
   "const answer: unknown = apply(held.unanswered, held.ledger, []);",
   "answer = apply(port.fn, port.receiver, [executorId, connection, version, generation]);",
   "answer = apply(close, receiver, closing);",
+  "const read: unknown = apply(port.runs, ledger, []);",
+  "const read: unknown = apply(port.times, ledger, [runId]);",
+  "answer = apply(shut, shutReceiver, [connection]);",
 ];
 const unreceivedReach = (source: string): string[] => [
   ...(startDraftCalls(source) > 0 ? ["startDraft"] : []),
@@ -234,11 +247,11 @@ test("대조군: D-90 닫기 박자에 시작 봉투·송신·표식의 글자�
   }
 });
 
-test("대조군: D-90 닫기 박자에 Reflect.apply 별칭의 다섯째 호출을 더하면 송신 자리 목록이 달라진다", () => {
+test("대조군: D-90 닫기 박자에 Reflect.apply 별칭의 여덟째 호출을 더하면 송신 자리 목록이 달라진다", () => {
   const base = sendSites(src(UNRECEIVED));
-  expect(base.filter((site) => site === "reflect_alias_call").length).toBe(4);
+  expect(base.filter((site) => site === "reflect_alias_call").length).toBe(7);
   const fifth = sendSites(`${src(UNRECEIVED)}\nanswer = apply(close, receiver, closing);`);
-  expect([fifth.filter((site) => site === "reflect_alias_call").length, fifth.length]).toEqual([5, base.length + 1]);
+  expect([fifth.filter((site) => site === "reflect_alias_call").length, fifth.length]).toEqual([8, base.length + 1]);
   // 허용한 줄과 글자가 같은 다섯째 호출도 목록의 수가 잡는다(같은 줄의 반복은 위 줄 목록만으로는 드러나지 않는다).
   expect(unreceivedReach(`${src(UNRECEIVED)}\nanswer = apply(close, receiver, closing);`)).toEqual([]);
 });

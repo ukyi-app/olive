@@ -8,10 +8,12 @@ import type {
   UnreceivedFull,
   UnreceivedOutcome,
   UnreceivedPorts,
+  UnreceivedRehelloResult,
+  UnreceivedRehelloSkip,
   UnreceivedSkip,
   UnreceivedTickResult,
 } from "../../../src/supervisor/dispatch/unreceived.ts";
-import { UNRECEIVED_ANSWER_AFTER_MS, unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
+import { createRehelloMemory, REHELLO_AFTER_MS, UNRECEIVED_ANSWER_AFTER_MS, unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
 import { type CycleBeats, createCycle } from "../../../src/supervisor/runtime/cycle.ts";
 import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
 import { readText } from "../../files.ts";
@@ -910,19 +912,22 @@ describe("정적", () => {
     }
   });
 
-  test("포트 객체의 속성은 hold에서 한 번씩만 읽고, 장부에서는 읽기와 닫기 둘만 꺼낸다", async () => {
+  test("포트 객체의 속성은 hold에서 한 번씩만 읽고, 장부에서는 읽기 셋(새 인사 갈래의 둘 포함)과 닫기 하나만 꺼낸다", async () => {
     const source = await code(FILE);
     const start = source.indexOf("function hold(");
     const end = source.indexOf("\n}\n", start);
     const reads = [...source.matchAll(/\b(ports|ledger)\.(\w+)/g)];
     expect(reads.map((match) => `${match[1]}.${match[2]}`).sort()).toEqual([
       "ledger.closeUnreceivedRun",
+      "ledger.instructionTimes",
+      "ledger.listRuns",
       "ledger.unansweredInstructions",
       "ports.beatValid",
       "ports.evidence",
       "ports.intake",
       "ports.ledger",
       "ports.observationsSettled",
+      "ports.rehello",
       "ports.withheld",
     ]);
     expect(reads.every((match) => (match.index ?? -1) > start && (match.index ?? -1) < end)).toBe(true);
@@ -983,6 +988,37 @@ describe("정적", () => {
     expect([squash(confirmTail(beforeReturn) ?? "") === CONFIRM_TAIL, closeLines(beforeReturn)]).toEqual([false, CLOSE_LINES]);
     expect([squash(afterConfirm(sameLine) ?? "") === AFTER_CONFIRM, closeLines(sameLine)]).toEqual([false, CLOSE_LINES]);
   });
+
+  // 새 인사 갈래의 마지막 확인과 closeConnection 사이. 장부 닫기와 같은 규칙이다: 확인의 답 비교, 닫기 문 하나, 기억 적기, 호출.
+  const LINKED = "const linked = confirmLast(evidence.confirm, head.executorId, connection, evidence.version, gate.generation);";
+  const SHUT_CALL = "answer = apply(shut, shutReceiver, [connection]);";
+  const AFTER_LINKED = `if (linked !== "current") return parked(linked); if (!rehelloStillValid(valid)) return parked("gate_closed"); closed.add(connection); let answer: unknown; try { ${SHUT_CALL}`;
+  const REHELLO_STILL_VALID = "function rehelloStillValid(valid: Bound): boolean { const answer = invoke(valid, []); return answer !== null && answer.value === true; }";
+  const afterLinked = (source: string) => {
+    const at = source.indexOf(LINKED);
+    if (at < 0 || source.indexOf(LINKED, at + 1) >= 0) return null;
+    const to = source.indexOf(SHUT_CALL, at);
+    return to < 0 ? null : squash(source.slice(at + LINKED.length, to + SHUT_CALL.length));
+  };
+  const shutLines = (source: string) =>
+    source
+      .split("\n")
+      .filter((line) => /\bshut\b/.test(line))
+      .map((line) => line.trim());
+
+  test("새 인사 갈래도 confirm 뒤에는 닫기 문 하나와 기억 적기만 두고 꺼내 둔 closeConnection을 부른다(글자 그대로). 그 호출 자리는 하나다", async () => {
+    const source = await code(FILE);
+    expect([afterLinked(source), bodyOf(source, "function rehelloStillValid(")]).toEqual([AFTER_LINKED, REHELLO_STILL_VALID]);
+    expect(shutLines(source)).toEqual(["const { closed, valid, closeConnection: { fn: shut, receiver: shutReceiver } } = port;", SHUT_CALL]);
+    // 대조군: 사이에 포트 호출·속성 읽기를 넣거나 호출을 두 번 두면 잡는다.
+    const gateLine = 'if (!rehelloStillValid(valid)) return parked("gate_closed");';
+    for (const injected of ["invoke(held.settled, []);", "const late = port.valid;"]) {
+      const broken = source.replace(gateLine, `${gateLine}\n  ${injected}`);
+      expect([injected, broken !== source, afterLinked(broken) === AFTER_LINKED]).toEqual([injected, true, false]);
+    }
+    const twice = source.replace(SHUT_CALL, `${SHUT_CALL}\n    ${SHUT_CALL}`);
+    expect([twice !== source, shutLines(twice).length]).toEqual([true, 3]);
+  });
 });
 
 describe("박자 유효 문(beatValid): confirm 뒤, 장부 닫기 바로 앞에서 본다", () => {
@@ -1017,6 +1053,340 @@ describe("박자 유효 문(beatValid): confirm 뒤, 장부 닫기 바로 앞에
       const live = started(w.ledger);
       const result = ran(unreceivedTick({ ...w.ports, beatValid } as unknown as UnreceivedPorts, AT));
       expect([result.halted, w.calls.length, w.stateOf(live.runId)]).toEqual(["beat_closed", 0, "preparing"]);
+    }
+  });
+});
+
+
+// 새 인사를 부르는 갈래(A6e, unreceived.md "새 인사를 부르는 갈래"). 시작 발행은 NOW이고, 그 실행기의 마지막 반영 인사는 시한 전
+// (서명·받은 시각 NOW + 1,000)이다. 장부 시계는 늘 NOW라 시작 임대의 끝은 NOW + 30,000이다(instructionTimes).
+// 서버의 closeConnection 대신 부른 연결 번호를 세는 가짜를 넘기고, 장부의 임대 읽기 둘은 실제 장부로 위임한다.
+const EARLY = full({ answeredAt: NOW + 1_000, receivedAt: NOW + 1_000 });
+const LATE = NOW + REHELLO_AFTER_MS;
+
+function rehelloWorld(windowMs: number | null = null) {
+  const w = world();
+  w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: w.state.version, lastFull: EARLY });
+  const order: string[] = [];
+  const shuts: number[] = [];
+  const r = {
+    memory: createRehelloMemory(),
+    windowMs: windowMs as unknown,
+    valid: (): unknown => true,
+    answer: (_connection: number): unknown => ({ kind: "closed" }),
+    runs: (): unknown => w.ledger.listRuns(),
+    times: (runId: string): unknown => w.ledger.instructionTimes(runId),
+  };
+  const confirm = w.state.confirm;
+  w.state.confirm = (executorId, connection, version, generation) => {
+    order.push("confirm");
+    return confirm(executorId, connection, version, generation);
+  };
+  const base = w.ports as unknown as { ledger: object };
+  const rp = () =>
+    ({
+      ...w.ports,
+      ledger: {
+        ...base.ledger,
+        listRuns: () => {
+          order.push("listRuns");
+          return r.runs();
+        },
+        instructionTimes: (runId: string) => {
+          order.push("instructionTimes");
+          return r.times(runId);
+        },
+      },
+      rehello: {
+        closeConnection: (connection: number) => {
+          order.push("closeConnection");
+          shuts.push(connection);
+          return r.answer(connection);
+        },
+        valid: () => {
+          order.push("valid");
+          return r.valid();
+        },
+        memory: r.memory,
+        reconnectWindowMs: r.windowMs,
+      },
+    }) as unknown as UnreceivedPorts;
+  return { ...w, r, order, shuts, rp, tick: (now = LATE) => unreceivedTick(rp(), now) };
+}
+
+const early = (live: { runId: string; requestId: string }, rehello?: UnreceivedRehelloSkip): UnreceivedOutcome =>
+  rehello === undefined ? skipped(live, "answer_too_early") : { requestId: live.requestId, runId: live.runId, executorId: WORKER_EXECUTOR, outcome: "skipped", reason: "answer_too_early", rehello };
+const reheld = (live: { runId: string; requestId: string }, result: UnreceivedRehelloResult, connection = CONN): UnreceivedOutcome => ({
+  requestId: live.requestId,
+  runId: live.runId,
+  executorId: WORKER_EXECUTOR,
+  outcome: "rehello",
+  connection,
+  answeredAt: NOW + 1_000,
+  result,
+});
+
+describe("새 인사를 부르는 갈래(A6e)", () => {
+  test("시한 전 인사뿐이고 조건이 모두 맞으면 그 연결을 한 번 닫고 장부는 부르지 않는다. 임대 읽기 → confirm → 닫기 문 → closeConnection 차례다", () => {
+    expect(REHELLO_AFTER_MS).toBe(31_000);
+    const w = rehelloWorld();
+    const live = started(w.ledger);
+    expect(ran(w.tick())).toEqual({ kind: "ran", runs: [reheld(live, "closed")], halted: null, haltedAt: null });
+    expect([w.shuts, w.calls.length, w.stateOf(live.runId)]).toEqual([[CONN], 0, "preparing"]);
+    expect(w.order).toEqual(["listRuns", "instructionTimes", "confirm", "valid", "closeConnection"]);
+    // 대조군: 갈래가 없으면 그대로 answer_too_early이고 rehello 칸도 없다.
+    const plain = world();
+    const other = started(plain.ledger);
+    plain.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: EARLY });
+    expect(ran(plain.tick(LATE)).runs).toEqual([skipped(other, "answer_too_early")]);
+  });
+
+  test("같은 연결은 두 번 닫지 않고, 새 연결의 인사가 반영되기 전에는 그 실행기를 다시 닫지 않는다(박자 사이 기억). 새 기억이면 다시 닫는다", () => {
+    const w = rehelloWorld();
+    const live = started(w.ledger);
+    ran(w.tick());
+    expect(ran(w.tick(LATE + 1)).runs).toEqual([early(live, "closed_before")]);
+    expect(w.shuts).toEqual([CONN]);
+    // 새 연결의 인사가 반영됐는데 여전히 시한 전이면 그 새 연결은 닫을 수 있다(창이 없을 때).
+    w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: w.state.version, lastFull: full({ connection: OTHER_CONN, answeredAt: NOW + 1_000, receivedAt: LATE }) });
+    w.state.current = (connection, executorId) => connection === OTHER_CONN && executorId === WORKER_EXECUTOR;
+    expect(ran(w.tick(LATE + 2)).runs).toEqual([reheld(live, "closed", OTHER_CONN)]);
+    expect(ran(w.tick(LATE + 3)).runs).toEqual([early(live, "closed_before")]);
+    expect(w.shuts).toEqual([CONN, OTHER_CONN]);
+    // 대조군: 기억이 막는 것이다. 박자마다 새 기억을 넘기면 같은 연결을 또 닫는다.
+    w.r.memory = createRehelloMemory();
+    ran(w.tick(LATE + 4));
+    expect(w.shuts).toEqual([CONN, OTHER_CONN, OTHER_CONN]);
+  });
+
+  test("시한 경계: 발행 + 30,999면 too_soon이고 31,000(정각)이면 닫는다. 시한 뒤 전체 인사가 있으면 이 갈래는 0이고 장부가 닫는다", () => {
+    const a = rehelloWorld();
+    const live = started(a.ledger);
+    expect(ran(a.tick(LATE - 1)).runs).toEqual([early(live, "too_soon")]);
+    expect([a.shuts, a.order]).toEqual([[], []]);
+    expect(ran(a.tick(LATE)).runs).toEqual([reheld(live, "closed")]);
+    const b = rehelloWorld();
+    const other = started(b.ledger);
+    b.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: full() });
+    expect(ran(b.tick()).runs).toMatchObject([{ runId: other.runId, outcome: "closed" }]);
+    expect([b.shuts, b.calls.length, b.order]).toEqual([[], 1, ["confirm"]]);
+  });
+
+  test("그 실행기에 임대를 믿을 실행이 있으면 닫지 않는다: 갱신으로 늘어난 임대는 끝 + 1,000ms 전까지 lease_trusted다", () => {
+    const w = rehelloWorld();
+    const live = started(w.ledger);
+    // 끝 NOW + 40,000(발행 NOW + 10,000 + 30,000). 시작 임대 끝(NOW + 30,000)보다 13,000ms 앞서 발행해 장부가 믿는다.
+    must(w.ledger.recordRenewInstruction({ runId: live.runId, requestId: id(), stopGeneration: 0, now: NOW + 10_000 }));
+    expect(ran(w.tick(NOW + 40_999)).runs).toEqual([early(live, "lease_trusted")]);
+    expect([w.shuts, w.order.includes("confirm")]).toEqual([[], false]);
+    expect(ran(w.tick(NOW + 41_000)).runs).toEqual([reheld(live, "closed")]);
+  });
+
+  test("임대 읽기: 같은 실행기의 끝나지 않은 실행만 보고, 끝 모름은 lease_trusted, 읽기 모름·꼴 틀림은 lease_unknown으로 0이다", () => {
+    const GHOST = id();
+    const owned = (executorId: string, state: string, expiresAt: unknown, times: unknown = undefined) => (w: ReturnType<typeof rehelloWorld>) => {
+      w.r.runs = () => {
+        const read = w.ledger.listRuns();
+        if (!read.known) return read;
+        return { known: true, value: [...read.value, { runId: GHOST, executorId, state }] };
+      };
+      w.r.times = (runId) => (runId === GHOST ? (times ?? { known: true, value: { runId, lease: { issuedAt: NOW, expiresAt } } }) : w.ledger.instructionTimes(runId));
+    };
+    const cases: [string, (w: ReturnType<typeof rehelloWorld>) => void, UnreceivedRehelloSkip | null][] = [
+      ["같은 실행기·running·끝 모름", owned(WORKER_EXECUTOR, "running", "unknown"), "lease_trusted"],
+      ["같은 실행기·unknown_running·끝 = now - 999", owned(WORKER_EXECUTOR, "unknown_running", LATE - 999), "lease_trusted"],
+      ["같은 실행기·끝 = now - 1,000(대조군)", owned(WORKER_EXECUTOR, "running", LATE - 1_000), null],
+      ["같은 실행기·finalized·끝 모름(대조군)", owned(WORKER_EXECUTOR, "finalized", "unknown"), null],
+      ["다른 실행기·끝 모름(대조군)", owned(OTHER_EXECUTOR, "running", "unknown"), null],
+      ["같은 실행기·임대 없음(대조군)", owned(WORKER_EXECUTOR, "running", null, { known: true, value: { runId: GHOST, lease: null } }), null],
+      ["끝이 숫자가 아님", owned(WORKER_EXECUTOR, "running", "later"), "lease_unknown"],
+      ["instructionTimes 모름", owned(WORKER_EXECUTOR, "running", null, { known: false, reason: "db_error" }), "lease_unknown"],
+      ["instructionTimes가 실행 없음(null)", owned(WORKER_EXECUTOR, "running", null, { known: true, value: null }), "lease_unknown"],
+      ["실행 항목의 상태가 장부의 상태가 아님", owned(WORKER_EXECUTOR, "gone", "unknown"), "lease_unknown"],
+      ["listRuns 모름", (w) => (w.r.runs = () => ({ known: false, reason: "db_error" })), "lease_unknown"],
+      [
+        "listRuns가 던짐",
+        (w) =>
+          (w.r.runs = () => {
+            throw new Error("읽기 실패");
+          }),
+        "lease_unknown",
+      ],
+      [
+        "instructionTimes가 던짐",
+        (w) =>
+          (w.r.times = () => {
+            throw new Error("읽기 실패");
+          }),
+        "lease_unknown",
+      ],
+    ];
+    for (const [label, arrange, why] of cases) {
+      const w = rehelloWorld();
+      const live = started(w.ledger);
+      arrange(w);
+      const runs = ran(w.tick()).runs;
+      expect([label, runs]).toEqual([label, why === null ? [reheld(live, "closed")] : [early(live, why)]]);
+      expect([label, w.shuts.length, w.calls.length]).toEqual([label, why === null ? 1 : 0, 0]);
+    }
+  });
+
+  test("재접속 제한 창: 그 인사를 받은 지 창이 지나기 전에는 닫지 않고(reconnect_window), 정각부터 닫는다", () => {
+    const w = rehelloWorld(60_000);
+    const live = started(w.ledger);
+    expect(ran(w.tick(NOW + 1_000 + 60_000 - 1)).runs).toEqual([early(live, "reconnect_window")]);
+    expect(w.shuts).toEqual([]);
+    expect(ran(w.tick(NOW + 1_000 + 60_000)).runs).toEqual([reheld(live, "closed")]);
+  });
+
+  test("closeConnection이 던지거나 not_open·stopping·정의 밖의 답이어도 장부는 0이고 박자는 이어 가며, 같은 연결을 다시 닫지 않는다", () => {
+    const answers: [() => unknown, UnreceivedRehelloResult][] = [
+      [
+        () => {
+          throw new Error("닫기 실패");
+        },
+        "threw",
+      ],
+      [() => ({ kind: "not_open" }), "not_open"],
+      [() => ({ kind: "stopping" }), "stopping"],
+      [() => ({ kind: "gone" }), "malformed_answer"],
+      [() => null, "malformed_answer"],
+    ];
+    for (const [answer, result] of answers) {
+      const w = rehelloWorld();
+      const live = started(w.ledger);
+      // 뒤 항목: 다른 실행기의 시한 뒤 인사로 장부까지 가는 가짜 실행(장부에 없어 unknown_run).
+      const after = ghost(OTHER_EXECUTOR);
+      w.state.after = [after];
+      w.state.evidence = (executorId) =>
+        executorId === OTHER_EXECUTOR
+          ? { known: true, tainted: false, pending: false, version: 0, lastFull: full({ connection: OTHER_CONN, principal: OTHER_EXECUTOR }) }
+          : { known: true, tainted: false, pending: false, version: 0, lastFull: EARLY };
+      w.state.current = (connection, executorId) => (connection === CONN && executorId === WORKER_EXECUTOR) || (connection === OTHER_CONN && executorId === OTHER_EXECUTOR);
+      w.r.answer = answer;
+      const first = ran(w.tick());
+      expect([result, first.halted, first.runs]).toEqual([
+        result,
+        null,
+        [reheld(live, result), { requestId: after.requestId, runId: after.runId, executorId: OTHER_EXECUTOR, outcome: "refused", reason: "unknown_run" }],
+      ]);
+      expect([result, w.calls.map((call) => call.runId), w.stateOf(live.runId)]).toEqual([result, [after.runId], "preparing"]);
+      expect([result, ran(w.tick(LATE + 1)).runs[0], w.shuts]).toEqual([result, early(live, "closed_before"), [CONN]]);
+    }
+  });
+
+  test("닫기 문이 true가 아니거나 던지면 닫지 않는다(gate_closed). 장부도 0이다", () => {
+    const gates: (() => unknown)[] = [
+      () => false,
+      () => undefined,
+      () => 1,
+      () => {
+        throw new Error("문 실패");
+      },
+    ];
+    for (const valid of gates) {
+      const w = rehelloWorld();
+      const live = started(w.ledger);
+      w.r.valid = valid;
+      expect(ran(w.tick()).runs).toEqual([early(live, "gate_closed")]);
+      expect([w.shuts, w.calls.length, w.order.at(-1)]).toEqual([[], 0, "valid"]);
+    }
+  });
+
+  test("confirm이 현재가 아니거나 던지면 0이다. 임대 읽기 안에서 그 실행기 줄이 바뀌거나 연결이 철회되면 confirm이 잡아 0이다", () => {
+    const cases: [string, (w: ReturnType<typeof rehelloWorld>) => void, UnreceivedRehelloSkip][] = [
+      ["연결 아님", (w) => (w.state.current = () => false), "link_not_current"],
+      [
+        "confirm이 던짐",
+        (w) =>
+          (w.state.confirm = () => {
+            throw new Error("확인 실패");
+          }),
+        "link_not_current",
+      ],
+      [
+        "listRuns 안에서 줄이 바뀜",
+        (w) =>
+          (w.r.runs = () => {
+            w.state.version += 1;
+            return w.ledger.listRuns();
+          }),
+        "evidence_changed",
+      ],
+      [
+        "instructionTimes 안에서 연결 철회",
+        (w) =>
+          (w.r.times = (runId) => {
+            w.state.current = () => false;
+            return w.ledger.instructionTimes(runId);
+          }),
+        "link_not_current",
+      ],
+    ];
+    for (const [label, arrange, why] of cases) {
+      const w = rehelloWorld();
+      const live = started(w.ledger);
+      arrange(w);
+      expect([label, ran(w.tick()).runs, w.shuts, w.calls.length]).toEqual([label, [early(live, why)], [], 0]);
+    }
+  });
+
+  test("오염·대기·맡기지 않을 실행기·증거 모름·전체 인사 없음·복원 대기·정지 세대 바뀜이면 닫지 않는다", () => {
+    const evidenceOf = (over: Record<string, unknown>) => (w: ReturnType<typeof rehelloWorld>) => {
+      w.state.evidence = () => ({ known: true, tainted: false, pending: false, version: 0, lastFull: EARLY, ...over }) as UnreceivedEvidenceRead;
+    };
+    const cases: [string, (w: ReturnType<typeof rehelloWorld>) => void, (live: { runId: string; requestId: string }) => UnreceivedOutcome[] | null][] = [
+      ["오염", evidenceOf({ tainted: true }), (live) => [skipped(live, "tainted")]],
+      ["대기", evidenceOf({ pending: true }), (live) => [skipped(live, "pending")]],
+      ["전체 인사 없음", evidenceOf({ lastFull: null }), (live) => [skipped(live, "no_full")]],
+      ["증거 모름", (w) => (w.state.evidence = () => ({ known: false })), (live) => [skipped(live, "evidence_unknown")]],
+      ["맡기지 않을 실행기", (w) => (w.state.withheld = () => ({ known: true, value: [WORKER_EXECUTOR] })), (live) => [skipped(live, "withheld")]],
+      ["복원 대기", (w) => (w.state.settled = () => false), () => null],
+      [
+        "정지 세대 바뀜",
+        (w) => {
+          must(w.ledger.applyStop({ generation: 1, stopped: true, now: NOW }));
+          w.state.generation = () => 1;
+        },
+        (live) => [skipped(live, "stop_generation")],
+      ],
+    ];
+    for (const [label, arrange, expected] of cases) {
+      const w = rehelloWorld();
+      const live = started(w.ledger);
+      arrange(w);
+      const result = w.tick();
+      const runs = result.kind === "ran" ? result.runs : null;
+      expect([label, runs, w.shuts, w.calls.length]).toEqual([label, expected(live), [], 0]);
+    }
+  });
+
+  test("새 인사 포트를 꺼내지 못하면 갈래가 없다: 만든 기억이 아님·창이 양의 안전 정수도 null도 아님·장부 읽기가 없음·접근자가 던짐", () => {
+    const arrangements: [string, (ports: Record<string, unknown>) => Record<string, unknown>][] = [
+      ["기억이 아님", (p) => ({ ...p, rehello: { ...(p.rehello as object), memory: {} } })],
+      ["창 0", (p) => ({ ...p, rehello: { ...(p.rehello as object), reconnectWindowMs: 0 } })],
+      ["창 문자열", (p) => ({ ...p, rehello: { ...(p.rehello as object), reconnectWindowMs: "60000" } })],
+      ["창 빠짐", (p) => ({ ...p, rehello: { ...(p.rehello as object), reconnectWindowMs: undefined } })],
+      ["closeConnection 아님", (p) => ({ ...p, rehello: { ...(p.rehello as object), closeConnection: 1 } })],
+      ["listRuns 없음", (p) => ({ ...p, ledger: { ...(p.ledger as object), listRuns: undefined } })],
+      [
+        "rehello 접근자가 던짐",
+        (p) => {
+          const copy = { ...p };
+          Object.defineProperty(copy, "rehello", {
+            get() {
+              throw new Error("접근 실패");
+            },
+          });
+          return copy;
+        },
+      ],
+    ];
+    for (const [label, arrange] of arrangements) {
+      const w = rehelloWorld();
+      const live = started(w.ledger);
+      const ports = arrange(w.rp() as unknown as Record<string, unknown>) as unknown as UnreceivedPorts;
+      expect([label, ran(unreceivedTick(ports, LATE)).runs, w.shuts]).toEqual([label, [skipped(live, "answer_too_early")], []]);
     }
   });
 });

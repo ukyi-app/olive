@@ -15,6 +15,9 @@
 //    속성도 읽지 않으며, 꺼내 둔 함수와 미리 만든 인자로 장부를 부른다.
 //    증거 읽기부터 장부 호출까지 await가 없다.
 // 5. 장부의 거절·예외·정의 밖의 답은 닫힘으로 세지 않는다. 예외와 정의 밖의 답은 그 자리에서 박자를 멈춘다(장부가 적었는지 모른다).
+// 6. 새 인사를 부르는 갈래(rehello 포트가 있을 때만): 그 실행기의 마지막 반영 인사가 시한 전이라 장부를 부를 수 없고, 시한이 지났고,
+//    그 연결을 닫은 적이 없고, 재접속 제한 창이 지났고, 그 실행기에 임대를 믿을 실행이 없을 때만 그 연결을 한 번 닫는다. 차례는 장부
+//    닫기와 같다: confirm이 마지막 증거 호출이고, 그 뒤에는 닫기 문 하나와 기억 적기, 꺼내 둔 closeConnection 호출뿐이다.
 import { limits, parsePrincipal, RUN_STATES, type RunState, type RunStatus } from "../../contract/v1/index.ts";
 import {
   LEDGER_RUN_STATES,
@@ -35,6 +38,34 @@ export interface UnreceivedLedger {
     input: UnreceivedClosureInput,
     from: { sender: string },
   ): { ok: true; run: { readonly runId: string; readonly state: LedgerRunState } } | { ok: false; reason: LedgerRefusal };
+  // 새 인사 갈래만 쓰는 읽기 둘(그 실행기에 임대를 믿을 실행이 있는가). 없으면 그 갈래는 닫지 않는다.
+  listRuns?: Ledger["listRuns"];
+  instructionTimes?: Ledger["instructionTimes"];
+}
+
+// 새 인사를 부르는 갈래의 박자 사이 기억. 이 갈래가 닫은 연결 번호를 쥔다. 값은 이 모듈의 WeakMap으로만 닿아 포트 코드가 고치지 못한다.
+declare const rehelloMemoryBrand: unique symbol;
+export type RehelloMemory = { readonly [rehelloMemoryBrand]: true };
+const REHELLO_CLOSED = new WeakMap<object, Set<number>>();
+
+// 프로세스에 하나를 만들어 박자마다 같은 값을 넘긴다. 박자마다 새로 만들면 같은 연결을 박자마다 닫는다.
+export function createRehelloMemory(): RehelloMemory {
+  const token = Object.freeze({});
+  REHELLO_CLOSED.set(token, new Set());
+  return token as RehelloMemory;
+}
+
+// 새 인사를 부르는 갈래(A6e)의 포트. 조립이 넘기고, 빠지면 이 갈래는 없다(닫지 않는다).
+export interface UnreceivedRehello {
+  // 서버의 closeConnection(transport/server.ts). 동기다.
+  closeConnection(connection: number): { readonly kind: "closed" | "not_open" | "stopping" };
+  // confirm 뒤, closeConnection 바로 앞에서 한 번 본다. 읽기만 한다. 조립은 순서기의 발급 깃발과 박자 유효 문을 함께 본 값을 넘긴다
+  // (서버는 발급 깃발을 모른다, server.md "뒤 조각이 지켜야 할 것").
+  valid(): boolean;
+  // createRehelloMemory()가 만든 값. 다른 값이면 이 갈래는 닫지 않는다.
+  readonly memory: RehelloMemory;
+  // 서버에 넘긴 연결 판단의 재접속 제한 창(settings.reconnect.windowMs). 제한이 없으면 null.
+  readonly reconnectWindowMs: number | null;
 }
 
 // 그 실행기의 마지막 반영(applied) 인사. 연결 판단이 낸 그 occupancy(full) 출력과 같은 묶음이어야 한다(조립의 조건, unreceived.md).
@@ -80,11 +111,17 @@ export interface UnreceivedPorts {
   // 이 박자가 아직 유효한가(박자 기한, 끝 코드, 장부 건강, 낸 허가의 폐기). confirm 뒤, 장부 닫기 바로 앞에서 본다(그 사이 다른 호출은
   // 없다). 거짓·던짐이면 닫지 않고 박자를 멈춘다(beat_closed). 빠지면 늘 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
   readonly beatValid?: () => boolean;
+  // 새 인사를 부르는 갈래. 빠지면 시한 전의 인사뿐인 실행은 그대로 answer_too_early다.
+  readonly rehello?: UnreceivedRehello;
 }
 
 // 장부의 START_UNREACHABLE_MS와 같은 식이다(장부는 내보내지 않는다). 장부가 같은 트랜잭션에서 다시 보므로 이 값은 부르지 않을 항목을
 // 미리 거르는 데만 쓴다: 장부 값보다 작으면 장부가 answer_too_early로 거절하고, 크면 늦게 닫힐 뿐이다. 정각(발행 + 이 값)은 통과다.
 export const UNRECEIVED_ANSWER_AFTER_MS = Math.max(limits.RUN_LEASE_MAX_MS, limits.MESSAGE_TTL_MAX_MS);
+
+// 새 인사를 부를 수 있는 이른 시각: 시작 발행 + 이 값. 실행기 시계가 CLOCK_SKEW_MS까지 늦으면 닫은 직후의 새 인사도 서명 시각이
+// 그만큼 이르다. 그만큼 더 기다려 새 인사가 장부의 시간 경계(발행 + UNRECEIVED_ANSWER_AFTER_MS)를 넘게 한다.
+export const REHELLO_AFTER_MS = UNRECEIVED_ANSWER_AFTER_MS + limits.CLOCK_SKEW_MS;
 
 export type UnreceivedNotRun =
   | "now_malformed"
@@ -123,13 +160,38 @@ export type UnreceivedSkip =
   // 증거를 옮기는 도중 변경 번호가 바뀐 것도 여기다.
   | "evidence_changed";
 
+// 새 인사 갈래가 닫지 않은 이유. 그 항목은 skipped/answer_too_early이고 이 이름을 rehello 칸에 싣는다.
+export type UnreceivedRehelloSkip =
+  // 지금이 시작 발행 + REHELLO_AFTER_MS 전이다.
+  | "too_soon"
+  // 이 갈래가 그 인사의 연결을 이미 닫았다(그 뒤 새 연결의 인사가 반영되지 않았다).
+  | "closed_before"
+  // 그 인사를 받은 지 재접속 제한 창이 지나지 않았다(그 연결이 창 안에서 열렸을 수 있다).
+  | "reconnect_window"
+  // 그 실행기에 임대를 믿을 실행이 있다(끝 모름 포함).
+  | "lease_trusted"
+  // 임대를 보는 장부 읽기를 모른다.
+  | "lease_unknown"
+  // confirm의 답(장부 닫기와 같은 이름).
+  | "link_not_current"
+  | "evidence_changed"
+  | "stop_generation"
+  // closeConnection 바로 앞의 문이 닫혔다.
+  | "gate_closed";
+
+// 새 인사 갈래가 부른 closeConnection의 결과. threw·malformed_answer는 닫혔는지 모른다(기억에는 남긴다).
+export type UnreceivedRehelloResult = "closed" | "not_open" | "stopping" | "threw" | "malformed_answer";
+
 type Head = { readonly requestId: string; readonly runId: string; readonly executorId: string };
 
 export type UnreceivedOutcome =
   // 장부가 not_started로 닫았다고 답했다. connection·answeredAt은 근거로 넘긴 인사의 값, at은 넘긴 now다.
   | (Head & { readonly outcome: "closed"; readonly connection: number; readonly answeredAt: number; readonly at: number })
   | (Head & { readonly outcome: "refused"; readonly reason: LedgerRefusal })
-  | (Head & { readonly outcome: "skipped"; readonly reason: UnreceivedSkip })
+  // rehello는 새 인사 갈래가 있고 시한 전의 인사라 그 갈래를 본 항목에만 있다.
+  | (Head & { readonly outcome: "skipped"; readonly reason: UnreceivedSkip; readonly rehello?: UnreceivedRehelloSkip })
+  // 새 인사 갈래가 그 실행기의 연결을 닫으려고 closeConnection을 불렀다. 장부는 부르지 않았다. connection·answeredAt은 시한 전 인사의 값이다.
+  | (Head & { readonly outcome: "rehello"; readonly connection: number; readonly answeredAt: number; readonly result: UnreceivedRehelloResult })
   // 장부가 닫았는지 모른다. 장부의 문구는 싣지 않는다.
   | (Head & { readonly outcome: "ledger_failed"; readonly reason: "threw" | "malformed_answer" })
   // 장부 읽기의 항목 칸을 읽을 수 없다. requestId를 읽지 못했으면 null이다.
@@ -148,6 +210,8 @@ export type UnreceivedTickResult =
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 // 장부의 UNRECEIVED_CLOSABLE과 같은 집합(장부는 내보내지 않는다). 장부가 다시 본다.
 const CLOSABLE: readonly LedgerRunState[] = ["preparing", "unknown_running"];
+// 장부의 TERMINAL과 같은 집합. 이 둘 밖의 실행은 임대를 믿을 수 있다(새 인사 갈래의 임대 확인).
+const ENDED: readonly LedgerRunState[] = ["finalized", "not_started"];
 // 계약의 실행 상태 항목의 칸(transport.ts의 runStatus). 장부의 answerRuns도 이 칸만 받는다.
 const RUN_STATUS_KEYS: readonly string[] = ["run_id", "state", "run_generation", "last_receipt_id"];
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
@@ -192,6 +256,18 @@ interface Held {
   readonly settled: Bound | null;
   // 박자 유효 문. absent는 포트가 없음(늘 유효), null은 꺼내지 못함(늘 무효)이다.
   readonly beatValid: Bound | "absent" | null;
+  // 새 인사 갈래. null은 포트가 없거나 꺼내지 못한 것이다(닫지 않는다).
+  readonly rehello: HeldRehello | null;
+}
+
+interface HeldRehello {
+  readonly closeConnection: Bound;
+  readonly valid: Bound;
+  readonly closed: Set<number>;
+  readonly windowMs: number | null;
+  // 장부 포트의 읽기 둘. 수신자는 Held.ledger다.
+  readonly runs: Fn;
+  readonly times: Fn;
 }
 
 function take(get: () => { receiver: unknown; fn: unknown }): Bound | null {
@@ -236,6 +312,32 @@ function hold(ports: UnreceivedPorts): Held | null {
   } catch {
     evidence = null;
   }
+  // 새 인사 갈래는 포트·기억·창·장부 읽기 둘 가운데 하나라도 꺼내지 못하면 없는 것이다(모름은 닫지 않는다).
+  let rehello: HeldRehello | null = null;
+  try {
+    const port: unknown = ports.rehello;
+    if (isObject(port)) {
+      const closeConnection: unknown = port.closeConnection;
+      const valid: unknown = port.valid;
+      const memory: unknown = port.memory;
+      const windowMs: unknown = port.reconnectWindowMs;
+      const runs: unknown = ledger.listRuns;
+      const times: unknown = ledger.instructionTimes;
+      const closed = isObject(memory) ? REHELLO_CLOSED.get(memory) : undefined;
+      if (
+        typeof closeConnection === "function" &&
+        typeof valid === "function" &&
+        closed !== undefined &&
+        (windowMs === null || isTime(windowMs)) &&
+        typeof runs === "function" &&
+        typeof times === "function"
+      ) {
+        rehello = { closeConnection: { receiver: port, fn: closeConnection as Fn }, valid: { receiver: port, fn: valid as Fn }, closed, windowMs, runs: runs as Fn, times: times as Fn };
+      }
+    }
+  } catch {
+    rehello = null;
+  }
   return {
     ledger: ledger as object,
     unanswered: unanswered as Fn,
@@ -251,6 +353,7 @@ function hold(ports: UnreceivedPorts): Held | null {
     }),
     settled: take(() => ({ receiver: ports, fn: ports.observationsSettled })),
     beatValid,
+    rehello,
   };
 }
 
@@ -468,6 +571,105 @@ function confirmLast(port: Bound, executorId: string, connection: number, versio
 
 type Judged = { readonly outcome: UnreceivedOutcome | null; readonly halt: UnreceivedHalt | null };
 
+// 새 인사 갈래의 준비 결과. go면 confirm부터 간다. null이면 이 갈래를 볼 항목이 아니다.
+type RehelloPlan = "go" | Exclude<UnreceivedRehelloSkip, "link_not_current" | "evidence_changed" | "stop_generation" | "gate_closed">;
+
+// 새 인사 갈래의 준비. 그 실행기의 마지막 반영 인사가 시한 전이라 장부를 부를 수 없는 항목만 본다. 증거를 읽은 바로 뒤, 전역 포트를
+// 다시 보기 전에 부른다: 장부 읽기(임대)도 외부 코드라, 복원 대기를 confirm 앞의 마지막 전역 조회로 두는 차례(readGate)를 지킨다.
+function planRehello(held: Held, item: StartItem, evidence: Evidence | "changed" | null, now: number): RehelloPlan | null {
+  const port = held.rehello;
+  if (port === null || evidence === null || evidence === "changed" || evidence.tainted || evidence.pending) return null;
+  const full = evidence.full;
+  if (full === null || full.principal !== item.executorId || full.answeredAt >= item.issuedAt + UNRECEIVED_ANSWER_AFTER_MS) return null;
+  if (now < item.issuedAt + REHELLO_AFTER_MS) return "too_soon";
+  // 닫은 연결의 인사가 아직 마지막 반영 인사다: 새 연결의 인사가 오기 전이다. 연결 번호는 서버가 다시 쓰지 않는다.
+  if (port.closed.has(full.connection)) return "closed_before";
+  // 연결은 그 인사를 받기 전에 열렸다. 받은 때가 창 정각 이전이면 다시 붙는 시각의 창(정각 제외)에 이 연결이 들지 않아, 닫은 뒤의
+  // 재접속이 이 연결 때문에 throttled가 되지 않는다(server.md "재접속 제한과 간격을 맞춘다"). 한 실행기를 창마다 한 번 넘게 닫지 않는 것도 된다.
+  if (port.windowMs !== null && now - full.receivedAt < port.windowMs) return "reconnect_window";
+  return leaseFree(held.ledger, port, item.executorId, now);
+}
+
+// 그 실행기에 임대를 믿을 실행이 없는가. 끝나지 않은(finalized·not_started 밖) 그 실행기 실행마다 장부가 믿는 임대의 끝을 본다.
+// 끝 + CLOCK_SKEW_MS가 now 이하일 때만 끝난 것으로 친다(실행기 시계가 늦으면 그만큼 더 돈다). 끝 모름은 믿는 것, 읽기 모름은 모름이다.
+// 닫으면 그 실행기는 다시 붙어 맞출 때까지 지시·갱신을 받지 못한다(server.md "closeConnection은 그 실행기에 임대를 믿는 실행이 없을 때만").
+function leaseFree(ledger: object, port: HeldRehello, executorId: string, now: number): RehelloPlan {
+  const ids: string[] = [];
+  try {
+    const read: unknown = apply(port.runs, ledger, []);
+    if (!isObject(read) || read.known !== true) return "lease_unknown";
+    const value: unknown = read.value;
+    if (!Array.isArray(value)) return "lease_unknown";
+    const length = value.length;
+    for (let i = 0; i < length; i += 1) {
+      const run: unknown = value[i];
+      if (!isObject(run)) return "lease_unknown";
+      const runId: unknown = run.runId;
+      const owner: unknown = run.executorId;
+      const state: unknown = run.state;
+      if (!isUuid(runId) || typeof owner !== "string" || !isState(state)) return "lease_unknown";
+      if (owner === executorId && !ENDED.includes(state)) ids.push(runId);
+    }
+  } catch {
+    return "lease_unknown";
+  }
+  for (const runId of ids) {
+    try {
+      const read: unknown = apply(port.times, ledger, [runId]);
+      if (!isObject(read) || read.known !== true) return "lease_unknown";
+      const times: unknown = read.value;
+      if (!isObject(times)) return "lease_unknown";
+      const lease: unknown = times.lease;
+      if (lease === null) continue;
+      if (!isObject(lease)) return "lease_unknown";
+      const end: unknown = lease.expiresAt;
+      if (end === "unknown") return "lease_trusted";
+      if (!isTime(end)) return "lease_unknown";
+      if (now < end + limits.CLOCK_SKEW_MS) return "lease_trusted";
+    } catch {
+      return "lease_unknown";
+    }
+  }
+  return "go";
+}
+
+// 새 인사 갈래의 닫기 문. 던지거나 true가 아니면 닫힘이다.
+function rehelloStillValid(valid: Bound): boolean {
+  const answer = invoke(valid, []);
+  return answer !== null && answer.value === true;
+}
+
+// 시한 전의 인사뿐인 항목. 갈래가 없거나 볼 항목이 아니면 answer_too_early 그대로다. 차례는 장부 닫기(judge)와 같다: confirm이 마지막
+// 증거 호출이고, 그 뒤에는 닫기 문 하나, 기억 적기, 꺼내 둔 closeConnection 호출뿐이다. 닫기 실패(던짐·정의 밖의 답)는 박자를 멈추지 않는다:
+// 장부를 쓰지 않았고, 기억에 남겨 같은 연결을 다시 닫지 않는다.
+function rehello(held: Held, head: Head, full: UnreceivedFull, evidence: Evidence, gate: Gate, plan: RehelloPlan | null): Judged {
+  const early: UnreceivedOutcome = { ...head, outcome: "skipped", reason: "answer_too_early" };
+  const port = held.rehello;
+  if (port === null || plan === null) return { outcome: early, halt: null };
+  const parked = (why: UnreceivedRehelloSkip): Judged => ({ outcome: { ...head, outcome: "skipped", reason: "answer_too_early", rehello: why }, halt: null });
+  if (plan !== "go") return parked(plan);
+  const { closed, valid, closeConnection: { fn: shut, receiver: shutReceiver } } = port;
+  const connection = full.connection;
+  const done = (result: UnreceivedRehelloResult): Judged => ({ outcome: { ...head, outcome: "rehello", connection, answeredAt: full.answeredAt, result }, halt: null });
+  const linked = confirmLast(evidence.confirm, head.executorId, connection, evidence.version, gate.generation);
+  if (linked !== "current") return parked(linked);
+  if (!rehelloStillValid(valid)) return parked("gate_closed");
+  closed.add(connection);
+  let answer: unknown;
+  try {
+    answer = apply(shut, shutReceiver, [connection]);
+  } catch {
+    return done("threw");
+  }
+  try {
+    if (!isObject(answer)) return done("malformed_answer");
+    const kind: unknown = answer.kind;
+    return done(kind === "closed" || kind === "not_open" || kind === "stopping" ? kind : "malformed_answer");
+  } catch {
+    return done("malformed_answer");
+  }
+}
+
 function tickOnce(held: Held, now: number): UnreceivedTickResult {
   if (!isTime(now)) return { kind: "not_run", reason: "now_malformed" };
   const first = readGate(held);
@@ -503,6 +705,7 @@ function judge(held: Held, item: StartItem, ledgerGeneration: number, now: numbe
   if (!isWorkerName(item.executorId)) return skip("not_worker");
 
   const evidence = readEvidence(held.evidence, item.executorId);
+  const plan = planRehello(held, item, evidence, now);
   const gate = readGate(held);
   if (typeof gate === "string") return { outcome: null, halt: gate };
   if (gate.generation !== ledgerGeneration) return { outcome: null, halt: "stop_generation_mismatch" };
@@ -518,7 +721,7 @@ function judge(held: Held, item: StartItem, ledgerGeneration: number, now: numbe
   if (full.principal !== item.executorId) return skip("principal_mismatch");
   if (full.stopGeneration !== gate.generation) return skip("stop_generation");
   // 서명 시각만 견준다. 받은 시각은 실행기가 그 시작을 받을 수 없게 된 뒤라는 증거가 아니다.
-  if (full.answeredAt < item.issuedAt + UNRECEIVED_ANSWER_AFTER_MS) return skip("answer_too_early");
+  if (full.answeredAt < item.issuedAt + UNRECEIVED_ANSWER_AFTER_MS) return rehello(held, head, full, evidence, gate, plan);
   if (full.runs.some((run) => run.run_id === item.runId)) return skip("run_in_answer");
 
   const closing: readonly unknown[] = [
