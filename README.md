@@ -21,7 +21,7 @@
   - 기본 명령(`src/main/no-role.ts`)은 역할을 고르라고 찍고 64로 끝난다. 이미지의 `ENTRYPOINT`는 비어 있어 `command`가 그대로 돈다.
 - **종료 코드:** 64는 역할을 고르지 않음, 69는 아직 구현되지 않음.
 - **사용자와 파일시스템:** 비root uid·gid 65532. 루트 파일시스템은 읽기 전용 전제이고 쓰기는 `/tmp`만 된다(파드가 emptyDir를 붙인다).
-- **포트:** 이미지에 듣는 포트를 적지 않는다(`EXPOSE`·`PORT` 없음). 실행기는 듣지 않는다.
+- **포트:** 이미지에 듣는 포트를 적지 않는다(`EXPOSE`·`PORT` 없음). 실행기는 TCP 포트를 듣지 않는다. 듣는 곳은 역할 컨테이너의 대리가 붙는 경로 유닉스 소켓 하나(`src/executor/agent-listener.ts`, D-102)뿐이고 abstract 소켓도 쓰지 않는다.
 - **들이지 않는 것:** hc 실행 파일, `/etc/claude-code`(관리 설정), 모델 CLI. 앞의 둘은 빌드가 확인한다.
 - **기반 이미지:** `oven/bun:<버전>-slim`(설치·시험 단계)과 `oven/bun:<버전>-distroless`(최종 단계, 셸 없음). 둘 다 digest로 고정한다.
 - **amd64 단일 빌드:** `app-build`가 `--platform linux/amd64`로 부른다.
@@ -54,7 +54,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드에 듣는 API가 없다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -119,7 +119,7 @@ test/               # 시험(*.test.ts)과 시험 명령(run.ts). test/contract/
 
 `test/executor/containment.test.ts`의 실제 프로세스 사례는 `bwrap --unshare-pid --unshare-user`로 만든 PID namespace 안에서만 돈다. 그 안의 `kill(-1)`은 밖에 닿지 않는다. `bwrap`이나 비특권 user namespace가 없으면(이미지의 `test` 단계가 그렇다) 그 사례를 등록하지 않고 이유를 한 줄 찍는다. 개발 기계에서 반드시 돌리려면 `OLIVE_REQUIRE_BWRAP=1 bun run test`로 없을 때 실패하게 한다. 호스트의 PID 공간에서 정리 코드에 진짜 신호를 주는 시험을 쓰지 않는다.
 
-GitHub 검사 `containment`(`.github/workflows/containment.yaml`)는 호스트 러너의 일반 계정으로 이 사례만 돌리고, `test/containment-junit.ts`가 JUnit 결과를 XML 문서로 해석해, 통과한 "실제 프로세스" 사례의 이름 집합이 그 파일의 기대 이름 목록(`EXPECTED`, 23개)과 정확히 같고 skip·todo·실패가 0개일 때만 성공시킨다. 사례를 더하거나 빼거나 이름을 바꾸면 그 목록을 같은 변경에서 고친다. 이 검사는 러너의 일회용 가상 머신에 Ubuntu `apparmor-profiles` 패키지가 주는 bwrap 전용 AppArmor 예외 프로필(`/usr/share/apparmor/extra-profiles/bwrap-userns-restrict`) 하나만 올리고, 머신 전체의 user namespace 제한(`kernel.apparmor_restrict_unprivileged_userns`)은 그대로 둔다. `build / test`는 이미지 빌드 안에서 돌아 bwrap이 없으므로 여전히 이 23개를 돌리지 않는다.
+GitHub 검사 `containment`(`.github/workflows/containment.yaml`)는 호스트 러너의 일반 계정으로 이 사례만 돌리고, `test/containment-junit.ts`가 JUnit 결과를 XML 문서로 해석해, 통과한 "실제 프로세스" 사례의 이름 집합이 그 파일의 기대 이름 목록(`EXPECTED`, 29개)과 정확히 같고 skip·todo·실패가 0개일 때만 성공시킨다. 사례를 더하거나 빼거나 이름을 바꾸면 그 목록을 같은 변경에서 고친다. 이 검사는 러너의 일회용 가상 머신에 Ubuntu `apparmor-profiles` 패키지가 주는 bwrap 전용 AppArmor 예외 프로필(`/usr/share/apparmor/extra-profiles/bwrap-userns-restrict`) 하나만 올리고, 머신 전체의 user namespace 제한(`kernel.apparmor_restrict_unprivileged_userns`)은 그대로 둔다. `build / test`는 이미지 빌드 안에서 돌아 bwrap이 없으므로 여전히 이 29개를 돌리지 않는다.
 
 - harness(`containment-harness.ts`)는 실제 신호를 쓰기 전에 bwrap이 만든 공간 안인지 스스로 확인한다(시험이 넣는 `--setenv` 표식, 자기 번호 1·2, 호스트가 아닌 `uid_map`). 아니면 신호 없이 끝난다.
 - `python3`(`/usr/bin/python3`)가 없으면 `nondumpable`·`zombieleader`·`tighthop` 사례만 등록하지 않고 이유를 찍는다. `nsenter`(`/usr/bin/nsenter`)가 없으면 `foreign` 사례만 등록하지 않는다.

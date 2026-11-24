@@ -1,6 +1,6 @@
 // 경합 순서 시험: 사건 순번과 포인터, 정리 응답의 승인, 맞춤의 만료, 종료 시각 판정, 준비 전 확인, 장부 대조, 세대 쓰기 중 송신, 깊은 결과.
 // 순서는 고정 장벽(쓰기에 실제로 들어갔다는 신호)으로 만든다.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -23,6 +23,7 @@ import {
   start,
   stopWrite,
   syncReply,
+  test,
   until,
 } from "./support.ts";
 

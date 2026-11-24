@@ -1,5 +1,5 @@
 // 실행기 코드의 정적 확인: 지시 본문에서 명령·argv·환경을 읽는 길이 없고, 띄우는 곳은 한 곳이며, 그 계획은 프로필에서만 온다.
-// 소켓·듣는 API·실행기 자신의 환경을 쓰지 않는다(연결의 실제 구현은 뒤 작업이다).
+// 듣는 곳은 대리가 붙는 경로 유닉스 소켓 한 파일뿐이고, 실행기 자신의 환경을 쓰지 않는다(연결의 실제 구현은 뒤 작업이다).
 import { expect, test } from "bun:test";
 import { list, readText } from "../files.ts";
 
@@ -107,7 +107,34 @@ test("정적: 새 종료 확인 영수증을 만드는 곳은 남은 수 0을 �
   expect(worker).toContain("store.validEvents(");
 });
 
-test("정적: 실행기 코드는 소켓·듣는 API를 쓰지 않는다(U3a는 실제 연결 없이 돈다)", async () => {
-  const banned = /\bBun\.(serve|listen|connect|udpSocket)\b|\bcreateServer\b|\.listen\(|node:(net|tls|http|https|http2|dgram)\b|\bfetch\(/;
-  for (const file of files) expect(banned.test(await code(file)), file).toBe(false);
+// 실행기가 듣는 곳은 agent-listener.ts의 경로 유닉스 소켓 하나다(D-102: 역할 컨테이너의 대리가 붙는다). 그 밖의 소켓·듣는 API는 실행기 코드에 없다.
+const LISTENER = "src/executor/agent-listener.ts";
+const SOCKET_APIS = /\bBun\.(serve|listen|connect|udpSocket)\b|\bcreateServer\b|\.listen\(|node:(net|tls|http|https|http2|dgram)\b|\bfetch\(/;
+
+// 듣는 한 파일이 할 수 없는 것: Bun.listen 말고 다른 소켓 API, 두 번 이상 듣기, unix 밖의 주소(TCP의 hostname·port), abstract 이름을 거르지 않기.
+function listenerProblems(source: string): string[] {
+  const problems: string[] = [];
+  const listens = [...source.matchAll(/\bBun\.listen\b/g)].length;
+  if (listens !== 1) problems.push(`Bun.listen ${listens}곳`);
+  if (SOCKET_APIS.test(source.replaceAll(/\bBun\.listen\b/g, ""))) problems.push("다른 소켓 API");
+  const call = /\bBun\.listen\s*(?:<[^>]*>)?\s*\(\s*\{([\s\S]*?)\bsocket\s*:/.exec(source)?.[1] ?? "";
+  if (!/^\s*unix\s*:\s*path\s*,\s*$/.test(call)) problems.push("unix 경로 하나만 넘기지 않는다");
+  if (/\b(hostname|port|tls)\s*:/.test(source)) problems.push("TCP·TLS 주소 칸");
+  if (!source.includes('if (!path.startsWith("/") || path.includes("\\0"))')) problems.push("abstract·상대 경로를 거르지 않는다");
+  return problems;
+}
+
+test("정적: 실행기 코드는 agent-listener.ts의 경로 유닉스 소켓 하나만 듣고, 그 밖의 소켓·듣는 API를 쓰지 않는다(TCP·abstract 금지)", async () => {
+  expect(files).toContain(LISTENER);
+  for (const file of files) if (file !== LISTENER) expect(SOCKET_APIS.test(await code(file)), file).toBe(false);
+  expect(listenerProblems(await code(LISTENER))).toEqual([]);
+  // 대조군: 확인이 실제로 잡는다(TCP로 듣기, 두 번 듣기, 붙기, 경로 검사 빠짐).
+  expect(listenerProblems('Bun.listen({ hostname: "0.0.0.0", port: 9, socket: {} }); Bun.listen({ unix: path, socket: {} }); Bun.connect({ unix: path });')).toEqual([
+    "Bun.listen 2곳",
+    "다른 소켓 API",
+    "unix 경로 하나만 넘기지 않는다",
+    "TCP·TLS 주소 칸",
+    "abstract·상대 경로를 거르지 않는다",
+  ]);
+  expect(SOCKET_APIS.test('Bun.listen({ unix: "\\0olive" })')).toBe(true);
 });
