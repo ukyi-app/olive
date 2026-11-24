@@ -3,7 +3,7 @@
 // 그래서 bun test가 낸 JUnit 결과를 읽어, 발견한 시험 파일마다 실행된 시험이 하나 이상인지 대조한다.
 // 발견 목록이 Bun이 실제로 읽는 파일보다 좁으면 빈 파일이 빠져나가므로, 허용 꼴 밖의 시험 이름은 먼저 거절한다.
 // 함정: `bun test`라고 치면 이 파일이 아니라 Bun 내장 러너가 바로 돈다. 이 확인은 `bun run test`로만 돈다.
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { root } from "./files.ts";
@@ -55,21 +55,34 @@ if (rejected.length > 0) {
 }
 discovered.sort();
 
+// 시험이 만드는 임시 폴더는 이 실행의 부모 폴더 아래(TMPDIR)로 모으고 끝에 부모째 지운다.
+// 공용 도구의 afterEach는 Bun이 모듈을 한 번만 읽어 처음 불러온 시험 파일에만 걸리고, 지우는 장치가 없는 도구와
+// 제품 코드·bwrap 안의 harness가 tmpdir() 아래에 만드는 폴더도 있어서, 도구마다 지우는 대신 실행 단위로 지운다.
+// 이 실행기는 자기 부모만 지우고 다른 폴더는 읽지도 판정하지도 않는다. 공용 TMPDIR에서 다른 실행(다른 PID 공간 포함)이
+// 쓰는 폴더나 무관한 폴더를 끝났다고 잘못 볼 수 있어서다. 비정상 종료로 남은 부모는 이 실행기가 치우지 않는다.
 const dir = mkdtempSync(join(tmpdir(), "olive-test-"));
 const report = join(dir, "junit.xml");
-let exitCode: number;
+let run: Bun.Subprocess | undefined;
+let exitCode = 1;
 let xml: string | undefined;
 try {
-  const run = Bun.spawnSync([process.execPath, "test", "--reporter=junit", `--reporter-outfile=${report}`], {
+  const scratch = join(dir, "tmp");
+  mkdirSync(scratch);
+  run = Bun.spawn([process.execPath, "test", "--reporter=junit", `--reporter-outfile=${report}`], {
     cwd: root,
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
+    env: { ...process.env, TMPDIR: scratch },
   });
+  await run.exited;
+  // 신호로 끝나면 exitCode는 null이고 exited는 128+신호 번호(SIGTERM이면 143)를 준다. 바깥 종료 코드는 신호 종료를 1로 낸다.
   exitCode = run.exitCode ?? 1;
   const file = Bun.file(report);
   if (await file.exists()) xml = await file.text();
 } finally {
+  // 함정: 자식이 뜬 뒤 어느 줄에서 예외가 나도 자식은 아직 이 폴더를 쓴다. 자식이 끝난 뒤에만 지운다.
+  if (run !== undefined) await run.exited;
   rmSync(dir, { recursive: true, force: true });
 }
 if (exitCode !== 0) process.exit(exitCode);
