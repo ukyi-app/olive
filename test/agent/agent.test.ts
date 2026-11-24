@@ -64,7 +64,12 @@ test("대리 정상 길: start → spawned·output·exited, 끝내기 → termin
   expect(launcher.calls).toHaveLength(1);
   const plan = launcher.calls[0]!.plan;
   // 계획은 start와 자격 값으로만 만든다. 자격 값은 credential_env 하나에만 있다.
-  expect(plan).toEqual({ program: "/usr/bin/role", argv: ["--plan"], cwd: "/work", env: { HOME: "/work", OLIVE_CREDENTIAL: SECRET } });
+  // 실패 진단에 값이 실리지 않게 자격 칸은 불리언으로, 나머지는 값을 뺀 꼴로 비교한다.
+  const { OLIVE_CREDENTIAL: credential, ...env } = plan.env;
+  expect(credential === SECRET).toBe(true);
+  // 다른 칸에 값이 섞였으면 아래 diff에 실리기 전에 여기서 멈춘다.
+  expect(JSON.stringify({ ...plan, env }).includes(SECRET)).toBe(false);
+  expect({ ...plan, env }).toEqual({ program: "/usr/bin/role", argv: ["--plan"], cwd: "/work", env: { HOME: "/work" } });
   expect(launcher.calls[0]!.hooks.outputBytes).toBe(4_096);
   launcher.finish(0, new TextEncoder().encode('{"ok":true}'));
   await settle();
@@ -214,6 +219,168 @@ test("스스로 집행: 임대 끝 + 여유까지 갱신이 없으면 끝나고,
   renewed.runtime.advance(50_000 + grace - renewed.runtime.t + T0);
   await settle();
   expect(renewed.runtime.exits).toEqual([AGENT_EXIT.lease_expired]);
+});
+
+test("스스로 집행: 기존 임대 끝 + 여유가 지난 뒤 갱신이 만료 콜백보다 먼저 와도 그 갱신을 받지 않고 lease_expired로 끝난다", async () => {
+  // 기본 여유(25초)에서 기존 집행 시각은 min(90초, 30초) + 25초 = 55초다.
+  const late = await agent();
+  late.role.receive(startBytes({ lease_until: T0 + 30_000, deadline_at: T0 + 90_000 }));
+  await settle();
+  const call = late.launcher.calls[0]!;
+  call.hooks.spawned({ pid: 7, exited: new Promise(() => {}), signal: () => {} });
+  late.runtime.advance(28_000);
+  const renew = encodeControl({ type: "renew", run_id: RUN, lease_until: T0 + 58_000 });
+  // 시계만 집행 시각 뒤로 옮긴다. 도래한 타이머는 아직 돌지 않았다(갱신이 먼저 처리되는 차례).
+  late.runtime.t = T0 + 55_001;
+  const before = late.wire.written.length;
+  late.role.receive(renew);
+  await settle();
+  expect(late.runtime.exits).toEqual([AGENT_EXIT.lease_expired]);
+  expect(late.wire.closed).toBe(true);
+  expect(call.signal.aborted).toBe(true);
+  // 그 뒤 역할이 성공으로 끝나고 제어가 끝내기·세기를 보내도 아무 결과도 나가지 않는다.
+  late.runtime.advance(1);
+  call.resolve({ exit: { code: 0, signal: null }, stdout: new TextEncoder().encode('{"ok":true}'), overflow: false });
+  await settle();
+  late.role.receive(terminate(1));
+  late.role.receive(count(2));
+  await settle();
+  expect(late.wire.written.length === before).toBe(true);
+  expect(late.runtime.exits).toEqual([AGENT_EXIT.lease_expired]);
+
+  // 집행 시각 직전의 갱신은 그대로 받아 감시를 새 임대로 옮긴다.
+  const ontime = await agent();
+  ontime.role.receive(startBytes({ lease_until: T0 + 30_000, deadline_at: T0 + 90_000 }));
+  await settle();
+  ontime.runtime.t = T0 + 54_999;
+  ontime.role.receive(encodeControl({ type: "renew", run_id: RUN, lease_until: T0 + 58_000 }));
+  await settle();
+  ontime.runtime.advance(58_000 + 25_000 - 54_999 - 1);
+  await settle();
+  expect(ontime.runtime.exits).toEqual([]);
+  expect(ontime.wire.closed).toBe(false);
+  ontime.runtime.advance(1);
+  await settle();
+  expect(ontime.runtime.exits).toEqual([AGENT_EXIT.lease_expired]);
+});
+
+test("스스로 집행: 여유 전에 받은 count의 0이 집행 시각 뒤에 돌아오면 counted를 보내지 않고 lease_expired로 끝난다", async () => {
+  let release: (() => void) | null = null;
+  class HeldSpace extends FakeSpace {
+    hold = false;
+    override survivors(): Promise<number | null> {
+      if (!this.hold) return super.survivors();
+      this.countCalls++;
+      return new Promise((resolve) => (release = () => resolve(0)));
+    }
+  }
+  const space = new HeldSpace();
+  const { role, launcher, wire, runtime } = await agent({}, { record: async () => space });
+  role.receive(startBytes({ lease_until: T0 + 30_000, deadline_at: T0 + 60_000 }));
+  await settle();
+  launcher.finish(0, new Uint8Array());
+  await settle();
+  role.receive(terminate(1));
+  await settle();
+  runtime.advance(54_999);
+  space.hold = true;
+  role.receive(count(2));
+  await settle();
+  const before = wire.written.length;
+  // 집행 시각(55초)을 지난 뒤 계수가 0으로 돌아온다. 만료 콜백은 그다음 차례다.
+  runtime.t = T0 + 55_001;
+  release!();
+  await settle();
+  expect(wire.written.length === before).toBe(true);
+  expect(wire.closed).toBe(true);
+  expect(runtime.exits).toEqual([AGENT_EXIT.lease_expired]);
+  runtime.advance(0);
+  await settle();
+  expect(runtime.exits).toEqual([AGENT_EXIT.lease_expired]);
+});
+
+test("차례: attach 전에 받은 바이트는 디코딩·띄우기 없이 protocol로 끝난다", async () => {
+  const runtime = new FakeRuntime();
+  const space = new FakeSpace();
+  const launcher = new FakeLauncher();
+  const role = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher }))!;
+  const bytes = startBytes();
+  const taken: boolean[] = [];
+  const original = Uint8Array.prototype.fill;
+  // 값 틀을 꺼냈다면 대리나 디코더가 값 배열을 0으로 채운다. 디코딩하지 않았으면 그런 채움이 없다.
+  Uint8Array.prototype.fill = function (this: Uint8Array, ...args: Parameters<Uint8Array["fill"]>) {
+    if (this.length === secretBytes().length && new TextDecoder().decode(this) === SECRET) taken.push(true);
+    return original.apply(this, args);
+  };
+  try {
+    role.receive(bytes);
+  } finally {
+    Uint8Array.prototype.fill = original;
+  }
+  await settle();
+  expect(launcher.calls).toHaveLength(0);
+  expect(taken.length === 0).toBe(true);
+  expect(runtime.exits).toEqual([AGENT_EXIT.protocol]);
+  // 집행 뒤에 이어진 링크에는 아무 말도 하지 않는다.
+  const wire = new Wire();
+  role.attach(wire);
+  expect(wire.written.length === 0).toBe(true);
+});
+
+test("차례: 열린 실행이 없을 때의 terminate·count는 공간 전체의 정리·세기로 답하고 띄우지 않는다(agent.md 표의 조건)", async () => {
+  const { role, launcher, space, wire, runtime } = await agent();
+  role.receive(terminate(1));
+  role.receive(count(2));
+  await settle();
+  expect(wire.messages()).toEqual([{ type: "hello" }, { type: "terminated", seq: 1 }, { type: "counted", seq: 2, survivors: 0 }]);
+  expect(space.terminations).toBe(1);
+  expect(launcher.calls).toHaveLength(0);
+  expect(runtime.exits).toEqual([]);
+});
+
+test("차례: terminate·count가 함께 쓰는 seq가 같거나 줄면 효과 전에 protocol로 끝난다", async () => {
+  for (const [first, second] of [
+    [count(7), terminate(7)],
+    [terminate(3), count(2)],
+    [count(4), count(4)],
+  ] as const) {
+    const { role, space, wire, runtime } = await agent();
+    role.receive(first);
+    await settle();
+    const terminations = space.terminations;
+    const written = wire.written.length;
+    role.receive(second);
+    await settle();
+    expect(runtime.exits).toEqual([AGENT_EXIT.protocol]);
+    expect(wire.closed).toBe(true);
+    // 두 번째 요청의 답은 없고, 정리는 집행의 한 번만 더 돈다.
+    expect(wire.written.length === written).toBe(true);
+    expect(space.terminations === terminations + 1).toBe(true);
+  }
+});
+
+test("스스로 집행: 두 번째 attach의 닫기가 던져도 예외를 내보내지 않고 첫 실행을 protocol로 집행한다", async () => {
+  const { role, launcher, space, wire, runtime } = await agent();
+  role.receive(startBytes());
+  await settle();
+  launcher.calls[0]!.hooks.spawned({ pid: 7, exited: new Promise(() => {}), signal: () => {} });
+  let thrown = false;
+  try {
+    role.attach({
+      write() {},
+      close() {
+        throw new Error("close failed");
+      },
+    });
+  } catch {
+    thrown = true;
+  }
+  await settle();
+  expect(thrown).toBe(false);
+  expect(wire.closed).toBe(true);
+  expect(launcher.calls[0]!.signal.aborted).toBe(true);
+  expect(space.terminations).toBe(1);
+  expect(runtime.exits).toEqual([AGENT_EXIT.protocol]);
 });
 
 test("스스로 집행: 정리가 끝나지 않아도 상한 뒤에는 끝난다(PID 1의 끝이 나머지를 끝낸다)", async () => {

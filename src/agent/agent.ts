@@ -129,9 +129,14 @@ export class RoleAgent {
   }
 
   // 링크가 이어졌다. hello를 보낸다. 링크는 하나뿐이다(두 번째 attach는 계약 밖이다).
+  // 두 번째 포트의 닫기가 던져도 첫 실행은 집행한다. 그 예외가 호출자에게 나가면 첫 링크와 실행이 그대로 남는다.
   attach(transport: AgentTransport): void {
     if (this.transport !== null) {
-      transport.close();
+      try {
+        transport.close();
+      } catch {
+        // 닫기 실패는 집행을 막지 않는다.
+      }
       return this.enforce("protocol");
     }
     this.transport = transport;
@@ -140,6 +145,8 @@ export class RoleAgent {
 
   receive(chunk: Uint8Array): void {
     if (this.closing) return;
+    // hello 전의 바이트는 디코딩하지 않는다(값 틀을 꺼내거나 띄우기를 시작하기 전에 거절).
+    if (this.transport === null) return this.enforce("protocol");
     let messages: ReceivedControl[];
     try {
       messages = this.decoder.push(chunk);
@@ -169,6 +176,8 @@ export class RoleAgent {
         // 프로그램이 끝난 뒤에도 실행이 닫히기 전에는 받는다(제어가 exited를 받기 전에 보낸 갱신이 엇갈려 올 수 있다).
         const run = this.run;
         if (run === null || run.runId !== message.run_id) return this.enforce("protocol");
+        // 기존 집행 시각이 지났으면 만료 콜백이 아직 돌지 않았어도 갱신으로 되살리지 않는다.
+        if (this.pastCutoff(run)) return this.enforce("lease_expired");
         run.lease = message.lease_until;
         return this.arm(run);
       }
@@ -182,7 +191,9 @@ export class RoleAgent {
         return this.serially(async () => {
           const survivors = await this.space.survivors().catch(() => null);
           // 프로그램이 끝난 실행은 0을 답한 때 닫는다. 0이 아니거나 모름이면 열린 채로 두어 임대 감시가 이어진다.
+          // 세는 동안 집행 시각이 지났으면 0으로 닫지 않고 집행한다(만료 콜백보다 계수 완료가 먼저 처리될 수 있다).
           const run = this.run;
+          if (survivors === 0 && run !== null && run.ended && this.pastCutoff(run)) return this.enforce("lease_expired");
           if (survivors === 0 && run !== null && run.ended) this.close(run);
           this.tell({ type: "counted", seq: message.seq, survivors });
         });
@@ -261,14 +272,24 @@ export class RoleAgent {
     return this.runtime.now() >= Math.min(run.deadline, run.lease);
   }
 
+  // 열린 실행의 지금 집행 시각: min(기한, 임대 끝) + 여유.
+  private cutoff(run: Run): number {
+    return Math.min(run.deadline, run.lease) + this.options.enforceGraceMs;
+  }
+
+  // 함정: 집행 시각이 지난 뒤에도 만료 콜백보다 다른 입력(갱신, 계수 완료)이 먼저 처리될 수 있다.
+  // 실행을 바꾸거나 닫는 자리는 타이머를 믿지 않고 이것으로 다시 본다.
+  private pastCutoff(run: Run): boolean {
+    return this.runtime.now() >= this.cutoff(run);
+  }
+
   // 열린 실행의 감시. min(기한, 임대 끝) + 여유가 지나도 닫히지 않으면 스스로 집행한다.
   private arm(run: Run): void {
     run.cancelTimer();
-    const at = Math.min(run.deadline, run.lease) + this.options.enforceGraceMs;
-    run.cancelTimer = this.runtime.setTimer(Math.max(0, at - this.runtime.now()), () => {
+    run.cancelTimer = this.runtime.setTimer(Math.max(0, this.cutoff(run) - this.runtime.now()), () => {
       if (this.run !== run) return;
       // 타이머가 이르게 울렸으면 다시 건다. 시각은 주입한 시계로만 판단한다.
-      if (this.runtime.now() < Math.min(run.deadline, run.lease) + this.options.enforceGraceMs) return this.arm(run);
+      if (!this.pastCutoff(run)) return this.arm(run);
       this.enforce("lease_expired");
     });
   }

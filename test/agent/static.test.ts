@@ -29,6 +29,12 @@ test("정적: 대리 코드는 소켓을 열거나 듣지 않고, 환경·시계
   for (const file of files) expect(banned.test(await code(file)), file).toBe(false);
 });
 
+// 가림의 보장은 CredentialValue까지다(link.ts 머리말). 받은 start 전체가 진단으로 나가는 자리를 대리 코드에 두지 않는다.
+test("정적: 대리 코드는 받은 메시지를 로그·inspect로 내보내지 않는다", async () => {
+  const banned = /\bconsole\.|\bBun\.inspect\b|node:util\b|\binspect\(|\bprocess\.(stdout|stderr)\b/;
+  for (const file of files) expect(banned.test(await code(file)), file).toBe(false);
+});
+
 test("정적: bun:ffi는 dumpable.ts 한 곳에서 prctl 하나만 연다", async () => {
   const users: string[] = [];
   for (const file of await list("src/**/*.ts")) if (/bun:ffi/.test(await code(file))) users.push(file);

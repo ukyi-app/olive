@@ -48,7 +48,8 @@ test("링크(제어 → 대리): 네 메시지가 같은 꼴로 돌아오고, st
   if (start.type !== "start") throw new Error("start");
   const { credential, ...rest } = start;
   expect(rest).toEqual(startMessage());
-  expect(new TextDecoder().decode(credential.take()!)).toBe(SECRET);
+  // 실패 진단에 값이 실리지 않게 같음은 불리언으로 본다.
+  expect(new TextDecoder().decode(credential.take()!) === SECRET).toBe(true);
   // 한 번만 내준다.
   expect(credential.take()).toBeNull();
   expect(decoder.end()).toEqual([]);
@@ -158,11 +159,49 @@ test("링크 크기: 봉투 상한을 넘는 접두, 값 상한을 넘는 값 �
   expect(encodeAgent(outputMessages(RUN, new Uint8Array(OUTPUT_CHUNK_BYTES))[0]!).length).toBeLessThanOrEqual(4 + 64 * 1024);
 });
 
+test("링크 차례(제어 → 대리): terminate·count는 seq 하나를 함께 쓰고, 같거나 작은 seq는 거절한다", () => {
+  const terminate = (seq: number) => encodeControl({ type: "terminate", seq });
+  const count = (seq: number) => encodeControl({ type: "count", seq });
+  expect(new ControlDecoder().push(concat(count(1), terminate(2), count(5))).map((message) => message.type)).toEqual(["count", "terminate", "count"]);
+  for (const [first, second] of [
+    [count(7), terminate(7)],
+    [terminate(7), count(7)],
+    [terminate(3), terminate(2)],
+  ]) {
+    const decoder = new ControlDecoder();
+    expect(decoder.push(first!)).toHaveLength(1);
+    expect(codeOf(() => decoder.push(second!))).toBe("link_out_of_order");
+  }
+  // 갱신은 seq를 쓰지 않는다.
+  expect(new ControlDecoder().push(concat(count(1), encodeControl({ type: "renew", run_id: RUN, lease_until: T0 }), terminate(2)))).toHaveLength(3);
+});
+
+test("링크 크기(대리 → 제어): output 한 조각의 원 바이트는 OUTPUT_CHUNK_BYTES 이하이고, 보내는 쪽과 받는 쪽이 같은 경계로 거절한다", () => {
+  const output = (bytes: number) => ({ type: "output" as const, run_id: RUN, data: Buffer.from(new Uint8Array(bytes)).toString("base64") });
+  const opened = () => {
+    const decoder = new AgentDecoder();
+    decoder.push(concat(encodeAgent({ type: "hello" }), encodeAgent({ type: "spawned", run_id: RUN })));
+    return decoder;
+  };
+  expect(opened().push(encodeAgent(output(OUTPUT_CHUNK_BYTES)))).toHaveLength(1);
+  // 덧붙임이 1·2개인 길이에서도 원 바이트로 센다.
+  expect(opened().push(encodeAgent(output(OUTPUT_CHUNK_BYTES - 1)))).toHaveLength(1);
+  expect(opened().push(encodeAgent(output(OUTPUT_CHUNK_BYTES - 2)))).toHaveLength(1);
+  expect(codeOf(() => encodeAgent(output(OUTPUT_CHUNK_BYTES + 1)))).toBe("link_bad_message");
+  expect(codeOf(() => opened().push(json({ v: 1, ...output(OUTPUT_CHUNK_BYTES + 1) })))).toBe("link_bad_message");
+});
+
+test("링크 인코더: 타입 밖의 종류는 두 인코더 모두 받는 쪽과 같은 사유로 거절한다", () => {
+  expect(codeOf(() => encodeControl({ type: "outside" } as never))).toBe("link_unknown_message");
+  expect(codeOf(() => encodeAgent({ type: "outside" } as never))).toBe("link_unknown_message");
+  expect(codeOf(() => encodeControl({ type: "count" } as never))).toBe("link_bad_message");
+});
+
 test("자격: 디코딩한 값과 거절·오류의 진단에 값의 글이 실리지 않는다(직렬화·문자열·inspect)", () => {
   const decoder = new ControlDecoder();
   const [start] = decoder.push(startBytes());
   for (const shown of [JSON.stringify(start), String((start as { credential: CredentialValue }).credential), Bun.inspect(start)]) {
-    expect(shown.includes(SECRET), shown).toBe(false);
+    expect(shown.includes(SECRET)).toBe(false);
   }
   // 지문과 다른 값(값의 글을 앞머리로 품은 값): 받는 쪽 오류에 값이 없다.
   const errors: unknown[] = [];
