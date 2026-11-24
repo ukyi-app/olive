@@ -48,10 +48,11 @@ import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createC
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
 import { createQueryBook } from "./query-book.ts";
-import { createSharedClock, type SharedClock } from "./shared-clock.ts";
+import { createSharedClock, type PeekableClock } from "./shared-clock.ts";
 import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer.ts";
 import { createWireSink, type WireSink } from "./sink.ts";
 import { createToolPorts } from "./tools-adapter.ts";
+import type { AdminSources } from "../admin/status.ts";
 
 // 종료 코드. 0은 요청된 멈춤(SIGTERM 등)을 끝 차례까지 마쳤을 때뿐이다. 64·69는 이미지의 다른 진입점, 81~89는 작업자 실행기가 쓴다.
 export const SUPERVISOR_EXIT = {
@@ -177,6 +178,8 @@ export interface RunningSupervisor {
   // 처리기를 부르는 길(본체 도구 호출이 감독에 닿는 길)은 아직 없다. 그 조각은 이것만 쓰고, 처리기 문맥의 now도 여기의 now로 읽고,
   // 처리기 호출을 박자와 겹치지 않게 부른다.
   tools(policy: ToolPolicyPort, config: ToolConfig, observe: (event: CancelDelivery) => void): { readonly ports: ToolPorts; readonly now: () => number };
+  // 관리 통로(src/supervisor/admin/)의 읽기 포트. 조립 상태, 복원기의 부작용 없는 상태 읽기, 공유 시계의 peek만 담는다(쓰기·송신·래치·하한 갱신 없음).
+  readonly admin: AdminSources;
 }
 
 export type BootResult = { readonly ok: true; readonly running: RunningSupervisor } | { readonly ok: false; readonly step: BootStep; readonly code: number; readonly reason: string };
@@ -374,7 +377,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
 
   // 4. 공유 시계 하나, 장부 열기 하나(reopen만), 결과 보관, 복원기 하나(단계는 아직 부르지 않아 세대 null).
   if (signal.aborted) return aborted("ledger");
-  const shared: SharedClock = make.sharedClock({ now: () => deps.wallNow() });
+  const shared: PeekableClock = make.sharedClock({ now: () => deps.wallNow() });
   const ledgerClock = () => shared.now();
   let opened: OpenResult;
   try {
@@ -859,5 +862,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     ports: createToolPorts({ ledger, policy, config, random: deps.random, cancel: { links: wired.links, clock: shared, signer: signing.signer, sink: wired.sink, observe } }),
     now: () => shared.now(),
   });
-  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools } };
+  // 관리 통로가 읽는 자리. 감독의 어떤 상태도 바꾸지 않는 읽기만 넘긴다: 조립 상태는 변수를 읽기만 하고, 장부는 복원기의 statusView
+  // (실패해도 장부를 고장으로 표시하지 않고 허가를 버리지 않는 읽기 하나), 시계는 공유 하한을 올리지 않는 peek다.
+  // look()·haltReason()을 부르지 않는다: 끝낼 사유를 붙잡는 래치를 관리 요청이 움직이지 않게. 도구 처리기의 포트(tools)를 쓰지 않는다(tools-adapter.md "관리 통로").
+  const admin: AdminSources = Object.freeze({
+    progress: () => ({ restored: stage >= 5, alive: !stopping && exitCode === 0 && halted === null, granted }),
+    view: (cap: number) => restorer.statusView(cap),
+    now: () => shared.peek(),
+  });
+  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools, admin } };
 }

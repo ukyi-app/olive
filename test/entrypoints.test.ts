@@ -126,8 +126,11 @@ test("entrypoints: src/에서 환경을 읽는 파일은 src/main/executor.ts·s
   expect(found).toEqual(["src/main/executor.ts", "src/main/role-agent.ts", "src/main/supervisor.ts"]);
 });
 
-// 감독이 듣는 곳은 실행기를 받는 연결 서버의 TCP 하나(tls-server.ts)뿐이다. 감독 진입점에서 닿는 로컬 모듈 전체를 본다.
+// 감독이 듣는 TCP는 실행기를 받는 연결 서버 하나(tls-server.ts)뿐이다. 감독 진입점에서 닿는 로컬 모듈 전체를 본다.
 const SUPERVISOR_LISTENER = "src/supervisor/transport/tls-server.ts";
+// 예외 하나: 관리 통로(D-60·D-101)의 경로 유닉스 소켓. kubectl exec로 같은 컨테이너에 들어온 관리 진입점만 붙는 자리라 TCP를 열지 않고,
+// 실행기 쪽 듣기와 같은 규칙(unixOnly: unix 경로 하나, hostname·port 없음)을 지킨다.
+const SUPERVISOR_ADMIN_LISTENER = "src/supervisor/admin/listener.ts";
 // 그 한 파일에서 허용한 세 자리(TLS 서버 만들기, 그 서버의 listen, 감싼 자기 메서드의 호출)를 각각 정확히 한 번 찾아 지운 뒤, 남은 글에서
 // 다른 종류의 듣기 API를 찾는다. 횟수만 세면 같은 파일에 붙인 Bun.serve·net.createServer·dgram 같은 두 번째 종류를 놓친다.
 const SUPERVISOR_ALLOWED = [/\btls\.createServer\(/, /\bthis\.server\.listen\(this\.options\.port, this\.options\.host,/, /\bawait server\.listen\(\);/];
@@ -150,10 +153,25 @@ test("entrypoints: 감독 듣기 확인이 허용 파일 안의 두 번째 종�
   }
 });
 
-test("entrypoints: 감독에서 닿는 코드에 듣는 API는 tls-server.ts 하나뿐이다", async () => {
+// 관리 통로 파일에도 감독 듣기 확인을 건다: 실행기 쪽 규칙(unixOnly)에 더해, 허용한 Bun.listen 호출 하나를 지운 나머지에서
+// 감독용 듣기 API(UDP createSocket·숫자 포트 bind 포함)를 찾는다. unixOnly만으로는 같은 파일에 붙인 UDP 듣기를 놓친다.
+const supervisorUnixOnly = (source: string): boolean => unixOnly(source) && !anyListening.test(source.replace(ALLOWED_LISTEN, ""));
+
+test("entrypoints: 감독 관리 소켓 확인이 허용 파일 안의 두 번째 종류 듣기(UDP 포함)를 잡는다", async () => {
+  const source = await Bun.file(join(root, SUPERVISOR_ADMIN_LISTENER)).text();
+  expect(supervisorUnixOnly(source)).toBe(true);
+  for (const extra of ["Bun.serve({ fetch: () => new Response() });", "Bun.listen({ hostname: h, port: 1, socket: {} });", "net.createServer().listen(1);", "dgram.createSocket('udp4');", "socket.bind(9);", "tls.createServer({});", "await server.listen();"]) {
+    expect(supervisorUnixOnly(`${source}\n${extra}\n`), extra).toBe(false);
+  }
+  // unixOnly 혼자로는 UDP를 잡지 못한다: 위 확인을 따로 두는 까닭.
+  expect(unixOnly(`${source}\ndgram.createSocket('udp4');\n`)).toBe(true);
+});
+
+test("entrypoints: 감독에서 닿는 코드에 듣는 API는 tls-server.ts와 관리 통로의 경로 유닉스 소켓(admin/listener.ts) 둘뿐이다", async () => {
   const files = await reachable("src/main/supervisor.ts");
   const listeners = [...files].filter(([, source]) => listening.test(source)).map(([file]) => relative(root, file));
-  expect(listeners).toEqual([SUPERVISOR_LISTENER]);
+  expect(listeners.sort()).toEqual([SUPERVISOR_ADMIN_LISTENER, SUPERVISOR_LISTENER]);
+  expect(supervisorUnixOnly(files.get(join(root, SUPERVISOR_ADMIN_LISTENER))!), SUPERVISOR_ADMIN_LISTENER).toBe(true);
   // 그 한 파일의 듣기: tls.createServer 하나와 그 서버의 listen 하나(나머지 ".listen("은 그 파일이 감싼 자기 메서드의 호출이다).
   const source = files.get(join(root, SUPERVISOR_LISTENER))!;
   expect([...source.matchAll(/\bcreateServer\(/g)].length).toBe(1);

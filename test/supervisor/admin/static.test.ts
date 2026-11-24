@@ -1,0 +1,141 @@
+// 관리 통로의 정적 확인: 효과(장부 쓰기·송신)를 낼 길이 없고, 도구 처리기의 포트를 다시 쓰지 않으며(S42), 관리 진입점은 이 폴더의
+// 말과 붙는 쪽만 끌어온다. 실제 조립에서 부른 장부 메서드·장부 파일·송신 수는 admin.test.ts가 본다.
+import { expect, test } from "bun:test";
+import { dirname, join, relative } from "node:path";
+import { list, readText, root } from "../../files.ts";
+
+// 줄 전체가 주석인 줄은 뺀다.
+const strip = (source: string) =>
+  source
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("//"))
+    .join("\n");
+const code = async (file: string) => strip(await readText(file));
+
+const ADMIN_DIR = "src/supervisor/admin/";
+// 관리 통로 폴더가 직접 부를 수 있는 장부 메서드. 없다: 장부 읽기는 조립이 넘긴 view(복원기의 statusView → Ledger.peekStatus) 하나다.
+const LEDGER_READS: readonly string[] = [];
+// 폴더 안에서 import할 수 있는 것. 장부는 상태 읽기(status.ts)만, 그것도 공개 면(index.ts)으로만 본다.
+const IMPORTS: Record<string, readonly string[]> = {
+  "protocol.ts": [],
+  "status.ts": ["../../ledger/index.ts", "./protocol.ts"],
+  "commands.ts": ["./protocol.ts", "./status.ts"],
+  "listener.ts": ["./protocol.ts"],
+  "client.ts": ["./protocol.ts"],
+};
+// 효과를 낼 수 있는 글: 연결에 싣기·연결 닫기·내보내기 포트·송신 문·발급·도구 처리기의 포트·nonce 소비·소켓에 붙기.
+const EFFECTS = /\bwriteFrame\b|\bcloseConnection\b|\bsink\b|\bsendInstruction\b|\bissuance\b|\bcreateToolPorts\b|tools-adapter|\.tools\s*\(|\bnonceStore\b|\bBun\.connect\b/;
+
+const transpiler = new Bun.Transpiler({ loader: "ts" });
+
+function adminProblems(name: string, source: string): string[] {
+  const problems: string[] = [];
+  const allowed = IMPORTS[name];
+  if (allowed === undefined) return [`표에 없는 파일 ${name}`];
+  for (const { path } of transpiler.scanImports(source)) if (!allowed.includes(path)) problems.push(`import ${path}`);
+  for (const match of source.matchAll(/\bledger\s*\.\s*([\w$]+)\s*\(/g)) if (!LEDGER_READS.includes(match[1]!)) problems.push(`ledger.${match[1]}`);
+  if (/\bledger\s*\[/.test(source)) problems.push("ledger[...]");
+  const effect = EFFECTS.exec(source);
+  if (effect !== null) problems.push(`효과 ${effect[0]}`);
+  const listens = [...source.matchAll(/\bBun\.listen\b/g)].length;
+  if (listens !== (name === "listener.ts" ? 1 : 0)) problems.push(`Bun.listen ${listens}곳`);
+  return problems;
+}
+
+test("정적: 관리 통로 폴더는 장부를 직접 부르지 않고, 연결에 싣거나 도구 처리기의 포트를 쓰는 글이 없으며, 듣는 곳은 listener.ts 하나다", async () => {
+  const files = await list(`${ADMIN_DIR}*.ts`);
+  expect(files.map((file) => file.slice(ADMIN_DIR.length))).toEqual(Object.keys(IMPORTS).sort());
+  for (const file of files) expect(adminProblems(file.slice(ADMIN_DIR.length), await code(file)), file).toEqual([]);
+  // 대조군: 확인이 실제로 잡는다.
+  const status = await code(`${ADMIN_DIR}status.ts`);
+  expect(adminProblems("status.ts", `${status}\nsources.ledger.setPause(null);`)).toEqual(["ledger.setPause"]);
+  expect(adminProblems("status.ts", `${status}\nsources.ledger.readStop();`)).toEqual(["ledger.readStop"]);
+  expect(adminProblems("commands.ts", `${await code(`${ADMIN_DIR}commands.ts`)}\nimport { createToolPorts } from "../runtime/tools-adapter.ts";`)).toEqual([
+    "import ../runtime/tools-adapter.ts",
+    "효과 createToolPorts",
+  ]);
+  expect(adminProblems("client.ts", "const s = await Bun.listen({ unix: path, socket: {} }); server.writeFrame(1);")).toEqual(["효과 writeFrame", "Bun.listen 1곳"]);
+});
+
+// 조립이 관리 통로에 넘기는 묶음(boot.ts의 const admin). 부르는 것은 복원기의 부작용 없는 상태 읽기, 공유 시계의 peek, Object.freeze뿐이다.
+// 조립 상태는 변수만 읽는다(끝낼 사유를 붙잡는 look()·박자 유효 문·끝 차례를 부르지 않는다). 장부의 다른 읽기(실패하면 장부를 고장으로
+// 표시한다)와 공유 시계의 now·read(하한을 올린다)를 부르지 않는다.
+const ADMIN_BLOCK_CALLS = ["Object.freeze", "restorer.statusView", "shared.peek"];
+function adminBlockCalls(boot: string): string[] | null {
+  const start = boot.indexOf("const admin: AdminSources = Object.freeze({");
+  if (start < 0 || boot.indexOf("const admin: AdminSources", start + 1) >= 0) return null;
+  const end = boot.indexOf("\n  });\n", start);
+  if (end < 0) return null;
+  return [...boot.slice(start, end).matchAll(/([\w$.]+)\s*\(/g)].map((match) => match[1]!);
+}
+
+test("정적: 조립이 관리 통로에 넘기는 묶음은 복원기의 상태 읽기·공유 시계의 peek만 부르고, 그 묶음이 진입점의 관리 처리기에 그대로 간다", async () => {
+  const boot = await code("src/supervisor/runtime/boot.ts");
+  expect(adminBlockCalls(boot)).toEqual(ADMIN_BLOCK_CALLS);
+  expect(boot).toContain("return { ok: true, running: { stop: () => finish(\"stop\"), done: settled, tools, admin } };");
+  // 대조군: 묶음 안에 쓰기 하나를 끼우거나 끝낼 사유를 읽으면 목록이 달라진다.
+  expect(adminBlockCalls(boot.replace("view: (cap: number) => restorer.statusView(cap),", "view: (cap: number) => (ledger.setPause(null), restorer.statusView(cap)),"))).toContain("ledger.setPause");
+  expect(adminBlockCalls(boot.replace("now: () => shared.peek(),", "now: () => shared.read(),"))).toContain("shared.read");
+  expect(adminBlockCalls(boot.replace("view: (cap: number) => restorer.statusView(cap),", "view: (cap: number) => (restorer.intakeOpen(), restorer.statusView(cap)),"))).toContain("restorer.intakeOpen");
+  expect(adminBlockCalls(boot.replace("alive: !stopping && exitCode === 0 && halted === null,", "alive: haltReason() === null,"))).toContain("haltReason");
+  // 진입점은 관리 처리기를 running.admin 하나로 만들고, 도구 처리기의 포트(running.tools)를 관리 통로에 넘기지 않는다(S42).
+  const main = await code("src/main/supervisor.ts");
+  expect([...main.matchAll(/createAdminHandlers\(([^)]*)\)/g)].map((match) => match[1])).toEqual(["running.admin"]);
+  expect(/\.tools\b/.test(main)).toBe(false);
+  // 소유자를 가리지 않는 읽기는 도구 처리기의 포트에 잇지 않는다(S42의 다른 절반).
+  expect(/listWaitingToolRequests/.test(await code("src/supervisor/runtime/tools-adapter.ts"))).toBe(false);
+});
+
+// 관리 통로가 닿는 부품 쪽 읽기의 몸통(메서드 머리부터 같은 들여쓰기의 닫는 괄호까지). 머리가 정확히 한 번 있어야 한다.
+function body(source: string, head: string): string | null {
+  const start = source.indexOf(head);
+  if (start < 0 || source.indexOf(head, start + 1) >= 0) return null;
+  const indent = /^\n( *)/.exec(head)?.[1] ?? "";
+  const end = source.indexOf(`\n${indent}}`, start + head.length);
+  return end < 0 ? null : source.slice(start + head.length, end);
+}
+const LEDGER_PEEK = "\n  peekStatus(cap: number, attempt: RestoreAttempt | null): Read<StatusPeek> {";
+const RESTORER_VIEW = "\n  statusView(cap: number): Read<StatusPeek> {";
+const CLOCK_PEEK = "\n    peek(): ClockReading {";
+// 장부의 고장 표시·허가·시도·쓰기를 바꾸는 글.
+const LEDGER_MUTATION = /#fail\b|#write\b|#revokeIntake\b|\.run\(|\.transaction\(|#(grant|broken|attempt|closed|stopEpoch)\s*(\?\?|\+|-)?=(?!=)|\b(INSERT|UPDATE|DELETE|REPLACE)\b/;
+const calls = (text: string) => [...text.matchAll(/([\w$.#]+)\s*\(/g)].map((match) => match[1]!);
+
+test("정적: 관리 통로가 닿는 부품 쪽 읽기는 상태를 바꾸지 않는다: 장부 peekStatus는 고장 표시·허가·쓰기를 건드리지 않고, 복원기 statusView는 그것만 부르고, 공유 시계 peek는 하한을 쓰지 않는다", async () => {
+  const ledger = body(await code("src/ledger/ledger.ts"), LEDGER_PEEK);
+  const restorer = body(await code("src/ledger/restore.ts"), RESTORER_VIEW);
+  const clock = body(await code("src/supervisor/runtime/shared-clock.ts"), CLOCK_PEEK);
+  expect([ledger, restorer, clock].map((found) => found !== null)).toEqual([true, true, true]);
+  expect(LEDGER_MUTATION.exec(ledger!)).toBeNull();
+  expect(calls(restorer!)).toEqual(["this.ledger.peekStatus"]);
+  expect(/\bfloor\s*=(?!=)|\bjudge\(/.test(clock!)).toBe(false);
+  // 대조군: 실패 처리에서 고장을 표시하거나 허가를 버리거나, 시계 peek가 하한을 쓰면 잡는다.
+  for (const mutated of ["this.#fail(reason);", "this.#grant = null;", "this.#broken ??= reason;", 'this.#db.query("DELETE FROM x").run();']) expect(LEDGER_MUTATION.test(`${ledger}\n${mutated}`), mutated).toBe(true);
+  expect(calls(`${restorer}\nthis.ledger.readStop();`)).toContain("this.ledger.readStop");
+  expect(/\bfloor\s*=(?!=)|\bjudge\(/.test(`${clock}\nfloor = at as number;`)).toBe(true);
+});
+
+// 진입점에서 import로 닿는 로컬 모듈 전체.
+async function reachable(entry: string): Promise<Map<string, string>> {
+  const seen = new Map<string, string>();
+  const queue = [join(root, entry)];
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (seen.has(file)) continue;
+    const source = await Bun.file(file).text();
+    seen.set(file, source);
+    for (const { path } of transpiler.scanImports(source)) {
+      if (path.startsWith(".") && path.endsWith(".ts")) queue.push(join(dirname(file), path));
+    }
+  }
+  return seen;
+}
+
+test("정적: 관리 진입점에서 닿는 코드는 관리 통로의 말과 붙는 쪽뿐이다(장부·박자·연결 서버를 끌어오지 않고, 듣지 않고, 환경을 읽지 않는다)", async () => {
+  const files = await reachable("src/main/admin.ts");
+  expect([...files.keys()].map((file) => relative(root, file)).sort()).toEqual(["src/main/admin.ts", "src/supervisor/admin/client.ts", "src/supervisor/admin/protocol.ts"]);
+  for (const [file, source] of files) {
+    expect(/\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\.listen\(/.test(source), relative(root, file)).toBe(false);
+    expect(/\bprocess\.env\b|\bBun\.env\b|import\.meta\.env/.test(strip(source)), relative(root, file)).toBe(false);
+  }
+});
