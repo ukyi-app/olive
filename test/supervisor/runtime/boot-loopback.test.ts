@@ -94,9 +94,7 @@ test("루프백: 복원 1단계 전의 맞춤에는 답하지 않고, 현관이 
       stopAuthority: { latestStop: () => stopGate.promise },
       publications: { lookup: () => Promise.reject(new Error("front_door_absent")) },
       peers: { contracts: async () => (await peersGate.promise, FRONT_ROWS) },
-    },
-    evidence: { read: () => ({ known: false }), confirm: () => "link_not_current" },
-    wallNow: Date.now,
+    },    wallNow: Date.now,
     monoNow: () => performance.now(),
     setTimer: (ms, fire) => {
       const handle = setTimeout(fire, ms);

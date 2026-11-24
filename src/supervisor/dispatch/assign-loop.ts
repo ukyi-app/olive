@@ -33,7 +33,7 @@ import type { Candidate } from "../transport/connections.ts";
 import { newUuid, type RefusalReason as DraftRefusalReason, sealDraft, startDraft, type StartDraftInput } from "./envelopes.ts";
 import { type Pick as PickResult, pickAssignment, type PickInput, type PreAssignFacts, type RunPlan } from "./pick.ts";
 import type { CredentialPort, InstructionSink, Random, Signer } from "./ports.ts";
-import { callAfterGate, type MarkFailure, sendInstruction } from "./send-gate.ts";
+import { callAfterGate, holdBeatValid, type MarkFailure, sendInstruction } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. markStartDispatch는 시작 봉투의 송신 표식이고,
 // startRun을 부른 그 장부 객체로 적는다(표식은 장부 열기마다 따로 센다).
@@ -283,13 +283,10 @@ function intakeOpen(intake: IntakeSource): boolean {
   }
 }
 
-// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다). 칸은 부를 때마다 한 번만 읽고 그 포트
+// 객체를 수신자로 부른다(send-gate.ts의 holdBeatValid): 같은 칸을 두 번 읽으면 접근자의 시간이 두 번 들고 두 읽기가 다른 함수를 낼 수 있다.
 function beatValid(ports: AssignLoopPorts): boolean {
-  try {
-    return ports.beatValid === undefined || ports.beatValid() === true;
-  } catch {
-    return false;
-  }
+  return holdBeatValid(ports)();
 }
 
 // rows는 listRuns의 행(실행 ID → 행)이다. 시작 직전에 지정 실행기를 읽는 데만 쓴다(대기 실행의 지정 실행기는 배정 뒤 바뀌지 않는다).

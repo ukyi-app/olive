@@ -111,7 +111,8 @@ interface BookState {
 
 const books = new WeakMap<AnswerEvidenceBook, BookState>();
 
-const newBookState = (first = 0): BookState => ({ counter: first, floor: first, allTainted: false, exhausted: false, entries: new Map(), owner: null, pendingOf: null });
+// 시작값이 이미 상한이면 처음부터 모름이다(아래 bump와 같은 까닭).
+const newBookState = (first = 0): BookState => ({ counter: first, floor: first, allTainted: false, exhausted: first >= Number.MAX_SAFE_INTEGER, entries: new Map(), owner: null, pendingOf: null });
 
 export interface AnswerEvidenceBookOptions {
   // 번호의 시작값(0 이상 안전 정수). 기본 0. 상한 근처의 동작을 시험으로 보려고 둔다.
@@ -128,11 +129,13 @@ export function createAnswerEvidenceBook(options: AnswerEvidenceBookOptions = {}
 
 const versionOf = (state: BookState, executorId: string): number => Math.max(state.entries.get(executorId)?.version ?? 0, state.floor);
 
-// 번호를 하나 올린 값. 상한(Number.MAX_SAFE_INTEGER)을 넘길 수 없으면 올리지 않고 장부를 모름으로 둔다: 상한 위에서는 1을 더해도
-// 같은 값이 나와 읽은 뒤의 변화를 confirm이 놓친다.
+// 번호를 하나 올린 값. 올린 값이 상한(Number.MAX_SAFE_INTEGER)에 닿는 그 순간 장부를 모름으로 둔다: 상한에서 읽힌 번호는 다음 변화가
+// 같은 값을 내(1을 더해도 상한 위는 구별되지 않는다) 읽은 뒤의 변화를 confirm이 놓친다. 그래서 상한은 알려진 번호로 내지 않는다.
 function bump(state: BookState): number {
-  if (state.counter >= Number.MAX_SAFE_INTEGER) state.exhausted = true;
-  else state.counter += 1;
+  if (state.counter >= Number.MAX_SAFE_INTEGER - 1) {
+    state.counter = Number.MAX_SAFE_INTEGER;
+    state.exhausted = true;
+  } else state.counter += 1;
   return state.counter;
 }
 

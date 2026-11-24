@@ -36,14 +36,14 @@ import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import { resendTick } from "../dispatch/resend.ts";
-import { type UnreceivedEvidence, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
+import { type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
 import type { ToolConfig, ToolPolicyPort, ToolPorts } from "../scheduler/tools.ts";
 import type { ConnectionSettings } from "../transport/connections.ts";
 import { RegistryState, type RegistrySettings } from "../transport/registry.ts";
 import type { ConnectionServer, ConnectionServerOptions, Delivered, StartResult } from "../transport/server.ts";
-import { type AnswerLines, createAnswerLines } from "./answers.ts";
+import { type AnswerLines, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
@@ -155,8 +155,6 @@ export interface SupervisorDeps {
   readonly startServer: (options: ConnectionServerOptions) => Promise<StartResult>;
   readonly credentialFiles: CredentialFiles;
   readonly frontDoor: FrontDoorPorts;
-  // D-90 박자의 증거 포트(A6c-2). 그 조각 전에는 모든 실행기에 { known: false }를 내는 포트를 넘긴다.
-  readonly evidence: UnreceivedEvidence;
   // 장부 시계의 원천(Unix epoch 밀리초). 이 파일이 공유 시계로 한 번 감싸 모든 소비자에 넘긴다.
   readonly wallNow: () => number;
   // 기다림의 기한과 끊김 판정을 재는 단조 시계(밀리초).
@@ -540,8 +538,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       ),
     resend: (clock, policy, input) =>
       make.ticks.resend({ ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen }, policy, input),
-    unreceived: (now) =>
-      make.ticks.unreceived({ ledger, evidence: deps.evidence, withheld: need(lines).withheld, intake, observationsSettled: unreceivedSettled, beatValid: effectsOpen }, now),
+    // 증거·맡기지 않을 실행기는 같은 답 줄의 것이다: confirm이 보는 연결(내보내기 포트의 answers)과 정지 세대(published)가 이 박자의
+    // intake·배정과 같은 원천이어야 장부 직전의 확인이 닫기의 근거와 같은 줄을 본다(unreceived.md "같은 객체"). 답 줄은 부를 때
+    // 읽는다(박자 함수 본문에서 위임한다).
+    unreceived: (now) => {
+      const answered = need(lines);
+      return make.ticks.unreceived({ ledger, evidence: answered.evidence, withheld: answered.withheld, intake, observationsSettled: unreceivedSettled, beatValid: effectsOpen }, now);
+    },
     assign: (now) => make.ticks.assign(assignPorts(), settings.assign, now),
   };
   // 세대를 모르면 "후보 없음"이 아니라 모름이다(assign-loop.ts의 CandidateSource).
@@ -671,6 +674,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       queries,
       cycle,
       observationsSettled,
+      // 프로세스에 하나인 D-90 증거 장부. 답 줄을 다시 만드는 길이 생기면 같은 장부를 넘겨야 번호가 이어지고 앞 줄이 쥔 답이 오염으로 남는다.
+      evidenceBook: createAnswerEvidenceBook(),
       observe: (note) => {
         if (note.kind === "fault") log("answer_fault", { where: note.where });
         else if (note.kind === "hello") log("hello", { outcome: note.outcome.kind });

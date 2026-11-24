@@ -150,8 +150,6 @@ const productionDeps: SupervisorDeps = {
   startServer: startConnectionServer,
   credentialFiles: nodeCredentialFiles,
   frontDoor: { stopAuthority: { latestStop: absent }, publications: { lookup: absent }, peers: { contracts: absent } },
-  // 증거 포트(A6c-2) 전: 모든 실행기가 모름이라 D-90 박자는 자동 닫기를 기록하지 않는다(후보를 알려고 장부를 읽기는 한다).
-  evidence: { read: () => ({ known: false }), confirm: () => "link_not_current" },
   wallNow: Date.now,
   monoNow: () => performance.now(),
   setTimer: (ms, fire) => {

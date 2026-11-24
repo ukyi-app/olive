@@ -27,21 +27,22 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 
 줄은 `boot.ts`, 박자 안은 각 부품(`src/supervisor/dispatch/`). 문은 (1) 접수 문 `intake`(515) = (2)와 같은 판정(`effects`, 506)에서 읽은 허가, (2) 박자 유효 문 `effectsOpen`(513)이다. 박자 다섯의 `beatValid` 포트에는 (2) 그 함수 하나를 넘긴다(534~562). 그 포트가 빠지면 부품은 늘 유효로 읽으므로 `boot-effects.test.ts`가 다섯 박자의 같은 함수를 단언한다. 처음부터 닫힌 5단계(`granted`도 장부 허가도 없음)는 (2)가 열림이라 기존 실행의 정지·상태 조회가 나간다.
 
-규칙은 하나다: **장부 쓰기·송신 표식·송신마다 얻을 것(포트의 수신 객체·메서드·인자, 공유 송신 함수에 넘기는 입력 객체의 칸)을 모두 얻고, 박자 유효 문을 마지막에 보고, 그 바로 뒤에 호출 하나.** 예외는 시작·갱신의 송신 하나다: 유효 문과 송신 사이에 시한·여유를 재는 장부 시계 호출 하나가 남는다(아래 "남는 한계"). 유효 문 뒤에 접근자 같은 외부 코드가 돌면 그 안에서 흐른 시간으로 박자 기한이 지나도 쓰거나 싣는다. "사이"는 마지막 확인(시계·연결·증거 등)과 효과 사이의 외부 호출, "유효 문 뒤"는 박자 유효 문을 본 뒤 호출 전에 도는 외부 코드(접근자 포함)다. 박자 안의 장부 쓰기·표식은 이 차례를 `send-gate.ts`의 `callAfterGate` 한 함수로 한다(얻기 → 유효 문 → `Reflect.apply`). 정적 시험(`test/supervisor/dispatch/start-send.test.ts`)이 그 본문과 부르는 줄 여섯을 글자 그대로 본다. 아래 표에서 "유효 문 뒤"가 "없음"이 아닌 자리는 박자 밖이거나 내보내기 포트 안, 또는 시작·갱신의 마지막 판정이 부르는 장부 시계 호출 하나다.
+규칙은 하나다: **장부 쓰기·송신 표식·송신마다 얻을 것(포트의 수신 객체·메서드·인자, 공유 송신 함수에 넘기는 입력 객체의 칸)을 모두 얻고, 박자 유효 문을 마지막에 보고, 그 바로 뒤에 호출 하나.** 예외는 시작·갱신의 송신 하나다: 유효 문과 송신 사이에 시한·여유를 재는 장부 시계 호출 하나가 남는다(아래 "남는 한계"). 유효 문 뒤에 접근자 같은 외부 코드가 돌면 그 안에서 흐른 시간으로 박자 기한이 지나도 쓰거나 싣는다. "사이"는 마지막 확인(시계·연결·증거 등)과 효과 사이의 외부 호출, "유효 문 뒤"는 박자 유효 문을 본 뒤 호출 전에 도는 외부 코드(접근자 포함)다. 박자 안의 장부 쓰기·표식은 이 차례를 `send-gate.ts`의 `callAfterGate` 한 함수로 한다(얻기·인자 원소를 함수 안 배열로 옮기기 → 유효 문 → `Reflect.apply`). 유효 문은 장부 쓰기마다 `holdBeatValid`로 포트의 칸을 한 번 읽어 그 포트 묶음을 수신자로 부른다(같은 칸을 두 번 읽지 않는다). 정적 시험(`test/supervisor/dispatch/start-send.test.ts`)이 그 본문과 부르는 줄 여섯을 글자 그대로 본다. 아래 표에서 "유효 문 뒤"가 "없음"이 아닌 자리는 박자 밖이거나 내보내기 포트 안, 또는 시작·갱신의 마지막 판정이 부르는 장부 시계 호출 하나다.
 
 | 효과 | 자리(확인 → 효과) | 직전에 읽는 문 | 사이 | 유효 문 뒤·호출 전에 도는 외부 코드(접근자 포함) | 기한이 정해지는 때 |
 |---|---|---|---|---|---|
 | 박자 다섯 부르기 | 순서기의 `gate()`가 박자마다 `restoreDone`(572) | `stage >= 5 && (2)` | 없음(순서기가 인자를 확인 전에 만든다) | 없음(만들 때 쥔 박자 함수를 `Reflect.apply`로 부른다) | 박자를 부르기 전(`beatLimit`, 822~826). 시각을 읽지 못하면 박자를 부르지 않고 96 |
-| 끊김: `markLostFor` | `link-loss.ts` 303 인자 → 304 `callAfterGate`(장부 포트 객체·`markLostFor` 얻기 → (2) → `Reflect.apply`), 실행기마다 | (2) | 없음 | 없음 | 박자 기한 |
-| 수명: 갱신 기록 | `life-loop.ts` 607 (1) → 609 연결 문 → 611 시계 → 627 인자 → 628 `callAfterGate`(장부 포트 객체·`recordRenewInstruction` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
-| 수명: 종료 기록 | `life-loop.ts` 723 시계 → 737 인자 → 738 `callAfterGate`(장부 포트 객체·`recordStopInstruction` → (2) → 호출) | (2)만(닫힌 접수에서도 종료는 적는다) | 없음 | 없음 | 박자 기한 |
-| 수명: 갱신·종료·조회 송신 | 갱신은 `life-loop.ts` 688 시계 함수 쥐기 → 707 `deliver`(마지막 여유 판정 692을 넘김), 종료·조회는 793·840 `deliver` → 280 `sendInstruction`(`send-gate.ts` 186 수신 객체·`send`, 190 (2) 쥐기 → 207 (2) → 갱신이면 208 여유 판정(장부 시계 호출) → 212 쥔 `send`) → 내보내기 포트의 `lastCheck` | (2), 그 뒤 포트 맨 앞의 발급 깃발 = 순서기 깃발 `&&` (2) | 갱신: (2) 뒤 장부 시계 호출 하나(남는 한계). 종료·조회: 없음 | 갱신은 그 장부 시계 호출. 모두 포트 안에서 깃발 뒤 서버의 인정 재확인·`finalCheck`(아래 "실행기로의 송신") | 박자 기한 |
-| 재전송: 시작의 송신 표식 | `resend.ts` 476 (1) → 연결 문·시계·봉하기(507) → 553 시계 함수 쥐기 → 572 공유 함수 → `send-gate.ts` 186 수신 객체·`send` → 190 (2) 쥐기 → 191 `start`의 칸·봉투 칸(`holdStart`) → 202 `callAfterGate`(쥔 표식 포트·`markStartDispatch` → (2) → 호출) | (1) 뒤 (2) | 입력의 칸 쥐기(포트 호출·await 없음). 표식 뒤 마지막 판정(207 (2) → 208 시한 확인)이 막으면 표식만 남고 싣지 않는다 | 없음 | 박자 기한 |
-| 재전송·배정: 송신(시작·취소·확정) | `send-gate.ts` 207 (2) → (시작이면 208 마지막 확인: 시작 시한의 장부 시계 호출) → 212 `Reflect.apply(send, target)` | (2). 시작은 (2) 뒤 마지막 확인 | 시작: (2) 뒤 장부 시계 호출 하나(남는 한계). 취소·확정: 없음 | 시작은 그 장부 시계 호출(`lastCheck`). 수신 객체·`send`·`start`의 칸은 186~191에서 미리 쥐었다. 포트 안은 아래 "실행기로의 송신" | 박자 기한 |
-| 배정: 잇기 | `assign-loop.ts` 457 (1) → 맡기지 않을 실행기·고르기 → 479 난수 → 482 인자 → 483 `callAfterGate`(장부 포트 객체·`assignToolRequest` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
-| 배정: 시작 기록 | `assign-loop.ts` 400 (1) → 맡기지 않을 실행기 → 505 난수 → 507 인자 → 508 `callAfterGate`(장부 포트 객체·`startRun` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
-| 배정: 시작의 송신 표식 | `assign-loop.ts` 548 봉하기 → 560 공유 함수 → `send-gate.ts` 186 → 190 → 191 → 202 `callAfterGate` | (2) | 재전송과 같음. 막히면 적힌 시작은 표식 없이 남아 재전송이 다룬다 | 없음 | 박자 기한 |
-| D-90 닫기 | `unreceived.ts` 506 `readGate`(2단계 `&&` (2)) → 530 `confirm` → 533 (2) → 536 `closeUnreceivedRun` | (2) 두 번 | 박자 유효 문 하나(읽기만 한다는 조건, 정한 것 8) | 없음(박자 처음에 쥔 함수·수신자를 `Reflect.apply`로) | 박자 기한 |
+| 끊김: `markLostFor` | `link-loss.ts`의 인자(`lostInput`) → `callAfterGate`(장부 포트 객체·`markLostFor` 얻기 → (2) → `Reflect.apply`), 실행기마다 | (2) | 없음 | 없음 | 박자 기한 |
+| 수명: 갱신 기록 | `life-loop.ts`의 (1) → 연결 문 → 시계 → 인자(`renewInput`) → `callAfterGate`(장부 포트 객체·`recordRenewInstruction` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
+| 수명: 종료 기록 | `life-loop.ts`의 시계 → 인자(`stopInput`) → `callAfterGate`(장부 포트 객체·`recordStopInstruction` → (2) → 호출) | (2)만(닫힌 접수에서도 종료는 적는다) | 없음 | 없음 | 박자 기한 |
+| 수명: 갱신·종료·조회 송신 | 갱신은 `life-loop.ts`의 시계 함수 쥐기 → `deliver`(마지막 여유 판정 `plainCheck`를 넘김), 종료·조회는 `deliver` → `sendInstruction`(`send-gate.ts`: 칸 쥐기(`readEnvelope`의 봉투 데이터 사본, `holder.sink`·`send`, `holdBeatValid`, `plain`의 두 칸) → `if (!gate())` (2) → 갱신이면 `verdictOf`의 여유 판정(장부 시계 호출) → 마지막 줄의 `Reflect.apply(send, target, …)`) → 내보내기 포트의 `lastCheck` | (2), 그 뒤 포트 맨 앞의 발급 깃발 = 순서기 깃발 `&&` (2) | 갱신: (2) 뒤 장부 시계 호출 하나(남는 한계). 종료·조회: 없음 | 갱신은 그 장부 시계 호출. 모두 포트 안에서 깃발 뒤 서버의 인정 재확인·`finalCheck`(아래 "실행기로의 송신") | 박자 기한 |
+| 재전송: 시작의 송신 표식 | `resend.ts`의 (1) → 연결 문·시계·봉하기 → 시계 함수 쥐기 → 공유 함수 → `send-gate.ts`의 `sendInstruction`: 칸 쥐기(`readEnvelope`의 봉투 데이터 사본, `holder.sink`·`send`, `holdBeatValid`, `holdStart`의 `start` 칸) → `const marking = callAfterGate(`(쥔 표식 포트·`markStartDispatch` → (2) → 호출) | (1) 뒤 (2) | 입력의 칸 쥐기(포트 호출·await 없음). 표식 뒤 마지막 판정(`if (!gate())` (2) → `verdictOf`의 시한 확인)이 막으면 표식만 남고 싣지 않는다 | 없음 | 박자 기한 |
+| 재전송: 송신(시작·취소·확정) | `send-gate.ts`의 `if (!gate())` (2) → (시작이면 `verdictOf`가 부르는 `lastCheck`: 시작 시한의 장부 시계 호출 1회) → 마지막 줄의 `Reflect.apply(send, target, …)` | (2). 시작은 (2) 뒤 마지막 확인 | 시작: (2) 뒤 장부 시계 호출 하나(남는 한계). 취소·확정: 없음(`lastCheck`·`plain` 없음) | 시작은 그 장부 시계 호출. 수신 객체·`send`·`start`의 칸은 칸 쥐기에서 미리 쥐었다. 포트 안은 아래 "실행기로의 송신" | 박자 기한 |
+| 배정: 시작의 송신 | `send-gate.ts`의 `if (!gate())` (2) → 마지막 줄의 `Reflect.apply(send, target, …)` | (2) | 없음: 배정의 `start`에는 `lastCheck`가 없어 표식 뒤 두 번째 (2)와 송신 사이의 장부 시계 호출이 0이다(`assign-loop.ts`의 `sendInstruction` 호출) | 없음. 포트 안은 아래 "실행기로의 송신" | 박자 기한 |
+| 배정: 잇기 | `assign-loop.ts`의 (1) → 맡기지 않을 실행기·고르기 → 난수 → 인자(`assignInput`) → `callAfterGate`(장부 포트 객체·`assignToolRequest` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
+| 배정: 시작 기록 | `assign-loop.ts`의 (1) → 맡기지 않을 실행기 → 난수 → 인자(`startInput`) → `callAfterGate`(장부 포트 객체·`startRun` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
+| 배정: 시작의 송신 표식 | `assign-loop.ts`의 봉하기 → 공유 함수 → `send-gate.ts`의 칸 쥐기 → `const marking = callAfterGate(` | (2) | 재전송과 같음. 막히면 적힌 시작은 표식 없이 남아 재전송이 다룬다 | 없음 | 박자 기한 |
+| D-90 닫기 | `unreceived.ts`의 `readGate`(2단계 `&&` (2)) → `confirm` → (2) → `closeUnreceivedRun` | (2) 두 번 | 박자 유효 문 하나(읽기만 한다는 조건, 정한 것 8) | 없음(박자 처음에 쥔 함수·수신자를 `Reflect.apply`로) | 박자 기한 |
 | 실행기로의 송신(지시·조회·재전송)·ACK | 내보내기 포트의 `lastCheck`가 맨 앞에서 발급 깃발 | 발급 깃발(640) = 순서기 깃발 `&&` (2) | 서버의 인정 재확인, `finalCheck`(시계로 봉투·작업 시한). 그 뒤 박자 기한은 다시 보지 않는다 | 사이 칸과 같다(뒤 조각, 남는 한계) | 박자 안이면 박자 기한 |
 | 자격 값 읽기·송신 | 자격 송신기의 두 문(읽기 앞, `lastCheck`) | 같은 발급 깃발 `&&` 복원기 접수 | 계정 파일 읽기(비동기, 두 번째 문이 다시 본다) | 해당 없음(박자 밖) | 박자 밖(영수증마다) |
 | 5단계 허가를 소비자에 보이기 | `kickRestore`의 수락(`granted`, 777) | 단계 결과를 기한 안에 받아들임. 받기 전은 닫힘(붙잡지 않음), 기한 넘김은 `intake_unaccepted` | 없음 | 해당 없음 | 단계를 부르기 전(764) |
@@ -71,7 +72,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | S15 | 서버 `deliver`에 `lines.deliver`, 박자마다 `pump()` | 672, 814 | "pump 수 = 박자 수", 루프백의 인사 반영 |
 | S16 | `candidate`마다 `noteCandidate` | 답 줄이 한다(`answers.ts`의 `candidate`). 조립은 답 줄의 `cycle`에 그 순서기를 넘긴다 | "같은 객체" |
 | S17 | `takeRequery()`를 다시 묻게 | 꺼내 수를 기록만(815). 답 줄은 실행 ID만 내고 사유를 내지 않는다. 다시 묻기는 수명 박자의 간격 | 남는 한계 |
-| S19 | D-90 박자, 증거는 `{ known: false }` | 534, 진입점의 `evidence` | 루프백 박자 보고 |
+| S19 | D-90 박자에 같은 답 줄의 `evidence`·`withheld`, 증거 장부는 프로세스에 하나 | `beats.unreceived`(박자 함수 본문에서 `need(lines)`로 위임), `make.lines`의 `evidenceBook: createAnswerEvidenceBook()` | `boot-evidence.test.ts`(시한 뒤 빈 full이면 닫기 1회, 오염·대기·번호 변경·연결 바뀜은 0회), `boot-effects.test.ts` "D-90 박자의 증거·맡기지 않을 실행기는 같은 답 줄의", "읽기만 한다" |
 | S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음 | 383 | "장부 not_initialized", 정적 `"create"` 0 |
 | S21 | 필수 이웃에 현관·관측 중계·실행기 | 370 | "필수 이웃(S21)" |
 | S22 | 1단계 전 서버가 보는 세대 `null` | 복원기를 감싸지 않고 넘김(446) | 루프백 1단계 전 맞춤 답 0 |
@@ -150,7 +151,6 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 
 - **차트 짝(N5c, homelab):** README 환경 표의 "차트 짝" 다섯(`OLIVE_REGISTRY_FILE`, `OLIVE_ENVIRONMENT`, `OLIVE_TARGETS`, `OLIVE_POLICY_REVISION`, `OLIVE_RESULT_DIR`)을 더하고, `OLIVE_TLS_DIR`·`OLIVE_TRUST_DIR`을 감독에는 늘 준다. 서명 키 Secret의 키 이름을 `supervisor-signing.key`로 맞춘다(지금 차트의 이름은 확인하지 않았다). 결과 폴더를 장부 PVC 아래에 둘지 정하고, 그 상위 경로에 링크를 두지 않는다(기동은 마지막 요소만 본다).
 - **현관(O08):** `FrontDoorPorts` 셋을 채운다. 권위 정지 기록은 모르면 던지고 "기록 없음"을 지어내지 않는다. 이웃 행은 현관(`front-door`, v2)과 관측 중계(이름을 진입점의 `observation-relay`와 맞춘다)를 그 연결이 실제로 쓰는 판과 인사에서 확인한 정책으로 낸다. 한 단계의 모든 답이 30초(`restoreStepWaitMs`) 안에 와야 한다(4단계는 게시 전부가 이 기한 하나를 나눠 쓴다). 넘기면 그 답은 모름이고 96이다.
-- **증거 포트(A6c-2):** `deps.evidence`를 답 줄의 실제 증거로 바꾼다. 같은 답 줄·같은 복원기를 읽어야 한다(`dispatch/unreceived.md`).
 - **연결 하나 닫기(A6c 뒤):** `closeConnection`을 부르는 자리는 두지 않았다. 둘 때는 박자 밖(주기)에서, 같은 서버로 부른다.
 - **관리 통로(M1a):** 상태는 조립의 기록(`restore_step`, `beat`의 D-90 건수·사유, `fatal`)과 같은 값을 읽는다. 도구 처리기 포트(`tools`)를 관리 명령에 다시 쓰지 않는다. 감독의 두 번째 듣기라 `test/entrypoints.test.ts`의 "감독에서 닿는 코드" 단언에 한 칸과 까닭을 더한다.
 - **시험 작업 넣기(M1t):** 운영 값에서 켜면 거절한다. 받는 길은 박자와 겹치지 않게 주기에서 부른다. 접수 판단(`intake`)은 지금 조립의 지역 객체이고 공개 면(`RunningSupervisor`)에 없다. M1t를 연결할 때 같은 판단을 읽는 포트를 공개 면에 더한다. 복원기를 직접 읽지 않는다: 기한을 넘긴 5단계의 허가는 장부에 남아 있을 수 있다.

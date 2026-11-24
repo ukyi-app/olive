@@ -500,6 +500,27 @@ describe("실행기 입력이 장부에 닿기 전의 구간(첫 외부 호출�
     expect(w.lines.evidence.read(R1)).toEqual({ known: false });
     const next = createAnswerLines({ ...w.ports, evidenceBook: book });
     expect(next.evidence.read(R1)).toMatchObject({ known: true, tainted: true, pending: false });
+    // 새 줄에 같은 장부·지금 연결·시한 뒤의 빈 full을 묶고 박자를 실제로 한 번 돌린다: 표시를 소비하는 쪽(박자)이 오염을 보고 닫지 않는다.
+    w.table.greet(2, R1, [], SIGNED);
+    next.deliver({ kind: "occupancy", connection: 2, answer: { executorId: R1, coverage: "full", runs: [] }, issuedAt: SIGNED } as Delivered);
+    expect(next.evidence.read(R1)).toMatchObject({ known: true, tainted: true, pending: false, lastFull: { connection: 2, runs: [] } });
+    const nextTick = unreceivedTick(
+      {
+        ledger: {
+          unansweredInstructions: () => w.real.unansweredInstructions(),
+          closeUnreceivedRun: (input: UnreceivedClosureInput, from: { sender: string }) => {
+            w.closeCalls.push(input);
+            return w.real.closeUnreceivedRun(input, from);
+          },
+        },
+        evidence: next.evidence,
+        withheld: next.withheld,
+        intake: { stopGeneration: () => 0 },
+        observationsSettled: () => true,
+      } as unknown as UnreceivedPorts,
+      AT,
+    );
+    expect(ran(nextTick).runs).toEqual([skippedOutcome(w, "tainted")]);
     expect([w.closeCalls.length, slot(w)]).toEqual([0, { known: true, value: false }]);
   });
 
@@ -545,7 +566,7 @@ describe("실행기 입력이 장부에 닿기 전의 구간(첫 외부 호출�
     expect(after).toEqual(atNote as never);
   });
 
-  test("변경 번호가 안전 정수 상한에 닿으면 그 장부는 사는 동안 모름이다: 닫지 않고, confirm은 current를 내지 않고, 같은 장부의 새 답 줄도 모름이다", () => {
+  test("변경 번호가 안전 정수 상한에 닿는 그 순간부터 그 장부는 사는 동안 모름이다: 상한은 알려진 번호로 내지 않고, 닫지 않고, confirm은 current를 내지 않고, 같은 장부의 새 답 줄도 모름이다", () => {
     const book = createAnswerEvidenceBook({ firstVersion: Number.MAX_SAFE_INTEGER - 8 });
     const w = world({ book });
     w.hello(1, []);
@@ -558,13 +579,35 @@ describe("실행기 입력이 장부에 닿기 전의 구간(첫 외부 호출�
       // 철회는 그 주체의 번호를 하나 올린다(연결 99는 쓰지 않는 번호).
       w.lines.deliver({ kind: "withdrawn", connection: 99, principal: R1 });
     }
-    expect(seen.at(-1)).toBe(Number.MAX_SAFE_INTEGER);
+    // 마지막으로 알려진 번호는 상한 - 1이다. 그다음 변화가 상한에 닿는 순간 모름이 된다(상한에서 읽힌 번호는 다음 변화와 같은 값이다).
+    expect(seen.at(-1)).toBe(Number.MAX_SAFE_INTEGER - 1);
     expect(seen.every((value, i) => Number.isSafeInteger(value) && (i === 0 || value > seen[i - 1]!))).toBe(true);
+    expect(w.lines.evidence.confirm(R1, 1, Number.MAX_SAFE_INTEGER - 1, 0)).toBe("evidence_changed");
     expect(w.lines.evidence.confirm(R1, 1, Number.MAX_SAFE_INTEGER, 0)).toBe("evidence_changed");
     expect(ran(w.tick()).runs).toEqual([skippedOutcome(w, "evidence_unknown")]);
     expect(w.closeCalls.length).toBe(0);
     expect(createAnswerLines({ ...w.ports, evidenceBook: book }).evidence.read(R1)).toEqual({ known: false });
     expect(() => createAnswerEvidenceBook({ firstVersion: -1 })).toThrow(RangeError);
+  });
+
+  test("상한 경계: 시작값이 상한이면 첫 읽기부터 모름, 상한 - 1이면 첫 읽기는 알려진 번호이고 변화 하나로 모름이 된다(교체한 새 답 줄도 모름)", () => {
+    const at = createAnswerEvidenceBook({ firstVersion: Number.MAX_SAFE_INTEGER });
+    const top = world({ book: at });
+    expect(top.lines.evidence.read(R1)).toEqual({ known: false });
+    top.hello(1, []);
+    expect(ran(top.tick()).runs).toEqual([skippedOutcome(top, "evidence_unknown")]);
+    expect(top.closeCalls.length).toBe(0);
+
+    const below = createAnswerEvidenceBook({ firstVersion: Number.MAX_SAFE_INTEGER - 1 });
+    const w = world({ book: below });
+    expect(w.lines.evidence.read(R1)).toMatchObject({ known: true, version: Number.MAX_SAFE_INTEGER - 1 });
+    w.lines.deliver({ kind: "withdrawn", connection: 99, principal: R1 });
+    expect(w.lines.evidence.read(R1)).toEqual({ known: false });
+    w.hello(1, []);
+    expect(ran(w.tick()).runs).toEqual([skippedOutcome(w, "evidence_unknown")]);
+    expect(w.lines.evidence.confirm(R1, 1, Number.MAX_SAFE_INTEGER - 1, 0)).toBe("evidence_changed");
+    expect(w.closeCalls.length).toBe(0);
+    expect(createAnswerLines({ ...w.ports, evidenceBook: below }).evidence.read(R1)).toEqual({ known: false });
   });
 });
 

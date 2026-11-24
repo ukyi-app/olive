@@ -33,7 +33,7 @@ import { type LifecycleIntent, type LifecyclePolicy, type LifecycleView, nextInt
 import { newUuid, type RefusalReason as DraftRefusalReason, renewDraft, sealDraft, statusQueryDraft, stopDraft } from "./envelopes.ts";
 import type { Clock, InstructionSink, Random, Signer } from "./ports.ts";
 import type { PendingQuery } from "./receipts.ts";
-import { callAfterGate } from "./send-gate.ts";
+import { callAfterGate, holdBeatValid } from "./send-gate.ts";
 import { type PlainCheck, sendInstruction } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 확정 기록(recordFinalizeInstruction)은 받지 않는다.
@@ -259,13 +259,10 @@ function intakeOpen(intake: LifeIntake): boolean {
   }
 }
 
-// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다). 칸은 부를 때마다 한 번만 읽고 그 포트
+// 객체를 수신자로 부른다(send-gate.ts의 holdBeatValid): 같은 칸을 두 번 읽으면 접근자의 시간이 두 번 들고 두 읽기가 다른 함수를 낼 수 있다.
 function beatValid(ports: LifeLoopPorts): boolean {
-  try {
-    return ports.beatValid === undefined || ports.beatValid() === true;
-  } catch {
-    return false;
-  }
+  return holdBeatValid(ports)();
 }
 
 // 갱신·취소·조회 봉투를 싣는다. 송신 포트에 닿는 길은 재전송·배정과 같은 공유 함수 하나다: 포트의 수신 객체와 send를 얻고 → 박자

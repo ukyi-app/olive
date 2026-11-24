@@ -25,7 +25,7 @@ import {
 } from "../../ledger/index.ts";
 import type { Connections, StopGenerationSource } from "../transport/connections.ts";
 import type { Clock } from "./ports.ts";
-import { callAfterGate } from "./send-gate.ts";
+import { callAfterGate, holdBeatValid } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 쓰기는 markLostFor 하나다.
 export type LinkLossLedger = Pick<Ledger, "listRuns" | "markLostFor">;
@@ -319,13 +319,10 @@ function judge(
   return { executorId, outcome: "moved", absentSince, at: now, runs };
 }
 
-// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다).
+// 박자 유효 문. 포트가 없으면 유효, 던지거나 true가 아니면 무효다(모름을 유효로 읽지 않는다). 칸은 부를 때마다 한 번만 읽고 그 포트
+// 객체를 수신자로 부른다(send-gate.ts의 holdBeatValid): 같은 칸을 두 번 읽으면 접근자의 시간이 두 번 들고 두 읽기가 다른 함수를 낼 수 있다.
 function beatValid(ports: LinkLossPorts): boolean {
-  try {
-    return ports.beatValid === undefined || ports.beatValid() === true;
-  } catch {
-    return false;
-  }
+  return holdBeatValid(ports)();
 }
 
 // 답의 옮긴 실행 목록을 칸마다 한 번 읽어 옮겨 적는다. 하나라도 꼴이 틀리거나 markLostFor가 할 수 없는 전이(진행 중 상태에서

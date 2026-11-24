@@ -437,6 +437,17 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     expect(await run.stop()).toBe(96);
   });
 
+  test("D-90 박자의 증거·맡기지 않을 실행기는 같은 답 줄의 evidence·withheld 그 객체다(배정 박자와 같은 withheld)", async () => {
+    const w = world();
+    const run = await running(w);
+    await untilStep(w, 5);
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    const lines = w.captured.lines!.value;
+    const ports = w.captured.beatPorts as { unreceived?: { evidence?: unknown; withheld?: unknown }; assign?: { withheld?: unknown } };
+    expect([ports.unreceived?.evidence === lines.evidence, ports.unreceived?.withheld === lines.withheld, ports.assign?.withheld === lines.withheld]).toEqual([true, true, true]);
+    expect(await run.stop()).toBe(0);
+  });
+
   // 처음부터 닫힌 5단계(현관의 정지 기록)와 시작된 작업 하나. 박자 유효 문은 접수 문과 달라 기존 실행의 정리는 나간다.
   // 입력마다 나가야 할 봉투가 다르다: 기한이 지난 작업은 종료(task_cancel), 기한 안의 작업은 상태 조회(status_query).
   const closedFromStart = async (wall: number): Promise<string[]> => {
@@ -492,7 +503,7 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
         };
       }
     };
-    watch("evidence", w.deps.evidence);
+    watch("evidence", w.captured.lines!.value.evidence);
     watch("lines", w.captured.lines!.value);
     watch("server", w.fake.server);
     const before = commits.length;
@@ -917,7 +928,7 @@ describe("D-90 박자 안의 박자 유효 문", () => {
         };
       }
     };
-    watch("evidence", w.deps.evidence);
+    watch("evidence", w.captured.lines!.value.evidence);
     watch("lines", w.captured.lines!.value);
     watch("server", w.fake.server);
     const live: unknown[] = [];
