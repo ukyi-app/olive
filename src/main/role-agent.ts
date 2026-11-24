@@ -94,7 +94,18 @@ function bufferedTransport(port: AgentSocketPort): AgentTransport & { flush(): v
 // prepare → 붙기 → attach. 붙어서 hello를 보냈으면 그 대리를, 끝내는 길이면(runtime.exit을 부른 뒤) null을 돌려준다.
 export async function runRoleAgent(options: RoleAgentEntryOptions): Promise<RoleAgent | null> {
   const { runtime } = options;
-  const agent = await RoleAgent.prepare(runtime, options.parts);
+  // 붙기 상한은 prepare 전부터 잰다. 정리 코어 기록(prepare)이 돌아오지 않으면 hello도 종료도 없는 대리가 남아, 제어는 86으로 다시 뜨기를
+  // 거듭하고 역할 컨테이너는 그대로 멈춰 있게 된다.
+  const limit = options.monoNow() + options.connectWaitMs;
+  let cancelPrepare: () => void = () => {};
+  const prepareBound = new Promise<"lapsed">((resolve) => (cancelPrepare = runtime.setTimer(options.connectWaitMs, () => resolve("lapsed"))));
+  const prepared = await Promise.race([RoleAgent.prepare(runtime, options.parts), prepareBound]);
+  cancelPrepare();
+  if (prepared === "lapsed") {
+    runtime.exit(ROLE_AGENT_EXIT.unreachable);
+    return null;
+  }
+  const agent = prepared;
   if (agent === null) return null;
   let transport: ReturnType<typeof bufferedTransport> | null = null;
   // 상한을 넘겨 버린 연결. 그 연결의 받은 바이트·닫힘은 대리에 넘기지 않는다(늦게 열린 연결을 닫을 때의 닫힘이 linkClosed가 되지 않게).
@@ -117,7 +128,6 @@ export async function runRoleAgent(options: RoleAgentEntryOptions): Promise<Role
       if (!abandoned) agent.linkClosed();
     },
   };
-  const limit = options.monoNow() + options.connectWaitMs;
   const unreachable = (): null => {
     runtime.exit(ROLE_AGENT_EXIT.unreachable);
     return null;

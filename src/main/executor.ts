@@ -30,13 +30,19 @@ export const EXECUTOR_ENV = [
 ] as const;
 
 // 운영 숫자의 임시값. socket.md가 기본값을 두지 않은 정책을 여기서 정한다. 실측 뒤 바꾼다.
+// worker의 기본 exitWaitMs와 같은 값. worker와 원격에 이 하나를 함께 넘긴다.
+const REPLY_WAIT_MS = limits.STOP_GRACE_MS + 5_000;
 const TIMING: ExecutorSettings["timing"] = {
-  // worker의 기본 exitWaitMs와 같은 값. worker와 원격에 이 하나를 함께 넘긴다.
-  replyWaitMs: limits.STOP_GRACE_MS + 5_000,
+  replyWaitMs: REPLY_WAIT_MS,
   helloWaitMs: 30_000,
   helloPollMs: 50,
   tickMs: 1_000,
   stopWaitMs: 10_000,
+  // 지시 처리와 recover 안에서 상한이 걸린 기다림은 실행마다 종료(terminate)와 계수(survivors)가 차례로 하나씩, 각각 replyWaitMs다
+  // (worker.confirmStopped). 비상 종료면 그 앞에 정지 세대 쓰기의 상한 2초(worker stopWriteWaitMs 기본)가 붙는다. 여기에 저장소 쓰기
+  // 몇 번의 여유를 더해 25초다. 맞춤 답의 정지 세대 쓰기는 link도 같은 25초(STOP_SYNC_WAIT_MS)까지만 기다리고 닫는다(그 뒤는 저장 장애).
+  // 그보다 오래 멈춘 쓰기는 더 기다려도 저장소가 쓰기를 차례로 하므로 새 연결의 맞춤이 그 뒤에 줄을 서서 얻는 것이 없다.
+  settleWaitMs: 2 * REPLY_WAIT_MS + 5_000,
 };
 const RECONNECT: ExecutorSettings["reconnect"] = { initialDelayMs: 1_000, maxDelayMs: 30_000, multiplier: 2, jitterRatio: 0.2 };
 const RECEIVE: ExecutorSettings["receive"] = { maxQueuedBytes: 1_048_576 };

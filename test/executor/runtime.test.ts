@@ -35,6 +35,7 @@ import {
   scratch,
   scriptedIo,
   sha256,
+  stopWrite,
   supervisorKeys,
   T0,
   taskStartBody,
@@ -67,7 +68,7 @@ function contents(): Map<string, string> {
   ]);
 }
 
-const TIMING: ExecutorSettings["timing"] = { replyWaitMs: 5_000, helloWaitMs: 1_000, helloPollMs: 50, tickMs: 1_000, stopWaitMs: 2_000 };
+const TIMING: ExecutorSettings["timing"] = { replyWaitMs: 5_000, helloWaitMs: 1_000, helloPollMs: 50, tickMs: 1_000, stopWaitMs: 2_000, settleWaitMs: 1_500 };
 
 function settings(over: Partial<ExecutorSettings> = {}): ExecutorSettings {
   return {
@@ -705,6 +706,8 @@ test("제품 설정의 응답 상한은 10초이고 worker의 exitWaitMs와 원�
   });
   if (!parsed.ok) throw new Error(parsed.name);
   expect(parsed.settings.timing.replyWaitMs).toBe(10_000);
+  // 다시 붙기 전 앞 지시와 기동 단계의 상한: 종료·계수 상한 둘(각 replyWaitMs)보다 길다.
+  expect(parsed.settings.timing.settleWaitMs).toBe(25_000);
   const result = await begin(harness(), parsed.settings);
   if (!result.ok) throw new Error(result.reason);
   expect(optionsOf(result.running.worker).exitWaitMs).toBe(10_000);
@@ -712,7 +715,8 @@ test("제품 설정의 응답 상한은 10초이고 worker의 exitWaitMs와 원�
 });
 
 // 루프백의 실제 상호 TLS 감독 흉내에 붙어 맞춤과 인사까지 마친 실행기. connects는 TLS 클라이언트의 connect 호출(TCP를 열기 전) 수다.
-async function loopbackRun() {
+// synced가 false면 맞춤 답을 보낸 뒤 인사를 기다리지 않고 돌려준다(세대 쓰기가 멈춘 경우).
+async function loopbackRun(options: { openStore?: ExecutorDeps["openStore"]; synced?: boolean } = {}) {
   const supervisorLeaf = pki.supervisor();
   const peers: { socket: tls.TLSSocket; got: Envelope[]; closed: boolean }[] = [];
   const server = await startTlsServer({
@@ -735,7 +739,7 @@ async function loopbackRun() {
   const agent = new FakeAgent();
   const deps: ExecutorDeps = {
     readText: async (path) => contents().get(path)!,
-    openStore: (dir, now) => ExecutorStore.open(dir, { now }),
+    openStore: options.openStore ?? ((dir, now) => ExecutorStore.open(dir, { now })),
     listenAgent: (remote) => {
       agent.attach(remote);
       agent.hello();
@@ -764,7 +768,7 @@ async function loopbackRun() {
   const peer = peers[0]!;
   const clock = new Clock(Date.now());
   peer.socket.write(frame(fromSupervisor(clock, worker.name, "stop_sync_reply", { challenge: (peer.got[0]!.body as { challenge: string }).challenge }, { stop_generation: 0 })));
-  await until(() => peer.got.some((e) => e.header.action === "hello") && link.live());
+  if (options.synced !== false) await until(() => peer.got.some((e) => e.header.action === "hello") && link.live());
   return { server, peers, peer, calls, clock, running: result.running, connects: () => connects };
 }
 
@@ -806,6 +810,31 @@ test("앞 연결의 지시가 끝나기 전에는 다시 붙지 않는다: 재�
     } finally {
       await r.server.close();
     }
+  }
+});
+
+test("앞 연결의 지시를 기다리는 다시 붙기에도 상한이 있다: 맞춤 답의 정지 세대 쓰기가 끝나지 않으면 settleWaitMs 뒤 다시 붙지 않고 89로 끝난다(루프백 TLS)", async () => {
+  const disk = scriptedIo();
+  const write = disk.hold(stopWrite);
+  const r = await loopbackRun({ openStore: (dir, now) => ExecutorStore.open(dir, { now, io: disk.io }), synced: false });
+  try {
+    await write.entered;
+    r.peer.socket.destroy();
+    await until(() => r.calls.some((call) => call.startsWith("log 감독 소켓: closed(")));
+    await until(() => r.calls.includes("log 앞 연결의 지시 처리가 끝나기를 기다린 뒤 다시 붙는다"));
+    // 상한 전에는 다시 붙지도 끝나지도 않는다.
+    expect(await within(r.running.done, TIMING.settleWaitMs - 300)).toBe("timeout");
+    expect(r.connects()).toBe(1);
+    expect(await within(r.running.done, 2_000)).toBe(EXECUTOR_EXIT.fatal);
+    await Bun.sleep(300);
+    expect(r.connects()).toBe(1);
+    expect(r.peers).toHaveLength(1);
+    expect(r.calls).toContain("client.close");
+    expect(r.calls).toContain("listener.stop");
+  } finally {
+    write.open();
+    await r.running.stop();
+    await r.server.close();
   }
 });
 
@@ -866,6 +895,45 @@ test("종료 영수증이 저장되고 실행 기록 쓰기만 실패한 볼륨:
   await connection.receive(fromSupervisor(clock, worker.name, "task_start", body, { stop_generation: 0, run_generation: 1 }));
   await until(() => writes.some((text) => text.includes('"type":"start"') && text.includes(runId)));
   expect(writes.filter((text) => text.includes('"type":"start"'))).toHaveLength(1);
+});
+
+test("정리 영수증만 남고 같은 세대의 종료 영수증이 없는 stopping(G02 입력)은 잠금을 풀지 않는다: 원격을 처음부터 잠그고 대리 hello를 믿지 않는다", async () => {
+  const dir = scratch();
+  const seeded = await ExecutorStore.open(dir, { now: () => T0 });
+  const run = randomUUID();
+  const instruction = randomUUID();
+  const accepted = randomUUID();
+  const cleaned = randomUUID();
+  await seeded.adoptStopGeneration(0);
+  const window = { start_stop_generation: 0, instruction_request_id: instruction, deadline_at: T0 + 50_000, lease_until: T0 + 20_000, credential_digest: "0".repeat(64) };
+  expect(await seeded.beginRun({ run_id: run, run_generation: 1, state: "preparing", ...window, exit: null, last_receipt_id: null })).toBe(true);
+  const acceptedBody = { receipt_id: accepted, run_id: run, instruction_request_id: instruction, instruction: "task_start" };
+  const cleanedBody = { receipt_id: cleaned, run_id: run, instruction_request_id: randomUUID(), cleaned_at: T0 };
+  const written = await seeded.commit(run, { state: "stopping", exit: "failed", last_receipt_id: cleaned }, [
+    { entry: { action: "receipt_accepted", id: accepted, run_id: run, run_generation: 1, acked: false, body: acceptedBody } },
+    { entry: { action: "receipt_cleaned", id: cleaned, run_id: run, run_generation: 1, acked: false, body: cleanedBody } },
+  ]);
+  expect(written.saved).toBe(true);
+
+  const h = harness({ hello: false });
+  const writes: string[] = [];
+  h.deps.listenAgent = (remote) => {
+    h.calls.push("listenAgent");
+    h.agent.remote = remote;
+    h.agent.session = remote.connect({ write: (bytes) => void writes.push(new TextDecoder().decode(bytes)), close: () => {} });
+    return { stop: () => h.calls.push("listener.stop") };
+  };
+  const starting = startExecutor(settings({ storeDir: dir }), h.deps);
+  await until(() => h.agent.remote !== null);
+  // 잠그지 않으면 hello 뒤 복원이 이 대리에 정리 요청(terminate)을 보내고 그 답을 기다린다.
+  expect(h.agent.remote!.state().distrusted).toBe("inherited_unverified");
+  h.agent.hello();
+  const result = await starting;
+  if (!result.ok) throw new Error(result.reason);
+  runs.push(Promise.resolve(result));
+  expect(result.running.remote.state().greeted).toBe(false);
+  expect(writes.filter((text) => text.includes('"type":"terminate"'))).toHaveLength(0);
+  expect(h.connects).toBe(1);
 });
 
 test("잠그지 않고 기동했는데 recover 뒤에 장부가 보류되면 감독에 붙지 않고 87로 끝나며 대리 소켓을 닫는다", async () => {
@@ -1002,4 +1070,31 @@ test("기동 중 멈춤 요청 뒤 단계가 실패해도 멈춤이 이긴다: �
   }
   expect(recovering.calls.at(-1)).toBe("listener.stop");
   expect(recovering.connects + opening.connects + reading.connects).toBe(0);
+});
+
+test("기동의 기다림에도 상한이 있다: 재료 읽기·저장소 열기·recover가 settleWaitMs 안에 끝나지 않으면 그 단계의 코드(timed_out)로 끝나고 연결 0", async () => {
+  const never = new Promise<never>(() => {});
+  const recover = WorkerExecutor.prototype.recover;
+  const cases: { step: StartStep; code: number; stall: (h: Harness) => void }[] = [
+    { step: "material", code: EXECUTOR_EXIT.material, stall: (h) => (h.deps.readText = () => never) },
+    { step: "store", code: EXECUTOR_EXIT.store, stall: (h) => (h.deps.openStore = () => never) },
+    { step: "recover", code: EXECUTOR_EXIT.recover, stall: () => (WorkerExecutor.prototype.recover = () => never) },
+  ];
+  try {
+    for (const c of cases) {
+      const h = harness();
+      c.stall(h);
+      const starting = startExecutor(settings(), h.deps);
+      await until(() => h.steps.includes(c.step));
+      h.timers.advance(TIMING.settleWaitMs - 1);
+      expect(await within(starting, 50), c.step).toBe("timeout");
+      h.timers.advance(1);
+      expect(await within(starting, 1_000)).toEqual({ ok: false, step: c.step, code: c.code, reason: "timed_out" });
+      expect(h.connects).toBe(0);
+      expect(h.calls.includes("listener.stop"), c.step).toBe(c.step === "recover");
+      WorkerExecutor.prototype.recover = recover;
+    }
+  } finally {
+    WorkerExecutor.prototype.recover = recover;
+  }
 });

@@ -98,6 +98,24 @@ test("대리 진입점: 제어가 아직 듣지 않으면 retryMs마다 다시 �
   expect(port.types()).toEqual(["hello"]);
 });
 
+test("대리 진입점: 정리 코어 기록(prepare)이 붙기 상한 안에 돌아오지 않으면 82로 끝나고 소켓에 붙지 않는다", async () => {
+  const order: string[] = [];
+  const runtime = new FakeRuntime();
+  const port = new Port();
+  const { connect, state } = connector(order, port);
+  const stalled = parts(order, { record: () => new Promise<never>(() => {}) });
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: stalled, connect, connectWaitMs: 250, retryMs: 100, monoNow: runtime.now });
+  await settle();
+  runtime.advance(249);
+  await settle();
+  expect(runtime.exits).toEqual([]);
+  runtime.advance(1);
+  expect(await running).toBeNull();
+  expect(runtime.exits).toEqual([ROLE_AGENT_EXIT.unreachable]);
+  expect(state.attempts).toBe(0);
+  expect(port.written).toEqual([]);
+});
+
 test("대리 진입점: 상한 안에 붙지 못하면 82로 끝나고 hello를 보내지 않는다", async () => {
   const order: string[] = [];
   const runtime = new FakeRuntime();
