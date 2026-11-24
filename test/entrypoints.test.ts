@@ -13,7 +13,8 @@ function run(entry: string) {
   });
 }
 
-for (const role of ["supervisor", "executor"] as const) {
+// 감독은 아직 자리 진입점이다. 실행기는 조립을 갖췄으므로 69 대신 "환경이 없으면 정해진 코드"를 본다(아래).
+for (const role of ["supervisor"] as const) {
   test(`entrypoints: ${role}는 역할 이름과 버전을 한 줄 찍고 69로 끝난다`, () => {
     const result = run(`src/main/${role}.ts`);
     expect(result.exitCode).toBe(69);
@@ -23,6 +24,22 @@ for (const role of ["supervisor", "executor"] as const) {
     );
   });
 }
+
+// 실행기 진입점은 환경이 없으면 감독에 붙기 전에 81로 끝난다. 환경마다의 경우와 연결 0은 test/executor/entry.test.ts가 본다.
+test("entrypoints: executor는 환경이 없으면 첫 이름을 한 줄 찍고 81로 끝난다", () => {
+  const result = run("src/main/executor.ts");
+  expect(result.exitCode).toBe(81);
+  expect(result.stdout.toString()).toBe("");
+  expect(result.stderr.toString()).toBe(`olive executor ${pkg.version}: 환경 OLIVE_ROLE이(가) 없다\n`);
+});
+
+// 대리 진입점(역할 컨테이너의 PID 1)은 링크 소켓 경로가 없으면 무엇도 하기 전에 81로 끝난다.
+test("entrypoints: role-agent는 OLIVE_AGENT_SOCKET이 없으면 한 줄 찍고 81로 끝난다", () => {
+  const result = run("src/main/role-agent.ts");
+  expect(result.exitCode).toBe(81);
+  expect(result.stdout.toString()).toBe("");
+  expect(result.stderr.toString()).toBe("olive role-agent: 환경 OLIVE_AGENT_SOCKET이(가) 없다\n");
+});
 
 test("entrypoints: 이미지 기본 명령(no-role)은 역할을 고르라고 한 줄 찍고 64로 끝난다", () => {
   const result = run("src/main/no-role.ts");
@@ -59,6 +76,44 @@ test("entrypoints: 경로 유닉스 소켓만 듣는다는 확인이 TCP·두 �
   expect(unixOnly('Bun.listen({ hostname: "0.0.0.0", socket: {} });')).toBe(false);
   expect(unixOnly(`${normal} const tcp = { port: 9 };`)).toBe(false);
   expect(unixOnly(`${normal} server.listen(9);`)).toBe(false);
+});
+
+// 진입점에서 import로 닿는 로컬 모듈 전체.
+async function reachable(entry: string): Promise<Map<string, string>> {
+  const transpiler = new Bun.Transpiler({ loader: "ts" });
+  const seen = new Map<string, string>();
+  const queue = [join(root, entry)];
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (seen.has(file)) continue;
+    const source = await Bun.file(file).text();
+    seen.set(file, source);
+    for (const { path } of transpiler.scanImports(source)) {
+      if (path.startsWith(".") && path.endsWith(".ts")) queue.push(join(dirname(file), path));
+    }
+  }
+  return seen;
+}
+
+// 대리는 제어가 듣는 소켓에 붙는 쪽이다. 대리가 들으면 같은 uid의 역할 프로그램이 그 자리를 바꿔치기할 수 있다(agent.md).
+test("entrypoints: 대리 진입점에서 닿는 코드에 듣는 API가 없다", async () => {
+  const files = await reachable("src/main/role-agent.ts");
+  for (const [file, source] of files) expect(listening.test(source), relative(root, file)).toBe(false);
+  expect(files.size).toBeGreaterThan(1);
+});
+
+// 환경을 읽는 곳은 두 진입점뿐이다. 조립(src/executor/runtime.ts)과 핵심(src/executor/, src/agent/)은 값으로만 받는다.
+test("entrypoints: src/에서 환경을 읽는 파일은 src/main/executor.ts와 src/main/role-agent.ts 둘뿐이다", async () => {
+  const readsEnv = /\bprocess\.env\b|\bBun\.env\b|import\.meta\.env/;
+  const found: string[] = [];
+  for (const file of (await Array.fromAsync(new Bun.Glob("src/**/*.ts").scan({ cwd: root }))).sort()) {
+    const code = (await Bun.file(join(root, file)).text())
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("//"))
+      .join("\n");
+    if (readsEnv.test(code)) found.push(file);
+  }
+  expect(found).toEqual(["src/main/executor.ts", "src/main/role-agent.ts"]);
 });
 
 test("entrypoints: 실행기에서 닿는 코드에 듣는 API는 agent-listener.ts의 경로 유닉스 소켓 하나뿐이다", async () => {

@@ -5,7 +5,7 @@
 - `remote-agent.ts`: `RemoteAgent`. `worker.ts`가 받는 `Launcher`(`launcher`)·`ProcessCleanup`(`cleanup`)·`RunSpace`(`space(inner)`)를 링크 위에서 구현한다. `worker.ts`의 공개 면은 그대로이고 같은 컨테이너 구현(`bunLauncher`, `PidSpace.record`)과 갈아 끼운다. 링크의 말은 `src/agent/link.ts`의 메시지·디코더(`AgentDecoder`, `encodeControl`) 그대로다.
 - `agent-listener.ts`: 실행기가 듣는 단 하나의 자리. 경로 유닉스 소켓 하나를 듣고 연결마다 `RemoteAgent.connect`에 넘긴다. 실제 `Bun.listen({ unix })`는 이 파일의 `bunUnixListen` 하나이고, 시험은 듣는 함수를 바꿔 넣는다.
 
-이 구현을 부르는 진입점은 아직 없다(`src/main/executor.ts`는 그대로다).
+이 구현은 실행기 기동 조립(`src/executor/runtime.ts`)이 부른다(README "작업자 실행기 진입점").
 
 ## 조립
 
@@ -25,7 +25,8 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 - 계획의 환경에서 `credentialEnv`의 값만 떼어 `start` 바로 뒤의 값 틀(`encodeCredentialFrame`)로 보내고, JSON의 `env`에는 싣지 않는다. 두 틀은 한 버퍼로 한 번에 쓴다(사이에 다른 쓰기가 끼지 않는다). 쓴 뒤 값과 틀을 0으로 채운다.
 - 실행 중(`starting`·`running`)에는 `renewEveryMs`(기본 1초)마다 `runWindow`의 임대 끝이 늘었는지 보고 늘었으면 `renew`를 보낸다. 대리의 스스로 집행이 worker의 임대를 따라가게 한다.
 - 중단(취소·기한·임대)이면 `terminate`를 보내고 `exitWaitMs` 안에 끝(`exited`·`unconfirmed`·`not_spawned`)을 듣지 못하면 `ExitUnconfirmed`로 돌아간다. 그 실행의 단계는 그대로 남아 늦게 온 끝을 받는다.
-- 시작을 보낸 뒤 `replyWaitMs` 안에 `spawned`·`not_spawned`가 없으면 `terminate`를 보내고 `ExitUnconfirmed`로 돌아간다. worker는 띄우지 않은 실행으로 세지만 단계가 `starting`이라 계수는 `null`이고 실행은 `unknown_running`이다. 단계는 남아 늦은 답을 받는다. 기한 타이머가 돌기 전에 기한 뒤의 답이 와도 같은 길이다(아래 "증거의 기한").
+- 시작을 보낸 뒤 `replyWaitMs` 안에 `spawned`·`not_spawned`가 없으면 `terminate`를 보내고 `ExitUnconfirmed`로 돌아간다. worker는 띄우지 않은 실행으로 센다. 그 계수 때 단계가 아직 `starting`(답 없음)이거나 늦은 `spawned`로 `running`이면 계수는 `null`이고 실행은 `unknown_running`이다. 단계는 남아 늦은 답을 받는다. 기한 타이머가 돌기 전에 기한 뒤의 답이 와도 같은 길이다(아래 "증거의 기한"). 타이머가 기한보다 먼저 돌면(소수 밀리초의 내림) 시계를 다시 보고 남은 시간을 올림해 다시 건다. 기한 전의 답은 버리지 않는다.
+- **늦은 `not_spawned`는 실패 종료로 닫힐 수 있다.** 기한 뒤의 `not_spawned`로 단계가 `ended`가 되면, worker가 그 뒤 새로 보낸 `terminate`와 `count`가 둘 다 기한 안에 답하고 0이면 그 실행은 `not_started`이고 `receipt_stopped(failed, remaining_processes 0)` 1건이 나간다(대리가 띄우지 않았다고 답했고, 그 뒤의 계수가 0을 확인했다). 늦은 시작 답이 언제나 `unknown_running`·종료 0건으로 끝나는 것은 아니다.
 - 이 모듈은 시계를 직접 읽지 않는다. `runtime.now`는 진입점이 넘기는 단조 시계(예: `performance.now`)이고, `setTimer`와 worker의 상한 타이머(전역 `setTimeout`)와 같은 시간 기준이어야 한다. worker의 `now`(벽시계)를 넘기지 않는다.
 
 ## 링크 대조 표
@@ -38,7 +39,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 | `hello` 두 번째, `hello` 전의 다른 말 | 아무 때 | 디코더 거절 → 잠금(`link_rejected`) |
 | `spawned(run)` | `starting`, 같은 실행, 시작 기한 안 | `running`. worker의 `spawned` 훅 |
 | `not_spawned(run, 사유)` | `starting`, 같은 실행, 시작 기한 안 | `ended`. `LaunchFailed`(`aborted`·`cleanup_busy`는 그대로, 나머지는 `spawn_failed`) |
-| `spawned(run)`·`not_spawned(run)` | `starting`, 같은 실행, 시작 기한 뒤(타이머가 아직 안 돌았어도) | 띄우기는 `ExitUnconfirmed`로 끝나고 `terminate`를 보낸다(시작 상한과 같은 길). 단계는 받은 말대로 `running`·`ended`가 되지만 worker의 훅은 부르지 않는다 |
+| `spawned(run)`·`not_spawned(run)` | `starting`, 같은 실행, 시작 기한 뒤(타이머가 아직 안 돌았어도) | 띄우기는 `ExitUnconfirmed`로 끝나고 `terminate`를 보낸다(시작 상한과 같은 길). 단계는 받은 말대로 `running`·`ended`가 되지만 worker의 훅은 부르지 않는다. `ended`가 된 뒤 새로 센 0은 실패 종료로 닫는다(위 "늦은 `not_spawned`") |
 | `output(run)` | `running`, 같은 실행, 합이 시작의 `output_bytes` 이하 | 모은다. 넘으면 잠금(`output_over_limit`) |
 | `exited(run)` | `running`, 같은 실행 | `ended`. 받은 때 worker의 `exited` 훅(제어가 끝을 아는 시각) |
 | `unconfirmed(run)` | `running`, 같은 실행 | `ended`. `ExitUnconfirmed` |
@@ -78,7 +79,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 3. **실행 중 링크 끊김·쓰기 실패:** `start`를 보낸 뒤 그 실행이 0으로 닫히기 전이면 잠금(`link_lost_mid_run`). 기다리던 요청은 `null`·거절, 띄우는 중이면 `ExitUnconfirmed`.
 4. **두 번째 연결:** 연결이 살아 있는데(`hello` 전이라도) 또 연결이 오면 두 연결을 닫고 잠금(`second_connection`). 쉬는 동안이어도 같다.
 5. **계약 밖의 말:** 디코더 거절, 틀 중간의 끊김, 단계·실행 ID가 어긋난 실행의 말, 보낸 적 없는 seq, 종류가 다른 답, 출력 상한 초과. 잠금.
-6. **상한 안에 답 없음:** 최종 계수가 늦으면 worker의 `bounded`가 `null`로 끝내고, 늦게 온 0은 이 객체에서도 `ended`를 닫지 않는다. `terminate`의 답이 늦으면 그 시도의 계수는 제때 0이어도 쓰지 않는다. 시작의 답이 늦으면 끝내기를 보내고 띄웠는지 모르는 채 돌아간다.
+6. **상한 안에 답 없음:** 최종 계수가 늦으면 worker의 `bounded`가 `null`로 끝내고, 늦게 온 0은 이 객체에서도 `ended`를 닫지 않는다. `terminate`의 답이 늦으면 그 시도의 계수는 제때 0이어도 쓰지 않는다. 시작의 답이 늦으면 끝내기를 보내고 띄웠는지 모르는 채 돌아간다(늦은 `not_spawned`로 `ended`가 된 뒤 새로 센 0은 예외다: 위 "조립"의 실패 종료).
 7. **0 아닌 수, 모름:** 대리의 답 그대로(`n`, `null`). 실행은 `ended`로 남아 다음 계수를 받는다.
 8. **확인 없이 물려받은 실행:** `inheritedUnverified: true`면 처음부터 잠금(`inherited_unverified`). 그 실행을 지금 붙은 대리의 0으로 닫지 않는다.
 
@@ -107,7 +108,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 ## 뒤 조각이 지켜야 할 것
 
-- **진입점(O-c):** 대리의 `hello`를 기다린 뒤에 감독에 연결한다(상한 안에 없으면 연결 전에 정한 코드로 끝난다). 장부에 기동 전부터 끝을 맺지 못한 실행(`preparing`·`running`·`stopping`·`checking`·`unknown_running`)이 있고 그 공간이 사라졌다는 따로 된 확인이 없으면 `inheritedUnverified: true`로 만든다. 소켓 경로·권한·umask, 지난 소켓 파일의 처리, 실제 타이머를 여기서 정한다. `replyWaitMs`는 worker의 `exitWaitMs`와 같은 값으로 넘기고(다르게 조립하면 worker가 포기한 정리의 늦은 계수를 여기서 받아 두 판단이 갈라진다), `runtime.now`에는 worker의 상한 타이머와 같은 시간 기준의 단조 시계를 함께 넘긴다(벽시계를 넘기면 시각이 뛸 때 기한 판정이 worker와 갈라진다). 두 값은 설정 한 곳에서 두 객체에 같이 넘긴다. 환경 읽기는 진입점에만 둔다.
+- **진입점(`src/executor/runtime.ts`, `src/main/executor.ts`):** 대리의 `hello`를 기다린 뒤에 감독에 연결한다(상한 안에 없으면 연결 전에 86으로 끝난다). hello는 받은 때(단조 시계)와 연결 세대로 판정하고, `recover` 사이에 세대가 바뀌면 남은 상한 안에서 새 세대의 hello를 다시 기다린다. 기동 대조(`WorkerExecutor` 생성자의 `auditRuns`)를 지난 장부에 기동 전부터 끝을 맺지 못한 실행(`preparing`·`running`·`stopping`·`checking`·`unknown_running`)이 있거나 장부가 보류됐으면, 그 공간이 사라졌다는 따로 된 확인이 아직 없으므로 `inheritedUnverified: true`로 만든다(그때는 원격이 어떤 `hello`도 받지 않으므로 기다리지 않고 감독에 붙는다). 소켓 경로·권한·umask, 지난 소켓 파일의 처리, 실제 타이머는 `src/main/executor.ts`가 정한다. **같은 밀리초 상한은 양쪽에 넘긴다:** `replyWaitMs`와 worker의 `exitWaitMs`는 설정 한 곳(`ExecutorTiming.replyWaitMs`)의 같은 값이다(다르게 조립하면 worker가 포기한 정리의 늦은 계수를 여기서 받아 두 판단이 갈라진다). **단조 시계는 `RemoteAgent`의 `runtime.now`에만 넘긴다:** worker에는 단조 시계 인자가 없고(`WorkerOptions.now`는 벽시계), worker의 응답 상한은 전역 `setTimeout`이 잰다. 그래서 `runtime.now`는 그 타이머와 시간 기준이 같은 단조 시계(`performance.now`)이고 `runtime.setTimer`도 `setTimeout`이다(벽시계를 넘기면 시각이 뛸 때 기한 판정이 worker와 갈라진다). 환경 읽기는 진입점에만 둔다.
 - **차트(H-split):** 역할 컨테이너는 자기 PID 공간을 가진다(`shareProcessNamespace` 없음). 링크 폴더는 제어에 쓰기, 역할에 읽기 전용. 키·TLS·저장소 볼륨은 제어 컨테이너에만. 역할 컨테이너에 exec·프로브를 두지 않는다. 역할 uid ≠ 제어 uid.
 - **회복(D-104, 이 PR에 없음):** 실행 중 링크가 끊긴 실행, 잠금 뒤의 실행은 파드 전체 재시작과 init의 새 세대 표식으로 스스로 정리하고, 안 되면 관리자 닫기로 간다. 그 확인이 생기면 기동 때 `inheritedUnverified: false`로 넘긴다. 새 `hello`만으로 그 실행을 닫지 않는다.
 - 값 틀을 만드는 자리는 `credential-send.ts`와 이 파일 둘이다(`test/supervisor/dispatch/credential-send.test.ts`). 세 번째를 더하지 않는다.
@@ -115,5 +116,6 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 ## 시험
 
 - `test/executor/remote-agent.test.ts`: 시험이 대리 자리에서 링크의 말을 직접 정해 worker 전체를 지난다. 대조군(0 → `receipt_stopped`), 띄우기 보류, 대리 죽음과 새 `hello`, 늦은 답과 `terminated`만의 답, 늦은 끝내기, 늦은 최종 계수(원격 단계·연결 세대까지), 응답 시각(시계만 기한을 넘기고 타이머는 돌지 않은 계수·끝내기·시작의 답, 기한 직전 대조군), 두 번째 연결(계수 대기 중, 쉬는 동안), 0 아닌 수·모름, 순서 틀림·모르는 말 다섯, 출력 상한, 시작 응답 상한, 잘린 틀, 끝의 시각, 깊은 결과(R16)·끝난 뒤 임대(R11)·nonce 장애(F10), 확인 없는 기동, 자격 값의 자리, renew 맞춤.
+- `test/executor/remote-start-timer.test.ts`: 시작 기한의 타이머가 정각보다 먼저 돌아도 기한 안의 `spawned`를 시작으로 기록하고, 다시 건 기다림이 기한에 닿으면 끝내기를 보낸다.
 - `test/executor/agent-listener.test.ts`: 스크래치 경로 소켓에 실제 대리 핵심(`RoleAgent`, 가짜 launcher·정리 코어)을 붙여 `hello → start → exited → terminate → count 0`이 `receipt_stopped`의 0까지 닿는 것, 실제 대리의 끝내기 응답만·최종 계수만 늦은 경우, 실제 소켓의 두 번째 연결, 경로·권한 거절, 다 못 쓴 바이트의 이어 쓰기와 0 채우기, 이어 쓰기 예외의 정리, 공개 면.
 - `test/executor/remote-{worker,ordering,recovery,hardening,evidence}.test.ts`: 기존 실행기 시험 파일을 원격 구현과 가짜 대리(`fake-agent.ts`)로 한 번 더 돌린다. 링크로 옮길 수 없는 가짜 launcher를 전제한 넷(`support.ts`의 `DIRECT_ONLY`: 끝을 drain 전에 알리는 셋, 출력 상한을 넘기는 하나)만 등록하지 않고 그 이름을 대조한다. 그 넷이 지키던 보장 가운데 링크로 옮길 수 있는 것(깊은 결과의 종료 증거, 끝난 뒤 임대, nonce 장애 뒤의 완료)은 `remote-agent.test.ts`가 제어가 끝을 관측한 뒤를 기준으로 다시 본다. drain 중 임대 만료의 `completed`만 링크에서 성립하지 않는다("끝의 시각").
