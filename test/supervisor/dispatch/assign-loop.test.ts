@@ -25,7 +25,7 @@ const POLICY: AssignLoopPolicy = {
   },
   accounts: [{ account: "acct-a", method: "api_key" }],
   plans: [{ role: "isolated_reader", snapshotDigest: SNAPSHOT, budgetLeft: 5000, runDurationMs: 600_000 }],
-  queue: { alertMaxWaitMs: 60_000 },
+  queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 1_000_000, alert: 1_000_000 } },
   originOf: (source) => (source === "admin-dm" ? "admin" : undefined),
 };
 
@@ -403,6 +403,32 @@ describe("보장 3: 장부가 시작을 승인한 뒤에만 시작 지시가 나
     const run = w.ledger.getRun(start.runId);
     expect(run.known && run.value?.state).toBe("preparing");
     expect(w.log).toEqual(["startRun", "seal", "send"]);
+  });
+
+  test("장부가 실은 예약을 그대로 판단에 넘기고, 같은 요청의 예약이 꼴 밖이거나 남은 몫이 모자라면 startRun을 부르지 않는다", async () => {
+    // 부탁 하나를 이어 대기 실행(예산 5000)을 만든다. 같은 요청에 이미 시작했던 작업자 줄이 하나 더 있는 것처럼 listRuns의 답에 줄을 더한다.
+    const w = world();
+    const { owner } = w.enqueueRequest();
+    const first = ran(await assignAndStartTick(w.ports, POLICY, NOW));
+    const runId = (first.requests[0] as { runId: string }).runId;
+    const limit = POLICY.queue.requestBudget.admin;
+    const withSibling = (reservedBudget: unknown) => () => {
+      const real = w.ledger.listRuns();
+      if (!real.known) throw new Error("읽지 못함");
+      const mine = real.value.find((r) => r.runId === runId);
+      if (mine === undefined || mine.inputRequestId !== owner || mine.reservedBudget !== 0) throw new Error(`대기 실행의 줄이 다르다: ${JSON.stringify(mine)}`);
+      return { known: true, value: [{ ...mine, runId: id(), queueSeq: 0, state: "finalized", reservedBudget }, ...real.value] };
+    };
+    for (const reserved of [limit - 5000 + 1, null, undefined, "0", -1]) {
+      w.wrap({ listRuns: withSibling(reserved) as never });
+      w.log.length = 0;
+      expect(ran(await assignAndStartTick(w.ports, POLICY, NOW)).starts, String(reserved)).toEqual([]);
+      expect(w.log, String(reserved)).toEqual([]);
+    }
+    // 남은 몫이 예산과 같으면 시작한다.
+    w.wrap({ listRuns: withSibling(limit - 5000) as never });
+    expect(ran(await assignAndStartTick(w.ports, POLICY, NOW)).starts).toEqual([expect.objectContaining({ runId })]);
+    expect(w.ledger.getRun(runId)).toMatchObject({ known: true, value: { state: "preparing", budgetLeft: 5000 } });
   });
 
   test("장부가 거절하면 지시를 만들지 않는다", async () => {

@@ -649,7 +649,8 @@ const TICK_POLICY: AssignLoopPolicy = {
   assignment: { allowed: [], registrations: [], expected: { profile_revision: "profile-1", policy_revision: "policy-1" } },
   accounts: [],
   plans: [],
-  queue: { alertMaxWaitMs: 60_000 },
+  // 요청 한도 20: 시작 예산 10을 관리자가 닫으면 남은 몫 10 < 다음 실행 12, D-90으로 닫으면 20 ≥ 12다.
+  queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 20, alert: 20 } },
   originOf: (source) => (source === "admin-dm" ? "admin" : undefined),
 };
 
@@ -701,11 +702,11 @@ test("D-94: 자동 닫기 조건이 맞는 실행을 자동 닫기와 관리자 
       slotHolds: holds.value,
       now: NOW + 40_000,
     };
-    const decision = planNext(view, { alertMaxWaitMs: 60_000 });
+    const decision = planNext(view, TICK_POLICY.queue);
     if (startsNext) {
       expect(decision.candidates.map((x) => x.runId), label).toEqual([next]);
     } else {
-      expect(decision, label).toEqual({ candidates: [], held: [{ runId: next, kind: "worker", reason: "budget_replenished" }] });
+      expect(decision, label).toEqual({ candidates: [], held: [{ runId: next, kind: "worker", reason: "request_budget_exceeded" }] });
     }
     // 실제 배정 박자: 자동 쪽은 새 시작 하나(preparing, 예산 12), 관리자 쪽은 새 시작 0(queued 그대로).
     const tick = await assignAndStartTick(tickPorts(c.ledger), TICK_POLICY, NOW + 40_000);

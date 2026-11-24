@@ -5,7 +5,8 @@ import { type HoldReason, type Origin, planNext, type SchedulerInput, type Sched
 import { id, must, NOW, open, ready, tempPath, worker } from "../../ledger/helpers.ts";
 
 // 숫자는 이 시험이 고른 값이다. 운영값이 아니다(운영값은 배포가 넣는다).
-const POLICY: SchedulerPolicy = { alertMaxWaitMs: 60_000 };
+const POLICY: SchedulerPolicy = { alertMaxWaitMs: 60_000, requestBudget: { admin: 100_000, alert: 100_000 } };
+const LIMIT = POLICY.requestBudget.admin;
 const LIFE: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 30_000 };
 
 let seq = 0;
@@ -22,6 +23,8 @@ function run(over: Partial<SchedulerRun> = {}): SchedulerRun {
     budgetLeft: 50_000,
     // 장부의 listRuns는 not_started 줄에만 싣는다. 가짜는 모든 줄에 "관리자가 닫지 않음"을 둔다(다른 상태에서는 읽지 않는다).
     closedByOperator: false,
+    // 장부의 listRuns는 작업자 줄에 싣는다. 가짜의 기본은 시작하지 않은 줄의 0이고, 시작한 줄을 흉내 내는 시험이 값을 넣는다.
+    reservedBudget: 0,
     startBar: null,
     ...over,
   };
@@ -100,20 +103,20 @@ describe("다음 시작 후보", () => {
     expect(nextIntent({ ...base, run: { runId: "c", kind: "worker", state: "cleanup_pending", deadlineAt: NOW + 1 } }, LIFE).intent).toBe("finalize");
   });
 
-  test("같은 입력 ID의 재시도는 시작한 실행(finalized)이 남긴 잔액을 넘으면 보류", () => {
-    // 같은 입력의 앞 실행이 남긴 예산보다 많이 받은 새 실행 줄은 시작 후보가 아니다.
-    const prior = run({ state: "finalized", budgetLeft: 1_000 });
-    const retry = run({ inputRequestId: prior.inputRequestId, budgetLeft: 50_000 });
+  test("같은 요청의 다음 작업은 요청 한도에서 앞 작업들이 시작 때 잡은 예산을 뺀 만큼까지만 후보", () => {
+    // 앞 작업이 시작 때 잡은 예산(예약)은 쓰고 남긴 잔액과 무관하게 전부 센다(D-77). 한도 100_000에서 60_000을 잡았으면 남은 몫은 40_000이다.
+    const prior = run({ state: "finalized", budgetLeft: 1_000, reservedBudget: 60_000 });
+    const next = run({ inputRequestId: prior.inputRequestId, budgetLeft: 50_000 });
     const inputs = [inputFor(prior, "admin")];
-    expect(planNext(view([prior, retry], inputs), POLICY)).toEqual({ candidates: [], held: [{ runId: retry.runId, kind: "worker", reason: "budget_replenished" }] });
+    expect(planNext(view([prior, next], inputs), POLICY)).toEqual({ candidates: [], held: [{ runId: next.runId, kind: "worker", reason: "request_budget_exceeded" }] });
 
-    // 앞 실행이 남긴 만큼 이하면 그 값 그대로 후보다(늘지 않는다).
-    const fair = { ...retry, budgetLeft: 1_000 };
-    expect(planNext(view([prior, fair], inputs), POLICY).candidates).toEqual([{ runId: retry.runId, kind: "worker", origin: "admin", budgetLeft: 1_000 }]);
+    // 남은 몫 이하면 그 값 그대로 후보다(앞 작업의 잔액 1_000보다 커도 된다).
+    const fair = { ...next, budgetLeft: 40_000 };
+    expect(planNext(view([prior, fair], inputs), POLICY).candidates).toEqual([{ runId: next.runId, kind: "worker", origin: "admin", budgetLeft: 40_000 }]);
 
-    // 앞 실행이 예산을 다 썼으면 새 실행 줄의 값과 무관하게 보류다.
+    // 앞 작업의 남은 예산이 0으로 적혔으면 새 실행 줄의 값과 무관하게 보류다.
     const spent = { ...prior, budgetLeft: 0 };
-    expect(planNext(view([spent, fair], inputs), POLICY).held).toEqual([{ runId: retry.runId, kind: "worker", reason: "budget_exhausted" }]);
+    expect(planNext(view([spent, fair], inputs), POLICY).held).toEqual([{ runId: next.runId, kind: "worker", reason: "budget_exhausted" }]);
     expect(planNext(view([run({ budgetLeft: 0, inputRequestId: "solo" })], [{ ...inputs[0]!, requestId: "solo" }]), POLICY).held[0]?.reason).toBe("budget_exhausted");
 
     // 입력이 만료됐거나 기한이 지났으면 보류다(지금 시각으로 다시 본다).
@@ -123,7 +126,7 @@ describe("다음 시작 후보", () => {
   });
 
   test("설정값이 없거나 틀리면 판단하지 않는다", () => {
-    expect(() => planNext(view([], []), { alertMaxWaitMs: 0 })).toThrow(TypeError);
+    expect(() => planNext(view([], []), { ...POLICY, alertMaxWaitMs: 0 })).toThrow(TypeError);
     expect(() => planNext(view([], []), {} as SchedulerPolicy)).toThrow(TypeError);
   });
 });
@@ -148,25 +151,27 @@ function startedReachesNotStarted(table: Partial<Record<LedgerRunState, readonly
 const broken = <T>(value: unknown) => value as T;
 
 describe("모르거나 꼴이 틀린 입력", () => {
-  test("F1: 같은 입력에서 소진된 실행이 있으면 대기 순번과 무관하게 후보 0", () => {
+  test("F1: 같은 요청의 남은 한도가 0이면 대기 순번과 무관하게 후보 0", () => {
     const first = run({ inputRequestId: "same", budgetLeft: 10 });
     const later = run({ inputRequestId: "same", state: "finalized", budgetLeft: 0 });
     const inputs = [inputFor(first, "admin")];
     expect(planNext(view([first, later], inputs), POLICY)).toEqual({ candidates: [], held: [{ runId: first.runId, kind: "worker", reason: "budget_exhausted" }] });
 
-    // 시작한 실행이 실제로 쓰고 남긴 잔액은 순번이 뒤여도 상한이다.
-    const used = { ...later, budgetLeft: 3 };
-    expect(planNext(view([first, used], inputs), POLICY).held).toEqual([{ runId: first.runId, kind: "worker", reason: "budget_replenished" }]);
+    // 뒤 순번 실행이 시작 때 잡은 예산이 한도에 닿았거나 넘으면 순번과 무관하게 남은 한도가 없다.
+    for (const reservedBudget of [LIMIT, LIMIT + 1]) {
+      const used = { ...later, budgetLeft: 3, reservedBudget };
+      expect(planNext(view([first, used], inputs), POLICY).held, String(reservedBudget)).toEqual([{ runId: first.runId, kind: "worker", reason: "budget_exhausted" }]);
+    }
 
-    // 아직 시작하지 않은 뒤 순번 줄의 최초 배정액은 앞 줄의 상한이 아니다.
+    // 아직 시작하지 않은 뒤 순번 줄은 예약이 0이라 앞 줄을 막지 않는다.
     const smaller = run({ inputRequestId: "same", budgetLeft: 5 });
     expect(planNext(view([first, smaller], inputs), POLICY).candidates.map((c) => c.runId)).toEqual([first.runId]);
   });
 
-  test("시작 전에 닫힌 줄(not_started)의 배정액은 상한이 아니고, 소진과 시작한 줄의 잔액은 그대로 상한이다", () => {
+  test("시작 전에 닫힌 줄(not_started)은 예약이 0이고, 소진과 시작한 줄의 예약은 그대로 요청 한도에서 빠진다", () => {
     // not_started로 들어오는 길이 queued에서, 또는 닫기 근거가 있을 때(D-90: 시작 지시의 예산에서 감액이 없을 때만, 관리자 닫기 D-91)뿐이고,
     // 닫기 줄을 빼면 시작한 줄이 여러 걸음으로도 not_started에 닿지 않는 동안만 성립한다. 표가 바뀌면 이 단언이 먼저 실패한다.
-    // D-90 닫기 줄로 닫힌 not_started는 상한에서 빼고, 관리자 닫기 줄로 닫힌 not_started는 상한으로 센다(closedByOperator, 아래 시험).
+    // 장부는 D-90으로 닫힌 줄의 예약을 0으로, 관리자가 닫은 줄의 예약을 시작 예산 전부로 싣는다(closedByOperator와의 대조는 아래 시험).
     for (const kind of ["worker", "session"] as const) {
       // 예외는 작업자의 닫기 줄뿐이다. 장부 트리거가 근거 줄이 있을 때만 허락한다: D-90(preparing·unknown_running, 실행기가 받은 적
       // 없는 실행, 쓴 예산 없음)과 관리자 닫기(unknown_running·stopping, 이미 돌았을 수 있음).
@@ -191,23 +196,35 @@ describe("모르거나 꼴이 틀린 입력", () => {
     expect(planNext(view([closedEarlier, current], inputs), POLICY).candidates.map((c) => c.runId)).toEqual([current.runId]);
     // 잔액 0으로 닫힌 줄은 여전히 소진이다.
     expect(planNext(view([current, { ...closedLater, budgetLeft: 0 }], inputs), POLICY).held).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_exhausted" }]);
-    // 시작한 적 있는 줄(시작 뒤에 끝난 상태)의 잔액은 순번과 무관하게 상한이다.
-    for (const state of ["finalized", "failed_stopped", "cleanup_pending"] as const) {
-      expect(planNext(view([current, { ...closedLater, state }], inputs), POLICY).held, state).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
+    // 시작한 적 있는 줄(시작 뒤에 끝난 상태)의 예약은 순번과 무관하게 한도에서 빠진다. 남은 몫 9 < 10이면 보류, 10이면 예산으로는
+    // 막지 않는다(결과 정리 전의 두 상태는 자리를 쥐고 있어 그 사유로 보류된다).
+    for (const [state, fits] of [
+      ["finalized", null],
+      ["failed_stopped", "slot_occupied"],
+      ["cleanup_pending", "slot_cleanup_pending"],
+    ] as const) {
+      expect(planNext(view([current, { ...closedLater, state, reservedBudget: LIMIT - 9 }], inputs), POLICY).held, state).toEqual([
+        { runId: current.runId, kind: "worker", reason: "request_budget_exceeded" },
+      ]);
+      const room = planNext(view([current, { ...closedLater, state, reservedBudget: LIMIT - 10 }], inputs), POLICY);
+      if (fits === null) expect(room.candidates.map((c) => c.runId), state).toEqual([current.runId]);
+      else expect(room.held, state).toEqual([{ runId: current.runId, kind: "worker", reason: fits }]);
     }
   });
 
-  test("관리자가 닫은 not_started 줄과 관리자가 닫았는지 모르는 not_started 줄의 잔액은 순번과 무관하게 상한이다", () => {
+  test("관리자가 닫았거나 닫았는지 모르는 not_started 줄은 예약 0을 믿지 않고, 그 예약은 순번과 무관하게 요청 한도에서 빠진다", () => {
     const current = run({ inputRequestId: "op", budgetLeft: 10 });
     const inputs = [inputFor(current, "admin")];
     for (const closedByOperator of [true, undefined, broken<boolean>("false")]) {
-      const closed = run({ inputRequestId: "op", state: "not_started", budgetLeft: 3, closedByOperator });
+      const closed = run({ inputRequestId: "op", state: "not_started", budgetLeft: 3, closedByOperator, reservedBudget: LIMIT - 9 });
       const label = String(closedByOperator);
-      expect(planNext(view([current, closed], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
-      expect(planNext(view([{ ...closed, queueSeq: 0 }, current], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_replenished" }]);
-      // 잔액이 같거나 크면 상한에 걸리지 않는다. 잔액 0은 소진이다.
-      expect(planNext(view([current, { ...closed, budgetLeft: 10 }], inputs), POLICY).candidates.map((c) => c.runId), label).toEqual([current.runId]);
+      expect(planNext(view([current, closed], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "request_budget_exceeded" }]);
+      expect(planNext(view([{ ...closed, queueSeq: 0 }, current], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "request_budget_exceeded" }]);
+      // 남은 몫이 같거나 크면 한도에 걸리지 않는다. 잔액 0은 소진이다.
+      expect(planNext(view([current, { ...closed, reservedBudget: LIMIT - 10 }], inputs), POLICY).candidates.map((c) => c.runId), label).toEqual([current.runId]);
       expect(planNext(view([current, { ...closed, budgetLeft: 0 }], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_exhausted" }]);
+      // 관리자 닫기는 시작 지시가 있어야만 되므로 예약 0은 장부와 어긋난 읽기다(D-94: 관리자가 닫은 실행의 예산을 돌려주지 않는다).
+      expect(planNext(view([current, { ...closed, reservedBudget: 0 }], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_unknown" }]);
     }
   });
 
@@ -320,6 +337,97 @@ describe("모르거나 꼴이 틀린 입력", () => {
     const queued = { runId: "q", kind: "worker" as const, state: "queued" as const, deadlineAt: NOW };
     expect(nextIntent({ ...base, cancelRequested: false, run: queued }, LIFE)).toEqual({ intent: "wait", runId: "q", toward: "queued" });
     expect(nextIntent({ ...base, cancelRequested: true, run: queued }, LIFE)).toEqual({ intent: "stop", runId: "q", toward: "not_started" });
+  });
+});
+
+describe("요청 한도(D-105: 요청 전체로 묶음, D-106: 모자라면 보류)", () => {
+  const limitOf = (admin: number, alert = admin): SchedulerPolicy => ({ ...POLICY, requestBudget: { admin, alert } });
+
+  test("재현 1: 역할이 다른 다음 작업은 앞 작업의 잔액보다 커도 요청 한도 안이면 후보", () => {
+    // 앞 작업은 100_000으로 시작해 계측 없이 끝났다(잔액 그대로). 다음 작업의 역할 예산은 200_000이다.
+    const prior = run({ inputRequestId: "r1", state: "finalized", budgetLeft: 100_000, reservedBudget: 100_000 });
+    const next = run({ inputRequestId: "r1", role: "review", budgetLeft: 200_000 });
+    const inputs = [inputFor(next, "admin")];
+    expect(planNext(view([prior, next], inputs), limitOf(300_000))).toEqual({ candidates: [{ runId: next.runId, kind: "worker", origin: "admin", budgetLeft: 200_000 }], held: [] });
+    // 한도가 1 모자라면 줄여 시작하지 않고 보류한다.
+    expect(planNext(view([prior, next], inputs), limitOf(299_999))).toEqual({ candidates: [], held: [{ runId: next.runId, kind: "worker", reason: "request_budget_exceeded" }] });
+  });
+
+  test("재현 2: 앞 작업들이 잡은 예산의 합이 셋째를 막는다(작업마다 역할 예산을 새로 받지 않는다)", () => {
+    const a = run({ inputRequestId: "r2", state: "finalized", budgetLeft: 100_000, reservedBudget: 100_000 });
+    // 관리자가 닫은 실행도 시작 예산 전부를 잡은 채다(D-94).
+    const b = run({ inputRequestId: "r2", state: "not_started", closedByOperator: true, budgetLeft: 100_000, reservedBudget: 100_000 });
+    const c = run({ inputRequestId: "r2", budgetLeft: 100_000 });
+    const inputs = [inputFor(c, "admin")];
+    expect(planNext(view([a, b, c], inputs), limitOf(250_000)).held).toEqual([{ runId: c.runId, kind: "worker", reason: "request_budget_exceeded" }]);
+    expect(planNext(view([a, b, c], inputs), limitOf(300_000)).candidates.map((x) => x.runId)).toEqual([c.runId]);
+    // 합이 한도에 닿았거나 넘으면 남은 것이 없다.
+    expect(planNext(view([a, b, c], inputs), limitOf(200_000)).held).toEqual([{ runId: c.runId, kind: "worker", reason: "budget_exhausted" }]);
+    expect(planNext(view([a, b, c], inputs), limitOf(199_999)).held).toEqual([{ runId: c.runId, kind: "worker", reason: "budget_exhausted" }]);
+  });
+
+  test("경계: 남은 몫과 자기 예산이 같으면 후보, 1 넘으면 보류", () => {
+    const prior = run({ inputRequestId: "edge", state: "finalized", reservedBudget: 60_000 });
+    const inputs = [inputFor(prior, "admin")];
+    const exact = run({ inputRequestId: "edge", budgetLeft: LIMIT - 60_000 });
+    expect(planNext(view([prior, exact], inputs), POLICY).candidates).toEqual([{ runId: exact.runId, kind: "worker", origin: "admin", budgetLeft: LIMIT - 60_000 }]);
+    const over = { ...exact, budgetLeft: LIMIT - 60_000 + 1 };
+    expect(planNext(view([prior, over], inputs), POLICY).held).toEqual([{ runId: exact.runId, kind: "worker", reason: "request_budget_exceeded" }]);
+    // 남은 몫이 1이면 예산 1의 작업은 후보다.
+    const one = run({ inputRequestId: "edge", budgetLeft: 1 });
+    expect(planNext(view([{ ...prior, reservedBudget: LIMIT - 1 }, one], inputs), POLICY).candidates.map((x) => x.runId)).toEqual([one.runId]);
+  });
+
+  test("대기 중인 같은 요청의 다른 작업은 예약이 0이라 한도를 나누지 않고, 다른 요청의 예약은 섞지 않는다", () => {
+    // 같은 요청의 목적이 다른 부탁 둘이 아직 대기 중이다. 둘 다 시작 전이라 앞 작업은 한도 전부를 볼 수 있다.
+    const first = run({ inputRequestId: "pair", budgetLeft: 60_000 });
+    const second = run({ inputRequestId: "pair", budgetLeft: 60_000 });
+    const inputs = [inputFor(first, "admin")];
+    expect(planNext(view([first, second], inputs), POLICY)).toEqual({
+      candidates: [{ runId: first.runId, kind: "worker", origin: "admin", budgetLeft: 60_000 }],
+      held: [{ runId: second.runId, kind: "worker", reason: "waiting_turn" }],
+    });
+    // 첫째가 시작해 60_000을 잡으면 둘째의 남은 몫은 40_000이다.
+    const started = { ...first, state: "running" as const, reservedBudget: 60_000 };
+    expect(planNext(view([started, second], inputs), POLICY).held).toEqual([{ runId: second.runId, kind: "worker", reason: "request_budget_exceeded" }]);
+    // 다른 요청이 한도를 다 잡았어도 이 요청과는 무관하다.
+    const other = run({ inputRequestId: "elsewhere", state: "finalized", reservedBudget: LIMIT });
+    expect(planNext(view([other, first], [...inputs, inputFor(other, "admin")]), POLICY).candidates.map((x) => x.runId)).toEqual([first.runId]);
+  });
+
+  test("예약을 모르면 보류하되 남은 예산 0을 가리지 않고, 세션 줄은 예약을 세지 않는다", () => {
+    const current = run({ inputRequestId: "unk", budgetLeft: 10 });
+    const inputs = [inputFor(current, "admin")];
+    for (const reserved of [null, undefined, Number.NaN, -1, 1.5, "10", Number.MAX_SAFE_INTEGER + 1]) {
+      const label = String(reserved);
+      const prior = run({ inputRequestId: "unk", state: "finalized", reservedBudget: broken<number | null>(reserved) });
+      expect(planNext(view([prior, current], inputs), POLICY), label).toEqual({ candidates: [], held: [{ runId: current.runId, kind: "worker", reason: "budget_unknown" }] });
+      const spent = run({ inputRequestId: "unk", state: "finalized", budgetLeft: 0 });
+      expect(planNext(view([prior, spent, current], inputs), POLICY).held, label).toEqual([{ runId: current.runId, kind: "worker", reason: "budget_exhausted" }]);
+    }
+    // 세션 줄에는 장부가 예약을 싣지 않는다. 같은 요청에 세션 줄이 있어도 모름이 아니고 합에도 넣지 않는다.
+    const sessionRow = run({ inputRequestId: "unk", kind: "session", role: null, state: "finalized", reservedBudget: undefined });
+    expect(planNext(view([sessionRow, current], inputs), POLICY).candidates.map((x) => x.runId)).toEqual([current.runId]);
+    expect(planNext(view([{ ...sessionRow, reservedBudget: LIMIT }, current], inputs), POLICY).candidates.map((x) => x.runId)).toEqual([current.runId]);
+  });
+
+  test("한도는 입력의 출처마다 따로다", () => {
+    const prior = run({ inputRequestId: "org", state: "finalized", reservedBudget: 20_000 });
+    const next = run({ inputRequestId: "org", budgetLeft: 50_000 });
+    const policy = limitOf(100_000, 60_000);
+    expect(planNext(view([prior, next], [inputFor(next, "admin")]), policy).candidates.map((x) => x.runId)).toEqual([next.runId]);
+    expect(planNext(view([prior, next], [inputFor(next, "alert")]), policy).held).toEqual([{ runId: next.runId, kind: "worker", reason: "request_budget_exceeded" }]);
+  });
+
+  test("요청 한도가 없거나 출처 하나라도 양의 안전 정수가 아니면 판단하지 않는다", () => {
+    for (const requestBudget of [undefined, null, 100_000, "100000", {}, { admin: 100_000 }, { alert: 100_000 }]) {
+      expect(() => planNext(view([], []), { alertMaxWaitMs: 60_000, requestBudget: broken<SchedulerPolicy["requestBudget"]>(requestBudget) }), String(requestBudget)).toThrow(TypeError);
+    }
+    for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, "100000"]) {
+      expect(() => planNext(view([], []), limitOf(broken<number>(bad), 100_000)), `admin ${String(bad)}`).toThrow(TypeError);
+      expect(() => planNext(view([], []), limitOf(100_000, broken<number>(bad))), `alert ${String(bad)}`).toThrow(TypeError);
+    }
+    expect(() => planNext(view([], []), limitOf(1))).not.toThrow();
   });
 });
 
