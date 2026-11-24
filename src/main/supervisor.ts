@@ -1,13 +1,17 @@
 // 감독의 진입점. 환경을 값으로 바꾸고 실제 파일·장부 열기·서버 시작·시계·타이머·CSPRNG를 src/supervisor/runtime/boot.ts의 조립에 넘긴다.
 // 환경 읽기는 이 파일에만 둔다(감독 쪽). 환경이 하나라도 없거나 틀리면 아무 파일도 읽기 전에 91로 끝난다(빈 값으로 뜨지 않는다).
-// 듣는 곳은 연결 서버(tls-server.ts의 TCP) 하나다.
+// 듣는 곳은 둘이다: 실행기를 받는 연결 서버(tls-server.ts의 TCP)와, 기동 뒤에 여는 관리 통로(admin/listener.ts의 경로 유닉스 소켓).
 import { getRandomValues } from "node:crypto";
+import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import { limits } from "../contract/v1/index.ts";
 import { openLedger } from "../ledger/index.ts";
 import { nodeCredentialFiles } from "../supervisor/accounts/credential-ref.ts";
+import { answerLine, createAdminHandlers } from "../supervisor/admin/commands.ts";
+import { type AdminFs, type AdminListening, AdminListenRefused, listenAdmin } from "../supervisor/admin/listener.ts";
+import { ADMIN_SOCKET_MODE, ADMIN_SOCKET_PATH } from "../supervisor/admin/protocol.ts";
 import { bootSupervisor, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
 import { RENEW_MARGIN_MS } from "../supervisor/scheduler/lifecycle.ts";
 import { createFileResultBackend } from "../supervisor/scheduler/result-store-file.ts";
@@ -160,6 +164,40 @@ const productionDeps: SupervisorDeps = {
   log: (event, fields) => console.error(`olive supervisor: ${format(event, fields)}`),
 };
 
+// 관리 소켓 경로의 파일 조작. 링크를 따라가지 않는다(lstat).
+export const adminFs: AdminFs = {
+  kind: (path) => {
+    try {
+      return lstatSync(path).isSocket() ? "socket" : "other";
+    } catch (error) {
+      if (typeof error === "object" && error !== null && (error as { code?: unknown }).code === "ENOENT") return "absent";
+      throw error;
+    }
+  },
+  unlink: (path) => unlinkSync(path),
+  chmod: (path, mode) => chmodSync(path, mode),
+};
+
+// 관리 통로(D-60·D-101)를 듣는다. 듣지 못해도 감독은 계속 돈다: 관리 통로는 읽기 전용이라 감독의 일이 그것에 기대지 않고,
+// 상태 조회는 "감독에 닿지 못함(모름)"으로 남는다. 사유는 기록에 남긴다.
+function startAdmin(running: RunningSupervisor): AdminListening | null {
+  const handlers = createAdminHandlers(running.admin);
+  try {
+    return listenAdmin({
+      path: ADMIN_SOCKET_PATH,
+      mode: ADMIN_SOCKET_MODE,
+      fs: adminFs,
+      monoNow: productionDeps.monoNow,
+      setTimer: productionDeps.setTimer,
+      answer: (line) => answerLine(line, handlers),
+      note: (note) => productionDeps.log("admin", { note }),
+    });
+  } catch (error) {
+    productionDeps.log("admin_listen_failed", { reason: error instanceof AdminListenRefused ? error.reason : "threw" });
+    return null;
+  }
+}
+
 async function main(): Promise<never> {
   // 신호 처리기는 무엇보다 먼저 건다. 함정: 이 프로세스가 컨테이너의 PID 1이면 커널은 처리기가 없는 신호를 버린다(SIGKILL 제외).
   // 기동 중의 신호는 기동을 멈추고(서버를 열었으면 닫고) 0으로, 기동 뒤의 신호는 끝 차례를 밟는다.
@@ -189,9 +227,13 @@ async function main(): Promise<never> {
     process.exit(started.code);
   }
   running = started.running;
+  // 복원 전에도 듣는다: 그때의 상태 조회는 "복원 전 모름"으로 답한다.
+  const admin = startAdmin(running);
   // 조립의 마지막 멈춤 확인과 이 줄 사이에 온 신호는 위 처리기가 abort만 했다. 여기서 끝 차례로 잇는다.
   if (stop.signal.aborted) void running.stop();
-  process.exit(await running.done);
+  const code = await running.done;
+  admin?.stop();
+  process.exit(code);
 }
 
 if (import.meta.main) await main();

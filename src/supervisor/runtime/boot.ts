@@ -52,6 +52,7 @@ import { createSharedClock, type SharedClock } from "./shared-clock.ts";
 import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer.ts";
 import { createWireSink, type WireSink } from "./sink.ts";
 import { createToolPorts } from "./tools-adapter.ts";
+import type { AdminSources } from "../admin/status.ts";
 
 // 종료 코드. 0은 요청된 멈춤(SIGTERM 등)을 끝 차례까지 마쳤을 때뿐이다. 64·69는 이미지의 다른 진입점, 81~89는 작업자 실행기가 쓴다.
 export const SUPERVISOR_EXIT = {
@@ -177,6 +178,8 @@ export interface RunningSupervisor {
   // 처리기를 부르는 길(본체 도구 호출이 감독에 닿는 길)은 아직 없다. 그 조각은 이것만 쓰고, 처리기 문맥의 now도 여기의 now로 읽고,
   // 처리기 호출을 박자와 겹치지 않게 부른다.
   tools(policy: ToolPolicyPort, config: ToolConfig, observe: (event: CancelDelivery) => void): { readonly ports: ToolPorts; readonly now: () => number };
+  // 관리 통로(src/supervisor/admin/)의 읽기 포트. 장부의 읽기 넷, 조립 상태, 복원기의 접수 판정, 공유 시계만 담는다(쓰기·송신 없음).
+  readonly admin: AdminSources;
 }
 
 export type BootResult = { readonly ok: true; readonly running: RunningSupervisor } | { readonly ok: false; readonly step: BootStep; readonly code: number; readonly reason: string };
@@ -859,5 +862,18 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     ports: createToolPorts({ ledger, policy, config, random: deps.random, cancel: { links: wired.links, clock: shared, signer: signing.signer, sink: wired.sink, observe } }),
     now: () => shared.now(),
   });
-  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools } };
+  // 관리 통로가 읽는 자리. 읽기만 한다: 장부는 읽기 넷만 묶어 넘기고(장부 객체를 넘기지 않는다), 조립 상태는 변수를 읽기만 한다.
+  // look()을 부르지 않는다: 끝낼 사유를 붙잡는 래치를 관리 요청이 움직이지 않게. 도구 처리기의 포트(tools)를 쓰지 않는다(tools-adapter.md "관리 통로").
+  const admin: AdminSources = Object.freeze({
+    progress: () => ({ restored: stage >= 5, alive: !stopping && exitCode === 0 && halted === null, granted }),
+    intakeOpen: () => restorer.intakeOpen(),
+    now: () => shared.now(),
+    ledger: Object.freeze({
+      readStop: () => ledger.readStop(),
+      readPause: () => ledger.readPause(),
+      listRuns: () => ledger.listRuns(),
+      listWaitingToolRequests: () => ledger.listWaitingToolRequests(),
+    }),
+  });
+  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools, admin } };
 }

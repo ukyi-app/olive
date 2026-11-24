@@ -1,0 +1,154 @@
+// 감독 관리 통로의 말(D-60·D-101). 관리 진입점(src/main/admin.ts)이 감독 컨테이너 안의 경로 유닉스 소켓에 붙어 요청 한 줄을 쓰고
+// 답 한 줄을 읽는다. 두 쪽이 이 파일 하나의 꼴을 쓴다. 설명은 README "감독 관리 통로"다.
+// 이 파일은 장부·박자·연결 서버를 import하지 않는다: 관리 진입점이 끌어오는 감독 쪽 코드는 이 파일과 client.ts뿐이다.
+
+// 감독 컨테이너 안의 고정 경로. 차트가 감독 컨테이너에만 붙인 /tmp emptyDir(이미지가 쓰는 유일한 자리) 아래다. 환경으로 받지 않는다:
+// 관리 진입점은 kubectl exec로 고정 argv만 받으므로 두 쪽이 같은 값을 코드에서 읽어야 한다.
+export const ADMIN_SOCKET_PATH = "/tmp/olive-admin.sock";
+// 감독과 kubectl exec로 들어온 관리 진입점은 같은 컨테이너의 같은 uid다. 그 밖의 uid는 붙지 못한다.
+export const ADMIN_SOCKET_MODE = 0o600;
+
+// 상한 표(README "감독 관리 통로"와 같다).
+export const ADMIN_LIMITS = {
+  // 요청 한 줄(줄바꿈 포함)의 상한. 넘으면 감독은 답하지 않고 닫는다.
+  requestMaxBytes: 1_024,
+  // 답 한 줄(줄바꿈 포함)의 상한. homelab CLI가 받는 진입점 출력의 상한(4,096바이트)과 같다.
+  replyMaxBytes: 4_096,
+  // 관리 진입점: 붙기 전에 정한 절대 기한. 답 한 줄을 받는 순간의 단조 시각으로 판정한다. CLI의 kubectl 요청 상한(20초)보다 짧게.
+  clientWaitMs: 5_000,
+  // 감독: 연결을 받은 순간부터 요청 한 줄을 다 받기까지. 받는 순간의 단조 시각으로 판정한다.
+  serverWaitMs: 2_000,
+  // 감독이 동시에 쥐는 관리 연결의 상한. 넘친 연결에는 busy를 답하고 닫는다.
+  maxConnections: 4,
+} as const;
+
+// homelab CLI(cli/src/core/olive-admin.ts)가 검사하는 상태 꼴. 칸을 바꾸면 판을 올린다(감독 이미지와 CLI는 따로 배포된다).
+export const STATUS_SCHEMA = "olive-supervisor-status/v1";
+// CLI가 받는 수의 상한(미만). 이 이상이면 상태를 내지 않고 모름이다.
+export const STATUS_MAX_COUNT = 1_000_000;
+
+// 관리 명령. 새 명령(M1t의 시험 작업 넣기 등)은 이 표와 commands.ts의 처리기 표에 함께 더한다.
+export const ADMIN_COMMANDS = ["status"] as const;
+export type AdminCommand = (typeof ADMIN_COMMANDS)[number];
+
+export interface SupervisorStatus {
+  readonly alive: boolean;
+  readonly queued: number;
+  readonly running: number;
+  readonly diagnosis: "active" | "paused";
+  readonly stop: "none" | "stopping" | "stopped";
+  readonly stopGeneration: number;
+  readonly intakeOpen: boolean;
+}
+
+// 상태를 모르는 사유. 감독은 답했지만 상태를 알려진 값으로 내지 못한다.
+export const UNKNOWN_REASONS = ["restore_not_done", "ledger_unreadable", "stop_unrecorded", "clock_unavailable", "out_of_range", "read_threw"] as const;
+export type UnknownReason = (typeof UNKNOWN_REASONS)[number];
+// 요청을 처리하지 않은 사유.
+export const REFUSED_REASONS = ["malformed", "unknown_command", "busy"] as const;
+export type RefusedReason = (typeof REFUSED_REASONS)[number];
+
+export type AdminReply =
+  | { readonly kind: "status"; readonly status: SupervisorStatus }
+  | { readonly kind: "unknown"; readonly reason: UnknownReason }
+  | { readonly kind: "refused"; readonly reason: RefusedReason };
+
+// 요청의 명령 밖 칸. 지금의 명령(status)은 받지 않는다. 받는 명령은 자기 처리기에서 칸을 검사한다.
+export type AdminArgs = Readonly<Record<string, unknown>>;
+export type AdminRequest = { readonly ok: true; readonly command: AdminCommand; readonly args: AdminArgs } | { readonly ok: false; readonly reason: "malformed" | "unknown_command" };
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const isCommand = (value: unknown): value is AdminCommand => typeof value === "string" && (ADMIN_COMMANDS as readonly string[]).includes(value);
+const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) < STATUS_MAX_COUNT;
+const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => {
+  const own = Object.keys(value);
+  return own.length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+};
+
+// 줄 하나를 JSON 객체로. 줄바꿈이 든 줄, 객체가 아닌 값은 null이다.
+function objectOf(line: string): Record<string, unknown> | null {
+  if (line.includes("\n")) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  return isRecord(value) ? value : null;
+}
+
+export function encodeRequest(command: AdminCommand): string {
+  return `${JSON.stringify({ command })}\n`;
+}
+
+// 요청 한 줄(줄바꿈 뺀 것). command 칸이 문자열이 아니면 malformed, 모르는 이름이면 unknown_command다.
+export function parseRequest(line: string): AdminRequest {
+  const value = objectOf(line);
+  if (value === null || typeof value.command !== "string") return { ok: false, reason: "malformed" };
+  if (!isCommand(value.command)) return { ok: false, reason: "unknown_command" };
+  const args = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "command"));
+  return { ok: true, command: value.command, args };
+}
+
+// 상태 칸을 CLI의 규칙으로 본다(칸 여덟, 수는 0 이상 상한 미만의 정수, 좁은 enum).
+export function validStatus(value: unknown): value is SupervisorStatus {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.alive === "boolean" &&
+    isCount(value.queued) &&
+    isCount(value.running) &&
+    (value.diagnosis === "active" || value.diagnosis === "paused") &&
+    (value.stop === "none" || value.stop === "stopping" || value.stop === "stopped") &&
+    Number.isSafeInteger(value.stopGeneration) &&
+    (value.stopGeneration as number) >= 0 &&
+    typeof value.intakeOpen === "boolean"
+  );
+}
+
+// CLI가 읽는 상태 한 줄(줄바꿈 없음). 칸의 차례는 CLI의 STATUS_FIELDS와 같다. 받은 값을 펼치지 않고 칸마다 옮긴다(다른 칸이 실리지 않게).
+export function statusLine(status: SupervisorStatus): string {
+  return JSON.stringify({
+    schema: STATUS_SCHEMA,
+    alive: status.alive,
+    queued: status.queued,
+    running: status.running,
+    diagnosis: status.diagnosis,
+    stop: status.stop,
+    stopGeneration: status.stopGeneration,
+    intakeOpen: status.intakeOpen,
+  });
+}
+
+export function encodeReply(reply: AdminReply): string {
+  const body = reply.kind === "status" ? `{"reply":"status","status":${statusLine(reply.status)}}` : JSON.stringify({ reply: reply.kind, reason: reply.reason });
+  return `${body}\n`;
+}
+
+// 답 한 줄(줄바꿈 뺀 것). 꼴이 하나라도 다르면 null이다(모르는 칸, 모르는 사유, 판이 다른 상태).
+export function parseReply(line: string): AdminReply | null {
+  const value = objectOf(line);
+  if (value === null) return null;
+  if (value.reply === "status") {
+    if (!exactKeys(value, ["reply", "status"]) || !isRecord(value.status)) return null;
+    const status = value.status;
+    if (!exactKeys(status, ["schema", "alive", "queued", "running", "diagnosis", "stop", "stopGeneration", "intakeOpen"]) || status.schema !== STATUS_SCHEMA) return null;
+    if (!validStatus(status)) return null;
+    // 칸마다 옮긴다(판 칸과 받은 객체를 싣지 않는다).
+    return {
+      kind: "status",
+      status: {
+        alive: status.alive,
+        queued: status.queued,
+        running: status.running,
+        diagnosis: status.diagnosis,
+        stop: status.stop,
+        stopGeneration: status.stopGeneration,
+        intakeOpen: status.intakeOpen,
+      },
+    };
+  }
+  if (!exactKeys(value, ["reply", "reason"])) return null;
+  if (value.reply === "unknown" && (UNKNOWN_REASONS as readonly unknown[]).includes(value.reason)) return { kind: "unknown", reason: value.reason as UnknownReason };
+  if (value.reply === "refused" && (REFUSED_REASONS as readonly unknown[]).includes(value.reason)) return { kind: "refused", reason: value.reason as RefusedReason };
+  return null;
+}
