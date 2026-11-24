@@ -804,13 +804,14 @@ test("D-97: 닫기 전에 새 파드로 시작을 다시 실어 접수·시작 �
   const path = tempPath();
   const ledger = ready(open(path));
   const live = startedWorker(ledger);
-  must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
+  // 끊김은 영수증 뒤에 적는다. D-92: 옮긴(unknown_running) 실행의 시작은 다시 내지 않으므로 재전송은 preparing일 때 한다.
   // +5000에 뜬 새 파드의 실행기에 +6000의 재전송이 원래 발행 시각(NOW)을 실은 시작을 내고, 접수·시작 영수증이 온다.
   const sent = await resendOnce(ledger, NOW + 6_000);
   expect(sent.map((e) => [e.header.action, e.header.request_id, e.header.issued_at])).toEqual([["task_start", live.requestId, NOW]]);
   must(ledger.applyReceipt({ ...accepted(live), now: NOW + 6_001 }, live.from));
   const started = { ...startedReceipt(live), now: NOW + 7_000 };
   must(ledger.applyReceipt(started, live.from));
+  must(ledger.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 7_001 }));
   const before = run(ledger, live.runId);
   expect(before).toMatchObject({ state: "unknown_running", startedReceiptId: started.receiptId });
   const at = CLOSABLE_AT + 1;
