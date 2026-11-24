@@ -70,8 +70,9 @@ test("실행기 진입점: 환경이 하나씩 빠질 때마다 81로 끝나고 
   expect(accepted.count).toBe(0);
 });
 
-test("실행기 진입점: 틀린 값(모르는 역할, 포트 없는 주소, 상대 경로)이면 81로 끝나고 감독 연결은 0이다", async () => {
+test("실행기 진입점: 틀린 값(역할이 아닌 대상 ID, 포트 없는 주소, 상대 경로)이면 81로 끝나고 감독 연결은 0이다", async () => {
   const cases: [string, string][] = [
+    // 대상 ID는 역할이 아니다: 차트의 읽기 대상 ID `reader`를 그대로 넘기면 거절한다. 차트가 v1 역할 이름(`isolated_reader`)으로 옮겨 넘긴다.
     ["OLIVE_ROLE", "reader"],
     ["OLIVE_SUPERVISOR_ADDR", "127.0.0.1"],
     ["OLIVE_SUPERVISOR_ADDR", "127.0.0.1:0"],
@@ -84,6 +85,30 @@ test("실행기 진입점: 틀린 값(모르는 역할, 포트 없는 주소, �
     expect(result.stderr).toContain(`환경 ${name}이(가) 틀렸다`);
   }
   expect(accepted.count).toBe(0);
+});
+
+test("실행기 진입점: 계약 v1이 거절할 값(정책 revision, 감독 주소가 IPv4가 아님, DNS 이름·URI SAN의 꼴, 인스턴스 이름)이면 저장소를 열기 전에 81, 감독 연결 0", async () => {
+  const cases: [string, string][] = [
+    ["OLIVE_POLICY_REVISION", "bad/rev"],
+    ["OLIVE_POLICY_REVISION", "p".repeat(65)],
+    ["OLIVE_SUPERVISOR_ADDR", `localhost:${supervisor.port}`],
+    ["OLIVE_SUPERVISOR_ADDR", `127.0.0.256:${supervisor.port}`],
+    ["OLIVE_SUPERVISOR_SERVER_NAME", "bad name"],
+    ["OLIVE_SUPERVISOR_SERVER_NAME", "-supervisor.olive-control.svc"],
+    ["OLIVE_SUPERVISOR_URI", "no-uri"],
+    // 실행기 꼴의 URI는 감독의 신원이 아니다.
+    ["OLIVE_SUPERVISOR_URI", "spiffe://olive.internal/ns/olive-control/executor/reader"],
+    ["OLIVE_INSTANCE", "Worker 1"],
+  ];
+  for (const [name, value] of cases) {
+    const result = await run({ ...FULL, [name]: value });
+    expect(result.code, `${name}=${value}`).toBe(EXECUTOR_EXIT.config);
+    expect(result.stderr, `${name}=${value}`).toContain(`환경 ${name}이(가) 틀렸다`);
+    expect(await Bun.file(join(FULL.OLIVE_STORE_DIR, "storage-id")).exists()).toBe(false);
+  }
+  expect(accepted.count).toBe(0);
+  // 대조군: 같은 값들의 맞는 꼴은 환경 단계를 지난다.
+  expect(settingsFromEnv(FULL).ok).toBe(true);
 });
 
 test("실행기 진입점: 환경이 다 있어도 재료 파일이 없으면 82로 끝나고 감독 연결·저장소 폴더가 없다", async () => {
@@ -124,6 +149,7 @@ test("실제 경로 유닉스 소켓: 제어의 듣기(umask를 되돌림, 0606,
     connect: connectUnix,
     connectWaitMs: 1_000,
     retryMs: 50,
+    monoNow: () => performance.now(),
   });
   expect(agent).not.toBeNull();
   await until(() => control.state().greeted);

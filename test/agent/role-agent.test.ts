@@ -55,7 +55,7 @@ test("대리 진입점: non-dumpable → PID 1 → 정리 코어 기록 → 소�
   const runtime = new FakeRuntime();
   const port = new Port();
   const { connect, state } = connector(order, port);
-  const agent = await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100 });
+  const agent = await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100, monoNow: runtime.now });
   expect(agent).not.toBeNull();
   expect(order).toEqual(["harden", "record", `connect ${PATH}`]);
   expect(port.types()).toEqual(["hello"]);
@@ -76,7 +76,7 @@ test("대리 진입점: non-dumpable·PID 1·기록 중 하나라도 실패하�
     const order: string[] = [];
     const runtime = new FakeRuntime();
     const { connect, state } = connector(order, new Port());
-    expect(await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order, over), connect, connectWaitMs: 1_000, retryMs: 100 })).toBeNull();
+    expect(await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order, over), connect, connectWaitMs: 1_000, retryMs: 100, monoNow: runtime.now })).toBeNull();
     expect(runtime.exits).toEqual([code]);
     expect(state.attempts).toBe(0);
   }
@@ -87,7 +87,7 @@ test("대리 진입점: 제어가 아직 듣지 않으면 retryMs마다 다시 �
   const runtime = new FakeRuntime();
   const port = new Port();
   const { connect, state } = connector(order, port, 2);
-  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100 });
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100, monoNow: runtime.now });
   await settle();
   expect(state.attempts).toBe(1);
   runtime.advance(100);
@@ -103,7 +103,7 @@ test("대리 진입점: 상한 안에 붙지 못하면 82로 끝나고 hello를 
   const runtime = new FakeRuntime();
   const port = new Port();
   const { connect, state } = connector(order, port, Number.POSITIVE_INFINITY);
-  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 250, retryMs: 100 });
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 250, retryMs: 100, monoNow: runtime.now });
   for (let i = 0; i < 5; i++) {
     await settle();
     runtime.advance(100);
@@ -122,7 +122,7 @@ test("대리 진입점: 다 못 쓴 바이트는 사본으로 쥐었다가 drain
   // hello 틀의 앞 3바이트만 쓰이고 나머지는 drain을 기다린다.
   port.limits = [3, 0];
   const { connect, state } = connector(order, port);
-  await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100 });
+  await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100, monoNow: runtime.now });
   expect(port.types()).toEqual([]);
   state.handlers!.drain();
   expect(port.types()).toEqual([]);
@@ -135,10 +135,57 @@ test("대리 진입점: 받은 조각은 대리에 넘긴 뒤 0으로 채운다.
   const order: string[] = [];
   const runtime = new FakeRuntime();
   const { connect, state } = connector(order, new Port());
-  await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100 });
+  await runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100, monoNow: runtime.now });
   const chunk = new Uint8Array([0, 0, 0, 2, 0x7b, 0x7d]);
   state.handlers!.data(chunk);
   expect([...chunk]).toEqual([0, 0, 0, 0, 0, 0]);
   await settle();
   expect(runtime.exits).toEqual([AGENT_EXIT.protocol]);
+});
+
+test("대리 진입점: 붙는 중인 연결이 상한을 넘기면 기다리지 않고 82로 끝나고, 늦게 돌아온 포트는 hello 없이 닫는다", async () => {
+  const order: string[] = [];
+  const runtime = new FakeRuntime();
+  const port = new Port();
+  let finish!: (port: AgentSocketPort) => void;
+  let late: AgentSocketHandlers | null = null;
+  const connect = (path: string, handlers: AgentSocketHandlers) => {
+    order.push(`connect ${path}`);
+    late = handlers;
+    return new Promise<AgentSocketPort>((resolve) => (finish = resolve));
+  };
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 1_000, retryMs: 100, monoNow: runtime.now });
+  await settle();
+  runtime.advance(1_000);
+  await settle();
+  expect(runtime.exits).toEqual([ROLE_AGENT_EXIT.unreachable]);
+  runtime.advance(50);
+  finish(port);
+  expect(await running).toBeNull();
+  await settle();
+  expect(port.ended).toBe(true);
+  expect(port.written).toEqual([]);
+  // 버린 연결을 닫을 때의 닫힘은 대리의 링크 끊김(75)이 되지 않는다.
+  late!.close();
+  await settle();
+  expect(runtime.exits).toEqual([ROLE_AGENT_EXIT.unreachable]);
+});
+
+test("대리 진입점: 다시 붙기 타이머가 상한 뒤에 늦게 깨면 더 붙지 않고 82로 끝난다(경과는 단조 시계로 잰다)", async () => {
+  const order: string[] = [];
+  const runtime = new FakeRuntime();
+  const port = new Port();
+  const { connect, state } = connector(order, port, 1);
+  // 벽시계와 따로 가는 단조 시계: 벽시계가 뒤로 가도 경과가 줄지 않는다.
+  let mono = 0;
+  const running = runRoleAgent({ socketPath: PATH, runtime, parts: parts(order), connect, connectWaitMs: 250, retryMs: 100, monoNow: () => mono });
+  await settle();
+  expect(state.attempts).toBe(1);
+  runtime.t -= 10_000;
+  mono = 300;
+  runtime.advance(10_100);
+  expect(await running).toBeNull();
+  expect(state.attempts).toBe(1);
+  expect(runtime.exits).toEqual([ROLE_AGENT_EXIT.unreachable]);
+  expect(port.written).toEqual([]);
 });

@@ -8,21 +8,28 @@
 // - 대리의 hello 전에는 감독에 붙지 않는다. 대리 없이 붙으면 받은 시작을 띄우지 못하고 not_started로 버리게 된다.
 //   예외는 물려받은 실행이 있어 원격이 처음부터 잠긴 기동이다(아래 inheritedUnverified). 그 원격은 어떤 hello도 받지 않으므로
 //   기다리면 매번 상한에 걸려 감독에게 그 실행(unknown_running)을 알릴 길이 없다. 띄우기는 잠금이 막는다.
+//   이 예외는 기동 대조(WorkerExecutor 생성자의 auditRuns)를 지난 장부로만 정한다. 그래서 원격을 worker 뒤에 만든다.
+// - hello는 받은 때(단조 시계)와 그 연결 세대로 판정한다. recover를 기다리는 사이 대리 연결이 바뀌면, 감독 소켓 start 전에
+//   처음 상한의 남은 시간 안에서 새 세대의 hello를 다시 기다린다.
 // - worker의 exitWaitMs와 원격의 replyWaitMs는 같은 값(timing.replyWaitMs) 하나에서 넘긴다. 원격의 시계(runtime.now)는 단조 시계이고
 //   worker의 상한 타이머(전역 setTimeout)와 같은 시간 기준이어야 한다(deps.monoNow·deps.setTimer). worker의 now는 벽시계다.
 // - 감독 소켓은 이 ExecutorLink에 하나만 붙인다. 우편함 하나를 소켓(inbox)과 worker(credentials)에 함께 넘긴다.
 // - 연결 뒤 지시 처리(Connection.receive)가 던지면(첫 접수·재정리 종료 영수증의 로컬 서명 실패 등) 이 WorkerExecutor를 더 쓰지 않는다.
 //   프로세스 안에서 다시 열지 않고 소켓을 멈춘 뒤 fatal 코드로 끝내 컨테이너 재시작에 맡긴다(같은 저장소를 두 객체가 쥐지 않는다).
-// - 끝낼 때 소켓 stop()을 기다린 뒤 TLS 클라이언트를 닫는다. stop이 상한(stopWaitMs) 안에 끝나지 않으면 기다리지 않고 닫는다.
+//   그 거절은 연결의 닫힘 사유와 따로 끝내기로 잇는다(아래 fatal). 끝내기는 예약기(setTimer)에 기대지 않는다.
+// - 끝낼 때 소켓 stop()을 기다린 뒤 TLS 클라이언트를 닫는다. stop이 상한(stopWaitMs) 안에 끝나지 않거나 상한을 걸지 못하면 기다리지 않고 닫는다.
 import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
+import { encodeControl, OUTPUT_MAX_BYTES } from "../agent/link.ts";
 import { type Role, ROLES } from "../contract/v1/index.ts";
 import type { TlsClient, TlsClientOptions } from "../transport/tls-client.ts";
 import type { RawTlsMaterial } from "../transport/tls-policy.ts";
 import type { UnixListening } from "./agent-listener.ts";
+import type { ProcessCleanup } from "./containment.ts";
 import { createCredentialInbox } from "./credential-inbox.ts";
+import type { Launcher } from "./launcher.ts";
 import { ExecutorLink } from "./link.ts";
 import { fixProfile, ProfileError, type RoleProfile } from "./profile.ts";
-import { RemoteAgent } from "./remote-agent.ts";
+import { type AgentLinkSession, type AgentLinkTransport, RemoteAgent, type RemoteAgentOptions } from "./remote-agent.ts";
 import { createExecutorSocket, type ExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "./socket.ts";
 import type { ExecutorStore, StoredRunState } from "./store.ts";
 import { type RunSpace, WorkerExecutor } from "./worker.ts";
@@ -139,10 +146,12 @@ export type StartResult =
 const UNFINISHED: readonly StoredRunState[] = ["preparing", "running", "stopping", "checking", "unknown_running"];
 
 // 제어 컨테이너는 실행마다 만드는 폴더가 없다. 역할 프로그램의 작업 폴더는 역할 컨테이너에 있고 이 컨테이너에 붙지 않는다(D-100).
-// 그래서 준비할 것도 지울 것도 없다. 실행마다 작업 폴더를 새로 만들고 지우는 일은 뒤 작업(O13)이 이 자리를 바꿔 정한다.
+// 그래서 준비할 것이 없다. 지우기는 확인할 수 없으므로 false다: receipt_cleaned는 자격·tmp·작업 폴더를 지웠다는 뜻이고
+// (계약 v1 receipt), 감독은 그 영수증으로 실행을 끝내고 슬롯을 푼다. 확인하지 못한 실행은 cleanup_pending으로 슬롯을 쥔 채 남는다.
+// 실행마다 작업 폴더를 지우고 그것을 확인하는 일은 뒤 작업(O13)이 이 자리를 바꿔 정한다.
 export const noRunFiles: RunSpace = {
   prepare: async () => {},
-  clean: async () => true,
+  clean: async () => false,
 };
 
 class MaterialError extends Error {}
@@ -156,9 +165,45 @@ interface Material {
 
 const PROFILE_KEYS = ["argv", "credentialEnv", "cwd", "env", "program", "revision", "role"];
 
+// 계약 v1의 revision 꼴(hello의 profile_revision·policy_revision). 계약의 공개 면이 이 정규식을 내지 않아 여기 다시 두고,
+// 계약 스키마의 것과 같은지는 시험이 대조한다. 진입점이 OLIVE_POLICY_REVISION을 볼 때도 쓴다.
+export const REVISION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+// 감독 공개 키 파일은 공개 형식 PEM(SubjectPublicKeyInfo) 한 덩이만 받는다. createPublicKey는 개인 키나 인증서에서도
+// 공개 부분을 꺼내므로, 그 꼴로 잘못 넣은 파일도 기동하게 된다.
+const PUBLIC_KEY_PEM = /^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/;
+
+// 대리 링크의 start에서 실행마다 달라지는 칸의 자리값. 꼴이 맞고 인코딩이 가장 긴 쪽을 넣어, 프로필이 실제 start에 실리는지 본다.
+const LINK_PROBE = {
+  run_id: "00000000-0000-0000-0000-000000000000",
+  credential_digest: "0".repeat(64),
+  output_bytes: OUTPUT_MAX_BYTES,
+  deadline_at: Number.MAX_SAFE_INTEGER,
+  lease_until: Number.MAX_SAFE_INTEGER,
+} as const;
+
 // 계약의 역할 이름인가. 진입점이 OLIVE_ROLE을 볼 때도 쓴다.
 export function isRole(value: unknown): value is Role {
   return typeof value === "string" && (ROLES as readonly string[]).includes(value);
+}
+
+// 대리 링크가 이 프로필로 start를 만들 수 있는가. 링크의 인코더(argv·고정 env의 개수, 이름, 틀 크기 상한)를 그대로 쓴다.
+// 실을 수 없는 프로필로 뜨면 감독이 등록·배정까지 성공한 뒤 매 작업이 대리 start 없이 실패한다.
+function linkCarries(profile: RoleProfile): boolean {
+  try {
+    encodeControl({
+      type: "start",
+      program: profile.program,
+      argv: [...profile.argv],
+      cwd: profile.cwd,
+      env: { ...profile.env },
+      credential_env: profile.credentialEnv,
+      ...LINK_PROBE,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // 프로필 JSON을 RoleProfile로 읽는다. 칸이 빠지거나 더 있거나 타입이 틀리면 거절한다. 경로·환경의 규칙은 fixProfile이 본다.
@@ -175,11 +220,11 @@ export function parseProfile(text: string): RoleProfile {
   const strings = (items: unknown) => Array.isArray(items) && items.every((item) => typeof item === "string");
   const env = value.env;
   const envOk = typeof env === "object" && env !== null && !Array.isArray(env) && Object.values(env).every((item) => typeof item === "string");
-  if (!isRole(value.role) || typeof value.revision !== "string" || value.revision === "") throw new MaterialError("profile_role_or_revision");
+  if (!isRole(value.role) || typeof value.revision !== "string" || !REVISION.test(value.revision)) throw new MaterialError("profile_role_or_revision");
   if (typeof value.program !== "string" || typeof value.cwd !== "string" || typeof value.credentialEnv !== "string" || !strings(value.argv) || !envOk) {
     throw new MaterialError("profile_types");
   }
-  return fixProfile({
+  const profile = fixProfile({
     role: value.role,
     revision: value.revision,
     program: value.program,
@@ -188,6 +233,8 @@ export function parseProfile(text: string): RoleProfile {
     env: env as Record<string, string>,
     credentialEnv: value.credentialEnv,
   });
+  if (!linkCarries(profile)) throw new MaterialError("profile_link_unencodable");
+  return profile;
 }
 
 function ed25519(key: KeyObject, name: string): KeyObject {
@@ -223,6 +270,7 @@ async function readMaterial(settings: ExecutorSettings, readText: ExecutorDeps["
   } catch {
     throw new MaterialError("supervisor_key_invalid");
   }
+  if (!PUBLIC_KEY_PEM.test(supervisorPem)) throw new MaterialError("supervisor_key_not_public");
   return {
     profile,
     signingKey: ed25519(signingKey, "signing_key"),
@@ -239,23 +287,70 @@ function reasonOf(error: unknown): string {
   return typeof code === "string" && /^[a-z_]{1,40}$/.test(code) ? code : "threw";
 }
 
-// 지금 연결이 hello를 했고 잠기지 않았으면 true. 상한까지 간격마다 본다. 잠기면(두 번째 연결 등) 기다리지 않고 false다.
-function waitForHello(remote: RemoteAgent, timing: ExecutorTiming, deps: ExecutorDeps): Promise<boolean> {
-  const limit = deps.monoNow() + timing.helloWaitMs;
+// 대리의 hello를 받은 때(단조 시계)와 그 연결 세대를 적는 원격. 원격에는 hello를 알리는 훅이 없어, 받은 조각을 넘긴 직후 상태를 본다.
+// 확인 간격의 타이머가 밀려도 받은 시각으로 상한과 견주려는 것이다: 상한 뒤에 받은 hello를 제때 온 것으로 치지 않고,
+// 상한 전에 받은 hello를 확인이 늦었다고 버리지 않는다.
+class GreetedRemote extends RemoteAgent {
+  private greetedAt: { readonly generation: number; readonly at: number } | null = null;
+
+  constructor(
+    options: RemoteAgentOptions,
+    private readonly greetClock: () => number,
+  ) {
+    super(options);
+  }
+
+  override connect(transport: AgentLinkTransport): AgentLinkSession | null {
+    const session = super.connect(transport);
+    if (session === null) return null;
+    const generation = this.state().generation;
+    return {
+      receive: (chunk) => {
+        session.receive(chunk);
+        const state = this.state();
+        if (this.greetedAt?.generation !== generation && state.generation === generation && state.greeted) {
+          this.greetedAt = { generation, at: this.greetClock() };
+        }
+      },
+      closed: () => session.closed(),
+    };
+  }
+
+  // 지금 연결이 hello를 했고 잠기지 않았으면 그 hello의 세대와 받은 시각. 아니면 null.
+  greeting(): { readonly generation: number; readonly at: number } | null {
+    const state = this.state();
+    if (!state.connected || !state.greeted || state.distrusted !== null) return null;
+    return this.greetedAt?.generation === state.generation ? this.greetedAt : null;
+  }
+}
+
+// 상한(limit, 단조 시계) 전에 받은 지금 연결의 hello가 있으면 그 세대, 없으면 null. 간격마다 본다. 잠기거나(두 번째 연결 등) 멈춤 요청이 오면
+// 기다리지 않는다.
+function waitForHello(remote: GreetedRemote, limit: number, timing: ExecutorTiming, deps: ExecutorDeps, stop: AbortSignal | undefined): Promise<number | null> {
   return new Promise((resolve) => {
+    stop?.addEventListener("abort", () => resolve(null), { once: true });
     const check = () => {
-      const state = remote.state();
-      if (state.greeted && state.distrusted === null) return resolve(true);
-      if (state.distrusted !== null || deps.monoNow() >= limit) return resolve(false);
-      deps.setTimer(Math.max(1, Math.min(timing.helloPollMs, Math.ceil(limit - deps.monoNow()))), check);
+      if (stop?.aborted) return resolve(null);
+      const greeting = remote.greeting();
+      if (greeting !== null && greeting.at < limit) return resolve(greeting.generation);
+      if (remote.state().distrusted !== null || deps.monoNow() >= limit) return resolve(null);
+      try {
+        deps.setTimer(Math.max(1, Math.min(timing.helloPollMs, Math.ceil(limit - deps.monoNow()))), check);
+      } catch {
+        // 다시 볼 수 없으면 hello가 없는 것으로 끝낸다(감독에 붙기 전이다).
+        resolve(null);
+      }
     };
     check();
   });
 }
 
-export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDeps): Promise<StartResult> {
+// stop: 기동 중의 멈춤 요청(진입점이 기동 전에 건 신호 처리기가 중단한다). 기다림(재료·저장소·hello·recover) 뒤마다 보고, 중단됐으면
+// 감독에 붙지 않고 연 대리 소켓을 닫은 뒤 코드 0으로 돌려준다. 기동을 마친 뒤의 멈춤은 RunningExecutor.stop이다.
+export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDeps, stop?: AbortSignal): Promise<StartResult> {
   const step = (name: StartStep) => deps.onStep?.(name);
   const fail = (at: StartStep, code: number, error: unknown): StartResult => ({ ok: false, step: at, code, reason: reasonOf(error) });
+  const stopped = (at: StartStep): StartResult => ({ ok: false, step: at, code: 0, reason: "stop_requested" });
   const timing = settings.timing;
 
   step("material");
@@ -265,6 +360,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   } catch (error) {
     return fail("material", EXECUTOR_EXIT.material, error);
   }
+  if (stop?.aborted) return stopped("material");
 
   step("store");
   let store: ExecutorStore;
@@ -273,20 +369,30 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   } catch (error) {
     return fail("store", EXECUTOR_EXIT.store, error);
   }
+  if (stop?.aborted) return stopped("store");
 
-  // 공간이 사라졌다는 따로 된 확인(D-104의 새 세대 표식)은 아직 없다. 그래서 끝을 맺지 못한 실행이 하나라도 남았거나 장부를 설명하지 못하면
-  // 원격을 처음부터 잠근다: 그 실행을 지금 붙을 대리의 0으로 닫지 않는다.
-  const inheritedUnverified = store.ledgerHeld() || store.runs().some((run) => UNFINISHED.includes(run.state));
-  const remote = new RemoteAgent({
-    credentialEnv: material.profile.credentialEnv,
-    runWindow: (runId) => store.run(runId),
-    runtime: { setTimer: deps.setTimer, now: deps.monoNow },
-    inheritedUnverified,
-    replyWaitMs: timing.replyWaitMs,
-  });
   let link: ExecutorLink | undefined;
   // 우편함은 소켓과 worker가 함께 쓰는 하나다. epoch는 offer·take 안에서만 읽으므로 link를 뒤에 만들어도 된다.
   const inbox = createCredentialInbox({ epoch: () => link?.epoch() ?? null });
+
+  // 원격은 기동 대조 뒤에 만든다(아래). worker에는 그 원격으로 넘기는 자리를 준다. worker는 생성자에서 이 셋을 부르지 않는다
+  // (프로세스 정리·공간·띄우기는 recover와 지시 처리부터 쓴다).
+  let remote: GreetedRemote | undefined;
+  let remoteSpace: RunSpace | undefined;
+  const ready = () => {
+    if (remote === undefined || remoteSpace === undefined) throw new Error("remote_not_ready");
+    return { remote, space: remoteSpace };
+  };
+  const cleanup: ProcessCleanup = {
+    terminate: () => ready().remote.cleanup.terminate(),
+    survivors: () => ready().remote.cleanup.survivors(),
+    busy: () => ready().remote.cleanup.busy(),
+  };
+  const space: RunSpace = {
+    prepare: (runId, signal) => ready().space.prepare(runId, signal),
+    clean: (runId) => ready().space.clean(runId),
+  };
+  const launcher: Launcher = { run: (plan, signal, hooks) => ready().remote.launcher.run(plan, signal, hooks) };
 
   step("worker");
   let worker: WorkerExecutor;
@@ -299,9 +405,9 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       signingKey: material.signingKey,
       supervisorKey: material.supervisorKey,
       credentials: inbox,
-      cleanup: remote.cleanup,
-      space: remote.space(noRunFiles),
-      launcher: remote.launcher,
+      cleanup,
+      space,
+      launcher,
       now: deps.wallNow,
       exitWaitMs: timing.replyWaitMs,
     });
@@ -309,19 +415,44 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     return fail("worker", EXECUTOR_EXIT.startup_audit, error);
   }
 
+  // 공간이 사라졌다는 따로 된 확인(D-104의 새 세대 표식)은 아직 없다. 그래서 끝을 맺지 못한 실행이 하나라도 남았거나 장부를 설명하지 못하면
+  // 원격을 처음부터 잠근다: 그 실행을 지금 붙을 대리의 0으로 닫지 않는다.
+  // 함정: 장부는 worker 생성자의 기동 대조(auditRuns)를 지난 뒤에 본다. 그 전의 장부에는 접수가 아닌 최초 preparing(사건·영수증 없음)이 남아,
+  // 물려받은 실행이 없는데도 대리를 잠그고 감독에 빈 목록으로 인사한 뒤 새 작업을 띄우지 못한다.
+  const inheritedUnverified = store.ledgerHeld() || store.runs().some((run) => UNFINISHED.includes(run.state));
+  const agent = new GreetedRemote(
+    {
+      credentialEnv: material.profile.credentialEnv,
+      runWindow: (runId) => store.run(runId),
+      runtime: { setTimer: deps.setTimer, now: deps.monoNow },
+      inheritedUnverified,
+      replyWaitMs: timing.replyWaitMs,
+    },
+    deps.monoNow,
+  );
+  remote = agent;
+  remoteSpace = agent.space(noRunFiles);
+
   step("agent_listen");
   let listener: UnixListening;
   try {
-    listener = deps.listenAgent(remote, settings.agentSocket);
+    listener = deps.listenAgent(agent, settings.agentSocket);
   } catch (error) {
     return fail("agent_listen", EXECUTOR_EXIT.agent_listen, error);
   }
 
   step("agent_hello");
-  if (inheritedUnverified) deps.log("물려받은 실행이 있어 대리를 믿지 않는다(inherited_unverified). 대리를 기다리지 않고 감독에 알린다");
-  else if (!(await waitForHello(remote, timing, deps))) {
+  const helloLimit = deps.monoNow() + timing.helloWaitMs;
+  const absent = (): StartResult => {
     listener.stop();
-    return { ok: false, step: "agent_hello", code: EXECUTOR_EXIT.agent_absent, reason: remote.state().distrusted ?? "no_hello" };
+    if (stop?.aborted) return stopped("agent_hello");
+    return { ok: false, step: "agent_hello", code: EXECUTOR_EXIT.agent_absent, reason: agent.state().distrusted ?? "no_hello" };
+  };
+  let greeted: number | null = null;
+  if (inheritedUnverified) deps.log("물려받은 실행이 있어 대리를 믿지 않는다(inherited_unverified). 대리를 기다리지 않고 감독에 알린다");
+  else {
+    greeted = await waitForHello(agent, helloLimit, timing, deps, stop);
+    if (greeted === null) return absent();
   }
 
   step("recover");
@@ -330,6 +461,19 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   } catch (error) {
     listener.stop();
     return fail("recover", EXECUTOR_EXIT.recover, error);
+  }
+
+  // recover를 기다리는 사이 대리 연결이 바뀌었을 수 있다(끊기고 새 세대가 붙음). 인사한 그 세대가 아직 연결·인사·신뢰 상태인지 다시 보고,
+  // 아니면 처음 상한의 남은 시간 안에서 지금 세대의 hello를 기다린다. 여기부터 감독 소켓 start까지는 await가 없다.
+  if (!inheritedUnverified && agent.greeting()?.generation !== greeted) {
+    deps.log("복원 중 대리 연결이 바뀌어 새 연결의 hello를 기다린다");
+    step("agent_hello");
+    greeted = await waitForHello(agent, helloLimit, timing, deps, stop);
+    if (greeted === null) return absent();
+  }
+  if (stop?.aborted) {
+    listener.stop();
+    return stopped("recover");
   }
 
   step("link");
@@ -358,38 +502,86 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   let ending: Promise<number> | undefined;
   let cancelTick: () => void = () => {};
   let socket: ExecutorSocket | undefined;
+  let fatalReason: string | null = null;
 
+  // 닫는 쪽 효과는 하나가 실패해도 나머지를 막지 않는다. 예약기가 고장 나 상한을 걸지 못하면 stop을 기다리지 않고 닫는다
+  // (끝나지 않을 수 있는 stop에 프로세스를 묶지 않는다).
   const shutdown = (code: number, reason: string): Promise<number> => {
     ending ??= (async () => {
-      cancelTick();
+      try {
+        cancelTick();
+      } catch {
+        // 다음 tick은 ending을 보고 돌지 않는다
+      }
       deps.log(`실행기를 멈춘다(${reason}), 코드 ${code}`);
       if (socket !== undefined) {
-        let cancelBound: () => void = () => {};
-        const stopped = await Promise.race([
-          socket.stop().then(() => true),
-          new Promise<boolean>((resolve) => (cancelBound = deps.setTimer(timing.stopWaitMs, () => resolve(false)))),
-        ]);
-        cancelBound();
-        if (!stopped) deps.log("감독 소켓이 상한 안에 멈추지 않아 기다리지 않고 닫는다");
+        const stopping = socket.stop().then(() => true);
+        let stopped: boolean;
+        try {
+          let cancelBound: () => void = () => {};
+          const bound = new Promise<boolean>((resolve) => (cancelBound = deps.setTimer(timing.stopWaitMs, () => resolve(false))));
+          stopped = await Promise.race([stopping, bound]);
+          cancelBound();
+        } catch {
+          stopped = false;
+        }
+        if (!stopped) deps.log("감독 소켓이 상한 안에 멈추지 않았거나 상한을 걸지 못해 기다리지 않고 닫는다");
       }
-      client.close();
-      listener.stop();
+      try {
+        client.close();
+      } catch {
+        // 클라이언트 닫기의 실패가 대리 소켓 닫기와 종료를 막지 않는다
+      }
+      try {
+        listener.stop();
+      } catch {
+        // 위와 같다
+      }
       resolveDone(code);
       return code;
     })();
     return ending;
   };
 
-  // 기록만 한다(socket.md: onEvent 안에서 소켓·link를 부르지 않는다). 치명 사건이면 멈춤을 타이머로 미뤄 연다.
+  // 치명 실패를 끝내기로 잇는다. 부른 자리(소켓 사건, 지시 처리의 거절) 밖의 마이크로태스크에서 끝낸다(socket.md: onEvent 안에서 소켓을
+  // 부르지 않는다). 예약기에 기대지 않는다: 예약기가 고장 난 것이 끝내는 이유일 수 있다(retry_unavailable).
+  // 끝내기가 정해진 순간부터 감독 소켓은 새 연결을 열지 않는다(아래 guardedLink.open).
+  const fatal = (reason: string) => {
+    if (fatalReason !== null) return;
+    fatalReason = reason;
+    queueMicrotask(() => void shutdown(EXECUTOR_EXIT.fatal, reason));
+  };
+
+  // 기록하고, 치명 사건이면 fatal로 넘긴다.
   const onEvent = (event: SocketEvent) => {
     deps.log(`감독 소켓: ${event.kind}${"reason" in event ? `(${event.reason})` : ""}`);
-    if (event.kind === "closed" && event.reason === "receive_failed") deps.setTimer(0, () => void shutdown(EXECUTOR_EXIT.fatal, "receive_failed"));
-    if (event.kind === "retry_unavailable") deps.setTimer(0, () => void shutdown(EXECUTOR_EXIT.fatal, "retry_unavailable"));
+    if (event.kind === "closed" && event.reason === "receive_failed") fatal("receive_failed");
+    if (event.kind === "retry_unavailable") fatal("retry_unavailable");
+  };
+
+  // 감독 소켓이 여는 연결마다 지시 처리(Connection.receive)의 거절을 fatal로 바로 잇는다. 소켓도 그 거절을 receive_failed 닫힘으로 알리지만,
+  // 연결이 먼저 닫혔으면(상대가 끊음 등) 그 연결의 닫힘 사건은 이미 나갔고 다시 나오지 않는다(socket.ts의 shut은 한 연결에 한 번).
+  // 연결 객체는 감싸지 않는다: 소켓이 link.isCurrent로 같은 객체인지 본다. 거절 반응은 소켓의 await보다 먼저 걸리므로 fatal의 끝내기는
+  // 소켓이 그 거절을 처리한 뒤에 돈다.
+  const guardedLink: Pick<ExecutorLink, "open" | "isCurrent" | "epoch"> = {
+    open: (transport) => {
+      if (fatalReason !== null || ending !== undefined) throw new Error("executor_stopping");
+      const connection = current.open(transport);
+      const receive = connection.receive.bind(connection);
+      connection.receive = (raw) => {
+        const handled = receive(raw);
+        handled.catch(() => fatal("receive_failed"));
+        return handled;
+      };
+      return connection;
+    },
+    isCurrent: (connection) => current.isCurrent(connection),
+    epoch: () => current.epoch(),
   };
 
   const created = createExecutorSocket({
     client,
-    link: current,
+    link: guardedLink,
     inbox,
     policy: settings.reconnect,
     receive: settings.receive,
@@ -408,21 +600,25 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   socket = created.socket;
   socket.start();
 
+  // 다음 tick을 걸지 못하는 것도 tick의 실패다: 걸리지 않은 채 두면 임대·맞춤 기한을 보지 않는 실행기가 살아남는다.
   const tick = () => {
     if (ending !== undefined) return;
     try {
       current.tick();
       worker.tick();
+      cancelTick = deps.setTimer(timing.tickMs, tick);
     } catch {
       void shutdown(EXECUTOR_EXIT.fatal, "tick_failed");
-      return;
     }
-    cancelTick = deps.setTimer(timing.tickMs, tick);
   };
-  cancelTick = deps.setTimer(timing.tickMs, tick);
+  try {
+    cancelTick = deps.setTimer(timing.tickMs, tick);
+  } catch {
+    fatal("tick_failed");
+  }
 
   return {
     ok: true,
-    running: { done, stop: () => shutdown(0, "requested"), remote, link: current, worker },
+    running: { done, stop: () => shutdown(0, "requested"), remote: agent, link: current, worker },
   };
 }

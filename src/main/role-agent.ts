@@ -5,7 +5,8 @@
 // 차례: RoleAgent.prepare(non-dumpable → PID 1 → 정리 코어 기록) → 제어 소켓에 붙음 → attach(hello).
 // - prepare가 소켓보다 먼저다. 그 앞에 연 것이 없어야 /proc/1을 읽을 틈과 기준 스캔 밖의 자원이 없다. 실패하면 prepare가 78~80으로 끝낸다.
 // - 제어는 저장소·기동 대조를 마친 뒤에 듣기 시작하므로 처음에는 소켓이 없을 수 있다. 간격(retryMs)을 두고 다시 붙되 상한(connectWaitMs)을
-//   넘기면 82로 끝난다. 그동안 띄운 것이 없어 끝나도 잃을 것이 없다.
+//   넘기면 82로 끝난다. 그동안 띄운 것이 없어 끝나도 잃을 것이 없다. 경과는 단조 시계(monoNow)로 재고, 다시 붙기 직전·붙기가 끝난 때·
+//   붙는 중의 기다림 모두에 상한을 건다. 상한 뒤에 늦게 돌아온 연결은 hello 없이 닫는다. runtime.now는 벽시계라 이 상한에 쓰지 않는다.
 // - 붙은 뒤 소켓이 닫히거나 오류가 나면 linkClosed()다(대리가 실행을 멈추고 75로 끝난다). runtime.exit은 실제로 프로세스를 끝낸다.
 import { type AgentParts, type AgentRuntime, type AgentTransport, productionParts, RoleAgent } from "../agent/agent.ts";
 
@@ -45,6 +46,8 @@ export interface RoleAgentEntryOptions {
   readonly connect: ConnectAgentSocket;
   readonly connectWaitMs: number;
   readonly retryMs: number;
+  // 붙기 상한을 재는 단조 시계(ms). runtime.setTimer와 같은 시간 기준이어야 한다.
+  readonly monoNow: () => number;
 }
 
 // 다 못 쓴 나머지를 사본으로 쥐었다가 drain에서 이어 쓴다. 쓰기 실패와 상한 초과는 던져 대리가 링크 끊김으로 다루게 한다.
@@ -94,33 +97,63 @@ export async function runRoleAgent(options: RoleAgentEntryOptions): Promise<Role
   const agent = await RoleAgent.prepare(runtime, options.parts);
   if (agent === null) return null;
   let transport: ReturnType<typeof bufferedTransport> | null = null;
+  // 상한을 넘겨 버린 연결. 그 연결의 받은 바이트·닫힘은 대리에 넘기지 않는다(늦게 열린 연결을 닫을 때의 닫힘이 linkClosed가 되지 않게).
+  let abandoned = false;
   const handlers: AgentSocketHandlers = {
     data: (chunk) => {
-      agent.receive(chunk);
+      if (!abandoned) agent.receive(chunk);
       // 제어가 보낸 바이트에는 자격 값 틀이 있다. 디코더가 사본을 쥐었으므로 받은 조각은 바로 0으로 채운다.
       chunk.fill(0);
     },
     drain: () => {
+      if (abandoned) return;
       try {
         transport?.flush();
       } catch {
         agent.linkClosed();
       }
     },
-    close: () => agent.linkClosed(),
+    close: () => {
+      if (!abandoned) agent.linkClosed();
+    },
   };
-  const limit = runtime.now() + options.connectWaitMs;
+  const limit = options.monoNow() + options.connectWaitMs;
+  const unreachable = (): null => {
+    runtime.exit(ROLE_AGENT_EXIT.unreachable);
+    return null;
+  };
   for (;;) {
+    if (options.monoNow() >= limit) return unreachable();
+    let attempt: Promise<AgentSocketPort>;
     try {
-      transport = bufferedTransport(await options.connect(options.socketPath, handlers));
-      break;
-    } catch {
-      if (runtime.now() + options.retryMs > limit) {
-        runtime.exit(ROLE_AGENT_EXIT.unreachable);
-        return null;
-      }
-      await new Promise<void>((resolve) => runtime.setTimer(options.retryMs, resolve));
+      attempt = options.connect(options.socketPath, handlers);
+    } catch (error) {
+      attempt = Promise.reject(error);
     }
+    let cancelBound: () => void = () => {};
+    const bound = new Promise<"lapsed">((resolve) => (cancelBound = runtime.setTimer(Math.max(1, Math.ceil(limit - options.monoNow())), () => resolve("lapsed"))));
+    let outcome: AgentSocketPort | "lapsed" | "refused";
+    try {
+      outcome = await Promise.race([attempt, bound]);
+    } catch {
+      outcome = "refused";
+    }
+    cancelBound();
+    if (outcome !== "lapsed" && outcome !== "refused" && options.monoNow() < limit) {
+      transport = bufferedTransport(outcome);
+      break;
+    }
+    if (outcome !== "refused") {
+      // 상한을 넘겼다. 늦게 돌아온(또는 앞으로 돌아올) 연결은 쓰지 않고 닫는다.
+      abandoned = true;
+      void attempt.then(
+        (port) => port.end(),
+        () => {},
+      );
+      return unreachable();
+    }
+    if (options.monoNow() + options.retryMs > limit) return unreachable();
+    await new Promise<void>((resolve) => runtime.setTimer(options.retryMs, resolve));
   }
   agent.attach(transport);
   return agent;
@@ -163,7 +196,7 @@ async function main(): Promise<void> {
     },
     exit: (code) => process.exit(code),
   };
-  await runRoleAgent({ socketPath, runtime, parts: productionParts(), connect: connectUnix, connectWaitMs: 60_000, retryMs: 500 });
+  await runRoleAgent({ socketPath, runtime, parts: productionParts(), connect: connectUnix, connectWaitMs: 60_000, retryMs: 500, monoNow: () => performance.now() });
 }
 
 if (import.meta.main) await main();
