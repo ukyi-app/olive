@@ -4,8 +4,13 @@
 // 시작 후보(StartCandidate)는 실행 허가가 아니다. 실제 시작은 장부의 startRun이 정지·세대·기한·점유를
 // 같은 트랜잭션에서 다시 본 뒤에만 된다. 부르는 쪽은 후보를 받아도 startRun의 거절을 그대로 따른다.
 //
-// 틀리는 방향은 늘 "시작하지 않음"이다. 종료를 확인하지 못한 실행, 출처를 모르는 입력, 앞 실행보다 많은 예산은 보류다.
-// 값이 빠졌거나 꼴이 틀리면(유한하지 않은 시각, 0 이상의 안전 정수가 아닌 잔액, 등록되지 않은 출처) 모름으로 보고 보류한다.
+// 틀리는 방향은 늘 "시작하지 않음"이다. 종료를 확인하지 못한 실행, 출처를 모르는 입력, 요청 한도의 남은 몫보다 많은 예산은 보류다.
+// 값이 빠졌거나 꼴이 틀리면(유한하지 않은 시각, 0 이상의 안전 정수가 아닌 잔액·예약, 등록되지 않은 출처) 모름으로 보고 보류한다.
+//
+// 예산은 요청(입력 ID) 하나에 한도 하나다(D-105). 같은 요청의 다른 작업자 실행들이 시작할 때 잡은 예산(장부 listRuns의
+// reservedBudget)의 합을 출처별 한도에서 뺀 나머지보다 이 실행의 예산이 크면 시작하지 않고 기다린다(D-106: 줄여 시작하지 않는다).
+// 한도는 설정값이라 배포로 숫자를 올리면 진행 중인 요청도 더 받는다. startRun은 이 한도를 다시 보지 않는다: 작업자 자리가 하나이고
+// 배정 박자가 직렬이라 이 판단과 시작 사이에 같은 요청의 다른 작업이 시작할 길이 없다는 전제다.
 import { type LedgerRunState, type Run, type RunKind, SLOT_FREE, type SlotHold, type StartBar } from "../../ledger/index.ts";
 
 // 입력의 인증된 출처 종류. 장부의 inputs.source(인증된 출처 이름)를 관리자 요청과 자동 경보로 나눈 것이다.
@@ -18,8 +23,12 @@ const isBudget = (value: unknown): value is number => Number.isSafeInteger(value
 
 // 이 판단이 실행 줄에서 읽는 칸. 모두 장부의 Run에 있는 칸이고 상태 이름도 장부 그대로다.
 // startBar는 queueView()가 대기 실행에 붙여 주는 값이다. 끝난 실행처럼 장부가 붙이지 않는 줄은 null을 넣는다.
-// closedByOperator는 not_started 줄이 관리자가 실패로 닫은 줄인가(장부의 listRuns가 싣는다). budgetBar만 읽는다.
-export type SchedulerRun = Pick<Run, "runId" | "kind" | "role" | "state" | "queueSeq" | "inputRequestId" | "deadlineAt" | "budgetLeft" | "closedByOperator"> & {
+// reservedBudget(작업자 줄의 예약)과 closedByOperator(not_started 줄이 관리자가 실패로 닫은 줄인가)는 장부의 listRuns가 싣는다.
+// budgetBar만 읽는다.
+export type SchedulerRun = Pick<
+  Run,
+  "runId" | "kind" | "role" | "state" | "queueSeq" | "inputRequestId" | "deadlineAt" | "budgetLeft" | "closedByOperator" | "reservedBudget"
+> & {
   startBar: StartBar | null;
 };
 
@@ -50,8 +59,11 @@ export interface SchedulerView {
 
 // 설정값. 설계는 "관리자 요청 우선, 경보가 굶지 않게"만 정했고 규칙과 숫자는 정하지 않았다(supervisor.md §11 S-10).
 // 규칙(미확정 기본): 이만큼 이상 기다린 경보는 관리자 요청보다 앞선다. 숫자는 배포가 넣는다(코드에 기본값이 없다).
+// requestBudget은 요청 하나가 모든 작업자 실행에 걸쳐 잡을 수 있는 예산의 합(토큰)의 출처별 한도다(D-105). 숫자는 설계에 없고
+// 배포가 넣는다(코드에 기본값이 없다). 양의 안전 정수가 아니면 판단하지 않는다.
 export interface SchedulerPolicy {
   alertMaxWaitMs: number;
+  requestBudget: Record<Origin, number>;
 }
 
 export type HoldReason =
@@ -71,12 +83,15 @@ export type HoldReason =
   | "now_unknown"
   // 실행 줄에 연결된 입력이 없거나, 입력의 출처·접수 시각·만료 시각·취소 여부가 빠졌거나 꼴이 틀리다.
   | "input_unknown"
-  // 이 실행 또는 같은 입력의 다른 실행의 남은 예산이 0 이상의 안전 정수가 아니다(읽지 못함).
+  // 이 실행 또는 같은 입력의 다른 실행의 남은 예산, 같은 입력의 다른 작업자 실행의 예약이 0 이상의 안전 정수가 아니다(읽지 못함).
+  // 관리자가 닫았거나 닫았는지 모르는 not_started 작업자 줄의 예약이 0인 것도 같다(장부와 어긋난 읽기).
   | "budget_unknown"
-  // 남은 예산이 없다(이 실행, 또는 같은 입력에 묶인 다른 실행 중 하나. 대기 순번과 무관하다).
+  // 남은 예산이 없다: 이 실행이나 같은 입력에 묶인 다른 실행 중 하나의 남은 예산이 0이거나(대기 순번과 무관하다), 같은 요청의
+  // 예약 합이 요청 한도에 닿았다.
   | "budget_exhausted"
-  // 같은 입력 ID의 앞 순번 실행이나 상태가 queued가 아닌 실행보다 남은 예산이 많다(관리자가 닫지 않은 not_started 줄은 비교하지 않는다).
-  | "budget_replenished";
+  // 요청 한도에서 같은 입력의 다른 작업자 실행들의 예약 합을 뺀 나머지보다 이 실행의 예산이 크다. 나머지가 늘 때까지(D-90 닫기)
+  // 또는 입력이 만료될 때까지 기다린다.
+  | "request_budget_exceeded";
 
 export interface Held {
   runId: string;
@@ -117,31 +132,37 @@ function slotBlock(view: SchedulerView, kind: RunKind): HoldReason | null {
   return null;
 }
 
-// 같은 입력에 묶인 다른 실행들. 같은 중복 키는 장부가 같은 실행을 돌려주므로, 재시도·새 세션의 새 실행 줄은 입력으로 잇는다.
+// 같은 입력에 묶인 다른 실행들. 같은 중복 키는 장부가 같은 실행을 돌려주므로, 같은 목적의 재시도는 새 줄을 만들지 않는다.
+// 같은 요청의 줄이 여럿인 것은 목적이 다른 부탁들이고, 그 묶음이 요청 한도 하나를 나눠 쓴다.
 // 입력 ID가 다른 줄(세션 교체 뒤 새로 접수한 같은 논리 요청 등)은 여기서 이을 수 없다.
 function sameInputRuns(view: SchedulerView, run: SchedulerRun): SchedulerRun[] {
   if (run.inputRequestId === null) return [];
   return view.runs.filter((other) => other.runId !== run.runId && other.inputRequestId === run.inputRequestId);
 }
 
-// 같은 입력 ID의 줄만 본다. 입력 ID가 다른 줄의 잔액은 이 판단이 거르지 않는다.
-function budgetBar(view: SchedulerView, run: SchedulerRun): HoldReason | null {
+// 같은 입력 ID의 줄만 본다. 입력 ID가 다른 줄의 잔액·예약은 이 판단이 거르지 않는다.
+function budgetBar(view: SchedulerView, run: SchedulerRun, limit: number): HoldReason | null {
   // 이 실행의 잔액을 모르면 다른 줄을 보기 전에 모름으로 보고한다(다른 줄의 0이 있어도 사유는 budget_unknown, 보류는 같다).
   if (!isBudget(run.budgetLeft)) return "budget_unknown";
   if (run.budgetLeft === 0) return "budget_exhausted";
   const others = sameInputRuns(view, run);
-  // 소진을 확인한 실행이 하나라도 있으면 순번과 무관하게 막는다. 다른 줄들 사이에서는 읽지 못한 잔액이 이 0을 가리지 않게
-  // 모름보다 먼저 본다.
+  // 장부가 같은 요청의 줄에 남은 예산 0을 적었으면(대기 중 감액, 계측의 소진) 순번·한도와 무관하게 막는다. 다른 줄들 사이에서는
+  // 읽지 못한 잔액·예약이 이 0을 가리지 않게 모름보다 먼저 본다.
   if (others.some((other) => other.budgetLeft === 0)) return "budget_exhausted";
   if (others.some((other) => !isBudget(other.budgetLeft))) return "budget_unknown";
-  // 상한: 같은 입력 ID의 앞 순번 행, 또는 상태가 queued가 아닌 행의 숫자. 관리자가 닫지 않은 not_started 행(closedByOperator가
-  // false)은 뺀다: 장부에서 not_started로 가는 길은 queued에서, D-90 닫기(근거 줄이 있을 때), 관리자 닫기(D-91, 근거 줄이 있을 때)뿐이다.
-  // queued에서 닫힌 줄의 숫자는 시작하지 않은 줄의 배정액이고, D-90으로 닫힌 줄은 장부가 시작 지시에 고정된 예산에서 감액이 적히지
-  // 않았을 때만 닫으므로 그 숫자도 쓰고 남긴 잔액이 아니다. 관리자가 닫은 줄은 "실패로 끝남"이고 이미 돌았을 수 있어 그 숫자는
-  // 쓰고 남긴 잔액이다: 시작한 줄과 같이 상한으로 센다. 관리자가 닫았는지 모르는 not_started 줄(칸이 없거나 불리언이 아님)도
-  // 상한으로 센다(막는 쪽). 시험이 전이표를 읽어 이 전제를 지킨다. 잔액 0의 not_started는 위의 소진 검사가 이미 막는다.
-  const bounds = others.filter((other) => !(other.state === "not_started" && other.closedByOperator === false) && (other.queueSeq < run.queueSeq || other.state !== "queued"));
-  if (bounds.some((other) => run.budgetLeft > other.budgetLeft)) return "budget_replenished";
+  // 세션 줄의 예약은 세지 않는다(세션 시작이 닫혀 있다). 대기 세션 자신의 예산은 이 함수가 종류를 가리지 않으므로 같은 요청의
+  // 남은 몫과 비교된다. 세션을 한도에 넣을지는 세션 시작을 열 때 다시 정한다.
+  const workers = others.filter((other) => other.kind === "worker");
+  if (workers.some((other) => !isBudget(other.reservedBudget))) return "budget_unknown";
+  // 예약 0을 믿는 줄은 시작 지시가 없는 queued와 관리자가 닫지 않았다고 확인된 not_started(대기에서 닫힘, D-90)뿐이다. 그 밖의
+  // 작업자 줄은 시작 지시와 같은 트랜잭션에 1 이상의 예산이 고정되고, 관리자 닫기도 시작 예산 전부를 잡는다(D-94). 그런 줄의
+  // 예약이 0이면 장부와 어긋난 읽기라 0으로 믿지 않는다.
+  const zeroTrusted = (other: SchedulerRun): boolean => other.state === "queued" || (other.state === "not_started" && other.closedByOperator === false);
+  if (workers.some((other) => other.reservedBudget === 0 && !zeroTrusted(other))) return "budget_unknown";
+  // 예약은 시작한 실행이 잡은 양이고 돌려주지 않는다(D-77). 대기 중인 다른 실행은 시작할 때 이 판단을 따로 지난다.
+  const left = limit - workers.reduce((sum, other) => sum + (other.reservedBudget as number), 0);
+  if (left <= 0) return "budget_exhausted";
+  if (run.budgetLeft > left) return "request_budget_exceeded";
   return null;
 }
 
@@ -151,18 +172,27 @@ function inputKnown(input: SchedulerInput): boolean {
 }
 
 // 슬롯과 무관하게 이 대기 실행을 시작해 볼 수 없는 이유. view.now가 유한한 수임을 부르는 쪽(planNext)이 확인했다.
-function ownBar(view: SchedulerView, run: SchedulerRun): HoldReason | { input: SchedulerInput } {
+function ownBar(view: SchedulerView, run: SchedulerRun, limits: Record<Origin, number>): HoldReason | { input: SchedulerInput } {
   if (run.startBar !== null) return run.startBar;
   if (view.now >= run.deadlineAt) return "deadline_passed";
   const input = run.inputRequestId === null ? undefined : view.inputs.find((item) => item.requestId === run.inputRequestId);
   if (input === undefined || !inputKnown(input)) return "input_unknown";
   if (input.cancelled) return "input_cancelled";
   if (view.now >= input.expiresAt) return "input_expired";
-  return budgetBar(view, run) ?? { input };
+  return budgetBar(view, run, limits[input.origin]) ?? { input };
 }
 
-function checkPolicy(policy: SchedulerPolicy): void {
+// 출처별 요청 한도는 검사한 값을 한 번 읽어 그대로 쓴다(판단 중에 다시 읽으면 검사하지 않은 값이 나올 수 있다).
+function checkPolicy(policy: SchedulerPolicy): Record<Origin, number> {
   if (!Number.isSafeInteger(policy.alertMaxWaitMs) || policy.alertMaxWaitMs <= 0) throw new TypeError("alertMaxWaitMs: 양의 정수가 아니다");
+  const given: unknown = policy.requestBudget;
+  if (typeof given !== "object" || given === null) throw new TypeError("requestBudget: 출처별 한도가 없다");
+  const read = (origin: Origin): number => {
+    const limit: unknown = (given as Record<Origin, unknown>)[origin];
+    if (!Number.isSafeInteger(limit) || (limit as number) <= 0) throw new TypeError(`requestBudget.${origin}: 양의 정수가 아니다`);
+    return limit as number;
+  };
+  return { admin: read("admin"), alert: read("alert") };
 }
 
 // 차례: 오래 기다린 경보(접수 순) → 관리자 요청(대기 순번) → 경보(대기 순번).
@@ -175,7 +205,7 @@ function rank(entry: { run: SchedulerRun; input: SchedulerInput }, now: number, 
 }
 
 export function planNext(view: SchedulerView, policy: SchedulerPolicy): QueueDecision {
-  checkPolicy(policy);
+  const limits = checkPolicy(policy);
   const decision: QueueDecision = { candidates: [], held: [] };
   for (const kind of KINDS) {
     const queued = view.runs.filter((run) => run.kind === kind && run.state === "queued");
@@ -185,7 +215,7 @@ export function planNext(view: SchedulerView, policy: SchedulerPolicy): QueueDec
     }
     const ready: { run: SchedulerRun; input: SchedulerInput }[] = [];
     for (const run of queued) {
-      const bar = ownBar(view, run);
+      const bar = ownBar(view, run, limits);
       if (typeof bar === "string") decision.held.push({ runId: run.runId, kind, reason: bar });
       else ready.push({ run, input: bar.input });
     }

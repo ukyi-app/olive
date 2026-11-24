@@ -333,8 +333,10 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
       inputRequestId: run.inputRequestId,
       deadlineAt: run.deadlineAt,
       budgetLeft: run.budgetLeft,
-      // 장부가 싣은 값 그대로 넘긴다. false가 아니면 budgetBar가 그 not_started 줄을 상한으로 센다(막는 쪽).
+      // 장부가 싣은 두 값 그대로 넘긴다. 예약이 빠졌거나 꼴이 틀린 작업자 줄이 같은 요청에 있으면 planNext가 그 요청의 대기 실행을
+      // budget_unknown으로 보류하고, 관리자가 닫았거나 닫았는지 모르는 not_started 줄의 예약 0도 같다(막는 쪽).
       closedByOperator: run.closedByOperator,
+      reservedBudget: run.reservedBudget,
       startBar: isStartBar(bar) ? bar : null,
     };
     view.push(entry);

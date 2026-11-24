@@ -9,7 +9,7 @@ import { type Origin, planNext, type SchedulerInput, type SchedulerPolicy, type 
 import { clock, digest, id, must, NOW, open, ready, SESSION_EXECUTOR, session, tempPath, WORKER_EXECUTOR, worker } from "./helpers.ts";
 
 // 숫자는 이 시험이 고른 값이다. 운영값이 아니다.
-const POLICY: SchedulerPolicy = { alertMaxWaitMs: 60_000 };
+const POLICY: SchedulerPolicy = { alertMaxWaitMs: 60_000, requestBudget: { admin: 1_000_000, alert: 1_000_000 } };
 const LIFE: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 30_000 };
 const ORIGIN_OF: Record<string, Origin> = { "admin-dm": "admin", alertmanager: "alert" };
 
@@ -499,8 +499,10 @@ test("시작 전에 닫힌 줄은 상한이 아님", () => {
   expect(ledger.startRun({ runId: current.runId, requestId: id(), stopGeneration: 0, now: NOW + 1 })).toMatchObject({ ok: true, run: { state: "preparing", budgetLeft: 10 } });
 });
 
-test("관리자가 닫은 줄의 잔액은 같은 입력의 다음 실행의 상한이고(감액이 적혔든 아니든), D-90으로 닫은 줄은 상한이 아니다", () => {
+test("관리자가 닫은 줄은 시작 예산 전부를 같은 요청의 한도에서 잡고(감액이 적혔든 아니든), D-90으로 닫은 줄은 잡지 않는다", () => {
   // closed: 먼저 시작해 닫힌 실행의 예산, reduced: 시작 뒤 적힌 잔액(없으면 감액 없음), next: 같은 입력의 다음 실행의 예산.
+  // 요청 한도 19: 관리자가 닫았으면 남은 몫은 19 - 10 = 9, D-90으로 닫았으면 19다.
+  const policy: SchedulerPolicy = { ...POLICY, requestBudget: { admin: 19, alert: 19 } };
   const cases = [
     { by: "operator", closed: 10, reduced: 4, next: 10, held: true },
     { by: "operator", closed: 10, reduced: null, next: 12, held: true },
@@ -526,9 +528,92 @@ test("관리자가 닫은 줄의 잔액은 같은 입력의 다음 실행의 상
       [first.runId, "not_started", c.reduced ?? c.closed, c.by === "operator"],
       [next.runId, "queued", c.next, undefined],
     ]);
-    const decision = planNext(view, POLICY);
-    if (c.held) expect(decision, label).toEqual({ candidates: [], held: [{ runId: next.runId, kind: "worker", reason: "budget_replenished" }] });
+    const decision = planNext(view, policy);
+    if (c.held) expect(decision, label).toEqual({ candidates: [], held: [{ runId: next.runId, kind: "worker", reason: "request_budget_exceeded" }] });
     else expect(decision.candidates.map((x) => x.runId), label).toEqual([next.runId]);
     ledger.close();
   }
+});
+
+// 실행 ID → [상태, 남은 예산, 예약, 예약 칸이 있는가].
+function reservations(ledger: Ledger): Map<string, [LedgerRunState, number, number | null | undefined, boolean]> {
+  const all = ledger.listRuns();
+  if (!all.known) throw new Error("실행 목록을 읽지 못함");
+  return new Map(all.value.map((r) => [r.runId, [r.state, r.budgetLeft, r.reservedBudget, "reservedBudget" in r]]));
+}
+
+test("listRuns의 예약: 시작 전·대기에서 닫힘·D-90 닫힘은 0, 시작하면 시작 지시의 예산 전부(시작 뒤 감액·관리자 닫기와 무관), 세션 줄에는 칸이 없다", () => {
+  const path = tempPath();
+  const first = ready(open(path));
+  const requestId = enqueue(first, "admin-dm", NOW);
+  const queued = must(first.admitRun(worker({ inputRequestId: requestId, budgetLeft: 10 }))).run.runId;
+  const cancelled = must(first.admitRun(worker({ inputRequestId: requestId, budgetLeft: 7 }))).run.runId;
+  must(first.recordStopInstruction({ runId: cancelled, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW }));
+  // 대기 중에 줄인 예산(9 → 6)은 시작 지시에 고정되고, 시작 뒤의 감액(6 → 2)은 예약을 줄이지 않는다.
+  const operator = must(first.admitRun(worker({ inputRequestId: requestId, budgetLeft: 9 }))).run.runId;
+  must(first.recordBudget({ runId: operator, budgetLeft: 6, now: NOW }));
+  expect(reservations(first).get(operator)).toEqual(["queued", 6, 0, true]);
+  must(first.startRun({ runId: operator, requestId: id(), stopGeneration: 0, now: NOW }));
+  must(first.recordBudget({ runId: operator, budgetLeft: 2, now: NOW }));
+  expect(reservations(first).get(operator)).toEqual(["preparing", 2, 6, true]);
+  must(first.markLostFor({ executorId: WORKER_EXECUTOR, now: NOW + 1 }));
+  must(first.closeRunByOperator({ runId: operator, checkedBy: "pod_replaced", podName: "worker-a-0", podStartedAt: NOW + 31_000, now: NOW + 31_000 }));
+  // 실행기가 받은 적 없는 실행: 시작한 동안은 예약 8, D-90으로 닫으면 0.
+  const unreceived = must(first.admitRun(worker({ inputRequestId: requestId, budgetLeft: 8 }))).run.runId;
+  must(first.startRun({ runId: unreceived, requestId: id(), stopGeneration: 0, now: NOW + 40_000 }));
+  expect(reservations(first).get(unreceived)).toEqual(["preparing", 8, 8, true]);
+  must(first.closeUnreceivedRun({ runId: unreceived, runs: [], answeredAt: NOW + 70_000, receivedAt: NOW + 70_001, now: NOW + 70_002 }, { sender: WORKER_EXECUTOR }));
+  const sessionRun = must(first.admitRun(session())).run.runId;
+  first.close();
+
+  // 다시 연 장부의 공개 읽기만으로 같은 값이 나온다.
+  const ledger = ready(open(path));
+  expect([...reservations(ledger)]).toEqual([
+    [queued, ["queued", 10, 0, true]],
+    [cancelled, ["not_started", 7, 0, true]],
+    [operator, ["not_started", 2, 6, true]],
+    [unreceived, ["not_started", 8, 0, true]],
+    [sessionRun, ["queued", 50_000, undefined, false]],
+  ]);
+  // 같은 요청의 예약 합은 6이다. 한도 16이면 남은 몫 10으로 예산 10의 대기 실행이 후보, 한도 15면 보류다.
+  const view = assemble(ledger, NOW + 80_000);
+  const worker10 = (limit: number) => planNext(view, { ...POLICY, requestBudget: { admin: limit, alert: limit } });
+  expect(worker10(16).candidates).toEqual([{ runId: queued, kind: "worker", origin: "admin", budgetLeft: 10 }]);
+  expect(worker10(15).candidates).toEqual([]);
+  expect(worker10(15).held.find((h) => h.runId === queued)).toEqual({ runId: queued, kind: "worker", reason: "request_budget_exceeded" });
+});
+
+test("판 4 전에 적힌 시작 지시와 시작 지시가 둘인 작업자 줄은 예약을 모르고, 같은 요청의 다음 실행은 보류다", () => {
+  const rebuildVersion = loadMigrations().findIndex((m) => m.name === "0004-instruction-rebuild.sql") + 1;
+  expect(rebuildVersion).toBeGreaterThan(1);
+  const path = tempPath();
+  const old = ready(open(path, { migrations: loadMigrations().slice(0, rebuildVersion - 1) }));
+  const requestId = enqueue(old, "admin-dm", NOW);
+  const runId = must(old.admitRun(worker({ inputRequestId: requestId, budgetLeft: 10 }))).run.runId;
+  must(old.startRun({ runId, requestId: id(), stopGeneration: 0, now: NOW }));
+  old.close();
+
+  // 판을 올려 연다. 그 시작 지시의 고정 예산 칸은 비어 있고, 지금 잔액(10)으로 메우지 않는다.
+  const ledger = ready(open(path));
+  const next = must(ledger.admitRun(worker({ inputRequestId: requestId, budgetLeft: 5 }))).run.runId;
+  const view = assemble(ledger, NOW + 1);
+  expect(view.runs.map((r) => [r.runId, r.state, r.reservedBudget])).toEqual([
+    [runId, "preparing", null],
+    [next, "queued", 0],
+  ]);
+  expect(planNext(view, POLICY).held).toEqual([{ runId: next, kind: "worker", reason: "budget_unknown" }]);
+  ledger.close();
+
+  // 시작 지시가 둘인 줄(API로는 생기지 않는다)은 어느 예산인지 정하지 않는다.
+  const twice = tempPath();
+  const a = ready(open(twice));
+  const req = enqueue(a, "admin-dm", NOW);
+  const started = must(a.admitRun(worker({ inputRequestId: req, budgetLeft: 10 }))).run.runId;
+  must(a.startRun({ runId: started, requestId: id(), stopGeneration: 0, now: NOW }));
+  a.close();
+  const raw = new Database(twice);
+  raw.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at, budget_left) VALUES (?, ?, 'task_start', 0, ?, 10)").run(id(), started, NOW + 1);
+  raw.close();
+  const b = ready(open(twice));
+  expect(reservations(b).get(started)).toEqual(["preparing", 10, null, true]);
 });
