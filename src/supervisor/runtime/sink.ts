@@ -39,6 +39,8 @@ export interface QueryBook {
 // lastCheck·finalCheck가 싣지 말라고 답한 이름. too_late·deadline만 too_late_to_send이고 나머지는 no_connection으로 옮긴다(sink.md "옮김 표").
 // clock_unavailable·too_late·deadline은 finalCheck, 나머지는 lastCheck가 낸다(check_threw는 둘 다).
 export const SINK_REFUSALS = [
+  // 순서기의 발급 깃발이 섰다(종료 중). 지시·ack 모두 싣지 않는다. 깃발을 읽다 던져도 같다.
+  "issuance_closed",
   // 시계가 던졌거나 안전 정수가 아닌 값을 냈다.
   "clock_unavailable",
   // 봉투 시한까지 남은 시간이 여유보다 짧다(갱신 13,000ms, 그 밖 11,000ms).
@@ -93,6 +95,9 @@ export interface WireSinkPorts {
   readonly clock: Clock;
   readonly queries: QueryBook;
   readonly observe?: (note: SinkNote) => void;
+  // 순서기의 발급 깃발(cycle.ts의 issuanceOpen). lastCheck의 맨 앞에서 읽고 true가 아니면(던짐 포함) 지시·ack 모두 싣지 않는다.
+  // 서버를 닫기 전에 새 발급을 막는 자리다. 감독의 조립은 늘 넘긴다(issuance.md). 빠지면 늘 열린 것으로 본다.
+  readonly issuanceOpen?: () => boolean;
 }
 
 // 박자 셋의 연결 문(LinkGate, ResendLinkGate, CancelLinkGate)이 모두 받는 꼴.
@@ -254,6 +259,16 @@ export function createWireSink(ports: WireSinkPorts): WireSink {
 // 기록도 남기지 않는다(observe가 서버를 다시 부를 수 있다). 포트가 던지면 그 조건을 모름으로 보고 싣지 않는다.
 function judge(head: Head, opening: boolean, ports: WireSinkPorts): SinkRefusal | null {
   try {
+    // 발급 깃발을 맨 앞에서 본다. 종료 중이면 지시의 종류와 복원 상태에 상관없이 넘긴 바이트 0이다.
+    if (ports.issuanceOpen !== undefined) {
+      let open: unknown;
+      try {
+        open = ports.issuanceOpen();
+      } catch {
+        return "issuance_closed";
+      }
+      if (open !== true) return "issuance_closed";
+    }
     let source: Pick<Restorer, "stopGeneration" | "intakeOpen">;
     let generation: unknown;
     try {
