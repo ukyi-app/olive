@@ -851,6 +851,10 @@ export class WorkerExecutor {
       if (record.state !== "finalized") patch.state = "finalized";
     } else if (has("receipt_stopped") && (unfinished || record.state === "unknown_running")) {
       patch.state = has("report_result") ? "ready_result" : "failed_stopped";
+      // 종료 값도 그 영수증을 따른다. 재시작 회복은 completed를 failed로 바꿔 영수증을 내므로(restartedExit) 그 기동이 실행 기록을 못 적었으면
+      // 파일의 기록은 아직 completed다. 상태만 맞추면 실행 기록과 감독이 받은 영수증이 다른 종료 사유를 말한다.
+      const exit = entries.findLast((entry) => entry.action === "receipt_stopped")!.body.exit as ExitKind;
+      if (exit !== record.exit) patch.exit = exit;
     }
     const latest = entries.findLast((entry) => entry.action !== "report_result")?.id ?? null;
     if (latest !== record.last_receipt_id) patch.last_receipt_id = latest;

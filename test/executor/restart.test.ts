@@ -473,43 +473,50 @@ async function handshake(w: ReturnType<typeof wired>, executor: string): Promise
   await until(() => w.got.some((envelope) => envelope.header.action === "hello"));
 }
 
+// 감독에 붙어 실행 하나를 띄운 뒤 대리 링크를 끊어 94로 끝낸다. exitedFirst면 프로그램이 0으로 끝나 completed가 파일에 남고
+// 최종 계수(terminate → count)의 답 전에 끊는다. 아니면 실행 도중 끊는다. 회복 요청은 표식 A로 남는다.
+async function lostAfterStart(name: string, exitedFirst: boolean) {
+  const dir = scratch();
+  const first = wired(MARKER_A);
+  const booted = await boot(first.h, dir);
+  if (!booted.ok) throw new Error(booted.reason);
+  const executor = booted.running.worker.name;
+  await handshake(first, executor);
+  const ledger = openLedger(join(scratch(), "supervisor.db"));
+  const runId = randomUUID();
+  const admitted = startedWorker(ledger, { runId, executorId: executor });
+  const value = credentialValue();
+  const credential = encodeCredentialFrame(runId, sha256(value), value);
+  if (!credential.ok) throw new Error("credential_frame");
+  first.wire.emit("data", credential.frame);
+  const clock = new Clock(T0);
+  const body = taskStartBody({ clock } as unknown as Rig, runId, sha256(value), { profile_revision: PROFILE.revision });
+  first.send(fromSupervisor(clock, executor, "task_start", body, { stop_generation: 0, run_generation: 1, request_id: admitted.requestId }));
+  await until(() => first.h.writes.some((text) => text.includes('"type":"start"')));
+  first.h.session!.receive(encodeAgent({ type: "spawned", run_id: runId }));
+  await until(() => first.got.some((envelope) => envelope.header.action === "receipt_started"));
+  if (exitedFirst) {
+    const output = Buffer.from(JSON.stringify({ role: "diagnosis", outcome: "completed", summary: "ok", items: [], refs: [] }));
+    first.h.session!.receive(encodeAgent({ type: "output", run_id: runId, data: output.toString("base64") }));
+    first.h.session!.receive(encodeAgent({ type: "exited", run_id: runId, code: 0, signal: null, overflow: false, stdout_bytes: output.length }));
+    // completed가 파일에 남고 최종 정리(terminate → count)가 대리에게 간 뒤, 그 답 전에 끊는다.
+    await until(() => first.h.writes.some((text) => text.includes('"type":"terminate"')));
+    await until(() => {
+      const run = onDiskRun(dir, runId) as { state: string; exit?: string | null };
+      return run.state === "stopping" && run.exit === "completed";
+    });
+  }
+  first.h.session!.closed();
+  expect(await booted.running.done, name).toBe(EXECUTOR_EXIT.restart_all);
+  await booted.running.worker.idle();
+  expect(stoppedReceipts(dir, runId), name).toEqual([]);
+  return { dir, runId, executor, ledger };
+}
+
 test("회복: 프로그램이 0으로 끝난 뒤 최종 계수 전에 대리 링크가 끊겨도, 새 표식 뒤 남은 0 영수증 한 건을 exit=failed로 맺어 감독 장부가 확정을 적는다(비교군: 실행 도중 끊김)", async () => {
   for (const exitedFirst of [true, false]) {
     const name = exitedFirst ? "exited(0) then link lost" : "link lost mid-run";
-    const dir = scratch();
-    const first = wired(MARKER_A);
-    const booted = await boot(first.h, dir);
-    if (!booted.ok) throw new Error(booted.reason);
-    const executor = booted.running.worker.name;
-    await handshake(first, executor);
-    const ledger = openLedger(join(scratch(), "supervisor.db"));
-    const runId = randomUUID();
-    const admitted = startedWorker(ledger, { runId, executorId: executor });
-    const value = credentialValue();
-    const credential = encodeCredentialFrame(runId, sha256(value), value);
-    if (!credential.ok) throw new Error("credential_frame");
-    first.wire.emit("data", credential.frame);
-    const clock = new Clock(T0);
-    const body = taskStartBody({ clock } as unknown as Rig, runId, sha256(value), { profile_revision: PROFILE.revision });
-    first.send(fromSupervisor(clock, executor, "task_start", body, { stop_generation: 0, run_generation: 1, request_id: admitted.requestId }));
-    await until(() => first.h.writes.some((text) => text.includes('"type":"start"')));
-    first.h.session!.receive(encodeAgent({ type: "spawned", run_id: runId }));
-    await until(() => first.got.some((envelope) => envelope.header.action === "receipt_started"));
-    if (exitedFirst) {
-      const output = Buffer.from(JSON.stringify({ role: "diagnosis", outcome: "completed", summary: "ok", items: [], refs: [] }));
-      first.h.session!.receive(encodeAgent({ type: "output", run_id: runId, data: output.toString("base64") }));
-      first.h.session!.receive(encodeAgent({ type: "exited", run_id: runId, code: 0, signal: null, overflow: false, stdout_bytes: output.length }));
-      // completed가 파일에 남고 최종 정리(terminate → count)가 대리에게 간 뒤, 그 답 전에 끊는다.
-      await until(() => first.h.writes.some((text) => text.includes('"type":"terminate"')));
-      await until(() => {
-        const run = onDiskRun(dir, runId) as { state: string; exit?: string | null };
-        return run.state === "stopping" && run.exit === "completed";
-      });
-    }
-    first.h.session!.closed();
-    expect(await booted.running.done, name).toBe(EXECUTOR_EXIT.restart_all);
-    await booted.running.worker.idle();
-    expect(stoppedReceipts(dir, runId), name).toEqual([]);
+    const { dir, runId, executor, ledger } = await lostAfterStart(name, exitedFirst);
 
     const next = wired(MARKER_B);
     const restarted = await boot(next.h, dir);
@@ -533,5 +540,33 @@ test("회복: 프로그램이 0으로 끝난 뒤 최종 계수 전에 대리 링
     const supervised = ledger.getRun(runId);
     expect(supervised.known && supervised.value?.state, name).toBe("failed_stopped");
     expect(ledger.recordFinalizeInstruction({ runId, requestId: randomUUID(), stopGeneration: 0, now: T0 + 700_000 }), name).toEqual({ ok: true });
+  }
+}, 15_000);
+
+test("회복: 새 표식의 첫 기동이 실행 기록을 못 적어 87이어도, 쓰기가 돌아온 기동은 실행 기록의 exit을 저장된 종료 영수증의 exit에 맞춘다(비교군: 실행 도중 끊김)", async () => {
+  const runsDown: Partial<StoreIo> = {
+    writeDurable: async (path, data) => {
+      if (path.includes("/runs/")) throw Object.assign(new Error("disk"), { code: "EACCES" });
+      await Bun.write(path, data);
+    },
+  };
+  for (const exitedFirst of [true, false]) {
+    const name = exitedFirst ? "exited(0) then link lost" : "link lost mid-run";
+    const { dir, runId } = await lostAfterStart(name, exitedFirst);
+    expect((onDiskRun(dir, runId) as { exit?: string | null }).exit, name).toBe(exitedFirst ? "completed" : "failed");
+
+    // 종료 영수증만 파일에 닿고 실행 기록은 앞 기동의 값으로 남는다.
+    const broken = harness({ marker: MARKER_B, io: runsDown });
+    expect(await boot(broken, dir), name).toMatchObject({ ok: false, step: "restart_check", code: EXECUTOR_EXIT.recover, reason: "restart_close_unsaved" });
+    const saved = stoppedReceipts(dir, runId);
+    expect(saved.map((event) => [event.body.remaining_processes, event.body.exit]), name).toEqual([[0, "failed"]]);
+
+    const healthy = harness({ marker: MARKER_B });
+    const result = await boot(healthy, dir);
+    if (!result.ok) throw new Error(result.reason);
+    const run = onDiskRun(dir, runId) as { state: string; exit?: string | null; last_receipt_id: string | null };
+    expect(stoppedReceipts(dir, runId), name).toEqual(saved);
+    expect([run.state, run.exit, run.last_receipt_id], name).toEqual(["failed_stopped", "failed", saved[0]!.id]);
+    expect(requestOnDisk(dir), name).toBe(false);
   }
 }, 15_000);

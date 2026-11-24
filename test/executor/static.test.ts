@@ -24,13 +24,14 @@ const READABLE = new Set([
   "ids",
   "outcome",
   "result_digest",
-  // 자기가 낸 영수증·보고의 칸(재전송 대조, 정리 사실, 성공 확정의 결과 대조)
+  // 자기가 낸 영수증·보고의 칸(재전송 대조, 정리 사실, 성공 확정의 결과 대조, 종료 값 대조)
   "instruction",
   "receipt_id",
   "report_id",
   "instruction_request_id",
   "cleaned_at",
   "result",
+  "exit",
 ]);
 
 function bodyReads(source: string): string[] {
