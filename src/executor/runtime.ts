@@ -2,8 +2,13 @@
 // 실제 파일·시계·타이머·소켓을 ExecutorDeps로 넘긴다. 시험은 같은 자리에 가짜를 넣는다.
 //
 // 기동 순서(감독 소켓 start 전의 단계가 실패하면 감독에 붙기 전에 EXECUTOR_EXIT의 정한 코드로 끝난다):
-//   재료(프로필·서명 키·감독 공개 키·TLS 파일) → 저장소 열기 → WorkerExecutor(기동 대조) → 대리 소켓 듣기 → 대리 hello 기다림
-//   → recover → ExecutorLink 하나 → TLS 클라이언트 → 감독 소켓 하나 start → link.tick·worker.tick 주기
+//   재료(프로필·서명 키·감독 공개 키·TLS 파일) → 저장소 열기 → WorkerExecutor(기동 대조) → [회복 요청이 있으면 회복 대조]
+//   → 대리 소켓 듣기 → 대리 hello 기다림 → recover → ExecutorLink 하나 → TLS 클라이언트 → 감독 소켓 하나 start → link.tick·worker.tick 주기
+//
+// 회복(D-104): 감독 소켓 start 뒤(첫 TLS 연결 성공 전 포함) 원격이 잠기면(실행 중 끊김, 두 번째 연결, 계약 밖의 말) 저장소에 회복 요청(그때 읽은 세대 표식, 끝을 맺지 못한
+// 실행)을 적고 restart_all로 끝난다. 차트의 restartPolicyRules가 이 코드에 RestartAllContainers를 걸어 kubelet이 역할 컨테이너까지 끝내고
+// init부터 다시 띄운다. init은 제어 전용 폴더에 새 세대 표식을 쓴다. 다음 기동의 회복 대조는 표식이 요청 때와 다를 때만 그 실행을 남은 0으로
+// 닫는다(아래 RESTART_EVIDENCE). 같거나(제어만 다시 떴다) 읽지 못하면(모름) 닫지 않고 restart_all로 다시 끝나 전체 재시작을 부른다.
 //
 // - 대리의 hello 전에는 감독에 붙지 않는다. 대리 없이 붙으면 받은 시작을 띄우지 못하고 not_started로 버리게 된다.
 //   예외는 물려받은 실행이 있어 원격이 처음부터 잠긴 기동이다(아래 inheritedUnverified). 그 원격은 어떤 hello도 받지 않으므로
@@ -35,12 +40,13 @@ import { createCredentialInbox } from "./credential-inbox.ts";
 import type { Launcher } from "./launcher.ts";
 import { ExecutorLink } from "./link.ts";
 import { fixProfile, ProfileError, type RoleProfile } from "./profile.ts";
-import { type AgentLinkSession, type AgentLinkTransport, RemoteAgent, type RemoteAgentOptions } from "./remote-agent.ts";
+import { type AgentLinkSession, type AgentLinkTransport, type DistrustReason, RemoteAgent, type RemoteAgentOptions } from "./remote-agent.ts";
 import { createExecutorSocket, type ExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "./socket.ts";
-import type { ExecutorStore, StoredRunState } from "./store.ts";
+import { type ExecutorStore, GENERATION_MARKER, type RunRecord, type StoredRunState } from "./store.ts";
 import { type RunSpace, WorkerExecutor } from "./worker.ts";
 
-// 종료 코드. 0은 요청된 멈춤(SIGTERM 등) 뒤뿐이다. 64·69는 이미지의 다른 진입점이, 75~80은 대리(src/agent/agent.ts)가 쓴다.
+// 종료 코드. 0은 요청된 멈춤(SIGTERM 등) 뒤뿐이다. 64·69는 이미지의 다른 진입점이, 75~80은 대리(src/agent/agent.ts)가,
+// 90~93·95·96은 init(src/main/agent-install.ts)이 쓴다.
 export const EXECUTOR_EXIT = {
   // 진입점: 환경이 없거나 꼴이 틀렸다.
   config: 81,
@@ -52,15 +58,21 @@ export const EXECUTOR_EXIT = {
   agent_listen: 85,
   // 상한 안에 대리의 hello가 없었다(대리가 없거나 늦거나, 붙은 연결이 잠겼다).
   agent_absent: 86,
-  // recover가 거절됐다(로컬 서명 실패 등).
+  // recover가 거절됐다(로컬 서명 실패 등). 회복 대조에서 닫기가 거절되거나 그 결과를 파일에 적지 못했거나 요청을 지우지 못했을 때도 쓴다.
   recover: 87,
   // TLS 클라이언트(재료 검사)나 감독 소켓(정책 검사)을 만들지 못했다.
   supervisor_setup: 88,
   // 감독에 붙은 뒤 지시 처리나 주기 처리가 던졌다. 이 WorkerExecutor를 버리고 컨테이너 재시작에 맡긴다.
   fatal: 89,
+  // 파드 전체 재시작을 부른다(D-104). 차트의 restartPolicyRules가 작업자 제어 컨테이너에서만 이 값 하나에 RestartAllContainers를 건다.
+  // 함정: 이 컨테이너가 다른 까닭으로 낼 수 있는 코드와 겹치면 그 실패도 역할 컨테이너를 끝낸다. 81~89(위), bun 자체의 1,
+  // 셸의 126·127, 신호의 128+n과 겹치지 않는 첫 빈 값이다. 유일성은 이 컨테이너 안의 것이다: 감독 진입점도 94를 쓸 수 있어,
+  // 규칙을 다른 컨테이너에 걸면 그 실패가 파드 전체 재시작을 부른다.
+  restart_all: 94,
 } as const;
 
-export type StartStep = "material" | "store" | "worker" | "agent_listen" | "agent_hello" | "recover" | "link" | "tls" | "socket";
+// restart_check는 저장소에 회복 요청이 있을 때만 지난다(없으면 차례가 그 전과 같다).
+export type StartStep = "material" | "store" | "worker" | "restart_check" | "agent_listen" | "agent_hello" | "recover" | "link" | "tls" | "socket";
 
 export interface SupervisorTarget {
   readonly address: string;
@@ -110,6 +122,8 @@ export interface ExecutorSettings {
   readonly storeDir: string;
   // 대리가 붙는 경로 유닉스 소켓(링크 폴더 안).
   readonly agentSocket: string;
+  // init이 쓰는 세대 표식 파일(제어 전용 폴더 안, D-104). 진입점이 init과 같은 상수를 넘긴다.
+  readonly generationMarker: string;
   readonly files: MaterialFiles;
   readonly timing: ExecutorTiming;
   // 감독 소켓의 정책. 기본값이 없다(socket.md). 진입점이 임시값을 넘긴다.
@@ -164,7 +178,27 @@ export const noRunFiles: RunSpace = {
   clean: async () => false,
 };
 
+// 파드 전체 재시작의 증거(D-104). 회복 대조가 세대 표식이 요청 때와 다른 것을 본 뒤, 그 요청의 실행을 닫는 동안만 worker의 정리 자리에 들어간다.
+// 이 0은 대리의 계수가 아니다. 표식이 다르면 init이 요청 뒤에 다시 돌았고, kubelet은 파드의 모든 컨테이너를 끝낸 뒤에만 init을 다시 돌린다.
+// 역할 컨테이너 PID 1(대리)의 끝은 그 PID 공간 전체의 끝이라(shareProcessNamespace 없음) 요청 때의 실행이 남긴 프로세스는 없다.
+// 함정: 지금 붙을 대리에게 묻지 않는다. 제어는 새 대리의 hello와 옛 공간의 연결을 가를 수 없고, 새 hello는 그 뒤의 새 실행에만 쓴다.
+const RESTART_EVIDENCE: ProcessCleanup = {
+  terminate: async () => {},
+  survivors: async () => 0,
+  busy: () => false,
+};
+
 class MaterialError extends Error {}
+
+// 세대 표식을 판단에 쓸 수 없다(읽지 못함·상한 초과·꼴 틀림). 모름이다: 닫지도 요청을 적지도 않는다.
+class GenerationUnknown extends Error {
+  constructor(
+    readonly code: "generation_unreadable" | "generation_malformed",
+    readonly detail: string = code,
+  ) {
+    super(code);
+  }
+}
 
 interface Material {
   readonly profile: RoleProfile;
@@ -474,10 +508,13 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     if (remote === undefined || remoteSpace === undefined) throw new Error("remote_not_ready");
     return { remote, space: remoteSpace };
   };
+  // 회복 대조가 요청의 실행을 닫는 동안만 RESTART_EVIDENCE다. 그 밖에는 원격이다(원격을 만들기 전이면 던져 worker가 모름으로 둔다).
+  let evidence: ProcessCleanup | null = null;
+  const backend = () => evidence ?? ready().remote.cleanup;
   const cleanup: ProcessCleanup = {
-    terminate: () => ready().remote.cleanup.terminate(),
-    survivors: () => ready().remote.cleanup.survivors(),
-    busy: () => ready().remote.cleanup.busy(),
+    terminate: () => backend().terminate(),
+    survivors: () => backend().survivors(),
+    busy: () => backend().busy(),
   };
   const space: RunSpace = {
     prepare: (runId, signal) => ready().space.prepare(runId, signal),
@@ -507,8 +544,8 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     return fail("worker", EXECUTOR_EXIT.startup_audit, error);
   }
 
-  // 공간이 사라졌다는 따로 된 확인(D-104의 새 세대 표식)은 아직 없다. 그래서 끝을 맺지 못한 실행이 하나라도 남았거나 장부를 설명하지 못하면
-  // 원격을 처음부터 잠근다: 그 실행을 지금 붙을 대리의 0으로 닫지 않는다.
+  // 기동 전부터 끝을 맺지 못한 실행은 공간이 사라졌다는 따로 된 확인이 있어야 닫는다. 그 확인은 아래 회복 대조(D-104의 새 세대 표식) 하나다.
+  // 회복 대조 뒤에도 끝을 맺지 못한 실행이 하나라도 남았거나 장부를 설명하지 못하면 원격을 처음부터 잠근다: 그 실행을 지금 붙을 대리의 0으로 닫지 않는다.
   // 함정: 장부는 worker 생성자의 기동 대조(auditRuns)를 지난 뒤에 본다. 그 전의 장부에는 접수가 아닌 최초 preparing(사건·영수증 없음)이 남아,
   // 물려받은 실행이 없는데도 대리를 잠그고 감독에 빈 목록으로 인사한 뒤 새 작업을 띄우지 못한다.
   // 함정: 상태 이름만 보지 않는다. 종료 영수증은 저장되고 실행 기록 쓰기만 실패한 실행은 checking 등으로 남지만, recover는 그 유효한 사건으로
@@ -518,8 +555,104 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 모두 같은 세대의 유효한 receipt_stopped를 전제한다(store.ts REQUIRED_EVENTS). receipt_cleaned만 있으면 finalized가 거절돼 보류가 서고
   // recover가 남은 수를 센다: 그때 잠기지 않은 원격이면 방금 붙은 대리에 정리 요청을 보낸다. 그래서 receipt_cleaned 하나로는 풀지 않는다.
   const settledByEvent = (runId: string) => !store.suspectRun(runId) && store.validEvents(runId).some((entry) => entry.action === "receipt_stopped");
-  const unverified = () => store.ledgerHeld() || store.runs().some((run) => UNFINISHED.includes(run.state) && !settledByEvent(run.run_id));
+  const unverifiedRun = (run: RunRecord) => UNFINISHED.includes(run.state) && !settledByEvent(run.run_id);
+  const unverified = () => store.ledgerHeld() || store.runs().some(unverifiedRun);
+  const stillOpen = (runId: string) => {
+    const run = store.run(runId);
+    return run !== undefined && unverifiedRun(run);
+  };
+  // 회복 요청의 실행이 끝을 맺은 것이 파일에도 남았는지: 실행 기록이 끝난 상태이고 그 실행의 사건이 모두 적혔다. 장부에 없는 실행은 닫을 것이 없다.
+  const durablyClosed = (runId: string) => {
+    if (store.run(runId) === undefined) return true;
+    const run = store.durableRun(runId);
+    return run !== undefined && !UNFINISHED.includes(run.state) && store.settled(runId);
+  };
+
+  // 세대 표식을 읽는다. 기다림은 settleWaitMs에 묶는다(기동의 다른 기다림과 같다).
+  const readGeneration = async (): Promise<string> => {
+    let text: string;
+    try {
+      text = await bounded(() => deps.readText(settings.generationMarker), timing.settleWaitMs, deps);
+    } catch (error) {
+      throw new GenerationUnknown("generation_unreadable", reasonOf(error));
+    }
+    if (!GENERATION_MARKER.test(text)) throw new GenerationUnknown("generation_malformed");
+    return text;
+  };
+
+  // 회복 대조. 원격을 만들기 전(잠금 판단 전), 대리 소켓을 열기 전, 감독에 붙기 전이다. 요청이 없으면 아무것도 하지 않는다.
+  // - 장부 전체를 믿을 수 없으면(ledgerHeld) 닫지 않고 요청을 그대로 둔다. 아래 잠금으로 지금처럼 붙는다(재시작으로 풀리지 않는다).
+  // - 요청의 실행 가운데 아직 끝을 맺지 못한 것만 닫는다. 요청 밖의 실행은 닫지 않는다(남으면 잠금).
+  // - 닫은 결과가 파일에 닿기 전에는 요청을 지우지 않는다. 지운 뒤에만 감독에 붙는다.
+  // 함정: 표식이 같으면 제어만 다시 떴다(규칙 밖 종료, 규칙이 빠진 배포). 역할 컨테이너는 그 실행을 아직 돌릴 수 있다.
+  const request = store.restartRequest();
+  if (request !== null) {
+    step("restart_check");
+    const restartAgain = (reason: string): StartResult => {
+      if (stop?.aborted) return stopped("restart_check");
+      deps.log(`회복 대조: 닫지 않고 파드 전체 재시작을 부른다(${reason})`);
+      return { ok: false, step: "restart_check", code: EXECUTOR_EXIT.restart_all, reason };
+    };
+    if (store.ledgerHeld()) deps.log("회복 대조: 장부가 보류돼 닫지 않는다. 요청을 두고 잠근 채 붙는다");
+    else {
+      const pending = request.runs.filter(stillOpen);
+      if (pending.length > 0) {
+        let marker: string;
+        try {
+          marker = await readGeneration();
+        } catch (error) {
+          const unknown = error as GenerationUnknown;
+          if (stop?.aborted) return stopped("restart_check");
+          deps.log(`회복 대조: 세대 표식을 판단에 쓸 수 없다(${unknown.detail})`);
+          return restartAgain(unknown.code);
+        }
+        if (stop?.aborted) return stopped("restart_check");
+        if (marker === request.marker) return restartAgain("generation_unchanged");
+        evidence = RESTART_EVIDENCE;
+        try {
+          await bounded(() => worker.reclaimRestarted(pending), timing.settleWaitMs, deps);
+        } catch (error) {
+          return fail("restart_check", EXECUTOR_EXIT.recover, error);
+        } finally {
+          evidence = null;
+        }
+        if (stop?.aborted) return stopped("restart_check");
+        // 메모리에서 닫혔어도 사건과 실행 기록이 파일에 닿지 않았으면 요청을 지우지 않고 끝난다. 다음 기동이 같은 요청으로 다시 닫는다.
+        if (pending.some((runId) => !stillOpen(runId) && !durablyClosed(runId))) {
+          return { ok: false, step: "restart_check", code: EXECUTOR_EXIT.recover, reason: "restart_close_unsaved" };
+        }
+        deps.log(`회복 대조: 세대 표식이 바뀌었다. 요청의 실행 ${pending.filter((runId) => !stillOpen(runId)).length}/${pending.length}개를 남은 0으로 닫았다`);
+      }
+      if (request.runs.some(stillOpen)) deps.log("회복 대조: 요청의 실행 일부를 닫지 못했다(장부가 설명하지 못함). 요청을 두고 잠근 채 붙는다");
+      else {
+        // 요청은 사건과 실행 기록이 모두 파일에 닿은 뒤에만 지운다. 앞선 기동에서 종료 영수증만 적히고 실행 기록을 못 적은 실행은 stillOpen이
+        // 아니므로(사건으로 판단) 위에서 닫지 않는다. 여기서 그 사건으로 실행 기록부터 맞추고, 못 맞추면 지우지 않고 87로 끝나 연결하지 않는다.
+        const unsaved = request.runs.filter((runId) => !durablyClosed(runId));
+        if (unsaved.length > 0) {
+          try {
+            await bounded(() => worker.settleRestarted(unsaved), timing.settleWaitMs, deps);
+          } catch (error) {
+            return fail("restart_check", EXECUTOR_EXIT.recover, error);
+          }
+          if (stop?.aborted) return stopped("restart_check");
+          if (unsaved.some((runId) => !durablyClosed(runId))) {
+            return { ok: false, step: "restart_check", code: EXECUTOR_EXIT.recover, reason: "restart_close_unsaved" };
+          }
+        }
+        try {
+          await bounded(() => store.clearRestartRequest(), timing.settleWaitMs, deps);
+        } catch (error) {
+          return fail("restart_check", EXECUTOR_EXIT.recover, error);
+        }
+        if (stop?.aborted) return stopped("restart_check");
+      }
+    }
+  }
+
   const inheritedUnverified = unverified();
+  // 붙은 뒤의 잠금만 회복을 시작한다(아래 restartAll). 붙은 뒤는 감독 소켓 start부터라 첫 TLS 연결이 서기 전도 든다: 잠긴 원격은
+  // 이 프로세스에서 다시 쓸 수 없고, 실행이 없을 때의 전체 재시작은 해가 없다. 그 전(hello 기다림)의 잠금은 86으로 끝낸다.
+  let onLock: (reason: DistrustReason) => void = () => {};
   const agent = new GreetedRemote(
     {
       credentialEnv: material.profile.credentialEnv,
@@ -527,6 +660,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       runtime: { setTimer: deps.setTimer, now: deps.monoNow },
       inheritedUnverified,
       replyWaitMs: timing.replyWaitMs,
+      onDistrust: (reason) => onLock(reason),
     },
     deps.monoNow,
   );
@@ -617,7 +751,8 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
 
   // 닫는 쪽 효과는 하나가 실패해도 나머지를 막지 않는다. 예약기가 고장 나 상한을 걸지 못하면 stop을 기다리지 않고 닫는다
   // (끝나지 않을 수 있는 stop에 프로세스를 묶지 않는다).
-  const shutdown = (code: number, reason: string): Promise<number> => {
+  // last: 소켓을 멈춘 뒤, 클라이언트·대리 소켓을 닫기 전에 한 번 돌고 끝 코드를 정한다(회복 요청 쓰기). 던지면 fatal이다.
+  const shutdown = (code: number, reason: string, last?: () => Promise<number>): Promise<number> => {
     ending ??= (async () => {
       try {
         cancelTick();
@@ -636,6 +771,15 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
         const stopped = (await untilDeadline(stopping, stopLimit, deps)).kind === "done";
         if (!stopped) deps.log("감독 소켓이 상한 안에 멈추지 않았거나 상한을 걸지 못해 기다리지 않고 닫는다");
       }
+      let final = code;
+      if (last !== undefined) {
+        try {
+          final = await last();
+        } catch {
+          final = EXECUTOR_EXIT.fatal;
+        }
+        if (final !== code) deps.log(`끝 코드를 ${final}로 바꾼다`);
+      }
       try {
         client.close();
       } catch {
@@ -646,10 +790,41 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       } catch {
         // 위와 같다
       }
-      resolveDone(code);
-      return code;
+      resolveDone(final);
+      return final;
     })();
     return ending;
+  };
+
+  // 회복 요청을 적는다. 세대 표식을 읽지 못하면 적지 않는다: 요청 때의 값을 모르면 다음 기동이 재시작을 확인할 수 없고, 빈 값과 견주면
+  // 제어만 다시 뜬 기동이 거짓 0을 낼 수 있다. 실행 목록은 메모리와 파일 어느 쪽에서든 끝을 맺지 못한 실행이다(더 넣어도 다음 기동은
+  // 그때 끝을 맺지 못한 것만 닫는다. 빼면 그 실행은 잠금으로 남는다). 표식 읽기와 쓰기는 각각 settleWaitMs에 묶는다.
+  const recordRestart = async (): Promise<number> => {
+    let marker: string;
+    try {
+      marker = await readGeneration();
+    } catch (error) {
+      deps.log(`세대 표식을 판단에 쓸 수 없어 회복 요청을 적지 않는다(${(error as GenerationUnknown).detail})`);
+      return EXECUTOR_EXIT.fatal;
+    }
+    const runs = new Set([...store.runs(), ...store.durableRunList()].filter((run) => UNFINISHED.includes(run.state)).map((run) => run.run_id));
+    try {
+      await bounded(() => store.writeRestartRequest({ marker, runs: [...runs] }), timing.settleWaitMs, deps);
+    } catch (error) {
+      deps.log(`회복 요청을 적지 못했다(${reasonOf(error)})`);
+      return EXECUTOR_EXIT.fatal;
+    }
+    return EXECUTOR_EXIT.restart_all;
+  };
+
+  // 감독에 붙은 뒤 원격이 잠겼다. 이 프로세스의 원격은 다시 믿을 수 없고, 그때 끝을 맺지 못한 실행은 모름이다. fatal과 같은 차례로 끝낸다:
+  // 정한 순간부터 새 연결을 열지 않고(fatalReason), 부른 자리(원격의 받는 처리) 밖의 마이크로태스크에서 소켓을 멈춘 뒤 요청을 적는다.
+  // 요청을 적으면 restart_all, 못 적으면 fatal(89)이다. 이미 끝내는 중이면 그 끝을 따른다.
+  // 함정: 소켓을 멈춰도 이미 시작한 지시 처리는 계속될 수 있다. 목록을 뜬 뒤에 접수된 실행은 요청에 없고 다음 기동에서 잠금으로 남는다.
+  const restartAll = (reason: DistrustReason) => {
+    if (fatalReason !== null || ending !== undefined) return;
+    fatalReason = `agent_${reason}`;
+    queueMicrotask(() => void shutdown(EXECUTOR_EXIT.restart_all, `agent_${reason}`, recordRestart));
   };
 
   // 치명 실패를 끝내기로 잇는다. 부른 자리(소켓 사건, 지시 처리의 거절) 밖의 마이크로태스크에서 끝낸다(socket.md: onEvent 안에서 소켓을
@@ -740,6 +915,8 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     return { ok: false, step: "socket", code: EXECUTOR_EXIT.supervisor_setup, reason: created.reason };
   }
   socket = created.socket;
+  // 여기까지 await가 없다: 위 hello 반복을 나온 뒤에 생긴 잠금은 모두 여기 뒤의 일이다.
+  onLock = restartAll;
   socket.start();
 
   // 다음 tick을 걸지 못하는 것도 tick의 실패다: 걸리지 않은 채 두면 임대·맞춤 기한을 보지 않는 실행기가 살아남는다.

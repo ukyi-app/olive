@@ -7,6 +7,8 @@
 //   nonces/<hash>         쓴 nonce 하나가 빈 파일 하나다
 //   ledger-hold           설명할 수 없는 장부의 표식. 운영자가 장부를 대조하고 이 파일을 지울 때까지 접수를 열지 않는다
 //   nonces/probe-*        nonce 배타 생성이 회복됐는지 그 연산으로 다시 해 보는 빈 기록
+//   restart-request.json  회복 요청(D-104): 원격이 잠긴 때 읽은 세대 표식과 그때 끝을 맺지 못한 실행. 조립(runtime.ts)만 쓰고 지운다.
+//                         파드 전체 재시작 뒤에도 남아야 해서 이 볼륨에 둔다(제어 전용 emptyDir은 새 파드에서 비어 있다).
 //
 // 쓰기는 한 줄로 차례로 한다(아래 serial). 상태 파일은 임시 파일에 쓰고 fsync한 뒤 rename하고 폴더도 fsync한다.
 // nonce 기록의 보장 범위는 "프로세스·파드 재시작 뒤에도 재사용 거부"까지다. fsync하지 않는다. 페이지 캐시를 잃는 노드 정전은
@@ -123,7 +125,19 @@ export interface StoreIo {
   writeDurable(path: string, data: string): Promise<void>;
   // 없을 때만 빈 파일을 만든다. 이미 있으면 code가 EEXIST인 오류를 던진다.
   createMarker(path: string): Promise<void>;
+  // 지우고 폴더를 fsync한다. 이미 없으면 성공이다.
+  removeDurable(path: string): Promise<void>;
 }
+
+// 회복 요청. marker는 init이 쓴 세대 표식(GENERATION_MARKER 꼴)이고, runs는 그때 끝을 맺지 못한 실행 ID다(빈 목록도 된다).
+export interface RestartRequest {
+  readonly marker: string;
+  readonly runs: readonly string[];
+}
+
+// 세대 표식의 꼴: 32바이트 난수의 소문자 16진수 64자. init(src/main/agent-install.ts)이 쓰고 조립이 읽는다.
+export const GENERATION_MARKER = /^[0-9a-f]{64}$/;
+const RESTART_FILE = "restart-request.json";
 
 export interface StoreOptions {
   now?: () => number;
@@ -175,6 +189,38 @@ async function writeDurable(path: string, data: string): Promise<void> {
 async function createMarker(path: string): Promise<void> {
   const handle = await open(path, NEW_FILE, 0o600);
   await handle.close();
+}
+
+async function removeDurable(path: string): Promise<void> {
+  await rm(path, { force: true });
+  const dir = await open(dirname(path), constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
+}
+
+function parseRestart(text: string): RestartRequest {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new StoreError("store_corrupt");
+  }
+  const r = value as Record<string, unknown> | null;
+  const runs = r?.runs;
+  const ok =
+    typeof value === "object" &&
+    value !== null &&
+    Object.keys(value).length === 2 &&
+    typeof r?.marker === "string" &&
+    GENERATION_MARKER.test(r.marker) &&
+    Array.isArray(runs) &&
+    runs.every((id) => typeof id === "string" && UUID.test(id)) &&
+    new Set(runs).size === runs.length;
+  if (!ok) throw new StoreError("store_corrupt");
+  return { marker: r!.marker as string, runs: [...(runs as string[])] };
 }
 
 const isSafeInt = (value: unknown, min: number): value is number => Number.isSafeInteger(value) && (value as number) >= min;
@@ -319,6 +365,8 @@ export class ExecutorStore implements NonceStore {
   private durable: number | null;
   private fence: number | null;
   private readonly io: StoreIo;
+  // 파일에 적힌 회복 요청. 쓰기·지우기가 파일에 닿은 뒤에만 바꾼다.
+  private restart: RestartRequest | null = null;
 
   private constructor(
     private readonly dir: string,
@@ -329,14 +377,14 @@ export class ExecutorStore implements NonceStore {
   ) {
     this.durable = stopGeneration;
     this.fence = stopGeneration;
-    this.io = { writeDurable, createMarker, ...io };
+    this.io = { writeDurable, createMarker, removeDurable, ...io };
   }
 
   // 최초 초기화(storage-id가 없음)와 기존 저장소 열기를 구분한다. 기존 저장소는 하위 폴더를 새로 만들지 않고,
   // 장부가 서로를 설명하는지 대조한다. 설명하지 못하면 열되 inconsistency()로 알리고, 그 판정은 ledger-hold로 다음 기동에도 남긴다.
   static async open(dir: string, options: StoreOptions = {}): Promise<ExecutorStore> {
     if (!isAbsolute(dir)) throw new StoreError("config_invalid");
-    const io: StoreIo = { writeDurable, createMarker, ...options.io };
+    const io: StoreIo = { writeDurable, createMarker, removeDurable, ...options.io };
     let fresh: boolean;
     try {
       await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -359,6 +407,8 @@ export class ExecutorStore implements NonceStore {
       }
     }
     const store = new ExecutorStore(dir, id, stop, options.now ?? Date.now, options.io ?? {});
+    const restartText = await readOptional(join(dir, RESTART_FILE));
+    store.restart = restartText === null ? null : parseRestart(restartText);
     const note = (reason: StoreInconsistency) => (store.inconsistent ??= reason);
     const holdText = await readOptional(join(dir, HOLD_FILE));
     const held = holdText === null ? null : ExecutorStore.parseHold(holdText);
@@ -658,6 +708,28 @@ export class ExecutorStore implements NonceStore {
     } catch {
       return false;
     }
+  }
+
+  // ---- 회복 요청(D-104) ----
+
+  restartRequest(): RestartRequest | null {
+    return this.restart === null ? null : { marker: this.restart.marker, runs: [...this.restart.runs] };
+  }
+
+  // 줄(serial) 밖에서 바로 쓴다: 멈춘 상태 쓰기 뒤에 서면 원격이 잠긴 실행기가 요청을 적지 못하고 끝나지도 못한다.
+  // 다른 파일의 쓰기와 겹쳐도 임시 이름이 달라 서로를 덮지 않는다. 적지 못하면 던진다.
+  async writeRestartRequest(request: RestartRequest): Promise<void> {
+    const text = JSON.stringify({ marker: request.marker, runs: [...request.runs] });
+    // 다음 기동이 읽지 못할 꼴은 적지 않는다(읽기는 store_corrupt로 열기를 실패시킨다).
+    const checked = parseRestart(text);
+    await this.io.writeDurable(join(this.dir, RESTART_FILE), text);
+    this.restart = checked;
+  }
+
+  // 지웠으면(이미 없었으면) 메모리도 비운다. 지우지 못하면 던진다.
+  async clearRestartRequest(): Promise<void> {
+    await this.io.removeDurable(join(this.dir, RESTART_FILE));
+    this.restart = null;
   }
 
   // ---- 정지 세대 ----

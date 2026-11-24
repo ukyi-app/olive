@@ -7,7 +7,8 @@
 //   그 답이 0이다. 그 밖은 모두 null(모름)이다. "안에"는 받은 때의 주입 단조 시계로 잰다(타이머 콜백이 늦게 돌아도 같다).
 // - 실행 중(시작을 보낸 뒤 그 실행이 0으로 닫히기 전) 링크가 끊기거나, 연결이 살아 있는데 두 번째 연결이 오거나, 링크가 계약 밖의 말을
 //   하면 이 객체는 대리를 다시 믿지 않는다(잠금). 잠긴 뒤에는 0을 말하지 않고 띄우지도 않는다. 새 hello로 풀리지 않는다.
-//   제어는 새 대리의 hello와 옛 공간에 남은 프로세스가 연 연결을 말로 가를 수 없기 때문이다. 회복은 이 파일 밖의 일이다.
+//   제어는 새 대리의 hello와 옛 공간에 남은 프로세스가 연 연결을 말로 가를 수 없기 때문이다. 회복은 이 파일 밖의 일이다
+//   (처음 잠기는 순간 onDistrust로 조립에 알린다. 조립은 파드 전체 재시작을 부른다, runtime.ts).
 // - terminated는 0의 증거가 아니다. terminate()는 끝났다는 사실만 알리고 남은 수는 언제나 survivors()가 따로 묻는다.
 // - 서명하지 않는다. 대리의 답은 서명 없는 사실이고 영수증은 worker가 자기 키로 낸다.
 // - 자격 값은 start 바로 뒤의 값 틀 하나에만 싣는다. 오류·관측(state)에는 사유 이름만 둔다. 보낸 뒤 값과 틀의 바이트를 0으로 채운다.
@@ -53,6 +54,9 @@ export interface RemoteAgentOptions {
   replyWaitMs: number;
   // 실행 중 임대 끝을 저장소와 맞춰 대리에게 renew로 보내는 간격.
   renewEveryMs?: number;
+  // 처음 잠기는 순간 한 번 부른다(inheritedUnverified로 처음부터 잠근 객체는 부르지 않는다). 조립이 회복(D-104)을 시작하는 자리다.
+  // 함정: 받는 처리 안에서 불린다. 이 안에서 원격을 다시 부르지 않는다(받은 쪽은 마이크로태스크로 미룬다).
+  onDistrust?: (reason: DistrustReason) => void;
 }
 
 // 중단 뒤 끝을 기다리는 상한을 launcher 훅이 주지 않았을 때의 값(bunLauncher와 같다). worker는 언제나 값을 넘긴다.
@@ -296,8 +300,9 @@ export class RemoteAgent {
     if (this.phase.kind !== "idle") this.lock("link_lost_mid_run");
   }
 
-  // 한 번 잠그면 풀지 않는다. 첫 사유를 남긴다.
+  // 한 번 잠그면 풀지 않는다. 첫 사유를 남긴다. 알림은 띄우기 실패와 연결 닫기를 마친 뒤에 한 번 부른다.
   private lock(reason: DistrustReason): void {
+    const first = this.distrust === null;
     this.distrust ??= reason;
     const phase = this.phase;
     if ((phase.kind === "starting" || phase.kind === "running") && phase.sink !== null) {
@@ -306,6 +311,7 @@ export class RemoteAgent {
       sink.failed(new ExitUnconfirmed());
     }
     if (this.connection !== null) this.drop();
+    if (first) this.options.onDistrust?.(reason);
   }
 
   private failPending(connection: Connection, error: AgentUnavailable): void {
