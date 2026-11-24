@@ -307,6 +307,10 @@ export interface ExecutorAnswerUnsaved {
   unsavedSightings: { runId: string; runGeneration: number }[];
 }
 
+// recordAnswerSightings의 입력. applyExecutorAnswer와 같은 꼴·같은 뜻이다(검증된 답 봉투의 coverage·runs·issued_at, 장부 시계의 now).
+// 같은 타입으로 두어, 부르는 쪽이 받은 답을 바꾸지 않고 둘 중 어느 연산에든 넘길 수 있게 한다.
+export type AnswerSightingsInput = ExecutorAnswerInput;
+
 // 재시작 복원 2단계가 적는 양성 관측 하나. 지정 실행기·같은 세대·not_known 밖의 답만 넘긴다(트리거가 다시 본다).
 export interface RunSightingObservation {
   executorId: string;
@@ -2571,12 +2575,42 @@ export class Ledger {
   // 재시작 복원 2단계가 받은 실행기의 답 가운데 지정 실행기·같은 세대·not_known 밖의 것을 같은 표에 적는다. 복원의 판정은 바꾸지 않는다.
   // 포트가 답 봉투의 시각을 싣지 않아 answered_at은 비워 둔다. received_at은 관측마다 복원기가 처음 받은 시각이다.
   recordRunSightings(key: symbol, observations: readonly RunSightingObservation[]): { ok: true } | Refused {
-    if (key !== RESTORE_KEY) throw new TypeError("복원 밖의 양성 관측은 applyExecutorAnswer로 적는다");
+    if (key !== RESTORE_KEY) throw new TypeError("recordRunSightings는 복원 전용 열쇠가 필요하다");
     const checked = observations.map((seen) => ({ ...seen, receivedAt: time(seen.receivedAt, "receivedAt") }));
     return this.#write("run_sighting", "continue", () => {
       for (const seen of checked) this.#sight(seen.executorId, seen.status, seen.coverage, null, seen.receivedAt);
       return { ok: true as const };
     });
+  }
+
+  // 운영 중 받은 실행기의 답에서 양성 관측만 적는다. 실행 상태·임대·영수증과 보고(deliveries)·자리는 바꾸지 않는다.
+  // 지금 연결의 답으로 인정되지 않은 답(대체된 연결이나 아직 인정 전인 연결의 답, 연결 판단의 not_current)을 위한 길이다: 그런 답으로 임대를
+  // 거두면 지금 연결이 아닌 쪽이 지금 실행을 바꾸지만, 관측까지 버리면 실행기가 안다고 한 실행을 D-90 닫기가 "받은 적 없음"으로 닫을 수 있다.
+  // 받을 때 유효했던 답이라 "안다고 한 적이 있다"만 남긴다.
+  // 보는 항목과 관측의 규칙은 applyExecutorAnswer와 같다: 장부에 있고 지정 실행기가 sender이고 세대가 같은 not_known 밖의 항목만, 첫 줄만 적는다.
+  // 다른 실행기·다른 세대·장부 밖 항목은 거절하지 않고 건너뛴다(트리거에 닿으면 답 전체가 거절되어 맞는 항목의 관측까지 잃는다).
+  // 장부 밖 실행을 돌려주지 않는 것은 닫을 대상을 고르는 일이 지금 연결의 답(applyExecutorAnswer)의 몫이어서다.
+  // 쓰기 모드는 applyExecutorAnswer·recordRunSightings와 같은 continue다: 관측은 자리를 더 오래 쥐는 쪽(D-90을 막는 쪽)의 기록이라
+  // 장부가 한 번 실패한 뒤에도, 사본 보류·정지 중에도 시도한다. 실패는 던지지 않고 applyExecutorAnswer와 같은 꼴로 돌려준다.
+  recordAnswerSightings(input: AnswerSightingsInput, from: { sender: string }): { ok: true } | ExecutorAnswerUnsaved {
+    const v = exact(input, ["coverage", "runs", "answeredAt", "now"], "recordAnswerSightings");
+    const coverage = oneOf(v.coverage, COVERAGES, "coverage");
+    const runs = answerRuns(v.runs, coverage);
+    const answeredAt = v.answeredAt === null ? null : time(v.answeredAt, "answeredAt");
+    const now = time(v.now, "now");
+    const sender = runExecutor(exact(from, ["sender"], "from").sender, "from.sender");
+    const written = this.#write("answer_sighting", "continue", () => {
+      for (const status of runs) {
+        if (status.state === "not_known") continue;
+        const row = this.#runRow(status.run_id);
+        if (row === null || row.executor_id !== sender || status.run_generation !== row.run_generation) continue;
+        this.#sight(sender, status, coverage, answeredAt, now);
+      }
+      return { ok: true as const };
+    });
+    if (written.ok) return written;
+    const unsavedSightings = runs.filter((run) => run.state !== "not_known").map((run) => ({ runId: run.run_id, runGeneration: run.run_generation as number }));
+    return { ok: false, reason: written.reason, unsavedSightings };
   }
 
   // 양성 관측을 적는 한 자리. 같은 (실행, 실행기, 세대)의 줄이 있으면 그대로 둔다(첫 관측을 덮지 않는다).

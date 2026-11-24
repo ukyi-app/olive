@@ -5,12 +5,13 @@ import { chmodSync, lstatSync, unlinkSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
-import { limits } from "../contract/v1/index.ts";
+import { limits, parsePrincipal, type Role } from "../contract/v1/index.ts";
 import { listenForAgent, type UnixListening } from "../executor/agent-listener.ts";
 import type { RemoteAgent } from "../executor/remote-agent.ts";
-import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, isRole, startExecutor } from "../executor/runtime.ts";
+import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, isRole, REVISION, type RunningExecutor, startExecutor } from "../executor/runtime.ts";
 import { ExecutorStore } from "../executor/store.ts";
 import { createTlsClient } from "../transport/tls-client.ts";
+import { parseIdentityUri } from "../transport/tls-policy.ts";
 
 // 읽는 환경. 출처와 없을 때의 동작은 README "작업자 실행기 진입점"의 표와 같아야 한다.
 export const EXECUTOR_ENV = [
@@ -47,17 +48,39 @@ const BIND_UMASK = 0o177;
 
 export type EnvResult = { readonly ok: true; readonly settings: ExecutorSettings } | { readonly ok: false; readonly name: string; readonly problem: "missing" | "invalid" };
 
+// 점 넷의 십진 IPv4(각 칸 0~255, 앞자리 0 없음). 차트는 감독 Service의 IPv4 고정 주소를 준다. 이름이면 DNS 조회에 기대게 되고,
+// 그 조회의 실패는 연결 뒤에야 드러난다.
+const IPV4_OCTET = /^(?:0|[1-9]\d{0,2})$/;
+const isIpv4 = (host: string) => {
+  const parts = host.split(".");
+  return parts.length === 4 && parts.every((part) => IPV4_OCTET.test(part) && Number(part) <= 255);
+};
+// 감독 인증서의 DNS SAN(SNI로도 보낸다). RFC 1123 호스트 이름의 꼴이다. 이 꼴이 아니면 감독 인증서의 DNS SAN과 같을 수 없어
+// TLS 상대 확인에서 매번 거절된다. 함정: 대문자를 막지 않는다. TLS 정책(tls-policy.ts)은 설정 문자열을 인증서 SAN과 글자 그대로 견주므로
+// 대문자가 섞인 SAN의 인증서에는 같은 대문자 설정이 맞는다. 값은 바꾸지 않고(소문자로 접지 않고) 그대로 넘긴다.
+const DNS_NAME = /^(?=.{1,253}$)[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$/i;
+// 인스턴스 이름은 실행기 이름(executor/<역할>/<인스턴스>/<저장소 ID>)의 한 칸이다. 저장소 ID 자리에 꼴이 맞는 자리값을 넣고 계약의 규칙(parsePrincipal)으로 본다.
+// 저장소를 만들기 전에 거른다: worker가 이름을 만들 때 걸리면 그 전에 저장소 ID가 이미 생긴다.
+const instanceOk = (role: Role, instance: string) => parsePrincipal(`executor/${role}/${instance}/0`)?.kind === "worker_executor";
+
 // 환경을 값으로 바꾼다. 처음 걸린 이름 하나를 돌려준다(값은 담지 않는다).
+// 꼴은 연결 전에 거를 수 있는 것까지 본다(계약 v1의 revision·실행기 이름 칸, 감독 신원 URI). 틀린 값으로 붙으면 감독이 맞춤·인사 단계에서
+// 거절하고 실행기는 다시 붙기를 되풀이한다.
 export function settingsFromEnv(env: Readonly<Record<string, string | undefined>>): EnvResult {
   for (const name of EXECUTOR_ENV) if ((env[name] ?? "") === "") return { ok: false, name, problem: "missing" };
   const value = (name: (typeof EXECUTOR_ENV)[number]) => env[name]!;
   const invalid = (name: string): EnvResult => ({ ok: false, name, problem: "invalid" });
+  // v1 역할 이름만 받는다. 차트의 대상 ID(읽기 대상 `reader` 등)는 역할이 아니다: 차트가 역할 이름(`isolated_reader`)으로 옮겨 넘긴다.
   const role = value("OLIVE_ROLE");
   if (!isRole(role)) return invalid("OLIVE_ROLE");
-  // 주소는 host:port 하나다. IPv6 리터럴은 받지 않는다(차트는 Service의 IPv4 고정 주소를 준다).
+  if (!instanceOk(role, value("OLIVE_INSTANCE"))) return invalid("OLIVE_INSTANCE");
+  if (!REVISION.test(value("OLIVE_POLICY_REVISION"))) return invalid("OLIVE_POLICY_REVISION");
+  // 주소는 IPv4:port 하나다. IPv6 리터럴과 이름은 받지 않는다.
   const addr = /^([^:\s]+):(\d{1,5})$/.exec(value("OLIVE_SUPERVISOR_ADDR"));
   const port = addr === null ? 0 : Number(addr[2]);
-  if (addr === null || port < 1 || port > 65_535) return invalid("OLIVE_SUPERVISOR_ADDR");
+  if (addr === null || !isIpv4(addr[1]!) || port < 1 || port > 65_535) return invalid("OLIVE_SUPERVISOR_ADDR");
+  if (!DNS_NAME.test(value("OLIVE_SUPERVISOR_SERVER_NAME"))) return invalid("OLIVE_SUPERVISOR_SERVER_NAME");
+  if (parseIdentityUri(value("OLIVE_SUPERVISOR_URI"))?.kind !== "supervisor") return invalid("OLIVE_SUPERVISOR_URI");
   for (const name of ["OLIVE_STORE_DIR", "OLIVE_TLS_DIR", "OLIVE_TRUST_DIR", "OLIVE_SIGNING_KEY_FILE", "OLIVE_PROFILE_FILE", "OLIVE_AGENT_SOCKET"] as const) {
     if (!isAbsolute(value(name))) return invalid(name);
   }
@@ -135,13 +158,23 @@ async function main(): Promise<never> {
     console.error(`olive executor ${pkg.version}: 환경 ${parsed.name}이(가) ${parsed.problem === "missing" ? "없다" : "틀렸다"}`);
     process.exit(EXECUTOR_EXIT.config);
   }
-  const started = await startExecutor(parsed.settings, productionDeps);
+  // 신호 처리기는 기동 전에 건다. 기동 중(hello 대기 30초 포함)의 신호는 기동을 중단시켜 감독에 붙지 않고 0으로 끝내고,
+  // 기동 뒤의 신호는 소켓을 멈춘 뒤 0으로 끝낸다. 함정: 이 프로세스가 컨테이너의 PID 1이면 커널은 처리기가 없는 신호를 버린다
+  // (SIGKILL 제외). 처리기 없이 두면 기동 중의 SIGTERM이 사라지고 기동을 마친 실행기가 감독에 붙는다.
+  const stop = new AbortController();
+  let running: RunningExecutor | undefined;
+  for (const signal of ["SIGTERM", "SIGINT"] as const) {
+    process.on(signal, () => {
+      if (running === undefined) stop.abort();
+      else void running.stop();
+    });
+  }
+  const started = await startExecutor(parsed.settings, productionDeps, stop.signal);
   if (!started.ok) {
     console.error(`olive executor ${pkg.version}: 기동 단계 ${started.step}에서 멈췄다(${started.reason})`);
     process.exit(started.code);
   }
-  const running = started.running;
-  for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => void running.stop());
+  running = started.running;
   process.exit(await running.done);
 }
 

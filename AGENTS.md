@@ -3,7 +3,7 @@
 올리브(홈랩 봇)의 감독과 작업자 실행기 코드다. 둘은 이미지 하나를 함께 쓰고 역할은 실행 명령으로 고른다. 이미지 계약, 버전 고정, 시험 방법, 폴더 배치는 README.md에 있다. 설계와 결정의 기준은 homelab 저장소의 `docs/plans/2026-11-13-olive/`(`spec.md` §4.1·§5.1, `supervisor.md`, `issues/O09-supervisor.md`)다.
 
 - 이 저장소는 homelab `apps/`에 등록하지 않는다. 이미지는 homelab `platform/` 값에 digest로 고정하고 사람 PR로만 올린다(D-18). main에 병합돼도 배포되지 않는다.
-- 공개(public) 저장소다. 시크릿 값, tailnet 이름(`*.ts.net`), Tailscale 주소, 개인 이메일, 운영 지식을 코드·로그·이미지에 두지 않는다. 비밀은 `infisical run`으로 환경변수에만 넣는다.
+- 공개(public) 저장소다. 시크릿 값, tailnet 이름(`*.ts.net`), Tailscale 주소, 개인 이메일, 운영 지식을 코드·로그·이미지에 두지 않는다. 개발·빌드·시험의 비밀은 `infisical run`으로 환경변수에만 넣는다. 실행 시 작업자 실행기의 키는 경로만 환경에서 읽고 PEM 값은 제어 컨테이너에만 붙인 Secret 파일에서 읽는다(README "공개 저장소").
 - 이미지에는 hc와 `/etc/claude-code`가 없다(D-37). Dockerfile의 `image-check` 단계가 빌드마다 확인한다. 실행기는 감독에 먼저 붙는 쪽이고 포트를 열고 듣지 않는다. 예외는 하나다: 역할 컨테이너의 대리가 붙는 경로 유닉스 소켓 하나를 `src/executor/agent-listener.ts`에서만 듣는다(D-102). TCP·abstract 소켓은 듣지 않는다(`test/executor/static.test.ts`).
 - 버전은 정확히 고정한다: Bun은 `.bun-version`·Dockerfile 두 FROM·`@types/bun`이 같은 값, npm 패키지는 정확한 버전, 기반 이미지는 digest. 최신 안정판보다 낮게 두면 그 이유를 고정한 자리 옆에 적는다.
 - 시험은 `bun run test`로 돌린다. `bun test`는 시험이 0개인 파일을 통과시킨다. `bun run test`(`test/run.ts`)가 JUnit 결과에서 파일마다 실행된 시험 수를 확인한다. 시험 파일 이름은 점으로 시작하지 않는 소문자 `*.test.ts`만 쓴다. Bun이 시험으로 읽는 다른 이름(`.x.test.ts`, `x.TEST.ts`, `*.spec.ts` 등)은 실패한다(README "시험").

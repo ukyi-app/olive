@@ -4,16 +4,42 @@
 import { afterEach, expect, test } from "bun:test";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import type * as tls from "node:tls";
-import { encodeAgent } from "../../src/agent/link.ts";
+import { encodeAgent, encodeControl } from "../../src/agent/link.ts";
 import type { Envelope } from "../../src/contract/v1/index.ts";
 import type { RemoteAgent } from "../../src/executor/remote-agent.ts";
-import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, type StartResult, type StartStep, startExecutor } from "../../src/executor/runtime.ts";
+import { REVISION as CONTRACT_REVISION } from "../../src/contract/v1/schema.ts";
+import {
+  EXECUTOR_EXIT,
+  type ExecutorDeps,
+  type ExecutorSettings,
+  noRunFiles,
+  type StartResult,
+  type StartStep,
+  startExecutor,
+} from "../../src/executor/runtime.ts";
 import { ExecutorStore } from "../../src/executor/store.ts";
+import { WorkerExecutor } from "../../src/executor/worker.ts";
+import { settingsFromEnv } from "../../src/main/executor.ts";
 import { startTlsServer } from "../../src/supervisor/transport/tls-server.ts";
 import { createFrameDecoder, encodeFrame } from "../../src/transport/framing.ts";
 import { createTlsClient, TlsConnectError } from "../../src/transport/tls-client.ts";
 import { makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
-import { Clock, executorKeys, fromSupervisor, scratch, supervisorKeys, until } from "./support.ts";
+import {
+  Clock,
+  credentialValue,
+  executorKeys,
+  FakeTransport,
+  fromSupervisor,
+  type Rig,
+  runWrite,
+  scratch,
+  scriptedIo,
+  sha256,
+  supervisorKeys,
+  T0,
+  taskStartBody,
+  until,
+} from "./support.ts";
 
 const pki = makePki();
 const leaf = pki.executor();
@@ -104,6 +130,8 @@ interface Harness {
   agent: FakeAgent;
   connects: number;
   logs: string[];
+  // 마지막 connect를 실패로 끝낸다.
+  failConnect?: (error: unknown) => void;
 }
 
 // 모든 바깥 효과를 기록한다. 가짜 TLS 클라이언트의 connect는 중단될 때까지 끝나지 않는다.
@@ -146,12 +174,13 @@ function harness(options: { files?: Map<string, string>; openStore?: ExecutorDep
           connect: (signal?: AbortSignal) => {
             h.connects++;
             calls.push("connect");
-            return new Promise((_resolve, reject) =>
+            return new Promise((_resolve, reject) => {
+              h.failConnect = reject;
               signal?.addEventListener("abort", () => {
                 calls.push("connect.aborted");
                 reject(new TlsConnectError({ kind: "aborted" }));
-              }),
-            );
+              });
+            });
           },
           close: () => calls.push("client.close"),
         };
@@ -419,4 +448,558 @@ test("연결 뒤 지시 처리가 던지면(로컬 서명 실패 등) 그 worker
   } finally {
     await server.close();
   }
+});
+
+// 시간 안에 풀리지 않으면 "timeout"이다. 끝나지 않는 약속을 시험 전체의 시간 초과가 아니라 그 단언의 실패로 보이게 한다.
+const within = <T>(promise: Promise<T>, ms: number) => Promise.race([promise, Bun.sleep(ms).then(() => "timeout" as const)]);
+const optionsOf = (value: object) => (value as unknown as { options: Record<string, unknown> }).options;
+
+test("정리 확인: O13 전에는 지웠는지 확인할 수 없으므로 noRunFiles.clean과 worker가 받은 공간의 clean은 false다(cleanup_pending에 남고 receipt_cleaned 0)", async () => {
+  expect(await noRunFiles.clean(randomUUID())).toBe(false);
+  const h = harness();
+  const result = await begin(h);
+  if (!result.ok) throw new Error(result.reason);
+  const space = optionsOf(result.running.worker).space as { clean(runId: string): Promise<boolean> };
+  expect(await space.clean(randomUUID())).toBe(false);
+});
+
+test("연결이 먼저 닫힌 뒤 지시 처리가 던져도 89로 끝나고, 같은 프로세스가 감독에 다시 붙지 않는다(루프백 TLS)", async () => {
+  const supervisorLeaf = pki.supervisor();
+  const peers: { socket: tls.TLSSocket; got: Envelope[]; closed: boolean }[] = [];
+  const server = await startTlsServer({
+    host: "127.0.0.1",
+    port: 0,
+    material: { certificatePem: supervisorLeaf.pem, privateKeyPem: supervisorLeaf.keyPem, trustBundlePem: pki.ca.pem },
+    now: Date.now,
+    onConnection: (c) => {
+      const decoder = createFrameDecoder();
+      const peer = { socket: c.socket, got: [] as Envelope[], closed: false };
+      c.socket.on("data", (chunk: Uint8Array) => {
+        for (const e of decoder.push(chunk).envelopes) peer.got.push(e.value as Envelope);
+      });
+      c.socket.once("close", () => (peer.closed = true));
+      peers.push(peer);
+    },
+  });
+  try {
+    const calls: string[] = [];
+    const agent = new FakeAgent();
+    const deps: ExecutorDeps = {
+      readText: async (path) => contents().get(path)!,
+      openStore: (dir, now) => ExecutorStore.open(dir, { now }),
+      listenAgent: (remote) => {
+        agent.attach(remote);
+        agent.hello();
+        return { stop: () => calls.push("listener.stop") };
+      },
+      createTlsClient: (options) => {
+        const client = createTlsClient(options);
+        return { connect: (signal) => client.connect(signal), close: () => (calls.push("client.close"), client.close()) };
+      },
+      wallNow: Date.now,
+      monoNow: () => performance.now(),
+      setTimer: (ms, fire) => {
+        const handle = setTimeout(fire, ms);
+        return () => clearTimeout(handle);
+      },
+      random: () => 0,
+      log: (line) => calls.push(`log ${line}`),
+    };
+    const result = await startExecutor(settings({ supervisor: { address: "127.0.0.1", port: server.port, serverName: SUPERVISOR_DNS, uri: SUPERVISOR_URI } }), deps);
+    if (!result.ok) throw new Error(result.reason);
+    const { worker, link } = result.running;
+    await until(() => peers[0]?.got.some((e) => e.header.action === "stop_sync_request") ?? false);
+    const peer = peers[0]!;
+    const request = peer.got[0]!;
+    const clock = new Clock(Date.now());
+    peer.socket.write(frame(fromSupervisor(clock, worker.name, "stop_sync_reply", { challenge: (request.body as { challenge: string }).challenge }, { stop_generation: 0 })));
+    await until(() => peer.got.some((e) => e.header.action === "hello") && link.live());
+    // 지시 처리가 기다리는 동안 감독이 연결을 끝내고, 그 뒤에 처리가 던진다(재정리 종료 영수증의 서명 실패 자리).
+    let entered = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    worker.handle = async () => {
+      entered = true;
+      await gate;
+      throw new Error("signing failed");
+    };
+    peer.socket.write(frame(fromSupervisor(clock, worker.name, "status_query", { run_ids: [randomUUID()] }, { stop_generation: 0 })));
+    await until(() => entered);
+    peer.socket.destroy();
+    await until(() => calls.some((call) => call.startsWith("log 감독 소켓: closed(")));
+    release();
+    expect(await within(result.running.done, 2_000)).toBe(EXECUTOR_EXIT.fatal);
+    expect(calls.filter((call) => !call.startsWith("log "))).toEqual(["client.close", "listener.stop"]);
+    // 다시 붙기 간격(100ms)을 넘겨 기다려도 새 연결이 없다.
+    await Bun.sleep(300);
+    expect(peers).toHaveLength(1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("다시 붙기 예약기가 고장 나도(재시도·종료 예약·멈춤 상한 모두 거절) 89로 끝나고 클라이언트·대리 소켓을 닫는다", async () => {
+  const h = harness();
+  const result = await begin(h);
+  if (!result.ok) throw new Error(result.reason);
+  h.deps.setTimer = () => {
+    throw new Error("timer unavailable");
+  };
+  h.failConnect!(new TlsConnectError({ kind: "tls_error", message: "refused" }));
+  expect(await within(result.running.done, 500)).toBe(EXECUTOR_EXIT.fatal);
+  expect(h.calls.slice(-2)).toEqual(["client.close", "listener.stop"]);
+});
+
+test("기동 대조가 거른 미접수 preparing만 남았으면 대리를 잠그지 않는다: hello 전 감독 연결 0, 상한이면 86", async () => {
+  const dir = scratch();
+  const seeded = await ExecutorStore.open(dir, { now: () => 1_800_000_000_000 });
+  // 사건도 마지막 영수증도 없는 최초 기록(첫 접수 영수증을 적기 전에 멈춘 자리). 기동 대조(auditRuns)가 접수가 아니라고 거른다.
+  const written = await seeded.beginRun({
+    run_id: randomUUID(),
+    run_generation: 1,
+    state: "preparing",
+    start_stop_generation: 0,
+    instruction_request_id: randomUUID(),
+    deadline_at: 1_800_000_100_000,
+    lease_until: 1_800_000_030_000,
+    credential_digest: "0".repeat(64),
+    exit: null,
+    last_receipt_id: null,
+  });
+  expect(written).toBe(true);
+  const h = harness({ hello: false });
+  const run = begin(h, settings({ storeDir: dir }));
+  await until(() => h.steps.includes("agent_hello"));
+  expect(h.agent.remote!.state().distrusted).toBeNull();
+  expect(h.connects).toBe(0);
+  h.timers.advance(TIMING.helloWaitMs);
+  expect(await run).toMatchObject({ ok: false, step: "agent_hello", code: EXECUTOR_EXIT.agent_absent, reason: "no_hello" });
+  expect(h.connects).toBe(0);
+});
+
+test("복원 중 대리 연결이 바뀌면 새 연결의 hello를 남은 기한 안에서 다시 기다린다: 없으면 86·연결 0, 오면 그 뒤에 붙는다", async () => {
+  for (const greets of [false, true]) {
+    const h = harness();
+    h.deps.onStep = (step) => {
+      h.steps.push(step);
+      if (step !== "recover") return;
+      // 1세대는 hello를 마쳤다. 복원을 기다리는 사이 끊기고 2세대가 붙기만 한다.
+      h.agent.session!.closed();
+      h.agent.attach(h.agent.remote!);
+    };
+    const run = begin(h);
+    await until(() => h.steps.includes("recover"));
+    await Bun.sleep(20);
+    expect(h.agent.remote!.state()).toMatchObject({ generation: 2, greeted: false });
+    expect(h.connects, `greets=${greets}`).toBe(0);
+    if (greets) {
+      h.agent.hello();
+      h.timers.advance(TIMING.helloPollMs);
+      expect(await run).toMatchObject({ ok: true });
+      expect(h.connects).toBe(1);
+    } else {
+      h.timers.advance(TIMING.helloWaitMs);
+      expect(await run).toMatchObject({ ok: false, step: "agent_hello", code: EXECUTOR_EXIT.agent_absent });
+      expect(h.calls).not.toContain("createTlsClient");
+      expect(h.connects).toBe(0);
+      expect(h.calls.at(-1)).toBe("listener.stop");
+    }
+  }
+});
+
+test("대리 hello는 받은 시각으로 상한과 견준다: 상한 뒤에 받은 hello는 확인이 밀려도 86, 상한 전에 받은 hello는 확인이 밀려도 붙는다", async () => {
+  const late = harness({ hello: false });
+  const lateRun = begin(late);
+  await until(() => late.steps.includes("agent_hello"));
+  // 950의 확인 뒤 다음 확인(1,000)이 밀려, 그 전 1,001에 hello를 받는다.
+  late.timers.advance(TIMING.helloWaitMs - 1);
+  late.timers.t = TIMING.helloWaitMs + 1;
+  late.agent.hello();
+  late.timers.advance(1);
+  expect(await lateRun).toMatchObject({ ok: false, step: "agent_hello", code: EXECUTOR_EXIT.agent_absent });
+  expect(late.connects).toBe(0);
+
+  const early = harness({ hello: false });
+  const earlyRun = begin(early);
+  await until(() => early.steps.includes("agent_hello"));
+  early.timers.advance(TIMING.helloWaitMs - 1);
+  early.agent.hello();
+  early.timers.t = TIMING.helloWaitMs + 2;
+  early.timers.advance(0);
+  expect(await earlyRun).toMatchObject({ ok: true });
+  expect(early.connects).toBe(1);
+});
+
+test("재료 틀림(v1 규칙): 프로필 revision의 꼴, 대리 링크가 실을 수 없는 argv·env·크기, 감독 공개 키 자리의 개인 키 PEM이면 82, 저장소·연결 0", async () => {
+  const names = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`E${i}`, "v"]));
+  const cases: [string, string, string][] = [
+    [FILES.profile, JSON.stringify({ ...PROFILE, revision: "bad/rev" }), "profile_role_or_revision"],
+    [FILES.profile, JSON.stringify({ ...PROFILE, revision: "r".repeat(65) }), "profile_role_or_revision"],
+    [FILES.profile, JSON.stringify({ ...PROFILE, argv: Array.from({ length: 257 }, () => "a") }), "profile_link_unencodable"],
+    [FILES.profile, JSON.stringify({ ...PROFILE, env: names(129) }), "profile_link_unencodable"],
+    [FILES.profile, JSON.stringify({ ...PROFILE, argv: ["x".repeat(70_000)] }), "profile_link_unencodable"],
+    [FILES.supervisorKey, pemOf(supervisorKeys.privateKey, "pkcs8"), "supervisor_key_not_public"],
+  ];
+  for (const [path, text, reason] of cases) {
+    const files = contents();
+    files.set(path, text);
+    const h = harness({ files });
+    expect(await begin(h), reason).toMatchObject({ ok: false, step: "material", code: EXECUTOR_EXIT.material, reason });
+    expect(h.calls).not.toContain("openStore");
+    expect(h.connects).toBe(0);
+  }
+  // 대조군: 링크 상한 그대로(argv 256개, 고정 env 128개)는 실을 수 있다.
+  const files = contents();
+  files.set(FILES.profile, JSON.stringify({ ...PROFILE, argv: Array.from({ length: 256 }, () => "a"), env: names(128) }));
+  expect(await begin(harness({ files }))).toMatchObject({ ok: true });
+});
+
+test("기동 중 멈춤 요청: hello를 기다리는 중이나 복원 중에 멈추면 감독에 붙지 않고 대리 소켓을 닫고 0으로 끝난다", async () => {
+  const waiting = harness({ hello: false });
+  const stopWaiting = new AbortController();
+  const run = startExecutor(settings(), waiting.deps, stopWaiting.signal);
+  runs.push(run);
+  await until(() => waiting.steps.includes("agent_hello"));
+  stopWaiting.abort();
+  // 상한(1,000)까지 시계를 옮기지 않는다: 멈춤 요청만으로 기다림이 끝나야 한다.
+  expect(await within(run, 500)).toMatchObject({ ok: false, step: "agent_hello", code: 0, reason: "stop_requested" });
+  expect(waiting.calls).not.toContain("createTlsClient");
+  expect(waiting.connects).toBe(0);
+  expect(waiting.calls.at(-1)).toBe("listener.stop");
+
+  const recovering = harness();
+  const stopRecovering = new AbortController();
+  recovering.deps.onStep = (step) => {
+    recovering.steps.push(step);
+    if (step === "recover") stopRecovering.abort();
+  };
+  const run2 = startExecutor(settings(), recovering.deps, stopRecovering.signal);
+  runs.push(run2);
+  expect(await within(run2, 500)).toMatchObject({ ok: false, step: "recover", code: 0, reason: "stop_requested" });
+  expect(recovering.calls).not.toContain("createTlsClient");
+  expect(recovering.connects).toBe(0);
+  expect(recovering.calls.at(-1)).toBe("listener.stop");
+});
+
+test("REVISION은 계약 v1 스키마(hello의 두 revision 칸)의 꼴과 같다", async () => {
+  // 계약의 공개 면이 이 정규식을 내지 않아 runtime.ts가 다시 둔다. 둘이 갈리면 여기서 걸린다.
+  const { REVISION } = await import("../../src/executor/runtime.ts");
+  expect(REVISION.source).toBe(CONTRACT_REVISION.source);
+  expect(REVISION.flags).toBe(CONTRACT_REVISION.flags);
+});
+
+test("제품 설정의 응답 상한은 10초이고 worker의 exitWaitMs와 원격의 replyWaitMs에 같은 값으로 들어간다", async () => {
+  const parsed = settingsFromEnv({
+    OLIVE_ROLE: "diagnosis",
+    OLIVE_INSTANCE: "worker-1",
+    OLIVE_POLICY_REVISION: "policy-r1",
+    OLIVE_SUPERVISOR_ADDR: "127.0.0.1:9",
+    OLIVE_SUPERVISOR_SERVER_NAME: SUPERVISOR_DNS,
+    OLIVE_SUPERVISOR_URI: SUPERVISOR_URI,
+    OLIVE_STORE_DIR: scratch(),
+    OLIVE_TLS_DIR: "/olive/tls",
+    OLIVE_TRUST_DIR: "/olive/trust",
+    OLIVE_SIGNING_KEY_FILE: FILES.signingKey,
+    OLIVE_PROFILE_FILE: FILES.profile,
+    OLIVE_AGENT_SOCKET: "/olive/link/agent.sock",
+  });
+  if (!parsed.ok) throw new Error(parsed.name);
+  expect(parsed.settings.timing.replyWaitMs).toBe(10_000);
+  const result = await begin(harness(), parsed.settings);
+  if (!result.ok) throw new Error(result.reason);
+  expect(optionsOf(result.running.worker).exitWaitMs).toBe(10_000);
+  expect(optionsOf(result.running.remote).replyWaitMs).toBe(10_000);
+});
+
+// 루프백의 실제 상호 TLS 감독 흉내에 붙어 맞춤과 인사까지 마친 실행기. connects는 TLS 클라이언트의 connect 호출(TCP를 열기 전) 수다.
+async function loopbackRun() {
+  const supervisorLeaf = pki.supervisor();
+  const peers: { socket: tls.TLSSocket; got: Envelope[]; closed: boolean }[] = [];
+  const server = await startTlsServer({
+    host: "127.0.0.1",
+    port: 0,
+    material: { certificatePem: supervisorLeaf.pem, privateKeyPem: supervisorLeaf.keyPem, trustBundlePem: pki.ca.pem },
+    now: Date.now,
+    onConnection: (c) => {
+      const decoder = createFrameDecoder();
+      const peer = { socket: c.socket, got: [] as Envelope[], closed: false };
+      c.socket.on("data", (chunk: Uint8Array) => {
+        for (const e of decoder.push(chunk).envelopes) peer.got.push(e.value as Envelope);
+      });
+      c.socket.once("close", () => (peer.closed = true));
+      peers.push(peer);
+    },
+  });
+  const calls: string[] = [];
+  let connects = 0;
+  const agent = new FakeAgent();
+  const deps: ExecutorDeps = {
+    readText: async (path) => contents().get(path)!,
+    openStore: (dir, now) => ExecutorStore.open(dir, { now }),
+    listenAgent: (remote) => {
+      agent.attach(remote);
+      agent.hello();
+      return { stop: () => calls.push("listener.stop") };
+    },
+    createTlsClient: (options) => {
+      const client = createTlsClient(options);
+      return { connect: (signal) => (connects++, client.connect(signal)), close: () => (calls.push("client.close"), client.close()) };
+    },
+    wallNow: Date.now,
+    monoNow: () => performance.now(),
+    setTimer: (ms, fire) => {
+      const handle = setTimeout(fire, ms);
+      return () => clearTimeout(handle);
+    },
+    random: () => 0,
+    log: (line) => calls.push(`log ${line}`),
+  };
+  const result = await startExecutor(settings({ supervisor: { address: "127.0.0.1", port: server.port, serverName: SUPERVISOR_DNS, uri: SUPERVISOR_URI } }), deps);
+  if (!result.ok) {
+    await server.close();
+    throw new Error(result.reason);
+  }
+  const { worker, link } = result.running;
+  await until(() => peers[0]?.got.some((e) => e.header.action === "stop_sync_request") ?? false);
+  const peer = peers[0]!;
+  const clock = new Clock(Date.now());
+  peer.socket.write(frame(fromSupervisor(clock, worker.name, "stop_sync_reply", { challenge: (peer.got[0]!.body as { challenge: string }).challenge }, { stop_generation: 0 })));
+  await until(() => peer.got.some((e) => e.header.action === "hello") && link.live());
+  return { server, peers, peer, calls, clock, running: result.running, connects: () => connects };
+}
+
+test("앞 연결의 지시가 끝나기 전에는 다시 붙지 않는다: 재시도 간격보다 늦고 응답 상한보다 이른 거절은 재연결 0·89, 같은 지연 뒤 정상 응답이면 그 뒤에 다시 붙는다(루프백 TLS)", async () => {
+  for (const outcome of ["rejects", "resolves"] as const) {
+    const r = await loopbackRun();
+    try {
+      const { worker } = r.running;
+      const handle = worker.handle.bind(worker);
+      let entered = false;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      worker.handle = async (...args: Parameters<typeof handle>) => {
+        entered = true;
+        await gate;
+        if (outcome === "rejects") throw new Error("signing failed");
+        return handle(...args);
+      };
+      r.peer.socket.write(frame(fromSupervisor(r.clock, worker.name, "status_query", { run_ids: [randomUUID()] }, { stop_generation: 0 })));
+      await until(() => entered);
+      r.peer.socket.destroy();
+      await until(() => r.calls.some((call) => call.startsWith("log 감독 소켓: closed(")));
+      // 다시 붙기 간격(100ms)의 세 배가 지나도 앞 연결의 지시가 끝나지 않았으면 새 연결 시도(TCP 전)가 없다.
+      await Bun.sleep(300);
+      expect(r.connects(), outcome).toBe(1);
+      expect(r.peers).toHaveLength(1);
+      release();
+      if (outcome === "rejects") {
+        expect(await within(r.running.done, 2_000)).toBe(EXECUTOR_EXIT.fatal);
+        await Bun.sleep(300);
+        expect(r.connects()).toBe(1);
+        expect(r.peers).toHaveLength(1);
+      } else {
+        await until(() => r.peers[1]?.got.some((e) => e.header.action === "stop_sync_request") ?? false);
+        expect(r.connects()).toBe(2);
+        expect(await within(r.running.done, 200)).toBe("timeout");
+        expect(await r.running.stop()).toBe(0);
+      }
+    } finally {
+      await r.server.close();
+    }
+  }
+});
+
+test("종료 영수증이 저장되고 실행 기록 쓰기만 실패한 볼륨: 재기동은 복원과 같은 유효한 종료 사건으로 판단해 대리를 잠그지 않는다(hello 전 연결 0, 뒤 연결 1, 새 작업 대리 start 1)", async () => {
+  const dir = scratch();
+  const disk = scriptedIo();
+  const seeded = await ExecutorStore.open(dir, { io: disk.io, now: () => T0 });
+  const run = randomUUID();
+  const instruction = randomUUID();
+  const accepted = randomUUID();
+  const stopped = randomUUID();
+  await seeded.adoptStopGeneration(0);
+  const window = { start_stop_generation: 0, instruction_request_id: instruction, deadline_at: T0 + 50_000, lease_until: T0 + 20_000, credential_digest: "0".repeat(64) };
+  expect(await seeded.beginRun({ run_id: run, run_generation: 1, state: "preparing", ...window, exit: null, last_receipt_id: null })).toBe(true);
+  const acceptedBody = { receipt_id: accepted, run_id: run, instruction_request_id: instruction, instruction: "task_start" };
+  const first = await seeded.commit(run, { state: "checking", last_receipt_id: accepted }, [
+    { entry: { action: "receipt_accepted", id: accepted, run_id: run, run_generation: 1, acked: false, body: acceptedBody } },
+  ]);
+  expect(first.saved).toBe(true);
+  disk.fail(runWrite("failed_stopped"));
+  const stoppedBody = { receipt_id: stopped, run_id: run, exit: "failed", remaining_processes: 0, stopped_at: T0 };
+  const last = await seeded.commit(run, { state: "failed_stopped", exit: "failed", last_receipt_id: stopped }, [
+    { entry: { action: "receipt_stopped", id: stopped, run_id: run, run_generation: 1, acked: false, body: stoppedBody } },
+  ]);
+  expect(last.saved).toBe(false);
+  expect(last.written.map((entry) => entry.action)).toEqual(["receipt_stopped"]);
+
+  const h = harness({ hello: false });
+  const writes: string[] = [];
+  h.deps.listenAgent = (remote) => {
+    h.calls.push("listenAgent");
+    h.agent.remote = remote;
+    h.agent.session = remote.connect({ write: (bytes) => void writes.push(new TextDecoder().decode(bytes)), close: () => {} });
+    return { stop: () => h.calls.push("listener.stop") };
+  };
+  const starting = begin(h, settings({ storeDir: dir }));
+  await until(() => h.steps.includes("agent_hello"));
+  expect(h.agent.remote!.state().distrusted).toBeNull();
+  expect(h.connects).toBe(0);
+  h.agent.hello();
+  h.timers.advance(TIMING.helloPollMs);
+  const result = await starting;
+  if (!result.ok) throw new Error(result.reason);
+  expect(h.connects).toBe(1);
+  const { worker, link, remote } = result.running;
+  expect(remote.state().distrusted).toBeNull();
+  expect((worker.hello().body as { runs: { state: string }[] }).runs.map((row) => row.state)).toEqual(["failed_stopped"]);
+
+  // 새 작업: 맞춘 연결에서 값과 task_start를 받으면 대리에게 start가 간다.
+  const connection = link.open(new FakeTransport());
+  const clock = new Clock(h.deps.wallNow());
+  await connection.receive(fromSupervisor(clock, worker.name, "stop_sync_reply", { challenge: connection.pending()!.challenge }, { stop_generation: 0 }));
+  const runId = randomUUID();
+  const value = credentialValue();
+  const inbox = optionsOf(worker).credentials as { offer(epoch: number, credential: { runId: string; digest: string; value: Uint8Array }): unknown };
+  inbox.offer(connection.epoch, { runId, digest: sha256(value), value });
+  const body = taskStartBody({ clock } as unknown as Rig, runId, sha256(value), { profile_revision: PROFILE.revision });
+  await connection.receive(fromSupervisor(clock, worker.name, "task_start", body, { stop_generation: 0, run_generation: 1 }));
+  await until(() => writes.some((text) => text.includes('"type":"start"') && text.includes(runId)));
+  expect(writes.filter((text) => text.includes('"type":"start"'))).toHaveLength(1);
+});
+
+test("잠그지 않고 기동했는데 recover 뒤에 장부가 보류되면 감독에 붙지 않고 87로 끝나며 대리 소켓을 닫는다", async () => {
+  let held = false;
+  const h = harness({
+    openStore: async (dir, now) => {
+      const store = await ExecutorStore.open(dir, { now });
+      const ledgerHeld = store.ledgerHeld.bind(store);
+      store.ledgerHeld = () => held || ledgerHeld();
+      return store;
+    },
+  });
+  const recover = WorkerExecutor.prototype.recover;
+  WorkerExecutor.prototype.recover = async () => {
+    held = true;
+  };
+  try {
+    expect(await begin(h)).toMatchObject({ ok: false, step: "recover", code: EXECUTOR_EXIT.recover, reason: "unverified_after_recover" });
+  } finally {
+    WorkerExecutor.prototype.recover = recover;
+  }
+  expect(h.agent.remote!.state().distrusted).toBeNull();
+  expect(h.calls).not.toContain("createTlsClient");
+  expect(h.connects).toBe(0);
+  expect(h.calls.at(-1)).toBe("listener.stop");
+});
+
+test("두 번째 hello 기다림이 풀린 직후 대리가 또 바뀌면 다시 기다린다: 3세대가 인사하지 않으면 86·연결 0, 인사하면 그 뒤에 붙는다", async () => {
+  for (const greets of [false, true]) {
+    const h = harness();
+    h.deps.onStep = (step) => {
+      h.steps.push(step);
+      if (step !== "recover") return;
+      h.agent.session!.closed();
+      h.agent.attach(h.agent.remote!);
+    };
+    const run = begin(h);
+    await until(() => h.steps.filter((step) => step === "agent_hello").length === 2);
+    // 2세대가 인사하고 확인이 그 hello로 풀린다. 이어지는 기동 코드가 돌기 전(같은 차례 안)에 3세대로 바뀐다.
+    h.agent.hello();
+    h.timers.advance(TIMING.helloPollMs);
+    h.agent.session!.closed();
+    h.agent.attach(h.agent.remote!);
+    await Bun.sleep(20);
+    expect(h.agent.remote!.state()).toMatchObject({ generation: 3, greeted: false });
+    expect(h.connects, `greets=${greets}`).toBe(0);
+    if (greets) {
+      h.agent.hello();
+      h.timers.advance(TIMING.helloPollMs);
+      expect(await run).toMatchObject({ ok: true });
+      expect(h.connects).toBe(1);
+    } else {
+      h.timers.advance(TIMING.helloWaitMs);
+      expect(await run).toMatchObject({ ok: false, step: "agent_hello", code: EXECUTOR_EXIT.agent_absent });
+      expect(h.connects).toBe(0);
+    }
+  }
+});
+
+test("프로필 크기 검사는 제품 출력 상한(64KiB)으로 인코딩한 실제 start에 묶인다: 틀 상한에 꼭 맞는 인자는 기동하고 한 글자 더 길면 82", async () => {
+  // 실제 start에 실리는 값: worker가 원격에 넘기는 출력 상한(65,536)과 가장 긴 시간 값. 실리면 틀 크기(4바이트 길이 접두 포함), 아니면 null.
+  const encoded = (n: number) => {
+    try {
+      return encodeControl({
+        type: "start",
+        run_id: randomUUID(),
+        program: PROFILE.program,
+        argv: ["x".repeat(n)],
+        cwd: PROFILE.cwd,
+        env: {},
+        credential_env: PROFILE.credentialEnv,
+        credential_digest: "0".repeat(64),
+        output_bytes: 65_536,
+        deadline_at: Number.MAX_SAFE_INTEGER,
+        lease_until: Number.MAX_SAFE_INTEGER,
+      }).length;
+    } catch {
+      return null;
+    }
+  };
+  // 이 프로필에서 인자 65,200자의 start 본문이 틀 상한 65,536바이트에 꼭 맞는다.
+  expect(encoded(65_200)).toBe(4 + 65_536);
+  expect(encoded(65_201)).toBeNull();
+  for (const [n, ok] of [
+    [65_200, true],
+    [65_201, false],
+  ] as const) {
+    const files = contents();
+    files.set(FILES.profile, JSON.stringify({ ...PROFILE, argv: ["x".repeat(n)] }));
+    const result = await begin(harness({ files }));
+    if (!ok) {
+      expect(result, String(n)).toMatchObject({ ok: false, step: "material", code: EXECUTOR_EXIT.material, reason: "profile_link_unencodable" });
+      continue;
+    }
+    expect(result, String(n)).toMatchObject({ ok: true });
+    if (result.ok) expect(optionsOf(result.running.worker).outputBytes).toBe(65_536);
+  }
+});
+
+test("기동 중 멈춤 요청 뒤 단계가 실패해도 멈춤이 이긴다: 재료·저장소·복원 실패는 0이고, 연 대리 소켓을 닫으며 연결 0", async () => {
+  const files = contents();
+  files.set(FILES.profile, "{");
+  const reading = harness({ files });
+  const stopReading = new AbortController();
+  const read = reading.deps.readText;
+  reading.deps.readText = async (path) => {
+    if (path === FILES.profile) stopReading.abort();
+    return read(path);
+  };
+  expect(await startExecutor(settings(), reading.deps, stopReading.signal)).toMatchObject({ ok: false, step: "material", code: 0, reason: "stop_requested" });
+  expect(reading.calls).not.toContain("openStore");
+
+  const stopOpening = new AbortController();
+  const opening = harness({
+    openStore: async () => {
+      stopOpening.abort();
+      throw new Error("unavailable");
+    },
+  });
+  expect(await startExecutor(settings(), opening.deps, stopOpening.signal)).toMatchObject({ ok: false, step: "store", code: 0, reason: "stop_requested" });
+  expect(opening.calls).not.toContain("listenAgent");
+
+  const stopRecovering = new AbortController();
+  const recovering = harness();
+  const recover = WorkerExecutor.prototype.recover;
+  WorkerExecutor.prototype.recover = async () => {
+    stopRecovering.abort();
+    throw new Error("signing failed");
+  };
+  try {
+    expect(await startExecutor(settings(), recovering.deps, stopRecovering.signal)).toMatchObject({ ok: false, step: "recover", code: 0, reason: "stop_requested" });
+  } finally {
+    WorkerExecutor.prototype.recover = recover;
+  }
+  expect(recovering.calls.at(-1)).toBe("listener.stop");
+  expect(recovering.connects + opening.connects + reading.connects).toBe(0);
 });
