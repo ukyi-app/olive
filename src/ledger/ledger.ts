@@ -526,6 +526,15 @@ export interface PendingReport {
   signal?: ReportSignal;
 }
 
+// 확정(result_finalize)에 싣는 결과 보관. settledResult만 낸다. storedAt은 그 결과 보고를 장부에 적은 시각이다: 감독은 결과를 저장한
+// 뒤에만 보고를 적으므로(recordReport) 저장을 마친 시각 이후의 첫 장부 시각이다.
+export interface SettledResult {
+  runId: string;
+  resultDigest: string;
+  storedRef: string;
+  storedAt: number;
+}
+
 // 받아 적은 세션 증거. 이 PR은 적고 읽기까지만 하고, 세션 시작의 근거로 소비하지 않는다(ledger.md "세션 증거").
 export interface TakeoverEvidence {
   receiptId: string;
@@ -3303,6 +3312,24 @@ export class Ledger {
         return { reportId: row.id, action: row.action, runId: row.run_id, storedRef: row.stored_ref, resultDigest: row.result_digest, ...(signal === null ? {} : { signal }) };
       }),
     );
+  }
+
+  // 그 실행의 결과가 저장 자리와 함께 반영됐는가(확정의 전제, life-loop.md "확정"). 실행 줄에 결과 digest가 있고, 그 실행의 결과 보고
+  // 가운데 반영됐고(applied_at) 저장 자리가 있고 digest가 실행 줄의 result_digest와 같은 것이 있을 때만 값이다. 아니면 null(없는 실행 포함).
+  // 상태는 보지 않는다: result_digest는 markResult가 ready_result로 판정할 때만 생기고 그 뒤 상태(cleanup_pending·finalized)에도 남는다.
+  // 같은 결과의 보고가 둘 이상이면 먼저 적은 것(받은 시각, id 차례)이다. 실행 줄과 보고를 한 읽기에서 대조한다. 장부를 바꾸지 않는다.
+  settledResult(runId: string): Read<SettledResult | null> {
+    return this.#read(() => {
+      const row = this.#runRow(runId);
+      if (row === null || row.result_digest === null) return null;
+      const report = this.#db
+        .query(
+          "SELECT stored_ref, received_at FROM deliveries WHERE run_id = ? AND action = 'report_result' AND applied_at IS NOT NULL AND stored_ref IS NOT NULL AND result_digest = ? ORDER BY received_at, id LIMIT 1",
+        )
+        .get(runId, row.result_digest) as { stored_ref: string; received_at: number } | null;
+      if (report === null) return null;
+      return { runId, resultDigest: row.result_digest, storedRef: report.stored_ref, storedAt: safe(report.received_at, "deliveries.received_at") };
+    });
   }
 
   // 결과 밖의 보고(세션 깨짐, 훅 사건)를 반영했다고 적는다. 결과 보고는 markResult의 reportId로 적는다.
