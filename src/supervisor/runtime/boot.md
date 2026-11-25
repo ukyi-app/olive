@@ -76,7 +76,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | S16 | `candidate`마다 `noteCandidate` | 답 줄이 한다(`answers.ts`의 `candidate`). 조립은 답 줄의 `cycle`에 그 순서기를 넘긴다 | "같은 객체" |
 | S17 | `takeRequery()`를 다시 묻게 | 꺼내 수를 기록만(`answerLines.takeRequery()`). 답 줄은 실행 ID만 내고 사유를 내지 않는다. 다시 묻기는 수명 박자의 간격 | 남는 한계 |
 | S19 | D-90 박자에 같은 답 줄의 `evidence`·`withheld`, 증거 장부는 프로세스에 하나 | `beats.unreceived`(박자 함수 본문에서 `need(lines)`로 위임), `make.lines`의 `evidenceBook: createAnswerEvidenceBook()` | `boot-evidence.test.ts`(시한 뒤 빈 full이면 닫기 1회, 오염·대기·번호 변경·연결 바뀜은 0회), `boot-effects.test.ts` "D-90 박자의 증거·맡기지 않을 실행기는 같은 답 줄의", "읽기만 한다" |
-| S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음 | `deps.openLedger`의 `mode: "reopen"` | "장부 not_initialized", 정적 `"create"` 0 |
+| S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음. 첫 설치는 감독 밖의 일회성 진입점 `src/main/ledger-init.ts`가 한다(D-110) | `deps.openLedger`의 `mode: "reopen"` | "장부 not_initialized", 정적 `"create"` 0, `test/ledger-init.test.ts` "정적: src/에서 \"create\" 글자를 쓰는 곳은"(`src/ledger/` 밖에서 그 진입점 하나) |
 | S21 | 필수 이웃에 현관·관측 중계·실행기 | `requiredPeers`(`settings.otherPeers`와 등록표의 활성 실행기) | "필수 이웃(S21)" |
 | S22 | 1단계 전 서버가 보는 세대 `null` | 복원기를 감싸지 않고 넘김(`published`) | 루프백 1단계 전 맞춤 답 0 |
 | S23 | `restoreDone`은 5단계 뒤만 | 순서기의 `restoreDone: () => stage >= 5 && effectsOpen()` | "관측 신호는 2단계를, 복원 끝은 5단계를" |
