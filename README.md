@@ -17,6 +17,7 @@
 
 - **하나의 이미지, 역할은 명령으로:** 감독과 작업자 실행기가 같은 이미지를 쓴다. 파드는 `command`로 역할을 고른다.
   - 감독: `["bun", "src/main/supervisor.ts"]`
+  - 장부 초기화(감독을 처음 켜기 전 한 번): `["bun", "src/main/ledger-init.ts"]`. 빈 장부 볼륨에 감독 장부를 만든다(아래 "장부 초기화").
   - 작업자 실행기(제어 컨테이너): `["bun", "src/main/executor.ts"]`
   - 대리 설치(작업자 실행기 파드의 init 컨테이너): `["bun", "src/main/agent-install.ts"]`. 이미지의 `/opt/olive/olive-agent`를 공유 볼륨의 `/opt/olive-agent/olive-agent`에 놓는다(아래 "대리 설치").
   - 역할 컨테이너의 대리(PID 1): `/opt/olive-agent/olive-agent`(`src/main/role-agent.ts`를 컴파일한 파일). 역할 컨테이너는 다른 이미지(glibc 계열)이고 대리를 init이 놓는다(D-103·D-107).
@@ -100,6 +101,8 @@ bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단�
 ```text
 src/main/
 ├── supervisor.ts   # 감독 진입점: 환경 → 조립(src/supervisor/runtime/boot.ts), 기동 뒤 관리 통로 소켓을 듣는다
+├── ledger-init.ts  # 장부 초기화 진입점(D-110): 빈 장부 볼륨에 감독 장부를 create로 한 번 만든다(감독과 같은 환경 이름 하나만 읽는다)
+├── ledger-path.ts  # 감독과 장부 초기화가 함께 쓰는 장부 자리(환경 이름, 파일 이름)
 ├── admin.ts        # 감독 관리 진입점: 감독 컨테이너에서 kubectl exec로 status(관리 소켓에 붙는다, 환경을 읽지 않고 듣지 않는다)
 ├── executor.ts     # 작업자 실행기(제어 컨테이너) 진입점: 환경 → 조립(src/executor/runtime.ts)
 ├── role-agent.ts   # 역할 컨테이너의 대리 진입점: 환경 → prepare → 제어 소켓에 붙음
@@ -309,7 +312,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 ## 감독 진입점
 
-감독 파드는 `bun src/main/supervisor.ts` 하나다. 환경을 읽는 곳은 이 파일뿐이고(`test/entrypoints.test.ts`), 조립(`src/supervisor/runtime/boot.ts`의 `bootSupervisor`)은 값과 주입받은 파일 읽기·장부 열기·서버 시작·시계·타이머·CSPRNG로만 돈다. 조건 번호와 코드 자리, 모름·실패 표, 뒤 조각의 조건은 `src/supervisor/runtime/boot.md`다. 같은 컨테이너에서 관리 진입점 `bun src/main/admin.ts status`가 kubectl exec로 돈다(아래 "감독 관리 통로").
+감독 파드는 `bun src/main/supervisor.ts` 하나다. 감독 쪽에서 환경을 읽는 곳은 이 파일과 장부 초기화 진입점(아래 "장부 초기화")뿐이고(`test/entrypoints.test.ts`), 조립(`src/supervisor/runtime/boot.ts`의 `bootSupervisor`)은 값과 주입받은 파일 읽기·장부 열기·서버 시작·시계·타이머·CSPRNG로만 돈다. 조건 번호와 코드 자리, 모름·실패 표, 뒤 조각의 조건은 `src/supervisor/runtime/boot.md`다. 같은 컨테이너에서 관리 진입점 `bun src/main/admin.ts status`가 kubectl exec로 돈다(아래 "감독 관리 통로").
 
 **지금은 접수를 열지 못한다.** 현관(O08)이 없어 복원 1단계(권위 정지 기록)가 늘 "모름"이다. 감독은 듣고 서버 tick만 돌리며 맞춤 요청에 답하지 않는다(D-76대로 닫힌 채). 1단계를 같은 복원기로 주기마다 다시 부르고 재시작하지 않는다. 운영 차트는 감독을 아직 켜지 않고, 환경도 다 주지 않는다(아래 표의 "차트 짝").
 
@@ -320,7 +323,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 1. 신호 처리기를 먼저 건다(PID 1이면 처리기 없는 신호를 커널이 버린다). 환경 읽기(`settingsFromEnv`). 없거나 빈 값이거나 꼴이 틀리면 **91**, 그 이름 하나를 찍는다. 포트 범위, 절대 경로, 등록표 설정(빈 문서를 적용해 `bad_settings`인지로 가른다), 정책 revision의 v1 꼴을 여기서 본다.
 2. 재료: TLS 인증서·키, 신뢰 묶음, 감독 서명 개인 키(Ed25519 PEM)를 바이트로 한 번 읽는다. 비었거나 읽지 못하거나 UTF-8이 아니거나 키가 Ed25519 개인 키가 아니면 **92**. 서버가 TLS 재료를 거절해도(`no_material`) 92다.
 3. 등록표 파일을 읽어 적용한다. 읽지 못하거나 적용이 `applied`가 아니면(환경 이름 불일치 포함) **93**. 활성 행의 실행기 이름에 현관(`front-door`)·관측 중계(`observation-relay`)를 더해 복원기의 필수 이웃으로 쓴다.
-4. 공유 시계를 한 번 만들고 장부를 `reopen`으로만 연다. `not_initialized`(빈 볼륨)를 포함한 모든 실패는 **94**이고 첫 설치(`create`)로 넘어가지 않는다. 결과 보관 폴더의 마지막 경로 요소가 링크 없는 실제 폴더가 아니면(`lstat`), 복원기를 만들지 못하면 장부를 닫고 94. 상위 경로 요소는 검사하지 않는다: 상위 경로는 차트가 고정하는 마운트 자리라 배포의 전제로 두고(N5c가 링크 없는 경로로 붙인다), 조립은 파일시스템을 직접 만지지 않는다.
+4. 공유 시계를 한 번 만들고 장부를 `reopen`으로만 연다. `not_initialized`(빈 볼륨)를 포함한 모든 실패는 **94**이고 첫 설치(`create`)로 넘어가지 않는다. 빈 볼륨은 감독을 켜기 전에 장부 초기화 진입점으로 만든다(아래 "장부 초기화"). 결과 보관 폴더의 마지막 경로 요소가 링크 없는 실제 폴더가 아니면(`lstat`), 복원기를 만들지 못하면 장부를 닫고 94. 상위 경로 요소는 검사하지 않는다: 상위 경로는 차트가 고정하는 마운트 자리라 배포의 전제로 두고(N5c가 링크 없는 경로로 붙인다), 조립은 파일시스템을 직접 만지지 않는다.
 5. 순서기를 서버보다 먼저 만든다. 정책이 범위 밖(`resendEveryMs` > 19,000 등)이면 장부를 닫고 **95**.
 6. 연결 서버 시작. 실패(`bad_settings`·`listen_failed`)면 장부를 닫고 **95**.
 7. 서버가 돌려준 같은 동기 구간에서 발급 → 내보내기 포트(`issuanceOpen`을 반드시 넘김) → 답 줄(`credentials`는 발급의 것)을 만든다. 생성자가 던지면 닫고(발급을 만든 뒤면 `issuance.shutdown()`, 그 전이면 `server.close()`) 장부를 닫은 뒤 **95**. 그 전에 서버가 `deliver`를 부르면 던져 그 연결을 닫는다.
@@ -340,6 +343,32 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 97 | 끝 차례를 밟지 못하고 끝났다(처리하지 않은 예외·거부) |
 
 끝 차례: `issuance.shutdown()`(발급 깃발 → 진행 중인 박자 대기 → `server.close()`) → 이미 생긴 장부 고장·허가 폐기를 코드에 반영 → `ledger.close()`. `server.close()`를 따로 부르지 않는다(발급을 만들기 전에 던진 7의 실패와, 기한 뒤에 늦게 선 서버만 예외). `shutdown()`을 부른 시점을 `shutdown_called` 기록으로 남긴다. 끝 차례의 기한은 진입 즉시(치명 기록보다 먼저) 정하고, 장부 닫기를 마친 뒤의 시각으로 다시 판정한다.
+
+### 장부 초기화(D-110)
+
+감독은 장부를 `reopen`으로만 열어 빈 볼륨이면 94로 끝난다(위 4). 빈 장부를 처음 만드는 일은 같은 이미지의 일회성 진입점 `bun src/main/ledger-init.ts`(인자 없음)가 한다. 장부를 `create`로 여는 곳은 `src/`에서 이 파일 하나다(`test/ledger-init.test.ts`의 정적 규칙, `boot.md` S20).
+
+**켜기 절차(장부 볼륨이 빈 처음 한 번).**
+
+1. 감독을 띄우지 않은 채 같은 이미지·같은 장부 볼륨·같은 `OLIVE_LEDGER_DIR`로 `bun src/main/ledger-init.ts`를 한 번 돌린다. 0이면 장부가 생겼다.
+2. 감독을 시작한다. 감독은 그 장부를 `reopen`으로 연다.
+
+장부를 이미 만든 뒤에 다시 돌려도 90으로 끝나고 아무것도 바꾸지 않는다. homelab 차트의 실행 꼴(Job 등)과 90을 어떻게 볼지는 차트 PR이 정한다.
+
+- **환경:** 감독과 같은 이름 `OLIVE_LEDGER_DIR` 하나만 읽고, 파일 이름은 감독과 같은 코드 상수 `supervisor.db`다(`src/main/ledger-path.ts`). 듣지 않고 어디에도 붙지 않는다.
+- **판정은 장부 모듈이 한다:** `openLedger`의 `create`가 받는 것은 없는 경로와 끊긴 같은 설치뿐이다(`src/ledger/ledger.md` "create가 받는 것은 둘뿐이다"). 만들다 끊긴 파일은 내용이 이 코드의 첫 설치 중간 모습과 정확히 같을 때만 이어 받는다. 그 밖의 것(빈 파일, 다른 파일, 남은 WAL)은 파일을 바꾸지 않고 94다.
+- **감독이 도는 동안:** 감독이 연 장부는 첫 설치를 마친 장부라, 잠금에 닿기 전의 판정(본체만 읽고 잠금을 잡지 않는 읽기)에서 `already_initialized`로 90이다(체크포인트 도중의 본체를 읽으면 다른 사유의 94일 수 있다). 어느 쪽도 파일을 바꾸지 않는다. 잠금(`locking_mode=EXCLUSIVE`, `busy_timeout 0`)은 그 판정을 통과한 빈 자리에서만 두 번째 방어선이다. 거꾸로 초기화가 도는 동안 감독이 뜨면 감독의 `reopen`이 실패해 94로 끝나고 재시작된다.
+- **남는 파일:** 파일을 예약한 뒤 실패(마이그레이션 실패, 디스크 가득 등)하면 만들다 만 파일이 남을 수 있다. 다음 실행이 끊긴 설치로 이어 받거나, 예약 직후의 0바이트 파일이면 94로 거절한다(사람이 그 빈 파일을 지운 뒤 다시 돌린다. `ledger.md`).
+
+| 코드 | 뜻 |
+|---|---|
+| 0 | 장부를 만들고 닫았다 |
+| 64 | 인자가 있다(사용법) |
+| 90 | 첫 설치를 마친 장부가 이미 있다. 아무것도 바꾸지 않았다 |
+| 91 | `OLIVE_LEDGER_DIR`이 없거나 빈 값이거나 절대 경로가 아니다(장부를 열기 전) |
+| 94 | 그 밖의 거절·실패(`open:<사유>`: 다른 파일, 폴더 없음, 잠김 등, `open:threw`, `open:unreadable`, `deps:threw`, `close:threw`). `close:threw`는 장부가 이미 생긴 뒤라 다시 돌리면 90이다 |
+
+메시지는 stderr 한 줄이고 stdout은 비어 있다. 사유만 찍고 장부 모듈의 상세 글은 싣지 않는다(SQLite 오류 글에 경로가 섞일 수 있다).
 
 ### 기한이 있는 기다림
 
@@ -364,7 +393,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 이름 | 뜻 | 출처 | 없을 때 |
 |---|---|---|---|
 | `OLIVE_SUPERVISOR_PORT` | 듣는 TCP 포트(1~65535). 주소는 코드 상수 `0.0.0.0` | 차트(값 8443) | 91 |
-| `OLIVE_LEDGER_DIR` | 장부 폴더(PVC). 파일 이름은 코드 상수 `supervisor.db` | 차트 | 91, 장부가 없거나 열리지 않으면 94 |
+| `OLIVE_LEDGER_DIR` | 장부 폴더(PVC). 파일 이름은 코드 상수 `supervisor.db`. 장부 초기화 진입점도 같은 이름을 읽는다 | 차트 | 91, 장부가 없거나 열리지 않으면 94 |
 | `OLIVE_SIGNING_KEY_DIR` | 그 안의 `supervisor-signing.key`(Ed25519 개인 키 PEM) | 차트(폴더). 파일 이름은 차트 짝(N5c)에서 Secret 키 이름과 맞춘다 | 91, 파일이 없으면 92 |
 | `OLIVE_ACCOUNTS_DIR` | 계정 폴더(`<별칭>/<키 이름>`) | 차트 | 91 |
 | `OLIVE_TLS_DIR` | 그 안의 `tls.crt`·`tls.key` | 차트(PKI가 켜진 때만. 진입점에는 필수) | 91, 파일이 없으면 92 |

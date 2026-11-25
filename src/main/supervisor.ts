@@ -18,6 +18,7 @@ import { createFileResultBackend } from "../supervisor/scheduler/result-store-fi
 import { RegistryState, type RegistryTarget } from "../supervisor/transport/registry.ts";
 import { startConnectionServer } from "../supervisor/transport/server.ts";
 import { CREDENTIAL_MAX_BYTES } from "../transport/framing.ts";
+import { LEDGER_FILE } from "./ledger-path.ts";
 
 // 읽는 환경. 차례는 README "감독 진입점"의 표와 같다: 차트가 이미 주는 이름이 앞, 차트 짝(N5c)이 더할 이름이 뒤다.
 export const SUPERVISOR_ENV = [
@@ -38,8 +39,8 @@ export const SUPERVISOR_ENV = [
 // 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
 export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_TEST_JOBS"] as const;
 
-// 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 서명 키의 이름은 차트의 Secret 키 이름과 맞춰야 한다(차트 짝에서 맞춘다).
-const LEDGER_FILE = "supervisor.db";
+// 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 장부 파일 이름은 장부 초기화 진입점과 함께 쓴다(ledger-path.ts).
+// 서명 키의 이름은 차트의 Secret 키 이름과 맞춰야 한다(차트 짝에서 맞춘다).
 const SIGNING_KEY_FILE = "supervisor-signing.key";
 // 듣는 주소. 파드 안의 모든 주소다(Service가 앞에 선다).
 const LISTEN_HOST = "0.0.0.0";
