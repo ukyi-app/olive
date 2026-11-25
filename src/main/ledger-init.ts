@@ -3,6 +3,7 @@
 // 환경은 감독과 같은 이름 하나(ledger-path.ts의 OLIVE_LEDGER_DIR)만 읽는다. 듣지 않고 어디에도 붙지 않는다.
 // 무엇을 받고 거절할지는 openLedger의 create가 판정한다(src/ledger/ledger.md "create가 받는 것은 둘뿐이다"). 첫 설치를 마친 장부는
 // 파일을 바꾸지 않는 판정에서 already_initialized로 거절되므로, 감독이 그 장부를 쥐고 있어도 잠금에 닿기 전에 90으로 끝난다.
+// 다만 감독의 체크포인트 도중의 본체를 읽으면 다른 사유의 94일 수 있다. 어느 쪽도 파일을 바꾸지 않는다.
 import { isAbsolute, join } from "node:path";
 import pkg from "../../package.json" with { type: "json" };
 import { type OpenOptions, type OpenResult, openLedger } from "../ledger/index.ts";
