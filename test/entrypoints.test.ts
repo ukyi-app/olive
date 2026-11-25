@@ -22,6 +22,42 @@ test("entrypoints: supervisor는 환경이 없으면 첫 이름을 한 줄 찍�
   expect(result.stderr.toString()).toBe(`olive supervisor ${pkg.version}: 환경 OLIVE_SUPERVISOR_PORT이(가) 없다\n`);
 });
 
+// 시험 현관 대역(D-109). 운영 값(시험 작업 꺼짐)에서 켜거나 on·off 밖의 값이면 아무 파일도 읽기 전에 91이다. 대역이 없거나 시험 값(둘 다 on)이면
+// 환경을 지나 재료 읽기에서 92로 끝나고(경로가 없다), 그 전에 고른 현관을 기록에 한 줄 남긴다. 환경 값마다의 경우는 test/supervisor/frontdoor/test-double.test.ts가 본다.
+test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거나 값이 틀리면 91로, 대역 없음·시험 값이면 환경을 지나 92로 끝난다", () => {
+  const env = {
+    OLIVE_SUPERVISOR_PORT: "8443",
+    OLIVE_LEDGER_DIR: "/olive-absent/ledger",
+    OLIVE_SIGNING_KEY_DIR: "/olive-absent/signing",
+    OLIVE_ACCOUNTS_DIR: "/olive-absent/accounts",
+    OLIVE_TLS_DIR: "/olive-absent/tls",
+    OLIVE_TRUST_DIR: "/olive-absent/trust",
+    OLIVE_REGISTRY_FILE: "/olive-absent/registry.json",
+    OLIVE_ENVIRONMENT: "home",
+    OLIVE_TARGETS: JSON.stringify([{ target: "reader", namespace: "olive-reader", roles: ["isolated_reader"] }]),
+    OLIVE_POLICY_REVISION: "policy-1",
+    OLIVE_RESULT_DIR: "/olive-absent/results",
+  };
+  const spawn = (extra: Record<string, string>) =>
+    Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
+  const refused = `olive supervisor ${pkg.version}: 환경 OLIVE_TEST_FRONTDOOR이(가) 틀렸다\n`;
+  const refusedEnv: Record<string, string>[] = [{ OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "off", OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "yes" }];
+  for (const extra of refusedEnv) {
+    const result = spawn(extra);
+    expect([JSON.stringify(extra), result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([JSON.stringify(extra), 91, "", refused]);
+  }
+  for (const [extra, mode] of [
+    [{}, "absent"],
+    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "off" }, "absent"],
+    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, "test_double"],
+  ] as const) {
+    const result = spawn(extra);
+    const lines = result.stderr.toString().split("\n");
+    expect([mode, result.exitCode, lines[0]]).toEqual([mode, 92, `olive supervisor: front_door mode=${mode}`]);
+    expect(lines).toContain(`olive supervisor ${pkg.version}: 기동 단계 material에서 멈췄다(certificate:unreadable)`);
+  }
+});
+
 // 실행기 진입점은 환경이 없으면 감독에 붙기 전에 81로 끝난다. 환경마다의 경우와 연결 0은 test/executor/entry.test.ts가 본다.
 test("entrypoints: executor는 환경이 없으면 첫 이름을 한 줄 찍고 81로 끝난다", () => {
   const result = run("src/main/executor.ts");

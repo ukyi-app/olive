@@ -12,7 +12,8 @@ import { nodeCredentialFiles } from "../supervisor/accounts/credential-ref.ts";
 import { answerLine, createAdminHandlers } from "../supervisor/admin/commands.ts";
 import { type AdminFs, type AdminListening, AdminListenRefused, listenAdmin } from "../supervisor/admin/listener.ts";
 import { ADMIN_SOCKET_MODE, ADMIN_SOCKET_PATH } from "../supervisor/admin/protocol.ts";
-import { bootSupervisor, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
+import { bootSupervisor, type FrontDoorPorts, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
+import { testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
 import { RENEW_MARGIN_MS } from "../supervisor/scheduler/lifecycle.ts";
 import { createFileResultBackend } from "../supervisor/scheduler/result-store-file.ts";
 import { RegistryState, type RegistryTarget } from "../supervisor/transport/registry.ts";
@@ -36,7 +37,9 @@ export const SUPERVISOR_ENV = [
 // 없어도 되는 환경. README "감독 진입점"의 표에서 필수 이름 뒤에 이 차례로 둔다.
 // OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
 // 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
-export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_TEST_JOBS"] as const;
+// OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"일 때만 받는다.
+// 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서는 차트 CI가 그 값을 거절한다) 그것 없이 켜면 운영 값으로 보고 91이다.
+export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 서명 키의 이름은 차트의 Secret 키 이름과 맞춰야 한다(차트 짝에서 맞춘다).
 const LEDGER_FILE = "supervisor.db";
@@ -65,7 +68,11 @@ const CYCLE: SupervisorSettings["cycle"] = { judgeMs: limits.DISCONNECT_JUDGE_MS
 // 꼴이 틀린 값으로 뜨면 모든 실행기의 정책 대조가 mismatch가 되어 접수가 늘 닫힌다.
 const REVISION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-export type EnvResult ={ readonly ok: true; readonly settings: SupervisorSettings } | { readonly ok: false; readonly name: string; readonly problem: "missing" | "invalid" };
+// frontDoor: 진입점이 조립에 넘길 현관 포트. absent(현관 전, 늘 모름)가 기본이고 test_double은 시험 현관 대역이다(frontDoorFor).
+export type EnvResult =
+  | { readonly ok: true; readonly settings: SupervisorSettings; readonly frontDoor: FrontDoorChoice }
+  | { readonly ok: false; readonly name: string; readonly problem: "missing" | "invalid" };
+export type FrontDoorChoice = "absent" | "test_double";
 
 // 환경을 값으로 바꾼다. 처음 걸린 이름 하나를 돌려준다(값은 담지 않는다). 연결 전에 거를 수 있는 것(포트, 절대 경로, 등록표 설정,
 // revision의 꼴)까지 여기서 본다.
@@ -101,6 +108,10 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (!REVISION.test(policyRevision)) return invalid("OLIVE_POLICY_REVISION");
   const testJobs = env.OLIVE_TEST_JOBS ?? "";
   if (testJobs !== "" && testJobs !== "on" && testJobs !== "off") return invalid("OLIVE_TEST_JOBS");
+  const testFrontDoor = env.OLIVE_TEST_FRONTDOOR ?? "";
+  if (testFrontDoor !== "" && testFrontDoor !== "on" && testFrontDoor !== "off") return invalid("OLIVE_TEST_FRONTDOOR");
+  if (testFrontDoor === "on" && testJobs !== "on") return invalid("OLIVE_TEST_FRONTDOOR");
+  const frontDoor: FrontDoorChoice = testFrontDoor === "on" ? "test_double" : "absent";
   const tlsDir = value("OLIVE_TLS_DIR");
   const trustDir = value("OLIVE_TRUST_DIR");
   return {
@@ -130,12 +141,13 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
         revisionOf: () => null,
       },
       // 배정 정책은 닫힌 값이다. 등록행·계정·실행 계획이 없어 후보가 없고 시작하지 않는다(역할 프로필 조각 전까지).
+      // 접수 출처는 시험 현관 대역일 때만 그 대역의 출처 하나를 관리자 요청으로 본다(D-109). 그 밖은 늘 모름이라 입력의 일을 보류한다.
       assign: {
         assignment: { allowed: targets.map((t) => ({ target: t.target, roles: t.roles })), registrations: [], expected: { profile_revision: "", policy_revision: policyRevision } },
         accounts: [],
         plans: [],
         queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 0, alert: 0 } },
-        originOf: () => undefined,
+        originOf: frontDoor === "test_double" ? testOriginOf : () => undefined,
       },
       life: LIFE,
       cycle: CYCLE,
@@ -145,11 +157,18 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       timing: TIMING,
       testJobs: testJobs === "on",
     },
+    frontDoor,
   };
 }
 
 // 현관(O08) 전의 현관 포트. 모두 모름(던짐)이라 복원 1단계가 실패하고 감독은 닫힌 채 듣는다(D-76). "기록 없음"을 지어내지 않는다.
 const absent = () => Promise.reject(new Error("front_door_absent"));
+const ABSENT_FRONT_DOOR: FrontDoorPorts = { stopAuthority: { latestStop: absent }, publications: { lookup: absent }, peers: { contracts: absent } };
+
+// 조립에 넘길 현관 포트. 시험 현관 대역은 settingsFromEnv가 시험 값에서만 test_double을 낸다.
+export function frontDoorFor(choice: FrontDoorChoice): FrontDoorPorts {
+  return choice === "test_double" ? testFrontDoorPorts() : ABSENT_FRONT_DOOR;
+}
 
 const format = (event: string, fields?: LogFields) =>
   [event, ...Object.entries(fields ?? {}).map(([key, item]) => `${key}=${item === null ? "-" : String(item)}`)].join(" ");
@@ -160,7 +179,7 @@ const productionDeps: SupervisorDeps = {
   createResultBackend: createFileResultBackend,
   startServer: startConnectionServer,
   credentialFiles: nodeCredentialFiles,
-  frontDoor: { stopAuthority: { latestStop: absent }, publications: { lookup: absent }, peers: { contracts: absent } },
+  frontDoor: ABSENT_FRONT_DOOR,
   wallNow: Date.now,
   monoNow: () => performance.now(),
   setTimer: (ms, fire) => {
@@ -230,7 +249,9 @@ async function main(): Promise<never> {
     console.error(`olive supervisor ${pkg.version}: 환경 ${parsed.name}이(가) ${parsed.problem === "missing" ? "없다" : "틀렸다"}`);
     process.exit(SUPERVISOR_EXIT.config);
   }
-  const started = await bootSupervisor(parsed.settings, productionDeps, stop.signal);
+  // 시험 현관 대역이면 기록에 먼저 남긴다: 이 감독의 정지 아님 기록·이웃 행·소유자 입력이 지어낸 값이라는 것을 기록만 보고도 알게.
+  productionDeps.log("front_door", { mode: parsed.frontDoor });
+  const started = await bootSupervisor(parsed.settings, { ...productionDeps, frontDoor: frontDoorFor(parsed.frontDoor) }, stop.signal);
   if (!started.ok) {
     console.error(`olive supervisor ${pkg.version}: 기동 단계 ${started.step}에서 멈췄다(${started.reason})`);
     process.exit(started.code);
