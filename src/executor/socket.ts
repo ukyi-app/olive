@@ -96,7 +96,7 @@ export type CloseReason =
 export type SocketEvent =
   | { readonly kind: "connecting"; readonly attempt: number }
   | { readonly kind: "connected"; readonly attempt: number }
-  // keepalive_failed: 붙은 소켓에 keepalive를 켜지 못해 link에 열지 않고 닫았다.
+  // keepalive_failed: 붙은 소켓에 keepalive를 켜거나 그 값을 넣고 되읽지 못해 link에 열지 않고 닫았다.
   | { readonly kind: "connect_failed"; readonly attempt: number; readonly reason: ConnectFailure["kind"] | "threw" | "keepalive_failed" }
   // 그 연결이 맞춤을 끝냈다. 다음 다시 붙기는 처음 간격부터다.
   | { readonly kind: "synced"; readonly attempt: number }
@@ -270,7 +270,7 @@ class Socket implements ExecutorSocket {
     }
     this.pending = null;
     // keepalive가 없으면 조용히 사라진 감독의 연결이 닫히지 않아 다시 붙지 않는다. 켜지 못한 소켓은 link에 열지 않는다.
-    // 아래 destroyed 확인이 이 호출 뒤에 온다.
+    // 아래 destroyed 확인이 이 호출 뒤에 온다. 이 뒤 이 소켓에 setKeepAlive를 다시 부르지 않는다(넣은 간격·횟수가 되돌아간다).
     if (!enableKeepAlive(verified.socket)) {
       verified.socket.destroy();
       this.emit({ kind: "connect_failed", attempt, reason: "keepalive_failed" });

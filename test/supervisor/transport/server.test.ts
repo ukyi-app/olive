@@ -18,7 +18,8 @@ import {
   type WriteFrameResult,
 } from "../../../src/supervisor/transport/server.ts";
 import { createFrameDecoder, encodeFrame } from "../../../src/transport/framing.ts";
-import { KEEPALIVE_INITIAL_DELAY_MS } from "../../../src/transport/keepalive.ts";
+import { KEEPALIVE_INITIAL_DELAY_MS, KEEPALIVE_OPTIONS } from "../../../src/transport/keepalive.ts";
+import { libcSocketOptions, type SocketOptionName } from "../../../src/transport/keepalive-ffi.ts";
 import type { RawTlsMaterial } from "../../../src/transport/tls-policy.ts";
 import { createTlsClient } from "../../../src/transport/tls-client.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../../transport/certs.ts";
@@ -1954,5 +1955,72 @@ describe("(6) 반쯤 열린 연결: 서버 쪽 소켓의 TCP keepalive", () => {
     expect(h.server.table().occupancy(h.restorer).map((o) => o.executorId)).toEqual([R2]);
     expect(h.delivered.filter((o) => o.kind === "withdrawn")).toEqual([{ kind: "withdrawn", connection: a.id, principal: R1 }]);
     expect(b.closed()).toBe(false);
+  });
+});
+
+describe("(7) 반쯤 열린 연결: 서버 쪽 소켓의 keepalive 간격·횟수·TCP_USER_TIMEOUT(libc로 넣고 되읽기)", () => {
+  const fdOf = (socket: tls.TLSSocket) => (socket as unknown as { _handle: { fd: number } })._handle.fd;
+  const optionsOf = (socket: tls.TLSSocket) =>
+    Object.fromEntries((Object.keys(KEEPALIVE_OPTIONS) as SocketOptionName[]).map((name) => [name, libcSocketOptions.get(fdOf(socket), name)]));
+
+  test("판단에 연 연결의 서버 쪽 소켓은 켬·첫 탐침 30초·간격 10초·4회·TCP_USER_TIMEOUT 70초다. 상대 쪽 소켓은 켜지 않았다", async () => {
+    const h = await start();
+    const a = await connect(h);
+    expect(optionsOf(serverSocket(h, a))).toEqual({ SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 10, TCP_KEEPCNT: 4, TCP_USER_TIMEOUT: 70_000 });
+    expect(optionsOf(a.socket)).toMatchObject({ SO_KEEPALIVE: 0, TCP_USER_TIMEOUT: 0 });
+  });
+
+  test("fd를 얻지 못하거나(fd 읽기가 던짐, 음수) 런타임 값의 되읽기가 다르면(setKeepAlive가 넣지 않음, 다른 지연) 판단에 열지 않고 닫는다. 이미 연 연결은 그대로다", async () => {
+    const h = await start();
+    const first = await connect(h);
+    // 서버 쪽 소켓의 setKeepAlive를 가진 원형을 찾아 감싼다. 상대 쪽 흉내는 setKeepAlive를 부르지 않으므로 서버 쪽 소켓만 걸린다.
+    let owner: object | null = serverSocket(h, first);
+    while (owner !== null && !Object.hasOwn(owner, "setKeepAlive")) owner = Object.getPrototypeOf(owner) as object | null;
+    if (owner === null) throw new Error("시험: setKeepAlive가 없다");
+    const original = Object.getOwnPropertyDescriptor(owner, "setKeepAlive")!;
+    const target = owner;
+    cleanup.push(() => Object.defineProperty(target, "setKeepAlive", original));
+    const call = (self: unknown, enable: boolean, delay: number) => (original.value as (enable: boolean, delay: number) => unknown).call(self, enable, delay);
+    const breakFd = (self: unknown, fd: PropertyDescriptor) => Object.defineProperty((self as { _handle: object })._handle, "fd", { configurable: true, ...fd });
+    const faults: ((this: unknown, enable: boolean, delay: number) => unknown)[] = [
+      function (enable, delay) {
+        const result = call(this, enable, delay);
+        breakFd(this, {
+          get() {
+            throw new Error("시험: fd 읽기 실패");
+          },
+        });
+        return result;
+      },
+      function (enable, delay) {
+        const result = call(this, enable, delay);
+        breakFd(this, { value: -1 });
+        return result;
+      },
+      function () {
+        return this;
+      },
+      function (enable) {
+        return call(this, enable, 20_000);
+      },
+    ];
+    for (const [i, fault] of faults.entries()) {
+      Object.defineProperty(target, "setKeepAlive", { configurable: true, writable: true, value: fault });
+      const client = createTlsClient({ address: HOST, port: h.server.port, supervisorDnsName: SUPERVISOR_DNS, supervisorUri: SUPERVISOR_URI, material: material(pki.executor()), now: Date.now });
+      cleanup.push(() => client.close());
+      const conn = await client.connect().catch(() => null);
+      await until(() => h.notes.filter((n) => n.kind === "keepalive_failed").length === i + 1);
+      if (conn !== null) {
+        conn.socket.on("error", () => {});
+        await until(() => conn.socket.destroyed);
+      }
+    }
+    Object.defineProperty(target, "setKeepAlive", original);
+    expect(h.notes.filter((n) => n.kind === "opened")).toEqual([{ kind: "opened", connection: first.id }]);
+    expect(h.server.table().get(first.id + 1)).toBeUndefined();
+    expect(first.closed()).toBe(false);
+    // 감싸기를 되돌린 뒤의 연결은 정상으로 열린다.
+    const next = await connect(h);
+    expect(optionsOf(serverSocket(h, next))).toEqual({ ...KEEPALIVE_OPTIONS });
   });
 });

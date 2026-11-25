@@ -11,7 +11,8 @@ import type { StoreIo } from "../../src/executor/store.ts";
 import { createExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
 import { startTlsServer, type TlsServer } from "../../src/supervisor/transport/tls-server.ts";
 import { createFrameDecoder, encodeCredentialFrame, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES, type MixedFrameDecoder } from "../../src/transport/framing.ts";
-import { KEEPALIVE_INITIAL_DELAY_MS } from "../../src/transport/keepalive.ts";
+import { KEEPALIVE_INITIAL_DELAY_MS, KEEPALIVE_OPTIONS } from "../../src/transport/keepalive.ts";
+import { libcSocketOptions, type SocketOptionName } from "../../src/transport/keepalive-ffi.ts";
 import { createTlsClient, type TlsClient } from "../../src/transport/tls-client.ts";
 import type { RawTlsMaterial } from "../../src/transport/tls-policy.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
@@ -960,4 +961,64 @@ test("keepalive: 커널이 조용한 감독을 끊으면(keepalive 만료의 ETI
   s.timer.waits[0]!.fire();
   await syncPeer(s, 1);
   expect(s.opened).toHaveLength(2);
+});
+
+const fdOf = (socket: tls.TLSSocket) => (socket as unknown as { _handle: { fd: number } })._handle.fd;
+const optionsOf = (socket: tls.TLSSocket) =>
+  Object.fromEntries((Object.keys(KEEPALIVE_OPTIONS) as SocketOptionName[]).map((name) => [name, libcSocketOptions.get(fdOf(socket), name)]));
+
+test("keepalive: 붙은 소켓을 libc로 되읽으면 켬·첫 탐침 30초·간격 10초·4회·TCP_USER_TIMEOUT 70초다. 감독 쪽 소켓은 켜지 않았다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw) });
+  s.socket.start();
+  await until(() => s.opened.length === 1 && s.peers.length === 1);
+  expect(optionsOf(raw[0]!)).toEqual({ SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 10, TCP_KEEPCNT: 4, TCP_USER_TIMEOUT: 70_000 });
+  expect(optionsOf(s.peers[0]!.socket)).toMatchObject({ SO_KEEPALIVE: 0, TCP_USER_TIMEOUT: 0 });
+});
+
+test("keepalive: fd를 얻지 못하거나(fd 읽기가 던짐, 음수) 런타임 값의 되읽기가 다르면(setKeepAlive가 넣지 않음, 다른 지연) link에 열지 않고 닫은 뒤 실패로 세어 다시 붙는다", async () => {
+  const handleOf = (socket: tls.TLSSocket) => (socket as unknown as { _handle: object })._handle;
+  const faults: ((socket: tls.TLSSocket) => void)[] = [
+    (socket) =>
+      Object.defineProperty(handleOf(socket), "fd", {
+        configurable: true,
+        get() {
+          throw new Error("시험: fd 읽기 실패");
+        },
+      }),
+    (socket) => Object.defineProperty(handleOf(socket), "fd", { configurable: true, value: -1 }),
+    (socket) => {
+      socket.setKeepAlive = () => socket;
+    },
+    (socket) => {
+      const original = socket.setKeepAlive.bind(socket);
+      socket.setKeepAlive = ((enable?: boolean) => original(enable, 20_000)) as typeof socket.setKeepAlive;
+    },
+  ];
+  for (const fault of faults) {
+    const raw: tls.TLSSocket[] = [];
+    const s = await setup({ wrap: capturing(raw, fault) });
+    s.socket.start();
+    await until(() => s.timer.waits.length === 1);
+    expect(s.opened).toHaveLength(0);
+    expect(s.events.filter((e) => e.kind !== "connecting")).toEqual([
+      { kind: "connect_failed", attempt: 1, reason: "keepalive_failed" },
+      { kind: "retry_scheduled", delayMs: 100 },
+    ]);
+    expect(raw[0]!.destroyed).toBe(true);
+    await until(() => s.client.openConnections() === 0);
+    expect(s.peers.flatMap((p) => p.got)).toEqual([]);
+  }
+});
+
+test("keepalive: 돌려받기 전에 이미 끊긴 소켓은 keepalive가 아니라 기존 사유(tls_error)로 닫고 다시 붙는다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw, (socket) => socket.destroy()) });
+  s.socket.start();
+  await until(() => s.timer.waits.length === 1);
+  expect(s.opened).toHaveLength(0);
+  expect(s.events.filter((e) => e.kind !== "connecting")).toEqual([
+    { kind: "connect_failed", attempt: 1, reason: "tls_error" },
+    { kind: "retry_scheduled", delayMs: 100 },
+  ]);
 });
