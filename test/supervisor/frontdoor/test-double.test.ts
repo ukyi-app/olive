@@ -1,5 +1,6 @@
 // 시험 현관 대역(D-109)의 시험: 대역 포트의 값, 진입점 설정(켜기는 시험 값에서만, 그 밖은 91), 실제 조립에서 켜짐 → 복원 5단계 →
-// 소유자 입력 하나 → status 0 → test-job의 장부 쓰기, 꺼짐(기본)의 지금 동작, 장부의 정지가 대역을 이기는 것, 문 직전에 닫힌 경우 쓰기 0.
+// 소유자 입력 하나 → status 0 → test-job의 장부 쓰기, 꺼짐(기본)의 지금 동작, 장부의 정지가 대역을 이기는 것, 문 직전·문 안에서 닫힌 경우 쓰기 0,
+// 장부가 거절한 입력의 다시 넣기. 진입점이 고른 현관을 조립에 넘기는 한 줄은 글로 고정한다.
 // 진입점을 실제로 띄워 91로 끝나는 것은 test/entrypoints.test.ts가 본다.
 import { describe, expect, test } from "bun:test";
 import { CONTRACT as CONTRACT_V1 } from "../../../src/contract/v1/index.ts";
@@ -19,6 +20,7 @@ import {
   testOriginOf,
 } from "../../../src/supervisor/frontdoor/test-double.ts";
 import type { FrontDoorPorts, RunningSupervisor } from "../../../src/supervisor/runtime/boot.ts";
+import { list, readText } from "../../files.ts";
 import { digest } from "../../ledger/helpers.ts";
 import { WALL, type World, world } from "../runtime/boot-world.ts";
 
@@ -130,12 +132,40 @@ describe("진입점 설정", () => {
     expect(ports.testInput).toBeUndefined();
     expect(frontDoorFor("test_double").testInput).toBeFunction();
   });
+
+  // 진입점이 고른 값을 조립에 넘기는 한 줄은 프로세스를 띄워도 재료 읽기(92)에서 멈춰 현관까지 가지 않는다. 그래서 글로 고정한다:
+  // 대역을 만드는 길은 frontDoorFor 하나이고, 진입점은 그것을 settingsFromEnv가 고른 값으로만 부른다.
+  test("진입점의 현관 넘기기: 대역 모듈을 import하는 src는 진입점 하나이고, 대역 포트는 frontDoorFor 안에서만, frontDoorFor는 고른 값으로 한 번만 부른다", async () => {
+    const importers: string[] = [];
+    for (const path of await list("src/**/*.ts")) {
+      if (path === "src/supervisor/frontdoor/test-double.ts") continue;
+      if (/["'][^"'\n]*test-double(?:\.ts)?["']/.test(await readText(path))) importers.push(path);
+    }
+    expect(importers).toEqual(["src/main/supervisor.ts"]);
+    const code = (await readText("src/main/supervisor.ts"))
+      .split("\n")
+      .filter((line) => !/^\s*\/\//.test(line))
+      .join("\n");
+    const flat = code.replace(/\s+/g, " ");
+    const count = (needle: string) => flat.split(needle).length - 1;
+    expect(count("frontDoorFor(")).toBe(2);
+    expect(count("export function frontDoorFor(choice: FrontDoorChoice): FrontDoorPorts {")).toBe(1);
+    expect(count("const parsed = settingsFromEnv(process.env);")).toBe(1);
+    expect(count("bootSupervisor(")).toBe(1);
+    expect(count("bootSupervisor(parsed.settings, { ...productionDeps, frontDoor: frontDoorFor(parsed.frontDoor) }, stop.signal)")).toBe(1);
+    expect(count("testFrontDoorPorts(")).toBe(1);
+    const body = /export function frontDoorFor\(choice: FrontDoorChoice\): FrontDoorPorts \{([^}]*)\}/.exec(flat)?.[1];
+    expect(body?.trim()).toBe('return choice === "test_double" ? testFrontDoorPorts() : ABSENT_FRONT_DOOR;');
+    // 대역 출처도 고른 값으로만 고른다.
+    expect(count("testOriginOf")).toBe(2);
+    expect(count('originOf: frontDoor === "test_double" ? testOriginOf : () => undefined,')).toBe(1);
+  });
 });
 
 // 실제 조립(boot.ts)과 실제 장부. 장부를 감싸 부른 메서드를 적는다. 진입점처럼 시험 작업을 켜고, 대역이면 출처 정책도 진입점과 같다.
 async function bootWith(
   choice: "absent" | "test_double",
-  over: { prepare?: (ledger: Ledger) => void; front?: (ports: FrontDoorPorts) => FrontDoorPorts } = {},
+  over: { prepare?: (ledger: Ledger) => void; front?: (ports: FrontDoorPorts) => FrontDoorPorts; around?: (key: string, call: () => unknown) => unknown } = {},
 ): Promise<{ w: World; running: RunningSupervisor; calls: string[]; raw: () => Ledger }> {
   const calls: string[] = [];
   let raw: Ledger | null = null;
@@ -154,7 +184,8 @@ async function bootWith(
             if (typeof value !== "function") return value;
             return (...args: unknown[]) => {
               calls.push(String(key));
-              return Reflect.apply(value, target, args);
+              const call = () => Reflect.apply(value, target, args);
+              return over.around === undefined ? call() : over.around(String(key), call);
             };
           },
         });
@@ -267,5 +298,59 @@ describe("실제 조립", () => {
       const code = await running.done;
       expect(code, model).toBe(model === "stop" ? 0 : 96);
     }
+  });
+
+  // 문 안의 읽기(장부 건강, 복원기를 거친 장부의 허가) 사이에 시작된 끝 차례. 함정: 끝 차례를 문의 읽기보다 먼저 보면 이 경우를 놓친다.
+  // 입력을 만든 뒤에만 걸어, 박자의 다른 읽기에서는 끝 차례를 시작하지 않는다.
+  test("문: 접수 문이 장부 건강·허가를 읽는 사이에 끝 차례가 시작돼도 장부에 넣지 않는다", async () => {
+    for (const read of ["health", "intakeOpen"] as const) {
+      let armed = false;
+      let stopNow: () => void = () => {};
+      const { w, running, calls } = await bootWith("test_double", {
+        front: (ports) => ({
+          ...ports,
+          testInput: (receivedAt) => {
+            armed = true;
+            return ports.testInput!(receivedAt);
+          },
+        }),
+        around: (key, call) => {
+          if (armed && key === read) {
+            armed = false;
+            stopNow();
+          }
+          return call();
+        },
+      });
+      stopNow = () => void running.stop();
+      await cycles(w, 10);
+      expect(events(w, "restore_step").find((f) => f.step === 5), read).toEqual({ step: 5, intakeMayOpen: true, closedBecause: "" });
+      expect(armed, read).toBe(false);
+      expect(count(calls, "enqueueInput"), read).toBe(0);
+      expect(events(w, "front_door_test_input"), read).toEqual([{ outcome: "closed", reason: null }]);
+      expect(await running.done, read).toBe(0);
+    }
+  });
+
+  test("장부가 거절하면(intake_closed) 받음으로 치지 않고 다음 주기에 다시 넣는다", async () => {
+    let refuse = true;
+    const { w, running, calls, raw } = await bootWith("test_double", {
+      around: (key, call) => {
+        if (key === "enqueueInput" && refuse) {
+          refuse = false;
+          return { ok: false, reason: "intake_closed" };
+        }
+        return call();
+      },
+    });
+    await cycles(w, 10);
+    expect(count(calls, "enqueueInput")).toBe(2);
+    expect(events(w, "front_door_test_input")).toEqual([
+      { outcome: "refused", reason: "intake_closed" },
+      { outcome: "created", reason: null },
+    ]);
+    expect(raw().listInputs()).toMatchObject({ known: true, value: [{ requestId: TEST_FRONT_DOOR_OWNER, source: TEST_FRONT_DOOR_SOURCE }] });
+    expect(w.names()).not.toContain("fatal");
+    expect(await running.stop()).toBe(0);
   });
 });

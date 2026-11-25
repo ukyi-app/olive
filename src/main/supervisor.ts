@@ -39,7 +39,7 @@ export const SUPERVISOR_ENV = [
 // OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
 // 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
 // OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"일 때만 받는다.
-// 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서는 차트 CI가 그 값을 거절한다) 그것 없이 켜면 운영 값으로 보고 91이다.
+// 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다) 그것 없이 켜면 운영 값으로 보고 91이다.
 export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 장부 파일 이름은 장부 초기화 진입점과 함께 쓴다(ledger-path.ts).

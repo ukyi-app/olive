@@ -412,7 +412,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 현관(O08)이 없는 시험 클러스터에서 감독이 복원 5단계를 마치고 접수를 열게 하는 현관 포트다(D-109). 코드는 `src/supervisor/frontdoor/test-double.ts`, 고르는 곳은 진입점(`frontDoorFor`), 장부에 입력을 넣는 곳은 조립(`boot.ts`의 `admitTestInput`)이다.
 
-- **켜기:** 감독 환경 `OLIVE_TEST_FRONTDOOR=on`이고 `OLIVE_TEST_JOBS=on`일 때만이다. 감독은 어느 클러스터에서 도는지 모르고, 아는 "시험 값"의 표시는 `OLIVE_TEST_JOBS=on` 하나뿐이다(운영 값에서는 차트 CI가 그 값을 거절한다: 아래 "감독 관리 통로"). 그래서 `OLIVE_TEST_JOBS`가 `on`이 아닌 값에서 대역을 켜면 운영 값으로 보고 아무 파일도 읽기 전에 **91**이다. 둘 다 시험 값 전용이고, 대역은 시험 작업 넣기(`test-job`)가 쓸 소유자 입력을 만드는 짝이다. 고른 현관은 기동 기록 첫 줄 `front_door mode=absent|test_double`에 남는다.
+- **켜기:** 감독 환경 `OLIVE_TEST_FRONTDOOR=on`이고 `OLIVE_TEST_JOBS=on`일 때만이다. 감독은 어느 클러스터에서 도는지 모르고, 아는 "시험 값"의 표시는 `OLIVE_TEST_JOBS=on` 하나뿐이다(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다: 아래 "감독 관리 통로"). 그래서 `OLIVE_TEST_JOBS`가 `on`이 아닌 값에서 대역을 켜면 운영 값으로 보고 아무 파일도 읽기 전에 **91**이다. 둘 다 시험 값 전용이고, 대역은 시험 작업 넣기(`test-job`)가 쓸 소유자 입력을 만드는 짝이다. 고른 현관은 기동 기록 첫 줄 `front_door mode=absent|test_double`에 남는다.
 - **대역이 만드는 것(D-76의 시험 값 한정 예외):** 권위 정지 기록 `{ generation: 0, stopped: false }`, 이웃 행 둘(`front-door` 계약 `olive-control/v2`, `observation-relay` 계약 `olive-control/v1`, 둘 다 정책 맞음), 시험 소유자 입력 하나(요청 ID `00000000-0000-4000-8000-000000000109`, 출처 `test-front-door`, 원문 참조 `test-front-door/<같은 ID>`, 만료는 처음 넣은 시각 + 168시간). 게시 결과는 만들지 않는다(늘 모름).
 - **장부의 정지가 이긴다:** 정지 기록은 세대 0이라, 장부에 같은 세대의 정지나 더 높은 세대가 있으면 장부의 기록이 남는다(`Ledger.mergeStop`). 대역은 정지를 풀거나 세대를 올리지 못하고, 정지를 내는 길도 없다.
 - **입력을 넣는 차례:** 5단계의 허가를 받아들인 뒤, 주기의 박자 밖(답 처리 뒤)에서 입력을 만들고(장부 시계) 데이터 사본 → `enqueueInput` 얻기 → 문(접수 문, 그 뒤 끝 차례가 아님을 맨 끝에) → 호출 하나다. 장부가 받으면(`created`·`existing`) 그 프로세스에서는 다시 넣지 않고, 거절이면 다음 주기에 다시 본다. 같은 요청 ID라 감독이 다시 떠도 줄은 하나다. 기록 `front_door_test_input outcome=…`에 남는다.
