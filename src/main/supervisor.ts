@@ -59,6 +59,9 @@ const TIMING: SupervisorSettings["timing"] = {
 };
 // 갱신을 낼 수 있는 구간을 7,000ms로 둔다(lifecycle.ts의 LifecyclePolicy 설명).
 const LIFE: SupervisorSettings["life"] = { renewEveryMs: limits.RUN_LEASE_MAX_MS - RENEW_MARGIN_MS - 7_000, answerTimeoutMs: 20_000 };
+// 결과 보고 없는 checking 실행을 결과 없음으로 판정하기까지의 기다림(D-113). T1 실측 전의 시험 숫자다: 실행기는 ack가 없는 보고를
+// RENEW_INTERVAL_MS(10초)마다 다시 보내므로(worker.ts의 tick) 그 재전송이 여섯 번 돌 시간이다.
+const RESULT_CHECK: SupervisorSettings["resultCheck"] = { reportWaitMs: 6 * limits.RENEW_INTERVAL_MS };
 const CYCLE: SupervisorSettings["cycle"] = { judgeMs: limits.DISCONNECT_JUDGE_MS, resendEveryMs: 5_000, assignCallsPerBeat: 4 };
 
 // 계약 v1 hello의 revision 칸 꼴(contract/v1/schema.ts의 REVISION과 같다). 계약은 index.ts로만 import하므로 같은 꼴을 여기 둔다.
@@ -138,6 +141,7 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
         originOf: () => undefined,
       },
       life: LIFE,
+      resultCheck: RESULT_CHECK,
       cycle: CYCLE,
       connection: {},
       // 같은 박자에 한 연결로 나가는 ack·지시·자격 값 틀 하나씩과 여유 하나.

@@ -536,6 +536,23 @@ export interface SettledResult {
   storedAt: number;
 }
 
+// failed_stopped 작업자 실행의 확정 본문(outcome·stored_at)을 정하는 데 쓰는 장부 사실. failedStop만 낸다.
+export interface FailedStop {
+  runId: string;
+  // 실행 줄이 failed_stopped가 된 장부 시각: 상태가 failed_stopped인 동안의 runs.updated_at. 그 상태로 옮긴 쓰기(종료 확인 영수증 또는
+  // markResult의 결과 없음 판정)가 넘긴 시각이다. 다음 전이(finalized·cleanup_pending)가 이 칸을 바꾸므로 그 뒤에는 이 읽기가 null이다.
+  // 함정: recordBudget은 상태와 무관하게 updated_at을 바꾼다. 지금 부르는 코드는 없지만, failed_stopped 줄에 부르면 이 값과 exit가 틀린다.
+  stoppedAt: number;
+  // 그 실행에 사유 requested의 취소 지시(task_cancel)가 적혔으면 true, 취소 지시가 없거나 다른 사유뿐이면 false. requested는 없고
+  // 사유 없이 적힌 취소 지시가 있으면 null(모름: requested였을 수 있다. 판 4 전의 줄이거나 사유를 넘기지 않은 기록).
+  requestedCancel: boolean | null;
+  // 종료 확인 영수증의 exit. 장부에는 exit 칸이 없어 결과 검사를 거친 실행만 "completed"로 안다: completed 영수증은 checking으로,
+  // 그 밖의 영수증은 곧바로 failed_stopped로 옮기고, 어느 쪽이든 그 영수증을 받은 시각(deliveries.received_at)을 같은 트랜잭션에서
+  // updated_at으로 적는다. 그래서 stoppedAt이 그 시각보다 늦으면 checking에서 뒤의 판정이 옮긴 것이다. 같거나 이르면 null
+  // (cancelled·deadline·failed 가운데 무엇인지 모른다. 같은 밀리초에 판정한 checking 실행도 여기에 든다).
+  exit: "completed" | null;
+}
+
 // 받아 적은 세션 증거. 이 PR은 적고 읽기까지만 하고, 세션 시작의 근거로 소비하지 않는다(ledger.md "세션 증거").
 export interface TakeoverEvidence {
   receiptId: string;
@@ -3330,6 +3347,25 @@ export class Ledger {
         .get(runId, row.result_digest) as { stored_ref: string; received_at: number } | null;
       if (report === null) return null;
       return { runId, resultDigest: row.result_digest, storedRef: report.stored_ref, storedAt: safe(report.received_at, "deliveries.received_at") };
+    });
+  }
+
+  // failed_stopped 작업자 실행의 확정 본문을 정할 사실(FailedStop). 실행 줄, 그 종료 확인 영수증, 취소 지시를 한 읽기에서 본다.
+  // 없는 실행이거나 지금 failed_stopped가 아니면 null이다. 있는 칸만 읽고 장부를 바꾸지 않는다.
+  failedStop(runId: string): Read<FailedStop | null> {
+    return this.#read(() => {
+      const row = this.#runRow(runId);
+      if (row === null || row.kind !== "worker" || row.state !== "failed_stopped" || row.stop_receipt_id === null) return null;
+      const receipt = this.#db.query("SELECT received_at FROM deliveries WHERE id = ? AND run_id = ? AND action = 'receipt_stopped'").get(row.stop_receipt_id, runId) as {
+        received_at: number;
+      } | null;
+      const reasons = (
+        this.#db.query(`SELECT ${this.#rebuildColumns ? "reason" : "NULL AS reason"} FROM instructions WHERE run_id = ? AND action = 'task_cancel'`).all(runId) as { reason: string | null }[]
+      ).map((cancel) => cancel.reason);
+      const requestedCancel = reasons.includes("requested") ? true : reasons.includes(null) ? null : false;
+      const stoppedAt = safe(row.updated_at, "runs.updated_at");
+      const exit = receipt !== null && stoppedAt > safe(receipt.received_at, "deliveries.received_at") ? ("completed" as const) : null;
+      return { runId, stoppedAt, requestedCancel, exit };
     });
   }
 

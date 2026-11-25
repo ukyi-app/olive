@@ -15,12 +15,15 @@
 // 4. 취소(requested)와 기한(deadline)은 사유를 장부에 함께 적고 내보낸다(연결이 없어도 적는다). 이미 종료 지시가 적힌 실행에는 새 종료
 //    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 쓰기를 부른 뒤 내보내기의 결과가
 //    정해지기 전의 어느 줄에서 던져도 그 항목까지 싣고 halted로 멈춘다.
-// 5. 확정(result_finalize)은 ready_result 실행에만, 장부의 settledResult가 "결과 보고가 저장 자리와 함께 반영됐고 digest가 실행 줄과
-//    같다"를 낼 때만 적고 내보낸다(resultSettled). 읽기가 모름이면 확정하지 않는다. 확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고
-//    (다시 보내는 것은 재전송 박자의 일), 접수가 닫혔으면(정지 포함) 적지 않는다. failed_stopped·cleanup_pending의 확정은 내지 않는다
-//    (outcome·stored_at의 출처와 정리 확인이 정해지지 않았다).
+// 5. 확정(result_finalize)은 ready_result 실행에는 장부의 settledResult가 "결과 보고가 저장 자리와 함께 반영됐고 digest가 실행 줄과
+//    같다"를 낼 때만(succeeded), failed_stopped 실행에는 장부의 failedStop으로 outcome을 정할 수 있을 때만(D-114: 요청 취소가 적혔으면
+//    cancelled, 아니면 종료 영수증 exit가 completed일 때 failed, stored_at은 failed_stopped가 된 장부 시각) 적고 내보낸다. 읽기가 모름이면
+//    확정하지 않는다. 확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고(다시 보내는 것은 재전송 박자의 일), 접수가 닫혔으면(정지 포함)
+//    적지 않는다. cleanup_pending의 확정은 내지 않는다(정리 확인이 정해지지 않았다).
 import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
+  type FailedStop,
+  type FinalizeOutcome,
   type InstructionTimes,
   LEDGER_RUN_STATES,
   type Ledger,
@@ -38,11 +41,11 @@ import type { PendingQuery } from "./receipts.ts";
 import { callAfterGate, holdBeatValid } from "./send-gate.ts";
 import { type PlainCheck, sendInstruction } from "./send-gate.ts";
 
-// 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. settledResult는 ready_result 실행에만 읽는다: 그 읽기의 고장이
-// 다른 상태의 갱신·종료를 막지 않게 한다.
+// 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. settledResult는 ready_result 실행에만, failedStop은 failed_stopped
+// 실행에만 읽는다: 그 읽기의 고장이 다른 상태의 갱신·종료를 막지 않게 한다.
 export type LifeLoopLedger = Pick<
   Ledger,
-  "listRuns" | "listInputs" | "instructionTimes" | "settledResult" | "recordRenewInstruction" | "recordStopInstruction" | "recordFinalizeInstruction"
+  "listRuns" | "listInputs" | "instructionTimes" | "settledResult" | "failedStop" | "recordRenewInstruction" | "recordStopInstruction" | "recordFinalizeInstruction"
 >;
 
 // 접수와 정지 세대. 실제로는 재시작 복원기(Restorer)다. 접수는 갱신·확정 직전에만 본다: 갱신은 장부에서 새 업무와 같은 전제를 거치고,
@@ -117,9 +120,10 @@ type RecordUnknown = "threw" | "malformed_answer";
 // 장부에 쓰는 의도.
 export type WritingIntent = "renew_lease" | "stop" | "finalize";
 
-// 확정을 적지 않은 이유. 모두 장부를 부르기 전이다. not_ready_result: failed_stopped·cleanup_pending(이 박자가 확정을 열지 않은 상태),
+// 확정을 적지 않은 이유. 모두 장부를 부르기 전이다. not_ready_result: cleanup_pending(이 박자가 확정을 열지 않은 상태),
+// outcome_unknown: failed_stopped인데 장부의 사실로 outcome을 정하지 못한다(failedOutcome이 null),
 // already_recorded: 그 실행에 확정 지시가 이미 적혔다(같은 요청 ID로 다시 보내는 것은 재전송 박자의 일), intake_closed: 접수가 닫혔다(정지 포함).
-export type FinalizeWithheld = "not_ready_result" | "already_recorded" | "intake_closed";
+export type FinalizeWithheld = "not_ready_result" | "outcome_unknown" | "already_recorded" | "intake_closed";
 
 // 갱신을 적지 않은 이유. 모두 장부를 부르기 전이다. no_connection은 연결 포트의 거절, link_unknown은 그 답을 모른다.
 export type RenewWithheld = "start_not_accepted" | "deadline_within_margin" | "intake_closed" | "no_connection" | "link_unknown" | "margin_lost" | "clock_unavailable";
@@ -191,7 +195,7 @@ export type RunOutcome =
       readonly field?: string;
       readonly sealReason?: string;
     }
-  // 확정을 적고 연결에 실었다. 나머지 넷은 종료의 같은 이름과 같은 뜻이다.
+  // 확정을 적고 연결에 실었다(본문의 outcome은 실은 봉투에 있다). 나머지 넷은 종료의 같은 이름과 같은 뜻이다.
   | { readonly runId: string; readonly outcome: "finalize_sent"; readonly requestId: string; readonly issuedAt: number; readonly executorId: string }
   | { readonly runId: string; readonly outcome: "finalize_refused"; readonly reason: LedgerRefusal }
   | { readonly runId: string; readonly outcome: "finalize_failed"; readonly failure: WriteFailure }
@@ -371,6 +375,8 @@ interface Facts {
   cancelRequested: boolean;
   // ready_result 실행의 결과 보관(장부의 settledResult). 그 밖의 상태와 보관이 반영되지 않은 실행은 null.
   settled: SettledResult | null;
+  // failed_stopped 실행의 확정 사실(장부의 failedStop). 그 밖의 상태는 null.
+  failed: FailedStop | null;
 }
 
 // 영수증 칸은 null(아직 없음)이거나 장부의 영수증 ID(UUID)다. 칸이 없거나 빈 문자열·다른 꼴이면 줄의 꼴이 틀린 것이다.
@@ -481,18 +487,74 @@ function readSettled(ledger: LifeLoopLedger, run: RunRow): SettledResult | null 
   }
 }
 
+// failed_stopped 실행의 확정 사실(failedStop). 읽기가 모름이거나 던지거나, 실행 줄은 failed_stopped인데 값이 없거나, 꼴이 틀리거나 다른
+// 실행의 답이면 undefined(모름). 답의 칸은 한 번씩만 읽어 옮겨 적는다.
+function readFailed(ledger: LifeLoopLedger, run: RunRow): FailedStop | undefined {
+  try {
+    const answer: unknown = ledger.failedStop(run.runId);
+    if (!isObject(answer) || answer.known !== true) return undefined;
+    const value: unknown = answer.value;
+    if (!isObject(value)) return undefined;
+    const { runId, stoppedAt, requestedCancel, exit } = value;
+    if (runId !== run.runId || !isTime(stoppedAt)) return undefined;
+    if (!(requestedCancel === true || requestedCancel === false || requestedCancel === null)) return undefined;
+    if (!(exit === "completed" || exit === null)) return undefined;
+    return { runId, stoppedAt, requestedCancel, exit };
+  } catch {
+    return undefined;
+  }
+}
+
+// D-114: failed_stopped 실행의 확정 outcome. 사유 requested의 취소 지시가 적혔으면 cancelled, 아니면 종료 영수증 exit가 completed(결과
+// 검사가 결과 없음으로 판정한 실행)일 때 failed. 그 밖은 null(정하지 못함): 장부에 exit 칸이 없어 종료 영수증이 곧바로 failed_stopped로
+// 옮긴 실행의 exit가 cancelled(그러면 cancelled)인지 deadline·failed(그러면 failed)인지 모르고, 사유 없이 적힌 취소 지시는 requested였을 수 있다.
+export function failedOutcome(facts: Pick<FailedStop, "requestedCancel" | "exit">): Exclude<FinalizeOutcome, "succeeded"> | null {
+  if (facts.requestedCancel === true) return "cancelled";
+  if (facts.requestedCancel === null) return null;
+  return facts.exit === "completed" ? "failed" : null;
+}
+
 // 한 실행의 판단 재료. 소유자 입력이 없는 실행은 취소 요청이 없다. 입력에 이어졌는데 그 줄이 없거나 모름이면 모름이다.
-// 대기 실행의 판단은 취소 요청만 본다. 그 밖은 지시 이력이 있어야 판단하고, ready_result는 결과 보관도 읽어야 판단한다.
+// 대기 실행의 판단은 취소 요청만 본다. 그 밖은 지시 이력이 있어야 판단하고, ready_result는 결과 보관, failed_stopped는 확정 사실도
+// 읽어야 판단한다.
 function factsOf(ledger: LifeLoopLedger, run: RunRow, cancels: Map<string, boolean | null>): Facts | { read: LifeRead } {
   const cancelled = run.inputRequestId === null ? false : cancels.get(run.inputRequestId);
   if (typeof cancelled !== "boolean") return { read: "inputs" };
-  if (run.state === "queued") return { run, times: null, cancelRequested: cancelled, settled: null };
+  if (run.state === "queued") return { run, times: null, cancelRequested: cancelled, settled: null, failed: null };
   const times = readTimes(ledger, run.runId);
   if (times === null) return { read: "instruction_times" };
-  if (run.state !== "ready_result") return { run, times, cancelRequested: cancelled, settled: null };
+  if (run.state === "failed_stopped") {
+    const failed = readFailed(ledger, run);
+    if (failed === undefined) return { read: "result" };
+    return { run, times, cancelRequested: cancelled, settled: null, failed };
+  }
+  if (run.state !== "ready_result") return { run, times, cancelRequested: cancelled, settled: null, failed: null };
   const settled = readSettled(ledger, run);
   if (settled === undefined) return { read: "result" };
-  return { run, times, cancelRequested: cancelled, settled };
+  return { run, times, cancelRequested: cancelled, settled, failed: null };
+}
+
+// 확정 본문(outcome·resultDigest·storedAt). ready_result는 결과 보관에서(succeeded), failed_stopped는 확정 사실에서(failed·cancelled,
+// stored_at은 failed_stopped가 된 장부 시각) 온다. 정하지 못하면 null.
+type FinalizeBody = { readonly outcome: FinalizeOutcome; readonly resultDigest: string | null; readonly storedAt: number };
+function finalizeBodyOf(facts: Facts): FinalizeBody | null {
+  if (facts.run.state === "ready_result") return facts.settled === null ? null : { outcome: "succeeded", resultDigest: facts.settled.resultDigest, storedAt: facts.settled.storedAt };
+  if (facts.run.state !== "failed_stopped" || facts.failed === null) return null;
+  const outcome = failedOutcome(facts.failed);
+  return outcome === null ? null : { outcome, resultDigest: null, storedAt: facts.failed.stoppedAt };
+}
+
+// 확정의 근거가 박자 처음에 읽은 것과 같은가. ready_result는 결과 보관 셋, failed_stopped는 확정 사실 셋을 대조한다.
+function sameBasis(planned: Facts, fresh: Facts): boolean {
+  if (planned.run.state !== fresh.run.state) return false;
+  if (fresh.run.state === "ready_result") {
+    const a = planned.settled;
+    const b = fresh.settled;
+    return a !== null && b !== null && a.resultDigest === b.resultDigest && a.storedRef === b.storedRef && a.storedAt === b.storedAt;
+  }
+  const a = planned.failed;
+  const b = fresh.failed;
+  return a !== null && b !== null && a.stoppedAt === b.stoppedAt && a.requestedCancel === b.requestedCancel && a.exit === b.exit;
 }
 
 // 지시를 적어도 되는 실행 줄인가. 실행 세대는 1 이상이고(장부는 0을 만들지 않고 받는 쪽은 0인 실행 지시를 받지 않는다), 지정 실행기는
@@ -654,10 +716,12 @@ async function act(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcom
     case "wait":
       return { runId: run.runId, outcome: "wait" };
     case "finalize":
-      // failed_stopped의 본문(outcome: failed·cancelled, stored_at)의 출처와 cleanup_pending의 정리 확인(O13)이 정해지지 않아 ready_result만 연다.
-      if (run.state !== "ready_result") return { runId: run.runId, outcome: "finalize_withheld", reason: "not_ready_result" };
+      // cleanup_pending의 정리 확인(O13)이 정해지지 않아 ready_result·failed_stopped만 연다.
+      if (run.state !== "ready_result" && run.state !== "failed_stopped") return { runId: run.runId, outcome: "finalize_withheld", reason: "not_ready_result" };
       // 확정이 이미 적힌 실행에 새 요청 ID의 확정을 또 적지 않는다(장부는 새 요청 ID면 받아 준다). 답이 없는 확정은 재전송 박자가 같은 요청 ID로 다시 보낸다.
       if (times !== null && times.lastFinalizeAt !== null) return { runId: run.runId, outcome: "finalize_withheld", reason: "already_recorded" };
+      // failed_stopped인데 outcome을 정하지 못하면 적지 않는다(failedOutcome). 그 실행은 자리를 쥔 채 남는다.
+      if (run.state === "failed_stopped" && finalizeBodyOf(plan.facts) === null) return { runId: run.runId, outcome: "finalize_withheld", reason: "outcome_unknown" };
       return finalizeOne(ctx, plan, trace);
     case "query":
       return queryOne(ctx, run, "intent");
@@ -881,8 +945,9 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   return notSent("send_answer_malformed", { delivery: "unknown" });
 }
 
-// 결과 확정. 판단이 확정을 낸 ready_result 실행(결과 보관이 장부에 반영됐다)에만 온다. 종료와 같은 차례다: 요청 ID → 다시 읽기(실행 줄·입력·
-// 지시 이력·결과 보관) → 접수 → 마지막 시계 읽기 → 판단 → 장부 포트 객체·메서드·인자 → 박자 유효 문 → 호출. 장부에 적힌 뒤에만 봉해 싣는다.
+// 결과 확정. 판단이 확정을 낸 ready_result 실행(결과 보관이 장부에 반영됐다)과 outcome을 정할 수 있는 failed_stopped 실행에만 온다.
+// 종료와 같은 차례다: 요청 ID → 다시 읽기(실행 줄·입력·지시 이력·결과 보관 또는 확정 사실) → 접수 → 마지막 시계 읽기 → 판단 →
+// 장부 포트 객체·메서드·인자 → 박자 유효 문 → 호출. 장부에 적힌 뒤에만 봉해 싣는다.
 async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcome> {
   const runId = plan.facts.run.runId;
   const requestId = freshUuid(ctx.ports.random);
@@ -894,28 +959,24 @@ async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<R
   if (!intakeOpen(ctx.ports.intake)) return { runId, outcome: "finalize_withheld", reason: "intake_closed" };
   const recordAt = readClock(ctx.ports, ctx.now);
   if (recordAt === null) return { runId, outcome: "finalize_failed", failure: "clock_unavailable" };
-  // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 확정이고, 결과 보관이 처음 읽은 것과
-  // 같고, 그 사이 확정이 적히지 않았을 때만 적는다. 마지막 시계 읽기 안에서 일어난 외부 쓰기는 보지 못한다(종료와 같다).
-  const settled = fresh.settled;
-  const planned = plan.facts.settled;
+  // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 확정이고, 확정의 근거(결과 보관
+  // 또는 확정 사실)가 처음 읽은 것과 같고, 본문을 정할 수 있고, 그 사이 확정이 적히지 않았을 때만 적는다. 마지막 시계 읽기 안에서 일어난
+  // 외부 쓰기는 보지 못한다(종료와 같다).
+  const body = finalizeBodyOf(fresh);
   if (
-    fresh.run.state !== "ready_result" ||
-    settled === null ||
-    planned === null ||
-    settled.resultDigest !== planned.resultDigest ||
-    settled.storedRef !== planned.storedRef ||
-    settled.storedAt !== planned.storedAt ||
+    !sameBasis(plan.facts, fresh) ||
+    body === null ||
     (fresh.times !== null && fresh.times.lastFinalizeAt !== null) ||
     nextIntent(viewOf(fresh, recordAt, ctx.unsentRenews), ctx.policy).intent !== "finalize"
   ) {
     return { runId, outcome: "superseded", planned: "finalize" };
   }
   const { executorId, runGeneration } = fresh.run;
-  const { resultDigest, storedAt } = settled;
+  const { outcome, resultDigest, storedAt } = body;
   const stopGeneration = ctx.stopGeneration;
   const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "finalize_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, reason });
   // 본문 세 칸(outcome·resultDigest·storedAt)을 늘 함께 넘긴다: 빼고 적은 확정은 재전송 박자가 본문을 다시 만들 수 없다.
-  const finalizeInput = { runId, requestId, stopGeneration, now: recordAt, outcome: "succeeded" as const, resultDigest, storedAt };
+  const finalizeInput = { runId, requestId, stopGeneration, now: recordAt, outcome, resultDigest, storedAt };
   const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordFinalizeInstruction, args: [finalizeInput] }; }, () => beatValid(ctx.ports));
   if (call.kind === "closed") return { runId, outcome: "beat_closed", planned: "finalize" };
   if (call.kind === "threw") return recordUnknown("threw");
@@ -945,7 +1006,7 @@ async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<R
   trace.fallback = () => notSent("draft_threw");
   let envelope: Envelope;
   try {
-    const drafted = finalizeDraft({ run: { runId, runGeneration, executorId }, requestId, stopGeneration, outcome: "succeeded", resultDigest, storedAt });
+    const drafted = finalizeDraft({ run: { runId, runGeneration, executorId }, requestId, stopGeneration, outcome, resultDigest, storedAt });
     if (!drafted.ok) return notSent(drafted.reason, { field: drafted.field });
     let sealed: ReturnType<typeof sealDraft>;
     try {

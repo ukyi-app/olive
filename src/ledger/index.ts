@@ -12,6 +12,7 @@ export {
   type ExecutorAnswerInput,
   type ExecutorAnswerResult,
   type ExecutorAnswerUnsaved,
+  type FailedStop,
   FINALIZE_OUTCOMES,
   type FinalizeInstructionInput,
   type FinalizeOutcome,

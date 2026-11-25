@@ -133,6 +133,8 @@ export interface Captured {
   lines?: { value: AnswerLines; ports: AnswerLinePorts };
   // 박자마다 마지막으로 넘긴 포트 묶음(박자 유효 문의 같은 객체 단언).
   beatPorts?: Partial<Record<"linkLoss" | "resultCheck" | "life" | "resend" | "unreceived" | "assign", { readonly beatValid?: () => boolean }>>;
+  // 결과 검사 박자에 마지막으로 넘긴 정책(설정의 같은 객체 단언).
+  resultCheckPolicy?: unknown;
   pumps: number;
   delivers: number;
 }
@@ -190,9 +192,10 @@ export function capturingMakers(captured: Captured, trace: Trace, over: Partial<
         (captured.beatPorts ??= {}).linkLoss = ports;
         return linkLossTick(ports, policy, input);
       },
-      resultCheck: (ports, now) => {
+      resultCheck: (ports, now, policy) => {
         (captured.beatPorts ??= {}).resultCheck = ports;
-        return resultCheckTick(ports, now);
+        captured.resultCheckPolicy = policy;
+        return resultCheckTick(ports, now, policy);
       },
       life: (ports, policy, input) => {
         (captured.beatPorts ??= {}).life = ports;
@@ -281,6 +284,7 @@ export function baseSettings(ledgerPath: string, results: string, over: Partial<
       originOf: () => undefined,
     },
     life: { renewEveryMs: 10_000, answerTimeoutMs: 20_000 },
+    resultCheck: { reportWaitMs: 60_000 },
     cycle: { judgeMs: 30_000, resendEveryMs: 5_000, assignCallsPerBeat: 1 },
     connection: {},
     maxPendingWriteBytes: 262_144,

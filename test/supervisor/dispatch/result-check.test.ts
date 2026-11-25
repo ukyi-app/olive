@@ -8,6 +8,7 @@ import { RESTORE_KEY } from "../../../src/ledger/ledger.ts";
 import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import {
   type PendingResult,
+  type ResultCheckPolicy,
   type ResultCheckPorts,
   type ResultCheckTickResult,
   resultCheckTick,
@@ -414,6 +415,293 @@ describe("재시작", () => {
     const w = world(ledger, path);
     expect(ranOf(resultCheckTick(w.ports, AT)).runs).toEqual([{ runId: run.runId, outcome: "judged", reportId: result.reportId, resultDigest: result.resultDigest, state: "ready_result" }]);
     expect(ledger.settledResult(run.runId)).toEqual({ known: true, value: { runId: run.runId, resultDigest: result.resultDigest, storedRef: result.storedRef, storedAt: NOW + 2 } });
+  });
+});
+
+// 결과 보고 없는 checking의 기한(D-113). 기한 숫자는 이 시험이 지어 넣는 값이다(운영 값은 src/main/supervisor.ts).
+const WAIT = 60_000;
+const WAITING: ResultCheckPolicy = { reportWaitMs: WAIT };
+// checking()은 completed 종료 영수증을 NOW + 1에 적는다. 실행 줄의 updated_at이 그 시각이다.
+const SINCE = NOW + 1;
+
+// 실제 순서기에 실제 결과 검사·수명 박자를 묶는다(위 "한 줄"과 같은 꼴, 기한 정책만 넘긴다).
+function line(policy: ResultCheckPolicy | undefined) {
+  let wall = NOW + 10;
+  const shared = createSharedClock({ now: () => wall });
+  const ledger = ready(open(tempPath(), { clock: () => shared.now() }));
+  const marks: unknown[] = [];
+  const sent: Envelope[] = [];
+  const intake = { intakeOpen: () => ledger.intakeOpen(), stopGeneration: () => 0 };
+  const idle = (kind: string) => ({ kind: "not_run", reason: kind }) as never;
+  const cycle = createCycle({
+    beats: {
+      linkLoss: () => idle("link_loss"),
+      resultCheck: (now) =>
+        resultCheckTick(
+          {
+            ledger: {
+              listRuns: () => ledger.listRuns(),
+              pendingReports: () => ledger.pendingReports(),
+              markResult: (input) => {
+                marks.push(input);
+                return ledger.markResult(input);
+              },
+            },
+            intake,
+            beatValid: () => true,
+          },
+          now,
+          policy,
+        ),
+      life: (clock, input) =>
+        lifeTick(
+          {
+            ledger,
+            intake,
+            links: { mayIssue: () => ({ ok: true }) },
+            clock,
+            random: { bytes: (length) => getRandomValues(new Uint8Array(length)) },
+            signer: { seal: (draft) => sealEnvelope(draft, keys.privateKey) },
+            sink: {
+              send: async (envelope) => {
+                sent.push(envelope);
+                return "sent";
+              },
+            },
+            beatValid: () => true,
+          },
+          { renewEveryMs: 10_000, answerTimeoutMs: 20_000 },
+          input,
+        ),
+      resend: async () => idle("resend"),
+      unreceived: () => idle("unreceived"),
+      assign: async () => idle("assign"),
+    },
+    serverTick: () => {},
+    ledgerClock: shared,
+    monotonic: { now: () => 1 },
+    restoreDone: () => true,
+    ledger,
+    policy: { judgeMs: 30_000, resendEveryMs: 5_000, assignCallsPerBeat: 1 },
+  });
+  const beat = async (at: number) => {
+    wall = at;
+    const report = await cycle.beat();
+    if (report.kind !== "ran" || report.resultCheck.kind !== "returned" || report.life.kind !== "returned" || report.life.result.kind !== "ran") throw new Error(JSON.stringify(report));
+    return { resultCheck: report.resultCheck.result, life: report.life.result };
+  };
+  return { ledger, marks, sent, beat };
+}
+
+// 수명 박자 한 번(실제 장부, 고정 시계, 연결은 늘 열림).
+async function lifeOnce(ledger: Ledger, at: number) {
+  const sent: Envelope[] = [];
+  const result = await lifeTick(
+    {
+      ledger,
+      intake: { intakeOpen: () => ledger.intakeOpen(), stopGeneration: () => 0 },
+      links: { mayIssue: () => ({ ok: true }) },
+      clock: { now: () => at },
+      random: { bytes: (length) => getRandomValues(new Uint8Array(length)) },
+      signer: { seal: (draft) => sealEnvelope(draft, keys.privateKey) },
+      sink: {
+        send: async (envelope) => {
+          sent.push(envelope);
+          return "sent";
+        },
+      },
+      beatValid: () => true,
+    },
+    { renewEveryMs: 10_000, answerTimeoutMs: 20_000 },
+    { lastQueries: [], unsentRenews: [] },
+  );
+  if (result.kind !== "ran") throw new Error(JSON.stringify(result));
+  return { runs: result.runs, sent: sent.map((envelope) => [envelope.header.action, envelope.body]) };
+}
+
+// 소유자 입력에 이은 작업자 실행을 시작·접수하고, 그 입력의 취소와 사유 requested의 취소 지시를 NOW + 1에 적는다.
+function cancelledRun(ledger: Ledger) {
+  const owner = id();
+  must(ledger.enqueueInput({ requestId: owner, source: "admin-dm", sourceRef: { ref: `inbox/${id()}`, expiresAt: NOW + 3_600_000 }, receivedAt: NOW }));
+  const run = must(ledger.admitRun(worker({ inputRequestId: owner }))).run;
+  const requestId = id();
+  must(ledger.startRun({ runId: run.runId, requestId, stopGeneration: 0, now: NOW }));
+  const sender = from(run);
+  must(ledger.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: run.runId, instructionRequestId: requestId, bodyDigest: digest(`accepted:${run.runId}`), now: NOW }, sender));
+  must(ledger.cancelInput(owner, NOW + 1));
+  must(ledger.recordStopInstruction({ runId: run.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1, reason: "requested" }));
+  return { runId: run.runId, from: sender };
+}
+
+describe("결과 보고 없는 checking의 기한(D-113)과 그 실패 확정(D-114)", () => {
+  test("한 줄: completed 종료 뒤 보고가 없으면 기한 전에는 0, 기한 정각에 failed_stopped로 판정하고 같은 박자의 수명 박자가 확정(failed, 판정 시각)을 적고 내보낸다", async () => {
+    const l = line(WAITING);
+    const run = checking(l.ledger);
+    const before = await l.beat(SINCE + WAIT - 1);
+    expect(before.resultCheck).toEqual({ kind: "ran", runs: [{ runId: run.runId, outcome: "waiting" }], halted: null, haltedAt: null });
+    expect([l.marks, l.sent, stateOf(l.ledger, run.runId)]).toEqual([[], [], "checking"]);
+
+    const at = await l.beat(SINCE + WAIT);
+    expect(at.resultCheck).toEqual({ kind: "ran", runs: [{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }], halted: null, haltedAt: null });
+    // 결과 없음 판정은 보고 ID 없이 부른다.
+    expect(l.marks).toStrictEqual([{ runId: run.runId, resultDigest: null, now: SINCE + WAIT }]);
+    expect(l.ledger.failedStop(run.runId)).toEqual({ known: true, value: { runId: run.runId, stoppedAt: SINCE + WAIT, requestedCancel: false, exit: "completed" } });
+    expect(at.life.runs).toEqual([expect.objectContaining({ runId: run.runId, outcome: "finalize_sent" })]);
+    expect(l.sent.map((envelope) => [envelope.header.action, envelope.body])).toEqual([["result_finalize", { run_id: run.runId, outcome: "failed", result_digest: null, stored_at: SINCE + WAIT }]]);
+    const unanswered = l.ledger.unansweredInstructions();
+    expect(unanswered.known ? unanswered.value.instructions.filter((item) => item.action === "result_finalize").map((item) => item.rebuild) : unanswered).toEqual([
+      { action: "result_finalize", outcome: "failed", resultDigest: null, storedAt: SINCE + WAIT },
+    ]);
+
+    // 늦게 온 결과 보고는 장부가 transition_denied로 거절한다(ack 없음, 반영 전 보고에 남지 않음).
+    const late = l.ledger.recordReport({ reportId: id(), action: "report_result", runId: run.runId, bodyDigest: digest("late"), storedRef: `results/${id()}`, resultDigest: digest("늦은 결과"), signal: null, now: SINCE + WAIT + 1 }, run.from);
+    expect(late).toEqual({ ok: false, reason: "transition_denied" });
+    expect(pendingIds(l.ledger)).toEqual([]);
+    // 다음 박자는 그 실행을 다시 판정하지 않고 확정을 또 적지 않는다.
+    const after = await l.beat(SINCE + WAIT + 1_000);
+    expect(after.resultCheck).toEqual({ kind: "ran", runs: [], halted: null, haltedAt: null });
+    expect([l.marks.length, l.sent.length, stateOf(l.ledger, run.runId)]).toEqual([1, 1, "failed_stopped"]);
+  });
+
+  test("취소 지시(requested) 뒤 cancelled로 끝난 실행은 결과 검사를 거치지 않고 확정 outcome cancelled, stored_at은 failed_stopped가 된 시각이다", async () => {
+    const w = world();
+    const run = cancelledRun(w.ledger);
+    must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: run.runId, exit: "cancelled", bodyDigest: digest("stopped cancelled"), now: NOW + 2 }, run.from));
+    expect(resultCheckTick(w.ports, NOW + 2 + WAIT, WAITING)).toEqual({ kind: "ran", runs: [], halted: null, haltedAt: null });
+    expect(w.marks).toEqual([]);
+    const life = await lifeOnce(w.ledger, NOW + 10_000);
+    expect(life.runs).toEqual([expect.objectContaining({ runId: run.runId, outcome: "finalize_sent" })]);
+    expect(life.sent).toEqual([["result_finalize", { run_id: run.runId, outcome: "cancelled", result_digest: null, stored_at: NOW + 2 }]]);
+  });
+
+  test("취소 지시(requested)가 적혔는데 completed로 끝나고 보고가 없으면 기한 뒤 판정하고 확정 outcome은 cancelled다", async () => {
+    const w = world();
+    const run = cancelledRun(w.ledger);
+    must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: run.runId, exit: "completed", bodyDigest: digest("stopped completed"), now: NOW + 2 }, run.from));
+    expect(ranOf(resultCheckTick(w.ports, NOW + 2 + WAIT, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: NOW + 2, state: "failed_stopped" }]);
+    const life = await lifeOnce(w.ledger, NOW + 2 + WAIT + 1);
+    expect(life.sent).toEqual([["result_finalize", { run_id: run.runId, outcome: "cancelled", result_digest: null, stored_at: NOW + 2 + WAIT }]]);
+  });
+
+  test("기한 직전에 보고가 오면 기한 정각의 박자는 그 보고로 ready_result를 판정한다(결과 없음 판정 0)", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    const result = report(w.ledger, run, "직전 본문", SINCE + WAIT - 1);
+    expect(ranOf(resultCheckTick(w.ports, SINCE + WAIT, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "judged", reportId: result.reportId, resultDigest: result.resultDigest, state: "ready_result" }]);
+    expect(w.marks).toEqual([{ runId: run.runId, resultDigest: result.resultDigest, reportId: result.reportId, now: SINCE + WAIT }]);
+    expect(w.ledger.failedStop(run.runId)).toEqual({ known: true, value: null });
+  });
+
+  test("기한 1ms 전, 정책 없음, 시계가 그 시각보다 뒤, checking 시각을 읽지 못함이면 기다린다(장부 호출 0)", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    expect(ranOf(resultCheckTick(w.ports, SINCE + WAIT - 1, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "waiting" }]);
+    expect(ranOf(resultCheckTick(w.ports, SINCE + 10 * WAIT)).runs).toEqual([{ runId: run.runId, outcome: "waiting" }]);
+    expect(ranOf(resultCheckTick(w.ports, SINCE - 1, { reportWaitMs: 1 })).runs).toEqual([{ runId: run.runId, outcome: "waiting" }]);
+    for (const updatedAt of [undefined, 0, 1.5, "x"]) {
+      w.wrap({
+        listRuns: () => {
+          const read = w.ledger.listRuns();
+          return read.known ? { known: true, value: read.value.map((row) => ({ ...row, updatedAt })) } : read;
+        },
+      } as never);
+      expect([String(updatedAt), ranOf(resultCheckTick(w.ports, SINCE + WAIT, WAITING)).runs]).toEqual([String(updatedAt), [{ runId: run.runId, outcome: "waiting" }]]);
+    }
+    expect([w.marks.length, stateOf(w.ledger, run.runId)]).toEqual([0, "checking"]);
+  });
+
+  test("기한 정책의 꼴이 틀리면 돌지 않는다", () => {
+    const w = world();
+    checking(w.ledger);
+    for (const reportWaitMs of [0, -1, 1.5, Number.NaN, "60000"]) {
+      expect([String(reportWaitMs), resultCheckTick(w.ports, SINCE + WAIT, { reportWaitMs } as never)]).toEqual([String(reportWaitMs), { kind: "not_run", reason: "policy_malformed" }]);
+    }
+    expect(w.marks).toEqual([]);
+  });
+
+  test("기한이 지나도 복원 전·정지 중·접수 문 닫힘·장부 읽기 모름이면 결과 없음 판정 0", () => {
+    const path = tempPath();
+    const first = ready(open(path));
+    const run = checking(first);
+    first.close();
+    // 다시 연 장부는 복원 5단계의 접수 허가 전이다.
+    const reopened = world(open(path), path);
+    expect(resultCheckTick(reopened.ports, SINCE + WAIT, WAITING)).toEqual({ kind: "not_run", reason: "intake_closed" });
+    expect(reopened.marks).toEqual([]);
+    reopened.ledger.close();
+
+    const w = world();
+    const other = checking(w.ledger);
+    w.setIntake(false);
+    expect(resultCheckTick(w.ports, SINCE + WAIT, WAITING)).toEqual({ kind: "not_run", reason: "intake_closed" });
+    w.setIntake(true);
+    const cases: [string, Partial<ResultCheckPorts["ledger"]>, "runs" | "reports"][] = [
+      ["실행 모름", { listRuns: () => ({ known: false, reason: "db_error" }) as never }, "runs"],
+      ["실행 던짐", { listRuns: () => {
+        throw new Error("읽기 실패");
+      } }, "runs"],
+      ["보고 모름", { pendingReports: () => ({ known: false, reason: "db_error" }) as never }, "reports"],
+      ["보고 던짐", { pendingReports: () => {
+        throw new Error("읽기 실패");
+      } }, "reports"],
+    ];
+    for (const [name, over, read] of cases) {
+      w.wrap(over);
+      expect([name, resultCheckTick(w.ports, SINCE + WAIT, WAITING)]).toEqual([name, { kind: "not_run", reason: "read_unknown", read }]);
+    }
+    w.wrap({});
+    must(w.ledger.applyStop({ generation: 1, stopped: true, now: NOW + 3 }));
+    expect(resultCheckTick(w.ports, SINCE + WAIT, WAITING)).toEqual({ kind: "not_run", reason: "intake_closed" });
+    expect([w.marks.length, stateOf(w.ledger, other.runId), run.runId === other.runId]).toEqual([0, "checking", false]);
+  });
+
+  test("결과 없음 판정 직전의 접수 문이나 박자 유효 문이 닫히면 그 실행부터 부르지 않고 멈춘다", () => {
+    for (const [close, halt] of [
+      ["intake", "intake_closed"],
+      ["valid", "beat_closed"],
+    ] as const) {
+      const w = world();
+      const one = checking(w.ledger);
+      const r1 = report(w.ledger, one, "하나");
+      // 둘째 실행은 보고 없이 기한이 지난 checking이다. 첫 실행의 판정이 장부에 닿은 뒤 문을 닫는다.
+      const second = id();
+      w.wrap({
+        listRuns: () => {
+          const read = w.ledger.listRuns();
+          return read.known ? { known: true, value: [...read.value, { ...read.value[0]!, runId: second, state: "checking", updatedAt: SINCE }] } : read;
+        },
+        markResult: ((input: Parameters<Ledger["markResult"]>[0]) => {
+          const answer = w.ledger.markResult(input);
+          if (close === "intake") w.setIntake(false);
+          else w.setValid(false);
+          return answer;
+        }) as never,
+      });
+      expect([close, resultCheckTick(w.ports, SINCE + WAIT, WAITING)]).toEqual([
+        close,
+        { kind: "ran", runs: [{ runId: one.runId, outcome: "judged", reportId: r1.reportId, resultDigest: r1.resultDigest, state: "ready_result" }], halted: halt, haltedAt: second },
+      ]);
+      expect([close, w.marks.length]).toEqual([close, 1]);
+    }
+  });
+
+  test("결과 없음 판정의 거절은 그 실행의 결과(reportId null)이고, 답이 failed_stopped가 아니거나 digest가 있으면 멈춘다", () => {
+    const answers: [string, (input: { runId: string }) => unknown, Record<string, unknown>, string | null][] = [
+      ["거절", () => ({ ok: false, reason: "transition_denied" }), { outcome: "refused", reportId: null, reason: "transition_denied" }, null],
+      ["상태가 ready_result", (input) => ({ ok: true, run: { runId: input.runId, state: "ready_result", resultDigest: null } }), { outcome: "ledger_failed", reportId: null, reason: "malformed_answer" }, "threw"],
+      ["digest가 있음", (input) => ({ ok: true, run: { runId: input.runId, state: "failed_stopped", resultDigest: digest("x") } }), { outcome: "ledger_failed", reportId: null, reason: "malformed_answer" }, "threw"],
+      ["던짐", () => {
+        throw new Error("쓰기 실패");
+      }, { outcome: "ledger_failed", reportId: null, reason: "threw" }, "threw"],
+    ];
+    for (const [name, answer, expected, halted] of answers) {
+      const w = world();
+      const run = checking(w.ledger);
+      w.wrap({ markResult: answer as never });
+      const result = ranOf(resultCheckTick(w.ports, SINCE + WAIT, WAITING));
+      expect([name, result.runs as unknown[], result.halted]).toEqual([name, [{ runId: run.runId, ...expected }], halted]);
+      expect([name, stateOf(w.ledger, run.runId)]).toEqual([name, "checking"]);
+    }
   });
 });
 

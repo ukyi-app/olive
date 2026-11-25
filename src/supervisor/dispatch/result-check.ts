@@ -1,12 +1,14 @@
 // 결과 검사의 한 박자. checking에 머문 작업자 실행마다 반영 전 결과 보고를 모으고, 판정 자리(resultVerdict)가 통과로 낸 결과만
-// 장부의 markResult로 ready_result에 옮긴다. 확정(result_finalize)은 이 박자가 아니라 수명 박자가 settledResult를 보고 낸다.
-// 장부·접수·박자 유효 문은 포트로, 판정 시각(now)은 순서기가 부르기 직전에 다시 읽은 장부 시계로 받는다.
+// 장부의 markResult로 ready_result에 옮긴다. 반영 전 결과 보고가 없는 채 checking이 된 지 기한(policy.reportWaitMs)이 지난 실행은
+// markResult(null)로 failed_stopped에 옮긴다(D-113). 확정(result_finalize)은 이 박자가 아니라 수명 박자가 낸다.
+// 장부·접수·박자 유효 문은 포트로, 판정 시각(now)은 순서기가 부르기 직전에 다시 읽은 장부 시계로, 기한은 정책 인자로 받는다.
 // 소켓·타이머·시계·난수를 직접 부르지 않는다. 쥐는 것은 이 모듈의 박자가 진행 중이라는 표시 하나다(돌아오면 지운다).
 //
 // 지키는 것(result-check.md "판단의 차례"):
 // 1. 모름은 판정하지 않는다. 실행 목록이나 반영 전 보고 목록을 읽지 못하거나 한 줄이라도 칸을 읽지 못하면 장부를 부르지 않는다.
 //    보고 한 줄을 건너뛰고 판정하면 그 실행의 다른 digest를 보지 못한 채 판정해, 장부가 그 보고를 충돌로 닫는다.
 // 2. 판정은 그 실행의 반영 전 결과 보고가 정확히 한 digest일 때만이다. 다른 digest가 함께 있으면 판정하지 않고 digest_conflict로 남긴다.
+//    결과 없음 판정은 반영 전 결과 보고가 하나도 없고, 실행 줄의 updated_at(checking이 된 시각)부터 now까지 기한 이상일 때만이다.
 // 3. markResult에는 늘 그 보고의 reportId를 넘긴다. 장부가 그 보고가 이 실행의 반영 전 보고이고 digest가 같은지 대조해(아니면
 //    reference_mismatch) 판정이 이 박자가 본 보고를 정확히 가리킨다. 확정을 여는 데에는 필요 없다: 빠져도 장부는 판정하면서
 //    그 실행의 반영 전 결과 보고를 모두 반영한다.
@@ -33,6 +35,12 @@ export interface PendingResult {
   readonly storedRef: string;
 }
 
+// 결과 없음 판정의 기한. 운영 값은 감독 설정 한 자리(src/main/supervisor.ts의 RESULT_CHECK)다.
+export interface ResultCheckPolicy {
+  // checking이 된 뒤 반영 전 결과 보고 없이 기다리는 시간(ms, 양의 안전 정수). 정각(경과 = 이 값)부터 결과 없음으로 판정한다.
+  readonly reportWaitMs: number;
+}
+
 export type ResultVerdict =
   // 그 digest로 판정한다. reportId는 그 digest의 첫 보고다(같은 digest의 나머지는 장부가 함께 반영한다).
   | { readonly kind: "pass"; readonly resultDigest: string; readonly reportId: string }
@@ -41,8 +49,8 @@ export type ResultVerdict =
   // 서로 다른 digest의 보고가 함께 있다. 판정하지 않는다. digests는 서로 다른 digest의 수다.
   | { readonly kind: "conflict"; readonly digests: number };
 
-// 결과 검사의 판정 자리. 관리자 결정을 기다리는 세 가지가 모두 여기서 갈린다:
-// - 보고가 없는 checking(Q-H3): 기다린다. 기한과 결과 없음 판정은 정하지 않았다.
+// 결과 검사의 판정 자리. 판정에 걸린 결정 셋이 여기서 갈린다:
+// - 보고가 없는 checking(D-113): 여기서는 기다림이다. 기한이 지났는지는 박자가 실행 줄의 시각으로 따로 본다.
 // - 감독이 직접 검사할 범위(Q-H1): 반영 전 결과 보고가 정확히 한 digest인지만 본다.
 // - 결과 outcome이 failed·needs_input인 결과(Q-H5): 장부의 보고 줄에는 outcome이 없고 이 박자는 보관소 본문을 읽지 않으므로,
 //   digest가 있는 결과는 모두 통과다. outcome으로 가르려면 보관소 읽기 포트가 함께 필요하다.
@@ -56,6 +64,8 @@ export function resultVerdict(reports: readonly PendingResult[]): ResultVerdict 
 
 export type ResultCheckNotRun =
   | "now_malformed"
+  // 정책 인자가 있는데 기한이 양의 안전 정수가 아니다.
+  | "policy_malformed"
   | "tick_in_progress"
   // 박자 처음의 접수 문이 닫혔거나 읽지 못했다.
   | "intake_closed"
@@ -73,13 +83,17 @@ export type ResultCheckHalt =
 export type ResultCheckOutcome =
   // 장부가 판정을 적었다고 답했다. state는 답의 실행 줄 상태다.
   | { readonly runId: string; readonly outcome: "judged"; readonly reportId: string; readonly resultDigest: string; readonly state: LedgerRunState }
-  // 반영 전 결과 보고가 없다(Q-H3 대기). 장부를 부르지 않았다.
+  // 반영 전 결과 보고가 없고 기한 전이다(또는 정책 인자가 없거나 checking이 된 시각을 읽지 못했다). 장부를 부르지 않았다.
   | { readonly runId: string; readonly outcome: "waiting" }
+  // 반영 전 결과 보고 없이 기한이 지나 장부가 결과 없음 판정을 적었다고 답했다(failed_stopped). checkingSince는 판정에 쓴 실행 줄의
+  // updated_at이다. 조립이 감독 기록에 경보 한 줄을 남긴다.
+  | { readonly runId: string; readonly outcome: "no_result"; readonly checkingSince: number; readonly state: LedgerRunState }
   // 서로 다른 digest의 반영 전 결과 보고가 있다. 장부를 부르지 않았다. 조립이 감독 기록에 경보 한 줄을 남긴다.
   | { readonly runId: string; readonly outcome: "digest_conflict"; readonly digests: number; readonly reports: number }
-  | { readonly runId: string; readonly outcome: "refused"; readonly reportId: string; readonly reason: LedgerRefusal }
+  // reportId는 판정에 넘긴 보고 ID다. 결과 없음 판정이면 null(보고를 넘기지 않는다).
+  | { readonly runId: string; readonly outcome: "refused"; readonly reportId: string | null; readonly reason: LedgerRefusal }
   // 장부가 적었는지 모른다. 장부의 문구는 싣지 않는다.
-  | { readonly runId: string; readonly outcome: "ledger_failed"; readonly reportId: string; readonly reason: "threw" | "malformed_answer" };
+  | { readonly runId: string; readonly outcome: "ledger_failed"; readonly reportId: string | null; readonly reason: "threw" | "malformed_answer" };
 
 export type ResultCheckTickResult =
   | { readonly kind: "not_run"; readonly reason: Exclude<ResultCheckNotRun, "read_unknown"> }
@@ -107,11 +121,12 @@ const isState = (value: unknown): value is LedgerRunState => (LEDGER_RUN_STATES 
 // 장부 객체를 얻는 ports.ledger 접근자도 외부 코드다.
 let running = false;
 
-export function resultCheckTick(ports: ResultCheckPorts, now: number): ResultCheckTickResult {
+// policy가 없으면 결과 없음 판정을 하지 않는다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
+export function resultCheckTick(ports: ResultCheckPorts, now: number, policy?: ResultCheckPolicy): ResultCheckTickResult {
   if (running) return { kind: "not_run", reason: "tick_in_progress" };
   running = true;
   try {
-    return tickOnce(ports, now);
+    return tickOnce(ports, now, policy);
   } finally {
     running = false;
   }
@@ -131,16 +146,22 @@ function beatValid(ports: ResultCheckPorts): boolean {
   return holdBeatValid(ports)();
 }
 
-// checking인 작업자 실행 ID를 실행 목록의 차례대로. 모든 줄의 실행 ID·종류·상태를 칸마다 한 번 읽는다. 한 줄이라도 읽지 못하거나
+// checking인 작업자 실행을 실행 목록의 차례대로. 모든 줄의 실행 ID·종류·상태를 칸마다 한 번 읽는다. 한 줄이라도 읽지 못하거나
 // 꼴이 틀리거나 같은 실행 ID가 둘이면 목록 전체가 모름이다(그 줄이 checking 실행일 수 있다).
-function readChecking(ports: ResultCheckPorts): string[] | null {
+// checking 줄은 updated_at도 한 번 읽는다. checking으로 오는 길은 completed 종료 영수증 하나라 그 시각이 영수증을 받은 시각이다.
+// 그 칸만 꼴이 틀리면 since가 null이고 그 실행은 결과 없음으로 판정하지 않는다(통과 판정은 이 칸을 쓰지 않는다).
+interface CheckingRun {
+  readonly runId: string;
+  readonly since: number | null;
+}
+function readChecking(ports: ResultCheckPorts): CheckingRun[] | null {
   try {
     const answer: unknown = ports.ledger.listRuns();
     if (!isObject(answer) || answer.known !== true) return null;
     const value: unknown = answer.value;
     if (!Array.isArray(value)) return null;
     const seen = new Set<string>();
-    const checking: string[] = [];
+    const checking: CheckingRun[] = [];
     const length = value.length;
     for (let index = 0; index < length; index += 1) {
       const row: unknown = value[index];
@@ -150,7 +171,9 @@ function readChecking(ports: ResultCheckPorts): string[] | null {
       const state: unknown = row.state;
       if (!isUuid(runId) || (kind !== "worker" && kind !== "session") || !isState(state) || seen.has(runId)) return null;
       seen.add(runId);
-      if (kind === "worker" && state === "checking") checking.push(runId);
+      if (kind !== "worker" || state !== "checking") continue;
+      const since: unknown = row.updatedAt;
+      checking.push({ runId, since: isTime(since) ? since : null });
     }
     return checking;
   } catch {
@@ -193,8 +216,21 @@ function readPending(ports: ResultCheckPorts): Map<string, PendingResult[]> | nu
 
 type Judged = { readonly outcome: ResultCheckOutcome | null; readonly halt: ResultCheckHalt | null };
 
-function tickOnce(ports: ResultCheckPorts, now: number): ResultCheckTickResult {
+// 기한. 정책 인자가 없으면 null(결과 없음 판정 없음), 칸을 읽지 못하거나 꼴이 틀리면 undefined다.
+function waitOf(policy: ResultCheckPolicy | undefined): number | null | undefined {
+  if (policy === undefined) return null;
+  try {
+    const wait: unknown = policy.reportWaitMs;
+    return isTime(wait) ? wait : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function tickOnce(ports: ResultCheckPorts, now: number, policy: ResultCheckPolicy | undefined): ResultCheckTickResult {
   if (!isTime(now)) return { kind: "not_run", reason: "now_malformed" };
+  const wait = waitOf(policy);
+  if (wait === undefined) return { kind: "not_run", reason: "policy_malformed" };
   if (!intakeOpen(ports)) return { kind: "not_run", reason: "intake_closed" };
   const checking = readChecking(ports);
   if (checking === null) return { kind: "not_run", reason: "read_unknown", read: "runs" };
@@ -202,10 +238,17 @@ function tickOnce(ports: ResultCheckPorts, now: number): ResultCheckTickResult {
   if (pending === null) return { kind: "not_run", reason: "read_unknown", read: "reports" };
 
   const runs: ResultCheckOutcome[] = [];
-  for (const runId of checking) {
+  for (const { runId, since } of checking) {
     const verdict = resultVerdict(pending.get(runId) ?? []);
     if (verdict.kind === "wait") {
-      runs.push({ runId, outcome: "waiting" });
+      // 기한 정각부터 판정한다. 시계가 그 시각보다 뒤로 갔으면(now < since) 경과가 음수라 기다린다.
+      if (wait === null || since === null || now - since < wait) {
+        runs.push({ runId, outcome: "waiting" });
+        continue;
+      }
+      const judged = mark(ports, runId, { resultDigest: null, since }, now);
+      if (judged.outcome !== null) runs.push(judged.outcome);
+      if (judged.halt !== null) return { kind: "ran", runs, halted: judged.halt, haltedAt: runId };
       continue;
     }
     if (verdict.kind === "conflict") {
@@ -230,11 +273,16 @@ function gateOpen(ports: ResultCheckPorts, shut: { halt: Exclude<ResultCheckHalt
   return beatValid(ports);
 }
 
-// 판정 하나. 인자는 문보다 먼저 만든다. callAfterGate가 장부 포트 수신자·메서드·인자 원소를 얻고 → 문 → 호출 하나다.
+// 판정 하나: 통과(그 digest와 첫 보고 ID) 또는 결과 없음(digest null, 보고 ID 없음). 결과 없음은 장부에 reportId를 넘기지 않는다:
+// 반영할 보고가 없고, 장부는 판정하면서 그 실행의 반영 전 결과 보고를 모두 닫는다.
+type Judgement = { readonly resultDigest: string; readonly reportId: string } | { readonly resultDigest: null; readonly since: number };
+
+// 인자는 문보다 먼저 만든다. callAfterGate가 장부 포트 수신자·메서드·인자 원소를 얻고 → 문 → 호출 하나다.
 // 답의 칸은 예외 처리 안에서 칸마다 한 번만 읽는다.
-function mark(ports: ResultCheckPorts, runId: string, verdict: Extract<ResultVerdict, { kind: "pass" }>, now: number): Judged {
-  const { reportId, resultDigest } = verdict;
-  const markInput = { runId, resultDigest, reportId, now };
+function mark(ports: ResultCheckPorts, runId: string, judgement: Judgement, now: number): Judged {
+  const resultDigest = judgement.resultDigest;
+  const reportId = judgement.resultDigest === null ? null : judgement.reportId;
+  const markInput = judgement.resultDigest === null ? { runId, resultDigest: null, now } : { runId, resultDigest: judgement.resultDigest, reportId: judgement.reportId, now };
   const shut: { halt: Exclude<ResultCheckHalt, "threw"> } = { halt: "beat_closed" };
   const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markResult, args: [markInput] }; }, () => gateOpen(ports, shut));
   if (call.kind === "closed") return { outcome: null, halt: shut.halt };
@@ -254,8 +302,11 @@ function mark(ports: ResultCheckPorts, runId: string, verdict: Extract<ResultVer
     const answeredId: unknown = run.runId;
     const state: unknown = run.state;
     const digest: unknown = run.resultDigest;
-    if (answeredId !== runId || digest !== resultDigest || !isState(state) || !JUDGED.includes(state)) return failed("malformed_answer");
-    return { outcome: { runId, outcome: "judged", reportId, resultDigest, state }, halt: null };
+    if (answeredId !== runId || digest !== resultDigest || !isState(state)) return failed("malformed_answer");
+    // 결과 없음은 보고 ID 없이 부르므로 장부는 checking에서 옮길 때만 ok로 답한다(이미 판정된 실행이면 transition_denied).
+    if (judgement.resultDigest === null) return state === "failed_stopped" ? { outcome: { runId, outcome: "no_result", checkingSince: judgement.since, state }, halt: null } : failed("malformed_answer");
+    if (!JUDGED.includes(state)) return failed("malformed_answer");
+    return { outcome: { runId, outcome: "judged", reportId: judgement.reportId, resultDigest: judgement.resultDigest, state }, halt: null };
   } catch {
     return failed("malformed_answer");
   }

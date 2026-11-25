@@ -37,7 +37,7 @@ import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import { resendTick } from "../dispatch/resend.ts";
-import { type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
+import { type ResultCheckPolicy, type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
 import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
@@ -111,6 +111,8 @@ export interface SupervisorSettings {
   readonly credentials: CredentialRefPolicy;
   readonly assign: AssignLoopPolicy;
   readonly life: LifecyclePolicy;
+  // 결과 검사 박자의 결과 없음 판정 기한(D-113).
+  readonly resultCheck: ResultCheckPolicy;
   readonly cycle: CyclePolicy;
   readonly connection: ConnectionSettings;
   readonly maxPendingWriteBytes: number;
@@ -553,12 +555,17 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     reconnectWindowMs: settings.connection.reconnect?.windowMs ?? null,
   };
 
-  // 결과 검사가 판정하지 않은 digest 충돌의 경보. 충돌한 실행마다 이 프로세스에서 한 줄만 남긴다: 판정하지 않은 보고는 반영 전으로 남아
-  // 박자마다 같은 충돌이 다시 나온다. 기억은 메모리뿐이라 감독이 다시 뜨면 다시 한 줄을 남긴다.
+  // 결과 검사의 경보 둘. 판정하지 않은 digest 충돌은 충돌한 실행마다 이 프로세스에서 한 줄만 남긴다: 판정하지 않은 보고는 반영 전으로
+  // 남아 박자마다 같은 충돌이 다시 나온다. 기억은 메모리뿐이라 감독이 다시 뜨면 다시 한 줄을 남긴다. 결과 없음 판정(D-113)은 장부가
+  // 적었다고 답한 판정마다 한 줄이다(그 실행은 다음 박자에 checking이 아니므로 다시 나오지 않는다).
   const conflicted = new Set<string>();
   const alertConflicts = (report: BeatReport): void => {
     if (report.kind !== "ran" || report.resultCheck.kind !== "returned" || report.resultCheck.result.kind !== "ran") return;
     for (const run of report.resultCheck.result.runs) {
+      if (run.outcome === "no_result") {
+        log("result_check_alert", { reason: "no_result", runId: run.runId, checkingSince: run.checkingSince });
+        continue;
+      }
       if (run.outcome !== "digest_conflict" || conflicted.has(run.runId)) continue;
       conflicted.add(run.runId);
       log("result_check_alert", { reason: "digest_conflict", runId: run.runId, digests: run.digests, reports: run.reports });
@@ -576,7 +583,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     linkLoss: (clocks, policy, input) =>
       make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
     // 판정은 접수 문을 본다: 정지 중·허가 폐기·복원 전에는 확정도 열리지 않으므로 판정만 앞당기지 않는다(result-check.md "접수").
-    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen }, now),
+    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen }, now, settings.resultCheck),
     life: (clock, input) =>
       make.ticks.life(
         { ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen },
