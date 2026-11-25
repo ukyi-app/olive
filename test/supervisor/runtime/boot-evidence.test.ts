@@ -6,6 +6,7 @@ import type { UnreceivedClosureInput } from "../../../src/ledger/index.ts";
 import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { linkLossTick } from "../../../src/supervisor/dispatch/link-loss.ts";
 import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
+import { resultCheckTick } from "../../../src/supervisor/dispatch/result-check.ts";
 import { assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop.ts";
 import { type UnreceivedPorts, unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
 import type { BootResult, RunningSupervisor } from "../../../src/supervisor/runtime/boot.ts";
@@ -46,6 +47,7 @@ async function prepared(during?: { call: number; act: () => void }): Promise<Pre
     makers: {
       ticks: {
         linkLoss: linkLossTick,
+        resultCheck: resultCheckTick,
         life: lifeTick,
         resend: resendTick,
         assign: assignAndStartTick,

@@ -314,7 +314,7 @@ test("정적: 표식은 공유 함수에서만 적고, 그 함수 안의 차례�
 });
 
 // 쥔 함수를 박자 유효 문 뒤에 부르는 공유 함수(send-gate.ts의 callAfterGate). 본문은 얻기(get) → 유효 문(open) → Reflect.apply 한 번이고,
-// 이 이름이 나오는 줄은 import 셋과 장부 쓰기 여섯·송신 표식 하나의 부르는 줄뿐이다. 이 함수로 송신 포트를 부르거나(다른 줄),
+// 이 이름이 나오는 줄은 import 넷과 장부 쓰기 일곱·송신 표식 하나의 부르는 줄뿐이다. 이 함수로 송신 포트를 부르거나(다른 줄),
 // 다른 이름에 담아 부르는 자리가 생기면 줄 목록이 달라진다. 부르는 줄은 쥘 메서드 이름까지 글자 그대로 견준다.
 const squash = (text: string) => text.replace(/\s+/g, " ").trim();
 const LIFE = "src/supervisor/dispatch/life-loop.ts";
@@ -330,6 +330,8 @@ const GATED_LINES = [
   "src/supervisor/dispatch/life-loop.ts: import { callAfterGate, holdBeatValid } from \"./send-gate.ts\";",
   "src/supervisor/dispatch/link-loss.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markLostFor, args: [lostInput] }; }, () => beatValid(ports));",
   "src/supervisor/dispatch/link-loss.ts: import { callAfterGate, holdBeatValid } from \"./send-gate.ts\";",
+  "src/supervisor/dispatch/result-check.ts: const call = callAfterGate(() => { const ledger = ports.ledger; return { receiver: ledger, fn: ledger.markResult, args: [markInput] }; }, () => gateOpen(ports, shut));",
+  "src/supervisor/dispatch/result-check.ts: import { callAfterGate, holdBeatValid } from \"./send-gate.ts\";",
   "src/supervisor/dispatch/send-gate.ts: const marking = callAfterGate(() => ({ receiver: mark?.receiver, fn: mark?.fn, args: [input] }), gate);"
 ];
 const gatedLines = (sources: ReadonlyMap<string, string>) =>
@@ -346,7 +348,7 @@ const gatedBody = (source: string) => {
   return start < 0 ? null : squash(source.slice(start, source.indexOf("\n}\n", start) + 2));
 };
 
-test("정적: callAfterGate는 얻기 → 박자 유효 문 → Reflect.apply 한 번이고, 그 이름은 장부 쓰기 여섯·송신 표식 하나를 부르는 줄과 import에만 있다", () => {
+test("정적: callAfterGate는 얻기 → 박자 유효 문 → Reflect.apply 한 번이고, 그 이름은 장부 쓰기 일곱·송신 표식 하나를 부르는 줄과 import에만 있다", () => {
   expect(gatedBody(src(GATE))).toBe(CALL_AFTER_GATE);
   expect(gatedLines(sources)).toEqual(GATED_LINES);
 });

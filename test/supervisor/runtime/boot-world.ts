@@ -19,6 +19,7 @@ import { assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop
 import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { linkLossTick } from "../../../src/supervisor/dispatch/link-loss.ts";
 import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
+import { resultCheckTick } from "../../../src/supervisor/dispatch/result-check.ts";
 import { unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
 import { createIssuance, type IssuancePorts } from "../../../src/supervisor/runtime/issuance.ts";
 import { createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
@@ -131,7 +132,7 @@ export interface Captured {
   sink?: { value: ReturnType<typeof createWireSink>; ports: WireSinkPorts };
   lines?: { value: AnswerLines; ports: AnswerLinePorts };
   // 박자마다 마지막으로 넘긴 포트 묶음(박자 유효 문의 같은 객체 단언).
-  beatPorts?: Partial<Record<"linkLoss" | "life" | "resend" | "unreceived" | "assign", { readonly beatValid?: () => boolean }>>;
+  beatPorts?: Partial<Record<"linkLoss" | "resultCheck" | "life" | "resend" | "unreceived" | "assign", { readonly beatValid?: () => boolean }>>;
   pumps: number;
   delivers: number;
 }
@@ -188,6 +189,10 @@ export function capturingMakers(captured: Captured, trace: Trace, over: Partial<
       linkLoss: (ports, policy, input) => {
         (captured.beatPorts ??= {}).linkLoss = ports;
         return linkLossTick(ports, policy, input);
+      },
+      resultCheck: (ports, now) => {
+        (captured.beatPorts ??= {}).resultCheck = ports;
+        return resultCheckTick(ports, now);
       },
       life: (ports, policy, input) => {
         (captured.beatPorts ??= {}).life = ports;

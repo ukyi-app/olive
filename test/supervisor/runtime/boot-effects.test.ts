@@ -412,8 +412,8 @@ describe("박자 안에서 기한을 넘긴 뒤의 장부 쓰기(R1)", () => {
   });
 });
 
-describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", () => {
-  test("박자 다섯은 같은 함수 하나를 beatValid로 받는다. 그 함수는 박자 유효 문이다: 장부를 쓸 수 없게 되면 닫힌다", async () => {
+describe("박자 유효 문을 박자 여섯에 넘긴다(R1·R2의 조립)", () => {
+  test("박자 여섯은 같은 함수 하나를 beatValid로 받는다. 그 함수는 박자 유효 문이다: 장부를 쓸 수 없게 되면 닫힌다", async () => {
     const w = world();
     let inject = false;
     countCommits(w, (point) => {
@@ -426,7 +426,7 @@ describe("박자 유효 문을 박자 다섯에 넘긴다(R1·R2의 조립)", ()
     await untilStep(w, 5);
     await w.time.advance(w.settings.timing.beatEveryMs);
     const ports = w.captured.beatPorts ?? {};
-    expect(Object.keys(ports).sort()).toEqual(["assign", "life", "linkLoss", "resend", "unreceived"]);
+    expect(Object.keys(ports).sort()).toEqual(["assign", "life", "linkLoss", "resend", "resultCheck", "unreceived"]);
     const gates = new Set(Object.values(ports).map((p) => p?.beatValid));
     expect(gates.size).toBe(1);
     const gate = [...gates][0];
