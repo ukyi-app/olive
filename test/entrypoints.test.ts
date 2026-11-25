@@ -22,6 +22,50 @@ test("entrypoints: supervisor는 환경이 없으면 첫 이름을 한 줄 찍�
   expect(result.stderr.toString()).toBe(`olive supervisor ${pkg.version}: 환경 OLIVE_SUPERVISOR_PORT이(가) 없다\n`);
 });
 
+// 시험 현관 대역(D-109). 운영 값(시험 작업 꺼짐)에서 켜거나 on·off 밖의 값이면 아무 파일도 읽기 전에 91이다. 대역이 없거나 시험 값(둘 다 on)이면
+// 환경을 지나 재료 읽기에서 92로 끝나고(경로가 없다), 그 전에 고른 현관을 기록에 한 줄 남긴다. 환경 값마다의 경우는 test/supervisor/frontdoor/test-double.test.ts가 본다.
+test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거나 값이 틀리면 91로, 대역 없음·시험 값이면 환경을 지나 92로 끝난다", () => {
+  const env = {
+    OLIVE_SUPERVISOR_PORT: "8443",
+    OLIVE_LEDGER_DIR: "/olive-absent/ledger",
+    OLIVE_SIGNING_KEY_DIR: "/olive-absent/signing",
+    OLIVE_ACCOUNTS_DIR: "/olive-absent/accounts",
+    OLIVE_TLS_DIR: "/olive-absent/tls",
+    OLIVE_TRUST_DIR: "/olive-absent/trust",
+    OLIVE_REGISTRY_FILE: "/olive-absent/registry.json",
+    OLIVE_ENVIRONMENT: "home",
+    OLIVE_TARGETS: JSON.stringify([{ target: "reader", namespace: "olive-reader", roles: ["isolated_reader"] }]),
+    OLIVE_POLICY_REVISION: "policy-1",
+    OLIVE_RESULT_DIR: "/olive-absent/results",
+  };
+  const spawn = (extra: Record<string, string>) =>
+    Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
+  const refused = `olive supervisor ${pkg.version}: 환경 OLIVE_TEST_FRONTDOOR이(가) 틀렸다\n`;
+  const refusedEnv: Record<string, string>[] = [{ OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "off", OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "yes" }];
+  for (const extra of refusedEnv) {
+    const result = spawn(extra);
+    expect([JSON.stringify(extra), result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([JSON.stringify(extra), 91, "", refused]);
+  }
+  for (const [extra, mode] of [
+    [{}, "absent"],
+    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "off" }, "absent"],
+    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, "test_double"],
+  ] as const) {
+    const result = spawn(extra);
+    const lines = result.stderr.toString().split("\n");
+    expect([mode, result.exitCode, lines[0]]).toEqual([mode, 92, `olive supervisor: front_door mode=${mode}`]);
+    expect(lines).toContain(`olive supervisor ${pkg.version}: 기동 단계 material에서 멈췄다(certificate:unreadable)`);
+  }
+});
+
+// 장부 초기화 진입점(D-110)은 환경이 없으면 장부를 열기 전에 91로 끝난다. 만들기·거절·바이트 무변화는 test/ledger-init.test.ts가 본다.
+test("entrypoints: ledger-init은 환경이 없으면 이름을 한 줄 찍고 91로 끝난다", () => {
+  const result = run("src/main/ledger-init.ts");
+  expect(result.exitCode).toBe(91);
+  expect(result.stdout.toString()).toBe("");
+  expect(result.stderr.toString()).toBe(`olive ledger-init ${pkg.version}: 환경 OLIVE_LEDGER_DIR이(가) 없다\n`);
+});
+
 // 실행기 진입점은 환경이 없으면 감독에 붙기 전에 81로 끝난다. 환경마다의 경우와 연결 0은 test/executor/entry.test.ts가 본다.
 test("entrypoints: executor는 환경이 없으면 첫 이름을 한 줄 찍고 81로 끝난다", () => {
   const result = run("src/main/executor.ts");
@@ -109,9 +153,16 @@ test("entrypoints: 대리 진입점에서 닿는 코드에 듣는 API가 없다"
   expect(files.size).toBeGreaterThan(1);
 });
 
-// 환경을 읽는 곳은 세 진입점뿐이다. 조립(src/executor/runtime.ts, src/supervisor/runtime/boot.ts)과 핵심(src/executor/, src/agent/,
+// 장부 초기화는 관리자가 한 번 돌리고 끝나는 명령이다. 듣는 곳이 없다.
+test("entrypoints: 장부 초기화 진입점에서 닿는 코드에 듣는 API가 없다", async () => {
+  const files = await reachable("src/main/ledger-init.ts");
+  for (const [file, source] of files) expect(listening.test(source), relative(root, file)).toBe(false);
+  expect(files.size).toBeGreaterThan(1);
+});
+
+// 환경을 읽는 곳은 네 진입점뿐이다(장부 초기화는 감독과 같은 이름 하나만 읽는다). 조립(src/executor/runtime.ts, src/supervisor/runtime/boot.ts)과 핵심(src/executor/, src/agent/,
 // src/supervisor/)은 값으로만 받는다.
-test("entrypoints: src/에서 환경을 읽는 파일은 src/main/executor.ts·src/main/role-agent.ts·src/main/supervisor.ts 셋뿐이다", async () => {
+test("entrypoints: src/에서 환경을 읽는 파일은 src/main/executor.ts·src/main/ledger-init.ts·src/main/role-agent.ts·src/main/supervisor.ts 넷뿐이다", async () => {
   const readsEnv = /\bprocess\.env\b|\bBun\.env\b|import\.meta\.env/;
   // 대조군: 세 꼴을 모두 잡고, 주석 줄은 빼고 본다(아래 필터).
   expect(["process.env.PORT", "Bun.env.PORT", "import.meta.env.PORT"].every((sample) => readsEnv.test(sample))).toBe(true);
@@ -123,7 +174,7 @@ test("entrypoints: src/에서 환경을 읽는 파일은 src/main/executor.ts·s
       .join("\n");
     if (readsEnv.test(code)) found.push(file);
   }
-  expect(found).toEqual(["src/main/executor.ts", "src/main/role-agent.ts", "src/main/supervisor.ts"]);
+  expect(found).toEqual(["src/main/executor.ts", "src/main/ledger-init.ts", "src/main/role-agent.ts", "src/main/supervisor.ts"]);
 });
 
 // 감독이 듣는 TCP는 실행기를 받는 연결 서버 하나(tls-server.ts)뿐이다. 감독 진입점에서 닿는 로컬 모듈 전체를 본다.

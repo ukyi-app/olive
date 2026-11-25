@@ -45,6 +45,7 @@ export {
   type SessionEvidence,
   type SessionReportEvidence,
   type SessionStopReason,
+  type SettledResult,
   type SlotHold,
   type SlotHoldObservation,
   SNAPSHOT_STALE_RECORDS,

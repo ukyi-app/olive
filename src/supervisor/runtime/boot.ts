@@ -15,11 +15,12 @@
 //    일의 동기 비용도 기한 안에 든다. 정각 이후면 타이머보다 먼저 처리된 결과여도 만료다. 현관 답은 복원기에 넘기기 전에 단계 기한을 본다.
 // 6. 효과의 문은 둘이다. 박자 유효 문(effectsOpen): 끝 코드가 정해졌거나, 진행 중인 박자의 기한이 지났거나, 장부를 쓸 수 없거나,
 //    받아들인 허가가 사라졌거나 받아들이지 않은 허가가 있으면 닫힘이다. 접수 문(intake): 박자 유효 문에 복원기의 접수를 더한다.
-//    기존 실행의 정리(종료·조회·끊김·D-90·재전송)는 박자 유효 문만, 새 일(접수·시작·갱신·자격 값)은 접수 문을 본다. D-90의 새 인사
-//    닫기(연결 하나 닫기)는 발급 깃발과 박자 유효 문을 함께 본다(서버는 발급 깃발을 모른다). 박자 다섯은
+//    기존 실행의 정리(종료·조회·끊김·D-90·재전송)는 박자 유효 문만, 새 일(접수·시작·갱신·자격 값)과 결과 판정은 접수 문을 본다. D-90의 새 인사
+//    닫기(연결 하나 닫기)는 발급 깃발과 박자 유효 문을 함께 본다(서버는 발급 깃발을 모른다). 박자 여섯은
 //    장부에 쓰기 직전(마지막 외부 호출 뒤의 같은 동기 구간)에 박자 유효 문을 다시 본다(beatValid 포트).
 import { executorName, type Role } from "../../contract/v1/index.ts";
 import {
+  type InputRecord,
   type Ledger,
   type OpenOptions,
   type OpenResult,
@@ -37,6 +38,7 @@ import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import { resendTick } from "../dispatch/resend.ts";
+import { type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
 import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
@@ -81,6 +83,9 @@ export interface FrontDoorPorts {
   readonly stopAuthority: StopAuthorityPort;
   readonly publications: PublicationPort;
   readonly peers: FrontPeers;
+  // 시험 현관 대역(D-109, frontdoor/test-double.ts)만 채운다. 받은 시각(장부 시계)으로 장부에 넣을 시험 소유자 입력 하나를 만든다.
+  // 없으면(운영) 조립은 이 자리에서 아무것도 읽지 않는다. 넣는 차례는 아래 admitTestInput이다.
+  readonly testInput?: (receivedAt: number) => InputRecord;
 }
 
 export interface SupervisorTiming {
@@ -120,9 +125,10 @@ export interface SupervisorSettings {
 
 export type LogFields = Readonly<Record<string, string | number | boolean | null>>;
 
-// 박자 다섯의 함수. 시험이 각 박자에 넘긴 포트(박자 유효 문)를 보려고 바꿔 끼운다.
+// 박자 여섯의 함수. 시험이 각 박자에 넘긴 포트(박자 유효 문)를 보려고 바꿔 끼운다.
 export interface BeatTicks {
   readonly linkLoss: typeof linkLossTick;
+  readonly resultCheck: typeof resultCheckTick;
   readonly life: typeof lifeTick;
   readonly resend: typeof resendTick;
   readonly unreceived: typeof unreceivedTick;
@@ -149,7 +155,7 @@ const MAKERS: SupervisorMakers = {
   issuance: createIssuance,
   sink: createWireSink,
   lines: createAnswerLines,
-  ticks: { linkLoss: linkLossTick, life: lifeTick, resend: resendTick, unreceived: unreceivedTick, assign: assignAndStartTick },
+  ticks: { linkLoss: linkLossTick, resultCheck: resultCheckTick, life: lifeTick, resend: resendTick, unreceived: unreceivedTick, assign: assignAndStartTick },
 };
 
 export interface SupervisorDeps {
@@ -272,6 +278,7 @@ function summarize(report: BeatReport): LogFields {
     serverTick: report.serverTick,
     clock: report.clock,
     linkLoss: step(report.linkLoss),
+    ...resultCheckFields(report.resultCheck),
     life: step(report.life),
     resend: step(report.resend),
     ...unreceivedFields(report.unreceived),
@@ -298,6 +305,16 @@ function unreceivedFields(value: Step<UnreceivedTickResult>): LogFields {
     run.outcome === "skipped" || run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome === "rehello" ? `rehello:${run.result}` : run.outcome,
   );
   return { unreceived: "ran", unreceivedOutcomes: tally(names), unreceivedHalted: result.halted };
+}
+
+// 결과 검사 박자의 결과. 실행마다 판정·대기·충돌·거절·장부 고장을 세고, 멈춘 이유를 따로 싣는다.
+function resultCheckFields(value: Step<ResultCheckTickResult>): LogFields {
+  if (value.kind === "skipped") return { resultCheck: `skipped:${value.reason}` };
+  if (value.kind === "threw") return { resultCheck: "threw" };
+  const result = value.result;
+  if (result.kind === "not_run") return { resultCheck: `not_run:${result.reason}` };
+  const names = result.runs.map((run) => (run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome));
+  return { resultCheck: "ran", resultCheckOutcomes: tally(names), resultCheckHalted: result.halted };
 }
 
 export async function bootSupervisor(settings: SupervisorSettings, deps: SupervisorDeps, signal: AbortSignal): Promise<BootResult> {
@@ -508,7 +525,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   };
   // 박자 유효 문. 차례가 판단이다: 끝 코드 → 장부 건강·허가 읽기 → 단조 시각 비교. 시각을 맨 끝에 보아야 읽기에 쓴 시간까지
   // 기한 비교에 든다. 처음부터 닫힌 5단계(받아들인 허가 없음, 장부의 허가도 없음)는 열림이다: 기존 실행의 정지·상태 조회는 나간다.
-  // 새 접수·시작·갱신·자격 값은 아래 접수 문이 따로 막는다. 박자 다섯의 beatValid 포트에 이 함수 그대로를 넘긴다(빠지면 그 부품은
+  // 새 접수·시작·갱신·자격 값은 아래 접수 문이 따로 막는다. 박자 여섯의 beatValid 포트에 이 함수 그대로를 넘긴다(빠지면 그 부품은
   // 늘 유효로 읽으므로 조립이 빠뜨리면 안 된다: boot-effects.test.ts의 같은 객체 단언). 이 함수는 읽기만 한다(답 줄·증거·연결·장부를
   // 바꾸지 않는다): D-90 박자가 마지막 증거 확인 뒤에 부른다(unreceived.md, boot-effects.test.ts "읽기만 한다").
   const SHUT = { open: false, intake: false } as const;
@@ -520,7 +537,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     return { open: true, intake: view.open };
   };
   const effectsOpen = (): boolean => effects().open;
-  // 박자 넷이 장부에 발급을 적기 직전에 보는 접수 문. 효과의 문과 같은 판정 하나에서 허가를 한 번 읽고 그 값을 쓴다. 정지 세대는 복원기 그대로다.
+  // 박자 넷이 장부에 발급을 적기 직전에, 결과 검사가 판정을 적기 직전에 보는 접수 문. 효과의 문과 같은 판정 하나에서 허가를 한 번 읽고 그 값을 쓴다. 정지 세대는 복원기 그대로다.
   const intake = {
     intakeOpen: (): boolean => {
       const seen = effects();
@@ -540,7 +557,19 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     reconnectWindowMs: settings.connection.reconnect?.windowMs ?? null,
   };
 
-  // 5. 순서기를 서버보다 먼저 만든다: 정책이 범위 밖이면 소켓을 열기 전에 끝낸다. 박자 다섯은 아래에서 만드는 객체에 부를 때 위임한다.
+  // 결과 검사가 판정하지 않은 digest 충돌의 경보. 충돌한 실행마다 이 프로세스에서 한 줄만 남긴다: 판정하지 않은 보고는 반영 전으로 남아
+  // 박자마다 같은 충돌이 다시 나온다. 기억은 메모리뿐이라 감독이 다시 뜨면 다시 한 줄을 남긴다.
+  const conflicted = new Set<string>();
+  const alertConflicts = (report: BeatReport): void => {
+    if (report.kind !== "ran" || report.resultCheck.kind !== "returned" || report.resultCheck.result.kind !== "ran") return;
+    for (const run of report.resultCheck.result.runs) {
+      if (run.outcome !== "digest_conflict" || conflicted.has(run.runId)) continue;
+      conflicted.add(run.runId);
+      log("result_check_alert", { reason: "digest_conflict", runId: run.runId, digests: run.digests, reports: run.reports });
+    }
+  };
+
+  // 5. 순서기를 서버보다 먼저 만든다: 정책이 범위 밖이면 소켓을 열기 전에 끝낸다. 박자 여섯은 아래에서 만드는 객체에 부를 때 위임한다.
   let wire: WireSink | null = null;
   let lines: AnswerLines | null = null;
   const need = <T>(value: T | null): T => {
@@ -550,6 +579,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const beats: CycleBeats = {
     linkLoss: (clocks, policy, input) =>
       make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
+    // 판정은 접수 문을 본다: 정지 중·허가 폐기·복원 전에는 확정도 열리지 않으므로 판정만 앞당기지 않는다(result-check.md "접수").
+    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen }, now),
     life: (clock, input) =>
       make.ticks.life(
         { ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen },
@@ -591,11 +622,14 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       serverTick: () => need(server).tick(),
       ledgerClock: shared,
       monotonic: { now: () => Math.floor(deps.monoNow()) },
-      // 순서기가 박자 다섯을 부르기 직전마다 본다. 5단계를 받아들였고 효과의 문이 열렸을 때만 참이다(기한을 넘긴 박자의 남은 박자를 막는다).
+      // 순서기가 박자 여섯을 부르기 직전마다 본다. 5단계를 받아들였고 효과의 문이 열렸을 때만 참이다(기한을 넘긴 박자의 남은 박자를 막는다).
       restoreDone: () => stage >= 5 && effectsOpen(),
       ledger,
       policy: settings.cycle,
-      observe: (report) => log("beat", summarize(report)),
+      observe: (report) => {
+        log("beat", summarize(report));
+        alertConflicts(report);
+      },
     });
   } catch (error) {
     closeLedger();
@@ -817,6 +851,53 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     });
   };
 
+  // 시험 현관 대역의 소유자 입력(D-109). 5단계의 허가를 받아들인 뒤, 주기의 박자 밖(답 처리 뒤)에서 장부가 받을 때까지 주기마다 한 번 넣는다.
+  // 같은 요청 ID라 다시 넣어도 줄은 하나다(enqueueInput의 created:false). 차례: 입력 만들기(장부 시계) → 데이터 사본 → 쓰기 함수 얻기 →
+  // 문 한 번(intake.intakeOpen + 끝 차례) → 호출 하나. 문 뒤에는 그 호출만 있다(사본이라 장부가 칸을 읽어도 대역의 코드가 돌지 않는다).
+  // 장부의 거절(접수 닫힘·정지)은 다음 주기에 다시 본다. 호출이 던지거나 답의 꼴이 틀리면 적혔는지 몰라 다시 넣지 않는다(장부 고장이면 주기가 96으로 끝낸다).
+  const makeTestInput = front.testInput;
+  let testInputSettled = makeTestInput === undefined;
+  let lastTestInputNote = "";
+  const noteTestInput = (outcome: string, reason: string | null = null) => {
+    const key = `${outcome}:${reason ?? ""}`;
+    if (key !== lastTestInputNote) log("front_door_test_input", { outcome, reason });
+    lastTestInputNote = key;
+  };
+  const admitTestInput = () => {
+    if (testInputSettled || makeTestInput === undefined || stopping || stage < 5 || !granted) return;
+    let input: InputRecord;
+    let write: Ledger["enqueueInput"];
+    try {
+      const made = makeTestInput(shared.now());
+      input = { requestId: made.requestId, source: made.source, sourceRef: { ref: made.sourceRef.ref, expiresAt: made.sourceRef.expiresAt }, receivedAt: made.receivedAt };
+      write = ledger.enqueueInput;
+    } catch {
+      return noteTestInput("not_made");
+    }
+    if (typeof write !== "function") return noteTestInput("not_made");
+    // 문: 접수 문(장부 건강·허가를 읽고 끝낼 사유를 붙잡는다)과 끝 차례를 한 판단으로 본다. 끝 차례는 맨 끝에 읽는다: 입력을 만드는 사이나
+    // 접수 문의 읽기 사이에 시작된 끝 차례도 본다(먼저 읽으면 그 뒤에 시작된 것을 놓친다).
+    if (!intake.intakeOpen() || stopping) return noteTestInput("closed");
+    // 답의 해석도 같은 try 안이다: 꼴이 틀린 답이나 칸을 읽다 던진 것은 적혔는지 모름(unknown)이다.
+    let outcome: "created" | "existing" | "refused" | "unknown";
+    let reason: string | null = null;
+    try {
+      const result: unknown = write.call(ledger, input);
+      const ok = typeof result === "object" && result !== null ? (result as { ok?: unknown }).ok : undefined;
+      if (ok === true) outcome = (result as { created?: unknown }).created === true ? "created" : "existing";
+      else if (ok === false) {
+        outcome = "refused";
+        const why = (result as { reason?: unknown }).reason;
+        reason = typeof why === "string" ? why : "unknown";
+      } else outcome = "unknown";
+    } catch {
+      outcome = "unknown";
+      reason = "threw";
+    }
+    if (outcome !== "refused") testInputSettled = true;
+    noteTestInput(outcome, reason);
+  };
+
   const sleep = (ms: number) =>
     new Promise<void>((resolve) => {
       let cancel: () => void = () => {};
@@ -860,6 +941,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       const requery = answerLines.takeRequery();
       if (requery.length > 0) log("requery", { count: requery.length });
       if (stopping) return;
+      admitTestInput();
       await sleep(timing.beatEveryMs);
     }
   };

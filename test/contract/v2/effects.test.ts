@@ -390,6 +390,12 @@ test("현관의 실행 세대: 조회의 답으로 채우고, 풀기 확정 값�
   for (const bad of [-1, 1.5, Number.NaN, "4", null, undefined]) {
     expect(adoptExecutionGeneration(unknownExecution, { answered: true, generation: bad } as never), JSON.stringify(bad)).toEqual({ authority: unknownExecution, regressed: false });
   }
+  // 결과 자체가 객체가 아니어도 던지지 않고 아는 값을 둔다.
+  for (const bad of [null, undefined, [], 4, "answered"]) {
+    for (const previous of [unknownExecution, known(5)]) {
+      expect(adoptExecutionGeneration(previous, bad as never), JSON.stringify(bad)).toEqual({ authority: previous, regressed: false });
+    }
+  }
 });
 
 test("표: 출력 묶음은 효과 넷(감독 → 현관, 정지·실행 세대 current, 닫힌 접수에서 받지 않음)과 조회 둘이다", () => {

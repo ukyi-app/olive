@@ -104,10 +104,10 @@ export type ExecutionGenerationOutcome = { answered: true; generation: number } 
 // (execution_generation_reply), 그리고 release_commit이 released로 확정된 본문의 execution_generation({ answered: true, generation }).
 // 실행 세대는 풀 때만 오르므로 받은 값이 아는 값보다 작으면 낮추지 않는다. 작은 값은 늦게 온 옛 답이거나 감독 장부의 되돌림이고,
 // 낮추면 옛 실행의 후보가 다시 통과한다. 그대로 두면 감독의 후보가 generation_mismatch로 닫힌다(regressed로 알린다).
-// 답이 없거나 값의 꼴이 틀리면 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다). 실행 세대는 1 이상이다(감독 장부의
-// run_epoch는 1에서 시작한다): 0은 감독이 확정할 수 없는 값이라 꼴이 틀린 값과 같이 받지 않는다.
+// 답이 없거나 꼴이 틀리면(결과가 객체가 아닌 값, null 포함) 아는 값을 그대로 둔다. 모르던 값은 모르는 채다(지어내지 않는다).
+// 실행 세대는 1 이상이다(감독 장부의 run_epoch는 1에서 시작한다): 0은 감독이 확정할 수 없는 값이라 꼴이 틀린 값과 같이 받지 않는다.
 export function adoptExecutionGeneration(previous: GenerationAuthority, outcome: ExecutionGenerationOutcome): { authority: GenerationAuthority; regressed: boolean } {
-  if (outcome.answered !== true) return { authority: previous, regressed: false };
+  if (!isPlainObject(outcome) || outcome.answered !== true) return { authority: previous, regressed: false };
   const value: unknown = outcome.generation;
   if (!isGeneration(value) || value < 1) return { authority: previous, regressed: false };
   if (!previous.known) return { authority: { known: true, current: value, prepared: null }, regressed: false };

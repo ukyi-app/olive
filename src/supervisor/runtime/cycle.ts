@@ -1,4 +1,4 @@
-// 감독의 박자 순서기. 한 박자에 연결 서버의 tick과 박자 다섯(끊김 → 수명 → 재전송 → 받은 적 없는 실행 닫기 → 배정·시작)을 정해진 차례로 부르고(배정만
+// 감독의 박자 순서기. 한 박자에 연결 서버의 tick과 박자 여섯(끊김 → 결과 검사 → 수명 → 재전송 → 받은 적 없는 실행 닫기 → 배정·시작)을 정해진 차례로 부르고(배정만
 // assigned가 나오면 같은 박자에서 정책의 횟수까지 되풀이한다), 박자 사이의 기억(watch, lastQueries, lastResends, unsentRenews)을
 // 쥐었다가 다음 박자에 넘긴다. 박자의 결과를 바꾸거나 다시 해석하지 않는다: 결과의 정해진 칸을 기억으로 옮기고, 멈췄거나 적혔는지
 // 모르는 결과 뒤에 장부를 다시 읽는 것만 한다.
@@ -20,15 +20,18 @@ import type { TickResult as AssignTickResult } from "../dispatch/assign-loop.ts"
 import type { LifeTickInput, LifeTickResult } from "../dispatch/life-loop.ts";
 import type { LinkLossPolicy, LinkLossTickInput, LinkLossTickResult, MonotonicClock, WatchEntry } from "../dispatch/link-loss.ts";
 import type { Clock } from "../dispatch/ports.ts";
+import type { ResultCheckTickResult } from "../dispatch/result-check.ts";
 import { type ResendPolicy, type ResendTickInput, type ResendTickResult, START_LAST_SEAL_MS } from "../dispatch/resend.ts";
 import type { UnreceivedTickResult } from "../dispatch/unreceived.ts";
 import { type ClockReading, isSharedClock, type SharedClock } from "./shared-clock.ts";
 
-// 박자 다섯. 조립은 실제 박자 함수에 그 포트·정책을 묶어 넘긴다(예: linkLoss = (c, p, i) => linkLossTick({ ...포트, ...c }, p, i)).
+// 박자 여섯. 조립은 실제 박자 함수에 그 포트·정책을 묶어 넘긴다(예: linkLoss = (c, p, i) => linkLossTick({ ...포트, ...c }, p, i)).
 // 시계와 끊김·재전송의 정책은 이 순서기가 넘기는 것을 그대로 포트에 넣어야 한다: 시계 하한과 정책 검사가 그 값에 걸려 있다.
-// createCycle이 다섯 함수를 한 번 꺼내 쥐므로 나중에 이 객체의 속성을 바꿔도 따르지 않는다. 지금의 장부·어댑터로 바꾸는 것은 함수 본문 안에서 한다.
+// createCycle이 여섯 함수를 한 번 꺼내 쥐므로 나중에 이 객체의 속성을 바꿔도 따르지 않는다. 지금의 장부·어댑터로 바꾸는 것은 함수 본문 안에서 한다.
 export interface CycleBeats {
   linkLoss(clocks: { readonly clock: Clock; readonly monotonic: MonotonicClock }, policy: LinkLossPolicy, input: LinkLossTickInput): LinkLossTickResult;
+  // 결과 검사(result-check.ts의 resultCheckTick). 동기다: 장부 읽기와 판정 쓰기 사이에 기다림이 없어야 한다.
+  resultCheck(now: number): ResultCheckTickResult;
   life(clock: Clock, input: LifeTickInput): Promise<LifeTickResult>;
   resend(clock: Clock, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult>;
   // D-90 닫기(unreceived.ts의 unreceivedTick). 동기다: 증거 읽기·마지막 확인·장부 호출 사이에 기다림이 없어야 한다.
@@ -92,7 +95,7 @@ export type Step<R> =
   | { readonly kind: "threw" }
   | { readonly kind: "skipped"; readonly reason: SkipReason };
 
-export type RereadBeat = "link_loss" | "life" | "resend" | "unreceived" | "assign";
+export type RereadBeat = "link_loss" | "result_check" | "life" | "resend" | "unreceived" | "assign";
 
 export type Reread =
   // 결과 밖을 대조할 목록. runs는 실행 목록, waiting_requests는 대기 부탁 목록(배정이 던지거나 halted: "threw"일 때만)이다. known은 그 목록을 읽었는지까지다:
@@ -119,9 +122,10 @@ export type BeatReport =
   | {
       readonly kind: "ran";
       readonly serverTick: "ok" | "threw";
-      // 박자 처음에 읽은 장부 시계. ok가 아니면 재전송·D-90 닫기·배정을 부르지 않았다.
+      // 박자 처음에 읽은 장부 시계. ok가 아니면 결과 검사·재전송·D-90 닫기·배정을 부르지 않았다.
       readonly clock: "ok" | "regressed" | "unavailable";
       readonly linkLoss: Step<LinkLossTickResult>;
+      readonly resultCheck: Step<ResultCheckTickResult>;
       readonly life: Step<LifeTickResult>;
       readonly resend: Step<ResendTickResult>;
       readonly unreceived: Step<UnreceivedTickResult>;
@@ -180,7 +184,14 @@ function takeBeats(beats: CycleBeats): CycleBeats {
     if (typeof fn !== "function") throw new TypeError(`순서기의 beats.${name}는 함수여야 한다`);
     return ((...args: unknown[]) => Reflect.apply(fn, beats, args)) as CycleBeats[K];
   };
-  return Object.freeze({ linkLoss: take("linkLoss"), life: take("life"), resend: take("resend"), unreceived: take("unreceived"), assign: take("assign") });
+  return Object.freeze({
+    linkLoss: take("linkLoss"),
+    resultCheck: take("resultCheck"),
+    life: take("life"),
+    resend: take("resend"),
+    unreceived: take("unreceived"),
+    assign: take("assign"),
+  });
 }
 
 export function createCycle(deps: CycleDeps): Cycle {
@@ -388,6 +399,26 @@ export function createCycle(deps: CycleDeps): Cycle {
       }
     }
 
+    // 결과 검사. 끊김 뒤·수명 앞에 두어 같은 박자의 수명 박자가 그 판정(ready_result)을 보고 확정을 낸다. 막힘과 시계는 D-90 닫기와 같다:
+    // 박자 처음의 시계가 ok일 때만, 부르기 직전에 장부 시계를 다시 읽어 now로 넘기고 그 읽기 뒤에 막힘을 마지막으로 본다.
+    // 시계를 믿을 수 없어 건너뛴 것은 막힘(stopped)이 아니라 수명 박자는 돈다. 동기 박자라 기다리지 않는다.
+    let resultCheck: Step<ResultCheckTickResult>;
+    const resultRead = blocked() || start.state !== "ok" ? null : readNow();
+    const resultAt = resultRead !== null && resultRead.state === "ok" ? resultRead.at : null;
+    const resultGate = gate() ?? (start.state !== "ok" || resultAt === null ? "clock_untrusted" : null);
+    if (resultGate !== null || resultAt === null) resultCheck = { kind: "skipped", reason: resultGate ?? "clock_untrusted" };
+    else {
+      try {
+        resultCheck = { kind: "returned", result: beats.resultCheck(resultAt) };
+      } catch {
+        resultCheck = { kind: "threw" };
+      }
+      // 장부가 판정을 적었는지 모르는 끝(던짐, 장부 호출이 던지거나 답이 정의 밖이어서 멈춤)만 다시 읽는다. 접수·유효 문으로 멈춘 것은
+      // 멈춘 그 실행의 장부 호출이 0회이고 앞 실행의 결과는 장부가 답한 그대로다.
+      if (resultCheck.kind === "threw") rereadRuns("result_check", "threw");
+      else if (resultCheck.result.kind === "ran" && resultCheck.result.halted === "threw") rereadRuns("result_check", "halted");
+    }
+
     let life: Step<LifeTickResult>;
     // 수명 직전의 장부 읽기도 포트다(그 안에서 복원이 다시 시작되거나 닫기가 불릴 수 있다). 읽은 뒤에 막힘을 본다.
     if (!blocked() && unsentRenews.size > 0) readRuns();
@@ -479,7 +510,7 @@ export function createCycle(deps: CycleDeps): Cycle {
       if (result.halted !== null || !result.requests.some((item) => item.outcome === "assigned")) break;
     }
 
-    return { kind: "ran", serverTick, clock: start.state, linkLoss, life, resend, unreceived, assign, rereads };
+    return { kind: "ran", serverTick, clock: start.state, linkLoss, resultCheck, life, resend, unreceived, assign, rereads };
   };
 
   const report = (value: BeatReport): BeatReport => {

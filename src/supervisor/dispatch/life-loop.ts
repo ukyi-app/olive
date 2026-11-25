@@ -15,9 +15,10 @@
 // 4. 취소(requested)와 기한(deadline)은 사유를 장부에 함께 적고 내보낸다(연결이 없어도 적는다). 이미 종료 지시가 적힌 실행에는 새 종료
 //    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 쓰기를 부른 뒤 내보내기의 결과가
 //    정해지기 전의 어느 줄에서 던져도 그 항목까지 싣고 halted로 멈춘다.
-//
-// 확정(result_finalize)은 내지 않는다. 판단에 넘기는 resultSettled는 늘 false다: 장부에 "그 실행의 결과 보고가 저장 자리와 함께
-// 반영됐다"를 읽는 공개 읽기가 없다(ready_result 상태만으로는 본문이 보관됐는지 모른다: markResult는 보고 없이도 판정한다).
+// 5. 확정(result_finalize)은 ready_result 실행에만, 장부의 settledResult가 "결과 보고가 저장 자리와 함께 반영됐고 digest가 실행 줄과
+//    같다"를 낼 때만 적고 내보낸다(resultSettled). 읽기가 모름이면 확정하지 않는다. 확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고
+//    (다시 보내는 것은 재전송 박자의 일), 접수가 닫혔으면(정지 포함) 적지 않는다. failed_stopped·cleanup_pending의 확정은 내지 않는다
+//    (outcome·stored_at의 출처와 정리 확인이 정해지지 않았다).
 import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
   type InstructionTimes,
@@ -27,20 +28,25 @@ import {
   type Refusal as LedgerRefusal,
   type Restorer,
   type Run,
+  type SettledResult,
   type TaskCancelReason,
 } from "../../ledger/index.ts";
 import { type LifecycleIntent, type LifecyclePolicy, type LifecycleView, nextIntent, RENEW_MARGIN_MS } from "../scheduler/lifecycle.ts";
-import { newUuid, type RefusalReason as DraftRefusalReason, renewDraft, sealDraft, statusQueryDraft, stopDraft } from "./envelopes.ts";
+import { finalizeDraft, newUuid, type RefusalReason as DraftRefusalReason, renewDraft, sealDraft, statusQueryDraft, stopDraft } from "./envelopes.ts";
 import type { Clock, InstructionSink, Random, Signer } from "./ports.ts";
 import type { PendingQuery } from "./receipts.ts";
 import { callAfterGate, holdBeatValid } from "./send-gate.ts";
 import { type PlainCheck, sendInstruction } from "./send-gate.ts";
 
-// 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. 확정 기록(recordFinalizeInstruction)은 받지 않는다.
-export type LifeLoopLedger = Pick<Ledger, "listRuns" | "listInputs" | "instructionTimes" | "recordRenewInstruction" | "recordStopInstruction">;
+// 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. settledResult는 ready_result 실행에만 읽는다: 그 읽기의 고장이
+// 다른 상태의 갱신·종료를 막지 않게 한다.
+export type LifeLoopLedger = Pick<
+  Ledger,
+  "listRuns" | "listInputs" | "instructionTimes" | "settledResult" | "recordRenewInstruction" | "recordStopInstruction" | "recordFinalizeInstruction"
+>;
 
-// 접수와 정지 세대. 실제로는 재시작 복원기(Restorer)다. 접수는 갱신 직전에만 본다: 갱신은 장부에서 새 업무와 같은 전제를 거치고,
-// 종료 지시는 정지 중에도 접수가 닫혀도 적힌다(장부의 쓰기 모드 continue).
+// 접수와 정지 세대. 실제로는 재시작 복원기(Restorer)다. 접수는 갱신·확정 직전에만 본다: 갱신은 장부에서 새 업무와 같은 전제를 거치고,
+// 종료 지시는 정지 중에도 접수가 닫혀도 적힌다(장부의 쓰기 모드 continue). 확정은 장부가 continue로 받지만 이 박자가 접수로 막는다.
 export type LifeIntake = Pick<Restorer, "intakeOpen" | "stopGeneration">;
 
 // 지정 실행기의 연결이 지금 지시를 낼 수 있는가(계약 v1의 mayIssue). 조립은 그 실행기의 Link와 부르는 순간의 시각(장부와 같은 시계)으로
@@ -79,7 +85,7 @@ export interface LifeTickInput {
   readonly unsentRenews: readonly string[];
 }
 
-export type LifeRead = "runs" | "inputs" | "instruction_times";
+export type LifeRead = "runs" | "inputs" | "instruction_times" | "result";
 
 // 내보내지 못한 이유. 앞의 넷과 봉하기 거절은 봉투를 만들지 못한 것이고, renew_margin_lost·deadline_within_margin은 싣기 직전에 잰
 // 송신 규칙(갱신)이다. beat_closed·sink_unavailable은 공유 송신 함수가 포트를 부르지 않은 것이다(박자 유효 문이 닫힘, 포트의 수신
@@ -108,6 +114,13 @@ type WriteFailure = "random_unavailable" | "clock_unavailable";
 // 장부를 불렀지만 적혔는지 모른다: 쓰기 포트가 던졌거나(threw) 답이 정의 밖이다(malformed_answer).
 type RecordUnknown = "threw" | "malformed_answer";
 
+// 장부에 쓰는 의도.
+export type WritingIntent = "renew_lease" | "stop" | "finalize";
+
+// 확정을 적지 않은 이유. 모두 장부를 부르기 전이다. not_ready_result: failed_stopped·cleanup_pending(이 박자가 확정을 열지 않은 상태),
+// already_recorded: 그 실행에 확정 지시가 이미 적혔다(같은 요청 ID로 다시 보내는 것은 재전송 박자의 일), intake_closed: 접수가 닫혔다(정지 포함).
+export type FinalizeWithheld = "not_ready_result" | "already_recorded" | "intake_closed";
+
 // 갱신을 적지 않은 이유. 모두 장부를 부르기 전이다. no_connection은 연결 포트의 거절, link_unknown은 그 답을 모른다.
 export type RenewWithheld = "start_not_accepted" | "deadline_within_margin" | "intake_closed" | "no_connection" | "link_unknown" | "margin_lost" | "clock_unavailable";
 
@@ -116,12 +129,12 @@ export type RunOutcome =
   // 세션 실행. 세션의 수명은 세션 계약 작업이 연다(장부가 세션 시작을 닫아 두었다).
   | { readonly runId: string; readonly outcome: "not_worker" }
   | { readonly runId: string; readonly outcome: "read_unknown"; readonly read: LifeRead }
-  // 판단이 확정을 냈지만 옮기지 않았다(결과 보관이 없다).
-  | { readonly runId: string; readonly outcome: "finalize_withheld" }
-  // 쓰기 직전에 다시 읽은 실행 줄·입력 취소·지시 이력으로 판단하니 계획한 의도가 아니었다(그 사이 다른 쓰기가 있었다). 쓰지 않았다.
-  | { readonly runId: string; readonly outcome: "superseded"; readonly planned: "renew_lease" | "stop" }
+  // 판단이 확정을 냈지만 옮기지 않았다. 장부를 부르지 않았다.
+  | { readonly runId: string; readonly outcome: "finalize_withheld"; readonly reason: FinalizeWithheld }
+  // 쓰기 직전에 다시 읽은 실행 줄·입력 취소·지시 이력(확정이면 결과 보관도)으로 판단하니 계획한 의도가 아니었다(그 사이 다른 쓰기가 있었다). 쓰지 않았다.
+  | { readonly runId: string; readonly outcome: "superseded"; readonly planned: WritingIntent }
   // 장부에 적기 직전에 본 박자 유효 문이 닫혔다. 쓰지 않았다.
-  | { readonly runId: string; readonly outcome: "beat_closed"; readonly planned: "renew_lease" | "stop" }
+  | { readonly runId: string; readonly outcome: "beat_closed"; readonly planned: WritingIntent }
   | { readonly runId: string; readonly outcome: "renew_withheld"; readonly reason: RenewWithheld }
   | { readonly runId: string; readonly outcome: "renew_sent"; readonly requestId: string; readonly issuedAt: number; readonly leaseUntil: number; readonly executorId: string }
   | { readonly runId: string; readonly outcome: "renew_refused"; readonly reason: LedgerRefusal }
@@ -178,6 +191,31 @@ export type RunOutcome =
       readonly field?: string;
       readonly sealReason?: string;
     }
+  // 확정을 적고 연결에 실었다. 나머지 넷은 종료의 같은 이름과 같은 뜻이다.
+  | { readonly runId: string; readonly outcome: "finalize_sent"; readonly requestId: string; readonly issuedAt: number; readonly executorId: string }
+  | { readonly runId: string; readonly outcome: "finalize_refused"; readonly reason: LedgerRefusal }
+  | { readonly runId: string; readonly outcome: "finalize_failed"; readonly failure: WriteFailure }
+  | {
+      readonly runId: string;
+      readonly outcome: "finalize_record_unknown";
+      readonly requestId: string;
+      readonly stopGeneration: number;
+      readonly issuedAt: number;
+      readonly executorId: string;
+      readonly reason: RecordUnknown;
+    }
+  | {
+      readonly runId: string;
+      readonly outcome: "finalize_recorded_not_sent";
+      readonly requestId: string;
+      readonly stopGeneration: number;
+      readonly issuedAt: number;
+      readonly executorId: string;
+      readonly reason: NotSentReason;
+      readonly delivery: Delivery;
+      readonly field?: string;
+      readonly sealReason?: string;
+    }
   // 같은 실행 ID의 상태 조회. cause가 stop_already_recorded이면 판단은 종료를 냈지만 이미 종료 지시가 적힌 실행이라 묻기만 했다.
   // at은 내보내기 포트가 돌아온 뒤에 읽은 시각이다(그 뒤에 실렸을 수는 없다). 그 시계를 읽지 못했으면 봉투 시한이다(포트는 시한 뒤에 싣지 않는다).
   | { readonly runId: string; readonly outcome: "query_sent"; readonly requestId: string; readonly executorId: string; readonly at: number; readonly cause: QueryCause }
@@ -197,7 +235,7 @@ export type QueryCause = "intent" | "stop_already_recorded";
 
 export type LifeTickResult =
   | { readonly kind: "not_run"; readonly reason: "clock_unavailable" | "input_malformed" | "stop_generation_unknown" | "policy_rejected" | "tick_in_progress" }
-  | { readonly kind: "not_run"; readonly reason: "read_unknown"; readonly read: Exclude<LifeRead, "instruction_times"> }
+  | { readonly kind: "not_run"; readonly reason: "read_unknown"; readonly read: Exclude<LifeRead, "instruction_times" | "result"> }
   | {
       readonly kind: "ran";
       // 끝나지 않은 실행(finalized·not_started 밖)마다 한 항목. 멈췄으면 멈춘 실행의 항목(쓰기를 불렀다면)까지 있고 그 뒤는 없다.
@@ -210,6 +248,9 @@ export type LifeTickResult =
     };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+// 계약의 결과 digest 꼴(소문자 16진수 64자리).
+const SHA256 = /^[0-9a-f]{64}$/;
+const isDigest = (value: unknown): value is string => typeof value === "string" && SHA256.test(value);
 // 장부의 시각 꼴(양의 안전 정수 ms).
 const isTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const isUuid = (value: unknown): value is string => typeof value === "string" && UUID.test(value);
@@ -320,13 +361,16 @@ function validMemory(input: unknown): Memory | null {
 }
 
 // 판단과 지시에 쓰는 실행 줄의 칸. 읽은 줄에서 칸마다 한 번만 읽어 옮겨 적는다(같은 칸을 두 번 읽어 다른 값을 보지 않는다).
-type RunRow = Pick<Run, "runId" | "runGeneration" | "kind" | "state" | "deadlineAt" | "executorId" | "inputRequestId" | "acceptedReceiptId" | "startedReceiptId">;
+// resultDigest는 ready_result 줄에서만 읽고(그 밖은 null) 확정의 대조에만 쓴다.
+type RunRow = Pick<Run, "runId" | "runGeneration" | "kind" | "state" | "deadlineAt" | "executorId" | "inputRequestId" | "acceptedReceiptId" | "startedReceiptId" | "resultDigest">;
 type Times = Pick<InstructionTimes, "lease" | "lastStopAt" | "lastFinalizeAt">;
 
 interface Facts {
   run: RunRow;
   times: Times | null;
   cancelRequested: boolean;
+  // ready_result 실행의 결과 보관(장부의 settledResult). 그 밖의 상태와 보관이 반영되지 않은 실행은 null.
+  settled: SettledResult | null;
 }
 
 // 영수증 칸은 null(아직 없음)이거나 장부의 영수증 ID(UUID)다. 칸이 없거나 빈 문자열·다른 꼴이면 줄의 꼴이 틀린 것이다.
@@ -349,9 +393,16 @@ function snapshotRun(raw: Record<string, unknown>): { runId: string; row: RunRow
     if (typeof executorId !== "string" || executorId === "") return { runId, row: null };
     if (!(inputRequestId === null || typeof inputRequestId === "string")) return { runId, row: null };
     if (!receiptCell(acceptedReceiptId) || !receiptCell(startedReceiptId)) return { runId, row: null };
+    // 결과 digest는 ready_result 줄에서만 읽는다. 다른 상태의 줄을 이 칸 하나로 모름으로 만들어 그 갱신·종료를 막지 않는다.
+    let resultDigest: string | null = null;
+    if (state === "ready_result") {
+      const read: unknown = raw.resultDigest;
+      if (!isDigest(read)) return { runId, row: null };
+      resultDigest = read;
+    }
     return {
       runId,
-      row: { runId, kind, state: state as Run["state"], runGeneration: runGeneration as number, deadlineAt, executorId, inputRequestId, acceptedReceiptId, startedReceiptId },
+      row: { runId, kind, state: state as Run["state"], runGeneration: runGeneration as number, deadlineAt, executorId, inputRequestId, acceptedReceiptId, startedReceiptId, resultDigest },
     };
   } catch {
     return { runId, row: null };
@@ -412,15 +463,36 @@ function readTimes(ledger: LifeLoopLedger, runId: string): Times | null {
   }
 }
 
+// 결과 보관(settledResult). 보관이 반영되지 않았으면 null, 읽기가 모름이거나 던지거나 답의 꼴이 틀리거나 다른 실행의 답이거나 digest가
+// 실행 줄과 다르면 undefined(모름). 답의 칸은 한 번씩만 읽어 옮겨 적는다.
+function readSettled(ledger: LifeLoopLedger, run: RunRow): SettledResult | null | undefined {
+  try {
+    const answer: unknown = ledger.settledResult(run.runId);
+    if (!isObject(answer) || answer.known !== true) return undefined;
+    const value: unknown = answer.value;
+    if (value === null) return null;
+    if (!isObject(value)) return undefined;
+    const { runId, resultDigest, storedRef, storedAt } = value;
+    if (runId !== run.runId || !isDigest(resultDigest) || resultDigest !== run.resultDigest) return undefined;
+    if (typeof storedRef !== "string" || storedRef === "" || !isTime(storedAt)) return undefined;
+    return { runId, resultDigest, storedRef, storedAt };
+  } catch {
+    return undefined;
+  }
+}
+
 // 한 실행의 판단 재료. 소유자 입력이 없는 실행은 취소 요청이 없다. 입력에 이어졌는데 그 줄이 없거나 모름이면 모름이다.
-// 대기 실행의 판단은 취소 요청만 본다. 그 밖은 지시 이력이 있어야 판단한다.
+// 대기 실행의 판단은 취소 요청만 본다. 그 밖은 지시 이력이 있어야 판단하고, ready_result는 결과 보관도 읽어야 판단한다.
 function factsOf(ledger: LifeLoopLedger, run: RunRow, cancels: Map<string, boolean | null>): Facts | { read: LifeRead } {
   const cancelled = run.inputRequestId === null ? false : cancels.get(run.inputRequestId);
   if (typeof cancelled !== "boolean") return { read: "inputs" };
-  if (run.state === "queued") return { run, times: null, cancelRequested: cancelled };
+  if (run.state === "queued") return { run, times: null, cancelRequested: cancelled, settled: null };
   const times = readTimes(ledger, run.runId);
   if (times === null) return { read: "instruction_times" };
-  return { run, times, cancelRequested: cancelled };
+  if (run.state !== "ready_result") return { run, times, cancelRequested: cancelled, settled: null };
+  const settled = readSettled(ledger, run);
+  if (settled === undefined) return { read: "result" };
+  return { run, times, cancelRequested: cancelled, settled };
 }
 
 // 지시를 적어도 되는 실행 줄인가. 실행 세대는 1 이상이고(장부는 0을 만들지 않고 받는 쪽은 0인 실행 지시를 받지 않는다), 지정 실행기는
@@ -459,7 +531,8 @@ function viewOf(facts: Facts, now: number, unsentRenews: ReadonlySet<string>): L
     lease: known,
     cancelRequested: facts.cancelRequested,
     lastInstructionAt,
-    resultSettled: false,
+    // 판단이 이 값을 보는 곳은 ready_result 하나다. 장부가 결과 보관의 반영을 확인한 실행만 true다(읽기가 모름이면 판단까지 가지 않는다).
+    resultSettled: facts.settled !== null,
     now,
   };
 }
@@ -581,7 +654,11 @@ async function act(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcom
     case "wait":
       return { runId: run.runId, outcome: "wait" };
     case "finalize":
-      return { runId: run.runId, outcome: "finalize_withheld" };
+      // failed_stopped의 본문(outcome: failed·cancelled, stored_at)의 출처와 cleanup_pending의 정리 확인(O13)이 정해지지 않아 ready_result만 연다.
+      if (run.state !== "ready_result") return { runId: run.runId, outcome: "finalize_withheld", reason: "not_ready_result" };
+      // 확정이 이미 적힌 실행에 새 요청 ID의 확정을 또 적지 않는다(장부는 새 요청 ID면 받아 준다). 답이 없는 확정은 재전송 박자가 같은 요청 ID로 다시 보낸다.
+      if (times !== null && times.lastFinalizeAt !== null) return { runId: run.runId, outcome: "finalize_withheld", reason: "already_recorded" };
+      return finalizeOne(ctx, plan, trace);
     case "query":
       return queryOne(ctx, run, "intent");
     case "renew_lease":
@@ -800,6 +877,95 @@ async function stopOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOu
   const sent = delivered.answer;
   // 받는 쪽은 내보내기 전에 확보한 값이다. 포트가 넘겨받은 봉투를 고쳐도 결과를 읽다 던지지 않는다.
   if (sent === "sent") return { runId, outcome: "stop_sent", requestId, cancelReason, issuedAt: recordAt, executorId: recipient };
+  if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
+  return notSent("send_answer_malformed", { delivery: "unknown" });
+}
+
+// 결과 확정. 판단이 확정을 낸 ready_result 실행(결과 보관이 장부에 반영됐다)에만 온다. 종료와 같은 차례다: 요청 ID → 다시 읽기(실행 줄·입력·
+// 지시 이력·결과 보관) → 접수 → 마지막 시계 읽기 → 판단 → 장부 포트 객체·메서드·인자 → 박자 유효 문 → 호출. 장부에 적힌 뒤에만 봉해 싣는다.
+async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcome> {
+  const runId = plan.facts.run.runId;
+  const requestId = freshUuid(ctx.ports.random);
+  if (requestId === null) return { runId, outcome: "finalize_failed", failure: "random_unavailable" };
+  const fresh = reread(ctx.ports, plan.facts.run);
+  if ("read" in fresh) return { runId, outcome: "read_unknown", read: fresh.read };
+  // 장부는 확정을 정지 중에도 접수가 닫혀도 받지만(continue) 이 박자는 접수가 열렸을 때만 연다: 확정은 되돌릴 수 없는 정리를 부르고,
+  // 정지 세대를 적용하기 전의 실행기는 받지 않는다. 갱신과 같이 쓰기 직전에만 본다(정지 세대의 변경은 장부의 대조가 거절한다).
+  if (!intakeOpen(ctx.ports.intake)) return { runId, outcome: "finalize_withheld", reason: "intake_closed" };
+  const recordAt = readClock(ctx.ports, ctx.now);
+  if (recordAt === null) return { runId, outcome: "finalize_failed", failure: "clock_unavailable" };
+  // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 확정이고, 결과 보관이 처음 읽은 것과
+  // 같고, 그 사이 확정이 적히지 않았을 때만 적는다. 마지막 시계 읽기 안에서 일어난 외부 쓰기는 보지 못한다(종료와 같다).
+  const settled = fresh.settled;
+  const planned = plan.facts.settled;
+  if (
+    fresh.run.state !== "ready_result" ||
+    settled === null ||
+    planned === null ||
+    settled.resultDigest !== planned.resultDigest ||
+    settled.storedRef !== planned.storedRef ||
+    settled.storedAt !== planned.storedAt ||
+    (fresh.times !== null && fresh.times.lastFinalizeAt !== null) ||
+    nextIntent(viewOf(fresh, recordAt, ctx.unsentRenews), ctx.policy).intent !== "finalize"
+  ) {
+    return { runId, outcome: "superseded", planned: "finalize" };
+  }
+  const { executorId, runGeneration } = fresh.run;
+  const { resultDigest, storedAt } = settled;
+  const stopGeneration = ctx.stopGeneration;
+  const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "finalize_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, reason });
+  // 본문 세 칸(outcome·resultDigest·storedAt)을 늘 함께 넘긴다: 빼고 적은 확정은 재전송 박자가 본문을 다시 만들 수 없다.
+  const finalizeInput = { runId, requestId, stopGeneration, now: recordAt, outcome: "succeeded" as const, resultDigest, storedAt };
+  const call = callAfterGate(() => { const ledger = ctx.ports.ledger; return { receiver: ledger, fn: ledger.recordFinalizeInstruction, args: [finalizeInput] }; }, () => beatValid(ctx.ports));
+  if (call.kind === "closed") return { runId, outcome: "beat_closed", planned: "finalize" };
+  if (call.kind === "threw") return recordUnknown("threw");
+  const answer: unknown = call.value;
+  trace.fallback = () => recordUnknown("threw");
+  if (!isObject(answer)) return recordUnknown("malformed_answer");
+  const ok: unknown = answer.ok;
+  if (ok === false) {
+    const reason: unknown = answer.reason;
+    return isRefusal(reason) ? { runId, outcome: "finalize_refused", reason } : recordUnknown("malformed_answer");
+  }
+  if (ok !== true) return recordUnknown("malformed_answer");
+
+  // 여기부터 장부에는 확정이 적혔다. 장부의 답에는 실행 줄이 없으므로 받는 쪽·실행 세대는 쓰기 직전에 다시 읽고 검증한 줄의 값이다.
+  const notSent = (reason: NotSentReason, extra: { field?: string; sealReason?: string; delivery?: Delivery } = {}): RunOutcome => ({
+    runId,
+    outcome: "finalize_recorded_not_sent",
+    requestId,
+    stopGeneration,
+    issuedAt: recordAt,
+    executorId,
+    reason,
+    delivery: extra.delivery ?? "not_sent",
+    ...(extra.field === undefined ? {} : { field: extra.field }),
+    ...(extra.sealReason === undefined ? {} : { sealReason: extra.sealReason }),
+  });
+  trace.fallback = () => notSent("draft_threw");
+  let envelope: Envelope;
+  try {
+    const drafted = finalizeDraft({ run: { runId, runGeneration, executorId }, requestId, stopGeneration, outcome: "succeeded", resultDigest, storedAt });
+    if (!drafted.ok) return notSent(drafted.reason, { field: drafted.field });
+    let sealed: ReturnType<typeof sealDraft>;
+    try {
+      // 확정의 머리 issued_at은 봉하는 때의 시각이다. 처음 봉할 때는 장부 기록에 넘긴 시각을 쓴다(종료와 같다).
+      sealed = sealDraft(drafted.draft, recordAt, { random: ctx.ports.random, signer: ctx.ports.signer });
+    } catch {
+      return notSent("seal_threw");
+    }
+    if (!sealed.ok) return notSent(sealed.reason, { field: sealed.field, sealReason: sealed.sealReason });
+    envelope = sealed.envelope;
+  } catch {
+    return notSent("draft_threw");
+  }
+  trace.fallback = () => notSent("send_threw", { delivery: "unknown" });
+  // 장부의 확정은 이미 적혔다. 싣지 않으면 그 기록의 식별값으로 finalize_recorded_not_sent다(새 요청 ID로 다시 만들지 않는다).
+  const delivered = await deliver(ctx.ports, envelope);
+  if (delivered.kind === "withheld") return notSent(delivered.reason);
+  if (delivered.kind === "threw") return notSent("send_threw", { delivery: "unknown" });
+  const sent = delivered.answer;
+  if (sent === "sent") return { runId, outcome: "finalize_sent", requestId, issuedAt: recordAt, executorId };
   if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
   return notSent("send_answer_malformed", { delivery: "unknown" });
 }
