@@ -15,7 +15,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 ## 정한 것
 
 1. **프로세스 하나 = 장부 열기 하나 = 공유 시계 하나 = 복원기 하나 = 서버 하나 = 순서기 하나.** 프로세스 안에서 다시 열지 않는다. 장부를 쓸 수 없게 되거나, 낸 접수 허가가 버려지거나, 박자·복원 단계가 기한을 넘기거나 거부되면 끝 차례를 밟고 96으로 끝내 Kubernetes 재시작에 맡긴다.
-2. **연결 전에 거를 값은 서버 시작 전에 거른다.** 재료(92), 등록표(93), 장부·결과 폴더·복원기(94), 순서기 정책(95)이 모두 `deps.startServer` 앞이다. 순서기를 서버보다 먼저 만드는 까닭이 이것이다(박자 다섯과 서버 tick은 부를 때 아래 객체에 위임한다).
+2. **연결 전에 거를 값은 서버 시작 전에 거른다.** 재료(92), 등록표(93), 장부·결과 폴더·복원기(94), 순서기 정책(95)이 모두 `deps.startServer` 앞이다. 순서기를 서버보다 먼저 만드는 까닭이 이것이다(박자 여섯과 서버 tick은 부를 때 아래 객체에 위임한다).
 3. **답 줄이 서기 전에는 받지 않는다.** 서버의 `deliver`는 7단계의 같은 동기 구간에서 답 줄로 바뀌고, 그 전에 불리면 던져 그 연결을 닫는다. 복원 1단계 전이라 맞춤에 답하지 않으므로 실제로는 오지 않는다(루프백 시험이 맞춤 답 0, `deliver` 0을 본다).
 4. **받아들인 복원 단계만 센다.** `stage`는 조립이 단계 결과를 기한 안에 받아들인 때 오른다. 순서기의 `restoreDone`은 5단계를 받아들였고 박자 유효 문(8)이 열렸을 때만 참이다. 답 줄의 `observationsSettled`는 2 이상일 때 참이고, 그 문이 가르는 것은 쌓아 둔 **인사·상태 관측**뿐이다: 검증된 기존 실행의 영수증·보고는 2단계 전에도 바로 장부로 가고 수락한 영수증의 ACK도 나간다(종료 영수증을 제때 적어 실행기가 끝을 확인받게). 복원기 게시 함수는 늘 같은 복원기를 내므로 게시 교체가 `deliver`·`pump` 안에서 일어날 수 없다.
 5. **모름이면 같은 복원기로 같은 단계를 다시 부른다.** `RestoreStepError`(현관 없음 등)는 다음 주기에 같은 단계를 부른다. 재시작하지 않는다: 현관이 없는 동안 되풀이 재기동이 생기지 않게. 다른 실패(순서 오류, 기한 넘김, 타이머 없음)는 96이다.
@@ -25,14 +25,15 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 
 ## 효과와 그 직전 확인
 
-자리는 `boot.ts`의 기호 이름이고(줄 번호는 코드가 바뀌면 어긋나 적지 않는다), 박자 안은 각 부품(`src/supervisor/dispatch/`)이다. 문은 (1) 접수 문 `intake` = (2)와 같은 판정(`effects`)에서 읽은 허가, (2) 박자 유효 문 `effectsOpen`이다. 박자 다섯의 `beatValid` 포트에는 (2) 그 함수 하나를 넘긴다(`beats`·`assignPorts`). 그 포트가 빠지면 부품은 늘 유효로 읽으므로 `boot-effects.test.ts`가 다섯 박자의 같은 함수를 단언한다. 처음부터 닫힌 5단계(`granted`도 장부 허가도 없음)는 (2)가 열림이라 기존 실행의 정지·상태 조회가 나간다.
+자리는 `boot.ts`의 기호 이름이고(줄 번호는 코드가 바뀌면 어긋나 적지 않는다), 박자 안은 각 부품(`src/supervisor/dispatch/`)이다. 문은 (1) 접수 문 `intake` = (2)와 같은 판정(`effects`)에서 읽은 허가, (2) 박자 유효 문 `effectsOpen`이다. 박자 여섯의 `beatValid` 포트에는 (2) 그 함수 하나를 넘긴다(`beats`·`assignPorts`). 그 포트가 빠지면 부품은 늘 유효로 읽으므로 `boot-effects.test.ts`가 여섯 박자의 같은 함수를 단언한다. 처음부터 닫힌 5단계(`granted`도 장부 허가도 없음)는 (2)가 열림이라 기존 실행의 정지·상태 조회가 나간다.
 
-규칙은 하나다: **장부 쓰기·송신 표식·송신마다 얻을 것(포트의 수신 객체·메서드·인자, 공유 송신 함수에 넘기는 입력 객체의 칸)을 모두 얻고, 박자 유효 문을 마지막에 보고, 그 바로 뒤에 호출 하나.** 예외는 시작·갱신의 송신 하나다: 유효 문과 송신 사이에 시한·여유를 재는 장부 시계 호출 하나가 남는다(아래 "남는 한계"). 유효 문 뒤에 접근자 같은 외부 코드가 돌면 그 안에서 흐른 시간으로 박자 기한이 지나도 쓰거나 싣는다. "사이"는 마지막 확인(시계·연결·증거 등)과 효과 사이의 외부 호출, "유효 문 뒤"는 박자 유효 문을 본 뒤 호출 전에 도는 외부 코드(접근자 포함)다. 박자 안의 장부 쓰기·표식은 이 차례를 `send-gate.ts`의 `callAfterGate` 한 함수로 한다(얻기·인자 원소를 함수 안 배열로 옮기기 → 유효 문 → `Reflect.apply`). 유효 문은 장부 쓰기마다 `holdBeatValid`로 포트의 칸을 한 번 읽어 그 포트 묶음을 수신자로 부른다(같은 칸을 두 번 읽지 않는다). 정적 시험(`test/supervisor/dispatch/start-send.test.ts`)이 그 본문과 부르는 줄 일곱(장부 쓰기 여섯·송신 표식 하나)을 글자 그대로 본다. 아래 표에서 "유효 문 뒤"가 "없음"이 아닌 자리는 박자 밖이거나 내보내기 포트 안, 또는 시작·갱신의 마지막 판정이 부르는 장부 시계 호출 하나다.
+규칙은 하나다: **장부 쓰기·송신 표식·송신마다 얻을 것(포트의 수신 객체·메서드·인자, 공유 송신 함수에 넘기는 입력 객체의 칸)을 모두 얻고, 박자 유효 문을 마지막에 보고, 그 바로 뒤에 호출 하나.** 예외는 시작·갱신의 송신 하나다: 유효 문과 송신 사이에 시한·여유를 재는 장부 시계 호출 하나가 남는다(아래 "남는 한계"). 유효 문 뒤에 접근자 같은 외부 코드가 돌면 그 안에서 흐른 시간으로 박자 기한이 지나도 쓰거나 싣는다. "사이"는 마지막 확인(시계·연결·증거 등)과 효과 사이의 외부 호출, "유효 문 뒤"는 박자 유효 문을 본 뒤 호출 전에 도는 외부 코드(접근자 포함)다. 박자 안의 장부 쓰기·표식은 이 차례를 `send-gate.ts`의 `callAfterGate` 한 함수로 한다(얻기·인자 원소를 함수 안 배열로 옮기기 → 유효 문 → `Reflect.apply`). 유효 문은 장부 쓰기마다 `holdBeatValid`로 포트의 칸을 한 번 읽어 그 포트 묶음을 수신자로 부른다(같은 칸을 두 번 읽지 않는다). 정적 시험(`test/supervisor/dispatch/start-send.test.ts`)이 그 본문과 부르는 줄 여덟(장부 쓰기 일곱·송신 표식 하나)을 글자 그대로 본다. 아래 표에서 "유효 문 뒤"가 "없음"이 아닌 자리는 박자 밖이거나 내보내기 포트 안, 또는 시작·갱신의 마지막 판정이 부르는 장부 시계 호출 하나다.
 
 | 효과 | 자리(확인 → 효과) | 직전에 읽는 문 | 사이 | 유효 문 뒤·호출 전에 도는 외부 코드(접근자 포함) | 기한이 정해지는 때 |
 |---|---|---|---|---|---|
-| 박자 다섯 부르기 | 순서기의 `gate()`가 박자마다 `restoreDone` | `stage >= 5 && (2)` | 없음(순서기가 인자를 확인 전에 만든다) | 없음(만들 때 쥔 박자 함수를 `Reflect.apply`로 부른다) | 박자를 부르기 전(주기 `loop`의 `beatLimit`). 시각을 읽지 못하면 박자를 부르지 않고 96 |
+| 박자 여섯 부르기 | 순서기의 `gate()`가 박자마다 `restoreDone` | `stage >= 5 && (2)` | 없음(순서기가 인자를 확인 전에 만든다) | 없음(만들 때 쥔 박자 함수를 `Reflect.apply`로 부른다) | 박자를 부르기 전(주기 `loop`의 `beatLimit`). 시각을 읽지 못하면 박자를 부르지 않고 96 |
 | 끊김: `markLostFor` | `link-loss.ts`의 인자(`lostInput`) → `callAfterGate`(장부 포트 객체·`markLostFor` 얻기 → (2) → `Reflect.apply`), 실행기마다 | (2) | 없음 | 없음 | 박자 기한 |
+| 결과 검사: 판정 기록 | `result-check.ts`의 (1) → 장부 읽기 둘(`listRuns`·`pendingReports`) → 판정 자리(`resultVerdict`) → 인자(`markInput`) → `callAfterGate`(장부 포트 객체·`markResult` → 문 `gateOpen`: (1) → (2) → 호출), 실행마다 | 얻기 뒤 (1) → (2)(정지 중·허가 폐기·5단계 전에는 판정하지 않는다) | 없음 | 없음 | 박자 기한 |
 | 수명: 갱신 기록 | `life-loop.ts`의 (1) → 연결 문 → 시계 → 인자(`renewInput`) → `callAfterGate`(장부 포트 객체·`recordRenewInstruction` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
 | 수명: 종료 기록 | `life-loop.ts`의 시계 → 인자(`stopInput`) → `callAfterGate`(장부 포트 객체·`recordStopInstruction` → (2) → 호출) | (2)만(닫힌 접수에서도 종료는 적는다) | 없음 | 없음 | 박자 기한 |
 | 수명: 확정 기록 | `life-loop.ts`의 결과 보관 다시 읽기(`settledResult`) → (1) → 시계 → 인자(`finalizeInput`) → `callAfterGate`(장부 포트 객체·`recordFinalizeInstruction` → (2) → 호출) | (1) 뒤 (2) | 없음 | 없음 | 박자 기한 |
@@ -59,7 +60,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | 번호 | 조건 | 코드 자리 | 시험(`test/supervisor/runtime/`) |
 |---|---|---|---|
 | S1 | 원천 시계를 공유 시계로 한 번 감싸 모든 소비자에 | `make.sharedClock`, 장부 `clock: ledgerClock`, 복원기(`make.restorer`의 `ledgerClock`), 순서기 `ledgerClock: shared`, 서버 `clock`, 발급·내보내기 포트·답 줄 `clock: shared`, 박자에는 순서기가 넘긴 시계, 도구 포트(`tools`의 `clock: shared`) | `boot.test.ts` "같은 객체", "공유 시계를 거친다(S1)", "도구 처리기 포트의 자리(S41)" |
-| S2 | 장부 한 열기를 박자·순서기·답 줄·결과·발급·송신 표식에 | `const ledger`(한 자리), 박자 다섯과 배정 포트(`beats`·`assignPorts`), 순서기, 발급(`make.issuance`), 답 줄 `ledger`·`results.ledger`(`make.lines`) | "같은 객체", 정적 "한 자리" |
+| S2 | 장부 한 열기를 박자·순서기·답 줄·결과·발급·송신 표식에 | `const ledger`(한 자리), 박자 여섯과 배정 포트(`beats`·`assignPorts`), 순서기, 발급(`make.issuance`), 답 줄 `ledger`·`results.ledger`(`make.lines`) | "같은 객체", 정적 "한 자리" |
 | S3 | 복원기 게시 함수 하나 | `published`를 서버·내보내기 포트·답 줄·발급에, 박자에는 같은 복원기(접수 문은 `intake`가 효과의 문을 더해 감싼다) | "같은 객체" |
 | S4 | 서버 하나 | `server = live`, 발급·내보내기 포트의 `server`, 답 줄 `table` | "같은 객체" |
 | S5 | 조회 등록부 하나 | `make.queries()`를 내보내기 포트와 답 줄에 | "같은 객체" |
@@ -76,7 +77,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | S16 | `candidate`마다 `noteCandidate` | 답 줄이 한다(`answers.ts`의 `candidate`). 조립은 답 줄의 `cycle`에 그 순서기를 넘긴다 | "같은 객체" |
 | S17 | `takeRequery()`를 다시 묻게 | 꺼내 수를 기록만(`answerLines.takeRequery()`). 답 줄은 실행 ID만 내고 사유를 내지 않는다. 다시 묻기는 수명 박자의 간격 | 남는 한계 |
 | S19 | D-90 박자에 같은 답 줄의 `evidence`·`withheld`, 증거 장부는 프로세스에 하나 | `beats.unreceived`(박자 함수 본문에서 `need(lines)`로 위임), `make.lines`의 `evidenceBook: createAnswerEvidenceBook()` | `boot-evidence.test.ts`(시한 뒤 빈 full이면 닫기 1회, 오염·대기·번호 변경·연결 바뀜은 0회), `boot-effects.test.ts` "D-90 박자의 증거·맡기지 않을 실행기는 같은 답 줄의", "읽기만 한다" |
-| S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음 | `deps.openLedger`의 `mode: "reopen"` | "장부 not_initialized", 정적 `"create"` 0 |
+| S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음. 첫 설치는 감독 밖의 일회성 진입점 `src/main/ledger-init.ts`가 한다(D-110) | `deps.openLedger`의 `mode: "reopen"` | "장부 not_initialized", 정적 `"create"` 0, `test/ledger-init.test.ts` "정적: src/에서 \"create\" 글자를 쓰는 곳은"(`src/ledger/` 밖에서 그 진입점 하나) |
 | S21 | 필수 이웃에 현관·관측 중계·실행기 | `requiredPeers`(`settings.otherPeers`와 등록표의 활성 실행기) | "필수 이웃(S21)" |
 | S22 | 1단계 전 서버가 보는 세대 `null` | 복원기를 감싸지 않고 넘김(`published`) | 루프백 1단계 전 맞춤 답 0 |
 | S23 | `restoreDone`은 5단계 뒤만 | 순서기의 `restoreDone: () => stage >= 5 && effectsOpen()` | "관측 신호는 2단계를, 복원 끝은 5단계를" |
@@ -91,8 +92,8 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | S36 | `nonces`는 장부, 요청 ID·nonce는 CSPRNG, `seal`은 키를 내주지 않음 | `nonces: ledger.nonceStore()`, `signer.ts` | "같은 객체"(같은 nonce 두 번째 거짓) |
 | S37 | `deliver`는 던지지 않음 | 답 줄이 서기 전만 던진다(정한 것 3), 그 뒤는 답 줄 그대로 | "답 줄이 서기 전의 deliver" |
 | S38 | 재료는 바이트로 한 번, 비면 거부 | 2단계(재료 읽기) | "연결 전에 거를 값" 표 |
-| S43 | 보고의 `threw`·`rereads`·`clock`, 답 줄 `fault`, D-90 보고를 기록 | `summarize`: D-90은 결과 종류별 건수(`unreceivedOutcomes`, 건너뜀·거절·장부 고장은 사유까지)와 멈춘 이유(`unreceivedHalted`), 다시 읽기는 `박자:사유` 건수(`rereadCauses`). `answer_fault` | `boot-effects.test.ts` "D-90 박자의 기록". 경보 기준은 켜기 전 |
-| S44 | 기록에 비밀 없음 | 결과 객체를 싣지 않고 갈래 이름·수만 | 정적 확인 없음(코드 읽기) |
+| S43 | 보고의 `threw`·`rereads`·`clock`, 답 줄 `fault`, D-90·결과 검사 보고를 기록 | `summarize`: D-90은 결과 종류별 건수(`unreceivedOutcomes`, 건너뜀·거절·장부 고장은 사유까지)와 멈춘 이유(`unreceivedHalted`), 결과 검사도 같은 꼴(`resultCheck`·`resultCheckOutcomes`·`resultCheckHalted`), 다시 읽기는 `박자:사유` 건수(`rereadCauses`). `answer_fault`. 결과 검사가 판정하지 않은 digest 충돌은 `result_check_alert` 한 줄(`alertConflicts`, 실행마다 프로세스에서 한 번) | `boot-effects.test.ts` "D-90 박자의 기록", `boot-result-check.test.ts`. 경보 기준은 켜기 전 |
+| S44 | 기록에 비밀 없음 | 결과 객체를 싣지 않고 갈래 이름·수만. 예외는 `result_check_alert`의 실행 ID 하나다: 비밀이 아니고 장부에서 그 실행을 찾는 열쇠라 싣는다(digest·저장 자리는 싣지 않는다) | 정적 확인 없음(코드 읽기) |
 | S47 | 답 줄의 `results` 필수, 실제 폴더 | `deps.createResultBackend`(실패면 `result_dir:…`), `make.lines`의 `results: { backend, ledger }`. 백엔드는 마지막 경로 요소만 `lstat`한다. 상위 경로는 배포 전제(README 환경 표) | "결과 보관 폴더가 틀림" |
 | S48 | 환경을 읽는 파일은 진입점뿐 | `src/main/supervisor.ts` | `test/entrypoints.test.ts` 환경 목록 |
 | S49 | 감독의 듣기는 `tls-server.ts` 하나 | 서버 하나 | `test/entrypoints.test.ts` "감독에서 닿는 코드", "허용 파일 안의 두 번째 종류 듣기" |

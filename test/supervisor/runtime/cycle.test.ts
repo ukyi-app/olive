@@ -1,5 +1,5 @@
-// 박자 순서기(src/supervisor/runtime/cycle.ts)와 공유 시계(shared-clock.ts). 박자 다섯·서버 tick·장부 읽기·시계는 가짜이고, 부른 차례와
-// 넘긴 인자를 기록한다. "실제 박자 다섯과 장부"만 실제 박자 함수·임시 폴더의 실제 장부·실제 내보내기 포트를 쓴다(서버는 가짜).
+// 박자 순서기(src/supervisor/runtime/cycle.ts)와 공유 시계(shared-clock.ts). 박자 여섯·서버 tick·장부 읽기·시계는 가짜이고, 부른 차례와
+// 넘긴 인자를 기록한다. "실제 박자 여섯과 장부"만 실제 박자 함수·임시 폴더의 실제 장부·실제 내보내기 포트를 쓴다(서버는 가짜).
 // 박자가 기다리는 동안의 일은 시험이 직접 쥔 약속(deferred)으로 차례를 정한다. 실제 시간을 기다리지 않는다.
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
@@ -10,6 +10,7 @@ import { assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop
 import { type LifeLoopPorts, type LifeTickResult, lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { type LinkLossPorts, type LinkLossTickResult, linkLossTick, type WatchEntry } from "../../../src/supervisor/dispatch/link-loss.ts";
 import type { Clock } from "../../../src/supervisor/dispatch/ports.ts";
+import { type ResultCheckPorts, type ResultCheckTickResult, resultCheckTick } from "../../../src/supervisor/dispatch/result-check.ts";
 import { type ResendPorts, type ResendTickResult, resendTick, START_LAST_SEAL_MS } from "../../../src/supervisor/dispatch/resend.ts";
 import { type UnreceivedPorts, type UnreceivedTickResult, unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
 import {
@@ -66,6 +67,12 @@ const unreceivedRan = (halted: Extract<UnreceivedTickResult, { kind: "ran" }>["h
   halted,
   haltedAt: halted === null ? null : REQ_1,
 });
+const resultCheckRan = (halted: Extract<ResultCheckTickResult, { kind: "ran" }>["halted"] = null): ResultCheckTickResult => ({
+  kind: "ran",
+  runs: [],
+  halted,
+  haltedAt: halted === null ? null : RUN_A,
+});
 const assignRan = (requests: readonly unknown[] = [], halted: "threw" | "intake_closed" | null = null): AssignTickResult =>
   ({ kind: "ran", starts: [], requests, halted, haltedAt: null }) as AssignTickResult;
 const assigned = (runId: string) => ({ ref: `ref-${runId}`, outcome: "assigned", runId, executorId: W1 });
@@ -96,6 +103,8 @@ function harness(policy: Partial<CycleDeps["policy"]> = {}) {
     resend: [] as { clock: Clock; policy: unknown; input: { lastResends: readonly { requestId: string; at: number }[] } }[],
     // D-90 닫기 박자는 calls에 남기지 않고 부른 순간의 calls 사본을 남긴다. 박자 넷의 차례를 보는 단언을 그대로 두고 다섯째의 자리는 이 사본으로 본다.
     unreceived: [] as { now: number; before: string[] }[],
+    // 결과 검사 박자도 calls에 남기지 않고 부른 순간의 calls 사본을 남긴다(박자 넷의 차례 단언을 그대로 둔다).
+    resultCheck: [] as { now: number; before: string[] }[],
     assign: [] as number[],
     instructionTimes: [] as string[],
   };
@@ -105,6 +114,7 @@ function harness(policy: Partial<CycleDeps["policy"]> = {}) {
     life: (): Promise<LifeTickResult> | LifeTickResult => lifeRan(),
     resend: (): Promise<ResendTickResult> | ResendTickResult => resendRan(),
     unreceived: (): UnreceivedTickResult => unreceivedRan(),
+    resultCheck: (): ResultCheckTickResult => resultCheckRan(),
     assign: (): Promise<AssignTickResult> | AssignTickResult => assignRan(),
   };
   const beats: CycleBeats = {
@@ -112,6 +122,10 @@ function harness(policy: Partial<CycleDeps["policy"]> = {}) {
       calls.push("linkLoss");
       seen.linkLoss.push({ clocks, policy: linkPolicy, input });
       return next.linkLoss();
+    },
+    resultCheck(now) {
+      seen.resultCheck.push({ now, before: [...calls] });
+      return next.resultCheck();
     },
     async life(clock, input) {
       calls.push("life");
@@ -668,6 +682,102 @@ describe("D-90 닫기 박자", () => {
   });
 });
 
+describe("결과 검사 박자", () => {
+  test("끊김 뒤·수명 앞에서 부르고, now는 부르기 직전에 다시 읽은 장부 시계다", async () => {
+    const h = harness();
+    h.next.linkLoss = () => {
+      h.state.wall = 2_000_300;
+      return linkLossRan();
+    };
+    const report = ran(await createCycle(h.deps).beat());
+    expect(h.calls).toEqual(["tick", "linkLoss", "life", "life:returned", "resend", "assign"]);
+    expect(h.seen.resultCheck).toEqual([{ now: 2_000_300, before: ["tick", "linkLoss"] }]);
+    expect(report.resultCheck).toEqual({ kind: "returned", result: resultCheckRan() });
+    expect(h.reports).toEqual([report]);
+  });
+
+  test("박자 처음의 시계가 후퇴·읽지 못함이거나 부르기 직전의 다시 읽기가 후퇴면 부르지 않고(clock_untrusted), 수명 박자는 돈다", async () => {
+    const h = harness();
+    const cycle = createCycle(h.deps);
+    await cycle.beat();
+    h.state.wall = 1_999_000;
+    const regressed = ran(await cycle.beat());
+    expect([regressed.clock, regressed.resultCheck, regressed.life.kind]).toEqual(["regressed", { kind: "skipped", reason: "clock_untrusted" }, "returned"]);
+
+    const unavailable = harness();
+    unavailable.deps = { ...unavailable.deps, ledgerClock: createSharedClock({ now: () => Number.NaN }) };
+    const blind = ran(await createCycle(unavailable.deps).beat());
+    expect([blind.clock, blind.resultCheck, blind.life.kind]).toEqual(["unavailable", { kind: "skipped", reason: "clock_untrusted" }, "returned"]);
+
+    const back = harness();
+    back.next.linkLoss = () => {
+      back.state.wall = 1_000;
+      return linkLossRan();
+    };
+    const late = ran(await createCycle(back.deps).beat());
+    expect([late.clock, late.resultCheck, late.life.kind]).toEqual(["ok", { kind: "skipped", reason: "clock_untrusted" }, "returned"]);
+    expect([h.seen.resultCheck.length, unavailable.seen.resultCheck.length, back.seen.resultCheck.length]).toEqual([1, 0, 0]);
+  });
+
+  test("복원 전·발급 닫힘이면 부르지 않고, 끊김 박자나 다시 읽기 안에서 막히면 같은 이유로 남은 박자도 막힌다", async () => {
+    const h = harness();
+    h.state.restoreDone = false;
+    expect(ran(await createCycle(h.deps).beat()).resultCheck).toEqual({ kind: "skipped", reason: "restore_not_done" });
+
+    const r = harness();
+    r.next.linkLoss = () => {
+      r.state.restoreDone = false;
+      return linkLossRan();
+    };
+    const restarted = ran(await createCycle(r.deps).beat());
+    expect([restarted.resultCheck, restarted.life]).toEqual(skippedAll("restore_not_done", 2));
+
+    const c = harness();
+    const cycle = createCycle(c.deps);
+    let closing: Promise<void> | null = null;
+    c.next.linkLoss = () => {
+      c.state.onClock = () => {
+        closing = cycle.closeIssuance();
+      };
+      return linkLossRan();
+    };
+    const report = ran(await cycle.beat());
+    await closing;
+    expect([report.resultCheck, report.life]).toEqual(skippedAll("issuance_closed", 2));
+    expect([h.seen.resultCheck.length, r.seen.resultCheck.length, c.seen.resultCheck.length]).toEqual([0, 0, 0]);
+  });
+
+  test("던지거나 장부 호출로 멈추면 실행 목록을 다시 읽고 수명 박자는 돈다. 접수·유효 문으로 멈춘 것은 다시 읽지 않는다", async () => {
+    for (const [name, arrange, rereads] of [
+      [
+        "던짐",
+        () => {
+          throw new Error("묶은 박자가 던짐");
+        },
+        [{ beat: "result_check", cause: "threw", read: "runs", known: true }],
+      ],
+      ["halted threw", () => resultCheckRan("threw"), [{ beat: "result_check", cause: "halted", read: "runs", known: true }]],
+      ["halted intake_closed", () => resultCheckRan("intake_closed"), []],
+      ["halted beat_closed", () => resultCheckRan("beat_closed"), []],
+    ] as const) {
+      const h = harness();
+      h.next.resultCheck = arrange;
+      const report = ran(await createCycle(h.deps).beat());
+      expect([name, report.resultCheck.kind, report.rereads, h.calls.filter((call) => call === "life").length]).toEqual([
+        name,
+        name === "던짐" ? "threw" : "returned",
+        rereads,
+        1,
+      ]);
+    }
+  });
+
+  test("결과 검사 박자 함수가 없으면 순서기를 만들지 않는다", () => {
+    const h = harness();
+    expect(() => createCycle({ ...h.deps, beats: { ...h.deps.beats, resultCheck: undefined } as unknown as CycleBeats })).toThrow("순서기의 beats.resultCheck는 함수여야 한다");
+  });
+});
+
 describe("단조 시계", () => {
   test("끊김 박자의 monotonic은 단조 시계이고 clock은 장부 시계다", async () => {
     const h = harness();
@@ -963,6 +1073,7 @@ function realWorld() {
   } as unknown as AssignLoopPolicy;
   const beats: CycleBeats = {
     linkLoss: (clocks, policy, input) => linkLossTick({ ledger, restorer: intake, connections: { occupancy: () => [] }, ...clocks }, policy, input),
+    resultCheck: (now) => resultCheckTick({ ledger, intake }, now),
     life: (clock, input) => lifeTick({ ...base, clock }, { renewEveryMs: 10_000, answerTimeoutMs: 20_000 }, input),
     resend: async (clock, policy, input) => {
       const result = await resendTick({ ...base, clock }, policy, input);
@@ -997,7 +1108,7 @@ function realWorld() {
   return { source, shared, ledger, runId, cycle, hooks, world, sent, written };
 }
 
-describe("실제 박자 다섯과 장부", () => {
+describe("실제 박자 여섯과 장부", () => {
   test("배정 직전 시계 읽기 안에서 닫기를 부르면 배정을 부르지 않고 장부에 새 시작 기록이 없다", async () => {
     const w = realWorld();
     let closing: Promise<void> | null = null;
@@ -1153,7 +1264,7 @@ describe("박자 함수와 완료 신호", () => {
     const h = harness();
     const trace: string[] = [];
     const methods: Record<string, unknown> = { target: h.deps.beats };
-    for (const name of ["linkLoss", "life", "resend", "unreceived", "assign"] as const) {
+    for (const name of ["linkLoss", "resultCheck", "life", "resend", "unreceived", "assign"] as const) {
       Object.defineProperty(methods, name, {
         get() {
           trace.push(`get.${name}`);
@@ -1169,11 +1280,11 @@ describe("박자 함수와 완료 신호", () => {
       return true;
     };
     const cycle = createCycle({ ...h.deps, beats: methods as unknown as CycleBeats, restoreDone });
-    // 다섯째 박자(D-90 닫기)도 같은 규칙이다: 만들 때 재전송과 배정 사이 차례로 한 번 꺼내 쥐고, 부르기 직전에 막힘을 본다.
-    expect(trace.splice(0)).toEqual(["get.linkLoss", "get.life", "get.resend", "get.unreceived", "get.assign"]);
+    // D-90 닫기와 결과 검사도 같은 규칙이다: 만들 때 박자 차례로 한 번 꺼내 쥐고, 부르기 직전에 막힘을 본다.
+    expect(trace.splice(0)).toEqual(["get.linkLoss", "get.resultCheck", "get.life", "get.resend", "get.unreceived", "get.assign"]);
     for (let pass = 0; pass < 2; pass += 1) {
       const report = ran(await cycle.beat());
-      expect(trace.splice(0)).toEqual(["gate", "enter.linkLoss", "gate", "enter.life", "gate", "enter.resend", "gate", "enter.unreceived", "gate", "enter.assign"]);
+      expect(trace.splice(0)).toEqual(["gate", "enter.linkLoss", "gate", "enter.resultCheck", "gate", "enter.life", "gate", "enter.resend", "gate", "enter.unreceived", "gate", "enter.assign"]);
       expect([report.linkLoss.kind, report.life.kind, report.resend.kind, report.assign.map((step) => step.kind)]).toEqual(["returned", "returned", "returned", ["returned"]]);
     }
   });
@@ -1198,14 +1309,18 @@ describe("박자 함수와 완료 신호", () => {
     h.next.linkLoss = () => linkLossRan(returned);
     await cycle.beat();
     h.next.linkLoss = () => linkLossRan();
-    // 다섯째 박자(D-90 닫기)와 그 앞의 확인도 같은 차례 기록에 남긴다.
+    // D-90 닫기·결과 검사와 그 앞의 확인도 같은 차례 기록에 남긴다.
     h.next.unreceived = () => {
       h.calls.push("unreceived");
       return unreceivedRan();
     };
+    h.next.resultCheck = () => {
+      h.calls.push("resultCheck");
+      return resultCheckRan();
+    };
     h.calls.length = 0;
     await cycle.beat();
-    expect(h.calls).toEqual(["tick", "gate", "linkLoss", "gate", "life", "life:returned", "gate", "resend", "gate", "unreceived", "gate", "assign"]);
+    expect(h.calls).toEqual(["tick", "gate", "linkLoss", "gate", "resultCheck", "gate", "life", "life:returned", "gate", "resend", "gate", "unreceived", "gate", "assign"]);
     const input = h.seen.linkLoss.at(-1)?.input.watch;
     expect([Object.getPrototypeOf(input), input]).toEqual([Array.prototype, [{ executorId: W1, absentSince: null }]]);
   });
@@ -1358,6 +1473,7 @@ describe("정적", () => {
     // 부르지 않는다. tsc가 이 묶음의 꼴을 확인한다.
     const bind = (ports: {
       linkLoss: Omit<LinkLossPorts, "clock" | "monotonic">;
+      resultCheck: ResultCheckPorts;
       life: Omit<LifeLoopPorts, "clock">;
       lifePolicy: LifecyclePolicy;
       resend: Omit<ResendPorts, "clock">;
@@ -1366,6 +1482,7 @@ describe("정적", () => {
       assignPolicy: AssignLoopPolicy;
     }): CycleBeats => ({
       linkLoss: (clocks, policy, input) => linkLossTick({ ...ports.linkLoss, ...clocks }, policy, input),
+      resultCheck: (now) => resultCheckTick(ports.resultCheck, now),
       life: (clock, input) => lifeTick({ ...ports.life, clock }, ports.lifePolicy, input),
       resend: (clock, policy, input) => resendTick({ ...ports.resend, clock }, policy, input),
       unreceived: (now) => unreceivedTick(ports.unreceived, now),

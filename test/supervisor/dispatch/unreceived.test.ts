@@ -157,6 +157,7 @@ describe("모름 표", () => {
     const shared = createSharedClock({ now: () => source.wall });
     const beats: CycleBeats = {
       linkLoss: () => ({ kind: "ran", executors: [], watch: [], halted: null, haltedAt: null }),
+      resultCheck: () => ({ kind: "ran", runs: [], halted: null, haltedAt: null }),
       life: async () => ({ kind: "ran", runs: [], pendingQueries: [], halted: null, haltedAt: null }),
       resend: async () => ({ kind: "ran", instructions: [], halted: null, haltedAt: null }),
       unreceived: (now) => unreceivedTick(w.ports, now),
@@ -561,6 +562,7 @@ async function beatWithAssign(w: ReturnType<typeof world>) {
   const cycle = createCycle({
     beats: {
       linkLoss: () => ({ kind: "ran", executors: [], watch: [], halted: null, haltedAt: null }),
+      resultCheck: () => ({ kind: "ran", runs: [], halted: null, haltedAt: null }),
       life: async () => ({ kind: "ran", runs: [], pendingQueries: [], halted: null, haltedAt: null }),
       resend: async () => ({ kind: "ran", instructions: [], halted: null, haltedAt: null }),
       unreceived: (now) => unreceivedTick(w.ports, now),
