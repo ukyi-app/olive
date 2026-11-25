@@ -20,6 +20,7 @@
 //    장부에 쓰기 직전(마지막 외부 호출 뒤의 같은 동기 구간)에 박자 유효 문을 다시 본다(beatValid 포트).
 import { executorName, type Role } from "../../contract/v1/index.ts";
 import {
+  type InputRecord,
   type Ledger,
   type OpenOptions,
   type OpenResult,
@@ -82,6 +83,9 @@ export interface FrontDoorPorts {
   readonly stopAuthority: StopAuthorityPort;
   readonly publications: PublicationPort;
   readonly peers: FrontPeers;
+  // 시험 현관 대역(D-109, frontdoor/test-double.ts)만 채운다. 받은 시각(장부 시계)으로 장부에 넣을 시험 소유자 입력 하나를 만든다.
+  // 없으면(운영) 조립은 이 자리에서 아무것도 읽지 않는다. 넣는 차례는 아래 admitTestInput이다.
+  readonly testInput?: (receivedAt: number) => InputRecord;
 }
 
 export interface SupervisorTiming {
@@ -847,6 +851,53 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     });
   };
 
+  // 시험 현관 대역의 소유자 입력(D-109). 5단계의 허가를 받아들인 뒤, 주기의 박자 밖(답 처리 뒤)에서 장부가 받을 때까지 주기마다 한 번 넣는다.
+  // 같은 요청 ID라 다시 넣어도 줄은 하나다(enqueueInput의 created:false). 차례: 입력 만들기(장부 시계) → 데이터 사본 → 쓰기 함수 얻기 →
+  // 문 한 번(intake.intakeOpen + 끝 차례) → 호출 하나. 문 뒤에는 그 호출만 있다(사본이라 장부가 칸을 읽어도 대역의 코드가 돌지 않는다).
+  // 장부의 거절(접수 닫힘·정지)은 다음 주기에 다시 본다. 호출이 던지거나 답의 꼴이 틀리면 적혔는지 몰라 다시 넣지 않는다(장부 고장이면 주기가 96으로 끝낸다).
+  const makeTestInput = front.testInput;
+  let testInputSettled = makeTestInput === undefined;
+  let lastTestInputNote = "";
+  const noteTestInput = (outcome: string, reason: string | null = null) => {
+    const key = `${outcome}:${reason ?? ""}`;
+    if (key !== lastTestInputNote) log("front_door_test_input", { outcome, reason });
+    lastTestInputNote = key;
+  };
+  const admitTestInput = () => {
+    if (testInputSettled || makeTestInput === undefined || stopping || stage < 5 || !granted) return;
+    let input: InputRecord;
+    let write: Ledger["enqueueInput"];
+    try {
+      const made = makeTestInput(shared.now());
+      input = { requestId: made.requestId, source: made.source, sourceRef: { ref: made.sourceRef.ref, expiresAt: made.sourceRef.expiresAt }, receivedAt: made.receivedAt };
+      write = ledger.enqueueInput;
+    } catch {
+      return noteTestInput("not_made");
+    }
+    if (typeof write !== "function") return noteTestInput("not_made");
+    // 문: 접수 문(장부 건강·허가를 읽고 끝낼 사유를 붙잡는다)과 끝 차례를 한 판단으로 본다. 끝 차례는 맨 끝에 읽는다: 입력을 만드는 사이나
+    // 접수 문의 읽기 사이에 시작된 끝 차례도 본다(먼저 읽으면 그 뒤에 시작된 것을 놓친다).
+    if (!intake.intakeOpen() || stopping) return noteTestInput("closed");
+    // 답의 해석도 같은 try 안이다: 꼴이 틀린 답이나 칸을 읽다 던진 것은 적혔는지 모름(unknown)이다.
+    let outcome: "created" | "existing" | "refused" | "unknown";
+    let reason: string | null = null;
+    try {
+      const result: unknown = write.call(ledger, input);
+      const ok = typeof result === "object" && result !== null ? (result as { ok?: unknown }).ok : undefined;
+      if (ok === true) outcome = (result as { created?: unknown }).created === true ? "created" : "existing";
+      else if (ok === false) {
+        outcome = "refused";
+        const why = (result as { reason?: unknown }).reason;
+        reason = typeof why === "string" ? why : "unknown";
+      } else outcome = "unknown";
+    } catch {
+      outcome = "unknown";
+      reason = "threw";
+    }
+    if (outcome !== "refused") testInputSettled = true;
+    noteTestInput(outcome, reason);
+  };
+
   const sleep = (ms: number) =>
     new Promise<void>((resolve) => {
       let cancel: () => void = () => {};
@@ -890,6 +941,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       const requery = answerLines.takeRequery();
       if (requery.length > 0) log("requery", { count: requery.length });
       if (stopping) return;
+      admitTestInput();
       await sleep(timing.beatEveryMs);
     }
   };
