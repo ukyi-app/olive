@@ -32,8 +32,7 @@ END;
 -- 실패 상태가 된 시각. 까닭: updated_at은 상태와 무관한 뒤 쓰기(recordBudget)도 바꿔, failed_stopped가 된 시각으로 읽으면 확정의
 -- stored_at이 틀린다. 값은 failed_stopped로 옮기는 같은 UPDATE에서 그 UPDATE의 updated_at으로만 들어가고 그 뒤로는 바뀌지 않는다.
 -- NULL은 장부가 그 시각을 칸으로 모른다는 뜻이다: failed_stopped가 된 적 없는 줄, 이 판 전에 failed_stopped가 된 줄(나중에 채우지
--- 않는다), 원 SQL로 이 칸 없이 옮긴 줄. 그 줄은 updated_at이 종료 확인 영수증을 받은 시각과 같을 때만 그 시각으로 읽는다(ledger.ts의
--- failedStop).
+-- 않는다), 원 SQL로 이 칸 없이 옮긴 줄. 그 줄의 실패 시각은 모름으로 읽는다(ledger.ts의 failedStop).
 -- exit 없이 이 칸을 적는 것은 checking에서 옮길 때(결과 없음 판정)뿐이다. 그래서 exit가 NULL이고 이 칸이 있는 줄은 completed로
 -- checking이 된 줄이다(판 8 전에 종료 확인을 받고 판 8 뒤에 판정된 줄). 그 밖에서 옮기는 쓰기는 exit를 함께 적는 첫 종료 확인뿐이다.
 

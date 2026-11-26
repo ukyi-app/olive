@@ -161,12 +161,12 @@ function storedExit(value: unknown): StopExit {
 
 // failed_stopped가 된 장부 시각과 종료 영수증 exit(FailedStop의 두 칸 주석). 실패 상태가 된 시각 칸(판 8 runs.failed_stopped_at)이
 // 있으면 그 값이고, 그때 exit 칸이 비었으면 completed다(트리거가 그 칸을 exit와 함께 적는 첫 종료 확인이나 checking에서 옮기는 쓰기에만
-// 허락한다). 시각 칸이 빈 줄은 updated_at이 종료 확인 영수증을 받은 시각과 같을 때만 그 시각이고, 다르면 시각을 모른다(null).
-function stopFacts(row: RunRow, receipt: { received_at: number } | null): Pick<FailedStop, "stoppedAt" | "exit"> {
+// 허락한다). 시각 칸이 빈 줄은 시각을 모른다(null). updated_at이 종료 확인 영수증 시각과 같아도 근거가 아니다: 감독이 다시 뜨면
+// 공유 시계의 하한이 0부터라 늦은 판정 뒤의 예산 기록이 영수증 시각을 다시 적을 수 있고, 그 장부는 판정이 같은 시각인 장부와 같다.
+function stopFacts(row: RunRow): Pick<FailedStop, "stoppedAt" | "exit"> {
   const exit = row.stop_exit === undefined || row.stop_exit === null ? null : storedExit(row.stop_exit);
   if (row.failed_stopped_at !== undefined && row.failed_stopped_at !== null) return { stoppedAt: safe(row.failed_stopped_at, "runs.failed_stopped_at"), exit: exit ?? "completed" };
-  const updated = safe(row.updated_at, "runs.updated_at");
-  return { stoppedAt: receipt !== null && updated === safe(receipt.received_at, "deliveries.received_at") ? updated : null, exit };
+  return { stoppedAt: null, exit };
 }
 
 // ---- 장부의 값 ----
@@ -573,10 +573,9 @@ export interface FailedStop {
   // 실행 줄이 failed_stopped가 된 장부 시각: 그 상태로 옮긴 쓰기(종료 확인 영수증 또는 markResult의 결과 없음 판정)가 넘긴 시각이다.
   // 판 8부터는 그 쓰기가 runs.failed_stopped_at에 함께 적고 그 뒤로 바뀌지 않는다. runs.updated_at으로 읽지 않는다: recordBudget 같은
   // 뒤 쓰기가 상태와 무관하게 그 칸을 바꾼다.
-  // 그 칸이 빈 줄(판 8 전에 failed_stopped가 된 줄, 원 SQL로 그 칸 없이 옮긴 줄)은 updated_at이 종료 확인 영수증을 받은 시각과 같을
-  // 때만 그 시각이다. 종료 확인 쓰기는 그 영수증을 받은 시각을 같은 트랜잭션에서 updated_at으로 적으므로, 같으면 그 뒤에 다른 시각의
-  // 쓰기가 없었고 곧바로 옮겼든 같은 밀리초에 판정했든 그 시각에 failed_stopped가 됐다(뒤 쓰기가 앞선 시각을 넘기지 않는다고 본다).
-  // 다르면 null(모름): 뒤의 결과 없음 판정인지 예산 기록 같은 다른 쓰기인지 장부가 가를 근거가 없다.
+  // 그 칸이 빈 줄(판 8 전에 failed_stopped가 된 줄, 원 SQL로 그 칸 없이 옮긴 줄)은 늘 null(모름)이다. updated_at이 종료 확인 영수증을
+  // 받은 시각과 같아도 그 시각이라고 보지 않는다: 감독이 다시 뜨면 공유 시계가 앞선 시각을 다시 낼 수 있어, 늦은 결과 없음 판정 뒤의
+  // 예산 기록이 영수증 시각을 다시 적은 줄과 그 시각에 곧바로 옮긴 줄을 장부가 가를 근거가 없다.
   stoppedAt: number | null;
   // 그 실행에 사유 requested의 취소 지시(task_cancel)가 적혔으면 true, 취소 지시가 없거나 다른 사유뿐이면 false. requested는 없고
   // 사유 없이 적힌 취소 지시가 있으면 null(모름: requested였을 수 있다. 판 4 전의 줄이거나 사유를 넘기지 않은 기록).
@@ -3412,14 +3411,11 @@ export class Ledger {
     return this.#read(() => {
       const row = this.#runRow(runId);
       if (row === null || row.kind !== "worker" || row.state !== "failed_stopped" || row.stop_receipt_id === null) return null;
-      const receipt = this.#db.query("SELECT received_at FROM deliveries WHERE id = ? AND run_id = ? AND action = 'receipt_stopped'").get(row.stop_receipt_id, runId) as {
-        received_at: number;
-      } | null;
       const reasons = (
         this.#db.query(`SELECT ${this.#rebuildColumns ? "reason" : "NULL AS reason"} FROM instructions WHERE run_id = ? AND action = 'task_cancel'`).all(runId) as { reason: string | null }[]
       ).map((cancel) => cancel.reason);
       const requestedCancel = reasons.includes("requested") ? true : reasons.includes(null) ? null : false;
-      const { stoppedAt, exit } = stopFacts(row, receipt);
+      const { stoppedAt, exit } = stopFacts(row);
       return { runId, stoppedAt, requestedCancel, exit };
     });
   }

@@ -25,7 +25,7 @@ function cancel(ledger: Ledger, s: ReturnType<typeof started>, reason: "requeste
 }
 
 describe("failedStop", () => {
-  test("종료 영수증이 곧바로 옮긴 failed_stopped는 그 영수증 시각과 그 exit다. 판 8 전의 줄이면 exit 모름(null)이다", () => {
+  test("종료 영수증이 곧바로 옮긴 failed_stopped는 그 영수증 시각과 그 exit다. 판 8 전의 줄이면 시각·exit 모두 모름(null)이다", () => {
     for (const exit of ["cancelled", "deadline", "failed"] as const) {
       const ledger = ready(open(tempPath()));
       const s = started(ledger);
@@ -35,11 +35,11 @@ describe("failedStop", () => {
       const old = ready(open(tempPath(), { migrations: BEFORE_STOP_EXIT() }));
       const t = started(old);
       stopped(old, t, exit, NOW + 7);
-      expect([exit, old.failedStop(t.runId)]).toEqual([exit, { known: true, value: { runId: t.runId, stoppedAt: NOW + 7, requestedCancel: false, exit: null } }]);
+      expect([exit, old.failedStop(t.runId)]).toEqual([exit, { known: true, value: { runId: t.runId, stoppedAt: null, requestedCancel: false, exit: null } }]);
     }
   });
 
-  test("completed로 checking이 된 뒤 결과 없음으로 판정된 failed_stopped는 판정 시각, exit completed다. 판 8 전의 줄이면 exit 모름이고 시각은 영수증 시각과 같을 때만 안다", () => {
+  test("completed로 checking이 된 뒤 결과 없음으로 판정된 failed_stopped는 판정 시각, exit completed다. 판 8 전의 줄이면 판정 시각과 무관하게 시각·exit 모두 모름이다", () => {
     const ledger = ready(open(tempPath()));
     const s = started(ledger);
     stopped(ledger, s, "completed", NOW + 1);
@@ -53,16 +53,13 @@ describe("failedStop", () => {
     must(same.markResult({ runId: t.runId, resultDigest: null, now: NOW + 1 }));
     expect(same.failedStop(t.runId)).toEqual({ known: true, value: { runId: t.runId, stoppedAt: NOW + 1, requestedCancel: false, exit: "completed" } });
 
-    // 판 8 전의 줄은 실패 시각 칸이 없다. 영수증보다 늦은 updated_at은 결과 없음 판정과 예산 기록이 같은 모양이라 시각·exit 모두 모른다.
-    for (const [judgedAt, stoppedAt] of [
-      [NOW + 60_001, null],
-      [NOW + 1, NOW + 1],
-    ] as const) {
+    // 판 8 전의 줄은 실패 시각 칸이 없다. updated_at은 뒤 예산 기록이 영수증 시각을 다시 적을 수도 있어 영수증 시각과 같아도 근거가 아니다.
+    for (const judgedAt of [NOW + 60_001, NOW + 1]) {
       const old = ready(open(tempPath(), { migrations: BEFORE_STOP_EXIT() }));
       const u = started(old);
       stopped(old, u, "completed", NOW + 1);
       must(old.markResult({ runId: u.runId, resultDigest: null, now: judgedAt }));
-      expect(old.failedStop(u.runId)).toEqual({ known: true, value: { runId: u.runId, stoppedAt, requestedCancel: false, exit: null } });
+      expect([judgedAt, old.failedStop(u.runId)]).toEqual([judgedAt, { known: true, value: { runId: u.runId, stoppedAt: null, requestedCancel: false, exit: null } }]);
     }
   });
 

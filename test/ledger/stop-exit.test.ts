@@ -139,7 +139,7 @@ test("판 8 뒤 원 SQL로 exit 없이 적은 종료 확인도 모름(NULL)으�
   // 사유 requested의 취소 지시가 있으면 exit를 몰라도 cancelled다.
   const requested = made((ledger, s) => must(ledger.recordStopInstruction({ runId: s.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1, reason: "requested" })), "failed_stopped");
   const requestedFacts = facts(requested.ledger, requested.s.runId);
-  expect(requestedFacts).toEqual({ runId: requested.s.runId, stoppedAt: NOW + 2, requestedCancel: true, exit: null });
+  expect(requestedFacts).toEqual({ runId: requested.s.runId, stoppedAt: null, requestedCancel: true, exit: null });
   expect(failedOutcome(requestedFacts as NonNullable<typeof requestedFacts>)).toBe("cancelled");
 
   // checking에서 결과 없음으로 판정되면 그 판정이 실패 시각을 적어 exit를 completed로 읽고 failed다.
@@ -152,11 +152,11 @@ test("판 8 뒤 원 SQL로 exit 없이 적은 종료 확인도 모름(NULL)으�
   // 곧바로 failed_stopped이고 취소 지시가 없으면 cancelled였을 수 있어 정하지 않는다.
   const direct = made(() => {}, "failed_stopped");
   const directFacts = facts(direct.ledger, direct.s.runId);
-  expect(directFacts).toEqual({ runId: direct.s.runId, stoppedAt: NOW + 2, requestedCancel: false, exit: null });
+  expect(directFacts).toEqual({ runId: direct.s.runId, stoppedAt: null, requestedCancel: false, exit: null });
   expect(failedOutcome(directFacts as NonNullable<typeof directFacts>)).toBeNull();
 });
 
-test("옛 줄(판 8 전에 종료 확인)의 exit는 모름이다: 곧바로 failed_stopped면 null이라 확정 outcome을 정하지 않고, 판정 시각이 늦으면 시각도 몰라 정하지 않는다", () => {
+test("옛 줄(판 8 전에 종료 확인)의 시각·exit는 모름이다: 곧바로 failed_stopped여도, 판정 시각이 늦어도 확정 outcome을 정하지 않는다", () => {
   const directPath = tempPath();
   const a = ready(open(directPath, { migrations: BEFORE() }));
   const direct = startedWorker(a);
@@ -164,7 +164,7 @@ test("옛 줄(판 8 전에 종료 확인)의 exit는 모름이다: 곧바로 fai
   a.close();
   const upgradedA = ready(open(directPath));
   const directFacts = facts(upgradedA, direct.runId);
-  expect(directFacts).toEqual({ runId: direct.runId, stoppedAt: NOW + 7, requestedCancel: false, exit: null });
+  expect(directFacts).toEqual({ runId: direct.runId, stoppedAt: null, requestedCancel: false, exit: null });
   expect(failedOutcome(directFacts as NonNullable<typeof directFacts>)).toBeNull();
 
   const judgedPath = tempPath();

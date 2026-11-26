@@ -1,5 +1,7 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
+import { copyFileSync } from "node:fs";
 import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import { type InstructionTimes, type Ledger, loadMigrations } from "../../../src/ledger/index.ts";
 import { type LifeLoopLedger, type LifeLoopPorts, type LifeTickResult, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
@@ -1799,11 +1801,11 @@ const withheldAs = (reason: "outcome_unknown" | "stored_at_unknown") => ({ outco
 
 describe("실패 확정의 stored_at(D-114): 예산 기록 같은 뒤 쓰기가 failed_stopped가 된 시각과 옛 줄의 exit를 바꾸지 않는다", () => {
   // 리뷰 재현의 네 대조군: 취소 지시 없이 exit cancelled 영수증을 NOW + 2에 적고, 예산 기록이 있으면 NOW + 19에 적는다.
-  // 판 7 줄은 실패 시각 칸이 없고 updated_at이 영수증 시각과 다르면 결과 없음 판정인지 예산 기록인지 가를 근거가 없어 보류한다.
+  // 판 7 줄은 실패 시각 칸이 없어 실패 시각도 exit도 모르고 보류한다(아래 "updated_at이 영수증 시각과 같아도").
   const controls: [7 | 8, boolean, Record<string, unknown>, Record<string, unknown>][] = [
     [8, false, { stoppedAt: NOW + 2, exit: "cancelled" }, sentAs("cancelled", NOW + 2)],
     [8, true, { stoppedAt: NOW + 2, exit: "cancelled" }, sentAs("cancelled", NOW + 2)],
-    [7, false, { stoppedAt: NOW + 2, exit: null }, withheldAs("outcome_unknown")],
+    [7, false, { stoppedAt: null, exit: null }, withheldAs("outcome_unknown")],
     [7, true, { stoppedAt: null, exit: null }, withheldAs("outcome_unknown")],
   ];
   for (const [version, budget, facts, expected] of controls) {
@@ -1830,9 +1832,9 @@ describe("실패 확정의 stored_at(D-114): 예산 기록 같은 뒤 쓰기가 
     expect(budgeted).toEqual(judged);
   });
 
-  test("판 7 줄의 사유 requested 취소: 영수증 시각 그대로면 그 시각으로 cancelled, 뒤 쓰기로 시각이 바뀌었으면 stored_at을 몰라 보류한다", async () => {
+  test("판 7 줄의 사유 requested 취소: 영수증 시각 그대로여도, 뒤 쓰기로 시각이 바뀌었어도 stored_at을 몰라 보류한다", async () => {
     const plain = await finalizeOf(7, [requestedAt(NOW + 1), stopAt("cancelled", NOW + 2)]);
-    expect(plain).toMatchObject({ facts: { stoppedAt: NOW + 2, exit: null }, ...sentAs("cancelled", NOW + 2) });
+    expect(plain).toMatchObject({ facts: { stoppedAt: null, exit: null }, ...withheldAs("stored_at_unknown") });
     for (const [name, after] of [
       ["예산 기록", budgetAt(NOW + 19)],
       ["결과 없음 판정", judgeAt(NOW + 19)],
@@ -1842,4 +1844,54 @@ describe("실패 확정의 stored_at(D-114): 예산 기록 같은 뒤 쓰기가 
       expect([name, got]).toMatchObject([name, { facts: { stoppedAt: null, exit: null }, ...withheldAs("stored_at_unknown") }]);
     }
   });
+
+  // 감독이 다시 뜨면 공유 시계의 하한이 0부터라(src/supervisor/runtime/shared-clock.ts), 결과 없음 판정 뒤의 예산 기록이 판정보다
+  // 이른 영수증 시각을 다시 적을 수 있다. 그러면 판정이 영수증과 같은 시각인 이력과 늦은 이력이 장부의 모든 표에서 같아져,
+  // updated_at과 영수증 시각의 일치로는 실패 시각을 가를 수 없다.
+  test("판 7에서 실패 상태가 된 줄은 updated_at이 영수증 시각과 같아도 확정을 보류한다: 판정 시각이 같은 이력과 늦은 이력이 장부로 같다", async () => {
+    const seed = tempPath();
+    const base = ready(open(seed, { migrations: BEFORE_STOP_EXIT() }));
+    const s = startedWorker(base);
+    requestedAt(NOW + 1)(base, s);
+    stopAt("completed", NOW + 2)(base, s);
+    base.close();
+    const tables: Record<string, unknown[]>[] = [];
+    for (const judgedAt of [NOW + 2, NOW + 19]) {
+      const path = tempPath();
+      copyFileSync(seed, path);
+      const judging = ready(open(path, { migrations: BEFORE_STOP_EXIT() }));
+      judgeAt(judgedAt)(judging, s);
+      judging.close();
+      const restarted = ready(open(path, { migrations: BEFORE_STOP_EXIT() }));
+      budgetAt(NOW + 2)(restarted, s);
+      restarted.close();
+      tables.push(tablesOf(path));
+      const w = world(path);
+      const read = w.ledger.failedStop(s.runId);
+      w.setClock(NOW + 30);
+      const { runId: _, ...outcome } = only(await tick(w), s.runId);
+      const facts = read.known && read.value !== null ? { stoppedAt: read.value.stoppedAt, exit: read.value.exit } : read;
+      expect([judgedAt, { facts, outcome, writes: writes(w), bodies: w.sent.map((e) => e.body) }]).toMatchObject([
+        judgedAt,
+        { facts: { stoppedAt: null, exit: null }, ...withheldAs("stored_at_unknown") },
+      ]);
+    }
+    expect(Object.keys(tables[0] ?? {}).length).toBeGreaterThan(0);
+    expect(tables[1]).toEqual(tables[0]);
+
+    // 판 8의 같은 이력은 실패 시각 칸이 판정 시각을 고정해 뒤 예산 기록과 무관하게 그 시각으로 보낸다.
+    const fixed = await finalizeOf(8, [requestedAt(NOW + 1), stopAt("completed", NOW + 2), judgeAt(NOW + 19), budgetAt(NOW + 2)]);
+    expect(fixed).toMatchObject({ facts: { stoppedAt: NOW + 19, exit: "completed" }, ...sentAs("cancelled", NOW + 19) });
+  });
 });
+
+// 장부 파일의 모든 표 내용. 두 이력이 장부만으로 갈리는지 보는 데 쓴다.
+function tablesOf(path: string): Record<string, unknown[]> {
+  const db = new Database(path, { readonly: true });
+  try {
+    const names = db.query("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all() as { name: string }[];
+    return Object.fromEntries(names.map(({ name }) => [name, db.query(`SELECT * FROM "${name}"`).all()]));
+  } finally {
+    db.close();
+  }
+}
