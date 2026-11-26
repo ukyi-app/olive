@@ -265,10 +265,11 @@ export type ReceiptOutcome =
   | { readonly outcome: "ack"; readonly action: string; readonly id: string; readonly delivery: Delivery; readonly ack: Draft<"ack">; readonly alarm?: LedgerAlarm }
   // 장부가 받았지만 ack 초안을 만들지 못했다.
   | { readonly outcome: "applied_without_ack"; readonly action: string; readonly id: string; readonly delivery: Delivery; readonly reason: AckUnavailable; readonly alarm?: LedgerAlarm }
-  // 장부가 거절했다. ack가 없다.
-  | { readonly outcome: "ledger_refused"; readonly action: string; readonly id: string; readonly reason: LedgerRefusal }
+  // 장부가 거절했다. ack가 없다. runId는 결과 보고(본문을 보관한 뒤 장부에 넘긴 것)에만 있다(아래 둘 다): 조립이 그 실행의 결과 없음
+  // 판정을 보류하는 근거다(result-check.ts의 ResultReach.unstoredResult).
+  | { readonly outcome: "ledger_refused"; readonly action: string; readonly id: string; readonly reason: LedgerRefusal; readonly runId?: string }
   // 장부가 던졌거나 답이 꼴에 맞지 않는다. 받았는지 모르므로 ack가 없다(다시 오면 장부가 다시 가른다).
-  | { readonly outcome: "ledger_failed"; readonly action: string; readonly id: string; readonly failure: "threw" | "malformed_answer" }
+  | { readonly outcome: "ledger_failed"; readonly action: string; readonly id: string; readonly failure: "threw" | "malformed_answer"; readonly runId?: string }
   // 기다리는 조회의 답이고 지금 인정된 연결에서 왔다. 밀린 답과 이번 답을 받은 순서대로 장부에 넘긴 결과다(settled의 마지막이 이번 답).
   // backlog는 다음에 그 실행기의 어떤 답보다 먼저 넘길 답이다(비면 밀린 답이 없다). ack는 없다(상태 보고는 id가 없다).
   | {
@@ -520,7 +521,8 @@ function handleResult(action: string, header: Record<string, unknown>, read: Rea
   if (stored.status !== "stored") return { outcome: "result_unknown", ...base, at: "store" };
 
   const report: ReportInput = { reportId, action: "report_result", runId, bodyDigest: header.body_digest as string, storedRef: stored.ref, resultDigest: digest, signal: null, now: input.now };
-  return settle(action, reportId, () => results.ledger.recordReport(report, from), header.sender as string, input.stopGeneration, ports.random);
+  const settled = settle(action, reportId, () => results.ledger.recordReport(report, from), header.sender as string, input.stopGeneration, ports.random);
+  return settled.outcome === "ledger_refused" || settled.outcome === "ledger_failed" ? { ...settled, runId } : settled;
 }
 
 type LedgerAnswer = { ok: true; delivery: Delivery; ack: string; alarm: LedgerAlarm | null } | { ok: false; reason: LedgerRefusal };

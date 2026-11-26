@@ -233,7 +233,7 @@ describe("보장 2: 모름과 거절에는 ack가 없다", () => {
     const refuse = { getRun: (r: string) => ledger.getRun(r), instructionTimes: (r: string) => ledger.instructionTimes(r), recordReport:() => ({ ok: false as const, reason: "ledger_unwritable" as const }) };
     const random = countingRandom();
     const refused = handleForward(forward(await resultReport(reportId, runId)), { ledger, random, results: { backend, ledger: refuse } });
-    expect(refused).toEqual({ outcome: "ledger_refused", action: "report_result", id: reportId, reason: "ledger_unwritable" });
+    expect(refused).toEqual({ outcome: "ledger_refused", action: "report_result", id: reportId, reason: "ledger_unwritable", runId });
     expect(random.calls).toBe(0);
     // 장부에 참조가 없는 본문이 남는다. 머리가 온전해 고아 정리가 보관 시각으로 고를 수 있다(이 처리기는 지우지 않는다).
     const left = listStored(backend);

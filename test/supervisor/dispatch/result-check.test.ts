@@ -41,6 +41,8 @@ interface World {
   greeted: string[];
   seen: string[];
   answered: string[];
+  // answeredAt·answeredState·sinceAnsweredMs·unstoredResult에 넘긴 실행 ID(부른 차례).
+  answeredRuns: string[];
 }
 
 // 단조 경과의 기본값. 이 파일의 어떤 기한보다 길다.
@@ -53,6 +55,8 @@ type ReachFacts = {
   sinceSeenMs?: unknown;
   answeredAt?: unknown;
   sinceAnsweredMs?: unknown;
+  answeredState?: unknown;
+  unstoredResult?: unknown;
 };
 const ANSWERED = Symbol("기한 시작 + 한 주기에 실은 조회");
 
@@ -72,10 +76,13 @@ function world(ledger?: Ledger, path?: string): World {
     sinceSeenMs: LONG,
     answeredAt: ANSWERED,
     sinceAnsweredMs: 0,
+    answeredState: "failed_stopped",
+    unstoredResult: false,
   };
   const greeted: string[] = [];
   const seen: string[] = [];
   const answered: string[] = [];
+  const answeredRuns: string[] = [];
   const answeredDefault = () => Math.max(NOW + 2, ...[reach.restoredAt, reach.greetedAt].filter((at): at is number => typeof at === "number")) + limits.RENEW_INTERVAL_MS;
   const ports: ResultCheckPorts = {
     ledger: {
@@ -103,13 +110,24 @@ function world(ledger?: Ledger, path?: string): World {
         seen.push(runId);
         return reach.sinceSeenMs as number | null;
       },
-      answeredAt: (executorId) => {
+      answeredAt: (executorId, runId) => {
         answered.push(executorId);
+        answeredRuns.push(runId);
         return (reach.answeredAt === ANSWERED ? answeredDefault() : reach.answeredAt) as number | null;
       },
-      sinceAnsweredMs: (executorId) => {
+      answeredState: (executorId, runId) => {
         answered.push(executorId);
+        answeredRuns.push(runId);
+        return reach.answeredState as string | null;
+      },
+      sinceAnsweredMs: (executorId, runId) => {
+        answered.push(executorId);
+        answeredRuns.push(runId);
         return reach.sinceAnsweredMs as number | null;
+      },
+      unstoredResult: (runId) => {
+        answeredRuns.push(runId);
+        return reach.unstoredResult as boolean | null;
       },
     },
   };
@@ -121,6 +139,7 @@ function world(ledger?: Ledger, path?: string): World {
     greeted,
     seen,
     answered,
+    answeredRuns,
     setReach: (facts) => {
       reach = { ...reach, ...facts };
     },
@@ -515,7 +534,7 @@ function line(policy: ResultCheckPolicy | undefined) {
             intake,
             beatValid: () => true,
             // 기한은 종료 영수증부터 센다(복원 5단계·인정 모두 그보다 이르고 재전송 한 주기가 지났다). 단조 경과는 모두 충분하다.
-            // 실행기는 기한 시작(종료 영수증) + 한 주기에 실은 조회에 방금 답했다.
+            // 실행기는 기한 시작(종료 영수증) + 한 주기에 실은 조회에 방금 답했고 결과가 없다고 말했다. 보관하지 못한 보고도 없다.
             reach: {
               restoredAt: () => NOW,
               greetedAt: () => NOW - limits.RENEW_INTERVAL_MS,
@@ -523,7 +542,9 @@ function line(policy: ResultCheckPolicy | undefined) {
               sinceGreetedMs: () => LONG,
               sinceSeenMs: () => LONG,
               answeredAt: () => SINCE + limits.RENEW_INTERVAL_MS,
+              answeredState: () => "failed_stopped",
               sinceAnsweredMs: () => 0,
+              unstoredResult: () => false,
             },
           },
           now,
@@ -1022,6 +1043,77 @@ describe("결과 없음 판정 전 실행기의 실제 답", () => {
     const w = world();
     const run = checking(w.ledger);
     w.setReach({ answeredAt: null, sinceAnsweredMs: null });
+    const result = report(w.ledger, run, "본문");
+    expect(ranOf(resultCheckTick(w.ports, SINCE + 10 * WAIT, WAITING)).runs).toEqual([
+      { runId: run.runId, outcome: "judged", reportId: result.reportId, resultDigest: result.resultDigest, state: "ready_result" },
+    ]);
+  });
+
+  test("답한 조회의 사실은 그 실행 ID로 묻는다: 같은 실행기의 다른 실행에 대한 답은 이 실행의 근거가 아니다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    expect(ranOf(resultCheckTick(w.ports, SINCE + WAIT, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
+    expect([...new Set(w.answeredRuns)]).toEqual([run.runId]);
+  });
+});
+
+// 실행기가 그 실행을 ready_result라고 답했거나(결과 보고를 만들어 ack를 기다린다), 감독이 받은 그 실행의 결과 보고 가운데 보관소나 장부에
+// 닿았는지 모르는 것이 있으면 결과 없음 판정을 하지 않는다. 이미 받은 결과를 결과 없음으로 판정하면 복구 뒤 같은 보고를 장부가 영영 거절한다.
+describe("결과 없음 판정 전 보관하지 못한 결과", () => {
+  const boom = () => {
+    throw new Error("읽기 실패");
+  };
+
+  test("답의 그 실행 상태가 ready_result이거나 모르면 기한이 한참 지나도 판정 0이고, 결과가 없다는 상태면 판정한다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    const late = SINCE + 10 * WAIT;
+    const waiting = [{ runId: run.runId, outcome: "waiting" as const }];
+    for (const [name, state] of [
+      ["ready_result", "ready_result"],
+      ["모름", null],
+      ["계약 밖 문자", "ready"],
+      ["문자가 아님", 1],
+    ] as const) {
+      w.setReach({ answeredState: state });
+      expect([name, ranOf(resultCheckTick(w.ports, late, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    w.setReach({ answeredState: "failed_stopped" });
+    expect(["던짐", ranOf(resultCheckTick({ ...w.ports, reach: { ...w.ports.reach!, answeredState: boom } }, late, WAITING)).runs]).toEqual(["던짐", waiting]);
+    expect([w.marks.length, stateOf(w.ledger, run.runId)]).toEqual([0, "checking"]);
+    for (const state of ["failed_stopped", "checking", "not_known"]) {
+      const v = world();
+      const each = checking(v.ledger);
+      v.setReach({ answeredState: state });
+      expect([state, ranOf(resultCheckTick(v.ports, late, WAITING)).runs]).toEqual([state, [{ runId: each.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]]);
+    }
+  });
+
+  test("감독이 받고 보관하지 못한 그 실행의 결과 보고가 있거나 모르면 판정 0이고, 없다고 하면 판정한다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    const late = SINCE + 10 * WAIT;
+    const waiting = [{ runId: run.runId, outcome: "waiting" as const }];
+    for (const [name, held] of [
+      ["있음", true],
+      ["모름", null],
+      ["참 같은 값", 1],
+      ["문자", "false"],
+    ] as const) {
+      w.setReach({ unstoredResult: held });
+      expect([name, ranOf(resultCheckTick(w.ports, late, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    w.setReach({ unstoredResult: false });
+    expect(["던짐", ranOf(resultCheckTick({ ...w.ports, reach: { ...w.ports.reach!, unstoredResult: boom } }, late, WAITING)).runs]).toEqual(["던짐", waiting]);
+    expect([w.marks.length, stateOf(w.ledger, run.runId)]).toEqual([0, "checking"]);
+    expect(ranOf(resultCheckTick(w.ports, late, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
+    expect(w.answeredRuns.every((runId) => runId === run.runId)).toBe(true);
+  });
+
+  test("보관하지 못한 보고도 ready_result 답도 통과 판정을 막지 않는다: 반영 전 결과 보고는 그 digest로 판정한다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    w.setReach({ answeredState: "ready_result", unstoredResult: true });
     const result = report(w.ledger, run, "본문");
     expect(ranOf(resultCheckTick(w.ports, SINCE + 10 * WAIT, WAITING)).runs).toEqual([
       { runId: run.runId, outcome: "judged", reportId: result.reportId, resultDigest: result.resultDigest, state: "ready_result" },

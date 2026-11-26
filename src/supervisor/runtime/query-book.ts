@@ -60,3 +60,19 @@ export function createQueryBook(): QueryRegistry {
     },
   };
 }
+
+// 새 조회 query가 대체하는 등록 항목: 같은 받는 이·같은 연결·같은 실행 ID 집합(차례 무관)이고 요청 ID가 다른 것. 등록부는 대체를
+// 모른다(답 줄은 같은 실행의 조회가 여럿 기다리는 것도 처리한다). 상한을 두는 것은 조립이다: 수명 박자는 답 없는 실행을 answerTimeoutMs마다
+// 새 요청 ID로 다시 묻으므로, 조립이 더할 때마다 이 항목을 끝내지 않으면 답하지 않는 연결에 항목이 끝없이 쌓인다. 끝낸 항목의 늦은 답은
+// 대조할 항목이 없어(unknown_query) 장부에도 결과 검사의 근거에도 닿지 않는다. 같은 요청 ID를 다시 실은 항목은 대체하지 않는다(실은 횟수만큼).
+export function supersededBy(pending: readonly SentQuery[], query: SentQuery): SentQuery[] {
+  const asked = new Set(query.runIds);
+  return pending.filter(
+    (held) =>
+      held.requestId !== query.requestId &&
+      held.recipient === query.recipient &&
+      held.connection === query.connection &&
+      new Set(held.runIds).size === asked.size &&
+      held.runIds.every((runId) => asked.has(runId)),
+  );
+}

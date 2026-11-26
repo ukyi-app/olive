@@ -18,6 +18,10 @@
 //    더해 그 연결에서 실행기가 실제로 답한 조회가 있고, 그 조회를 실은 때가 기한 시작 + 재전송 한 주기 이후여야 한다(장부 시각과
 //    단조 경과 모두). 인정된 연결 번호만으로는 실행기와 주고받을 수 있는지 모른다: TCP 탐침을 대신 받는 중계 뒤에서 실행기가 사라져도
 //    번호는 남는다. 실행기는 같은 연결에 먼저 실은 보고 뒤에 조회의 답을 싣으므로, 그 조회 전에 다시 보낼 기회가 있던 보고는 답보다 먼저 닿는다.
+//    그 조회는 그 실행 ID를 물은 것이어야 한다: 같은 실행기의 다른 실행만 물은 조회의 답은 이 실행의 보고가 앞서 닿았다는 근거가 아니다.
+//    그 답에서 실행기가 그 실행을 ready_result(결과 보고를 만들어 ack를 기다림)라고 말했으면 기다린다: 보고가 오는 중이거나 감독이 받고도
+//    보관하지 못했다. 감독이 받은 그 실행의 결과 보고 가운데 보관소나 장부에 닿았는지 모르는 것이 남아 있어도 기다린다: 이미 받은 결과를
+//    결과 없음으로 판정하면 복구 뒤 같은 보고를 장부가 영영 거절한다.
 // 3. markResult에는 늘 그 보고의 reportId를 넘긴다. 장부가 그 보고가 이 실행의 반영 전 보고이고 digest가 같은지 대조해(아니면
 //    reference_mismatch) 판정이 이 박자가 본 보고를 정확히 가리킨다. 확정을 여는 데에는 필요 없다: 빠져도 장부는 판정하면서
 //    그 실행의 반영 전 결과 보고를 모두 반영한다.
@@ -25,7 +29,7 @@
 // 5. 장부 호출은 장부 포트 수신자·메서드·인자 얻기 → 문(접수 → 박자 유효 문) → 호출 하나다(send-gate.ts의 callAfterGate).
 //    문 뒤에는 외부 코드가 없고, 읽기부터 호출까지 await가 없다.
 // 6. 장부가 던지거나 답이 정의 밖이면 그 자리에서 박자를 멈춘다(판정이 적혔는지 모른다). 거절은 그 실행의 결과이고 박자는 이어 간다.
-import { limits } from "../../contract/v1/index.ts";
+import { limits, RUN_STATES } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger, REFUSALS as LEDGER_REFUSALS, type LedgerRunState, type Refusal as LedgerRefusal, type Restorer } from "../../ledger/index.ts";
 import { callAfterGate, holdBeatValid } from "./send-gate.ts";
 
@@ -58,11 +62,17 @@ export interface ResultReach {
   // 이 프로세스가 그 실행을 결과 없음 판정을 기다리는 checking으로 처음 물은 뒤의 단조 경과(처음 물을 때 0). 종료 영수증 시각은 장부
   // 시계뿐이라, 영수증이 기준일 때 단조 쪽 기준을 이것으로 대신한다(처음 물은 때는 영수증을 받은 때보다 이르지 않다).
   sinceSeenMs(runId: string): number | null;
-  // greetedAt과 같은 연결에서 그 실행기가 답한(감독이 받아 대조한) 상태 조회 가운데 가장 늦게 실은 것의 실은 시각. 답을 받은 시각이
-  // 아니다: 실행기는 조회를 받은 뒤에 답을 만들므로 실은 시각이 답을 만든 때의 하한이다. 답한 조회가 없거나 모르면 null.
-  answeredAt(executorId: string): number | null;
+  // greetedAt과 같은 연결에서 그 실행기가 답한(감독이 받아 대조한) 상태 조회 가운데 그 실행 ID를 물은 것 중 가장 늦게 실은 것의 실은
+  // 시각. 답을 받은 시각이 아니다: 실행기는 조회를 받은 뒤에 답을 만들므로 실은 시각이 답을 만든 때의 하한이다. 그 실행을 묻지 않은
+  // 조회의 답은 쓰지 않는다. 답한 조회가 없거나 모르면 null.
+  answeredAt(executorId: string, runId: string): number | null;
+  // 같은 답에서 실행기가 그 실행에 대해 말한 상태(계약 v1의 RUN_STATES). 모르면 null.
+  answeredState(executorId: string, runId: string): string | null;
   // 같은 조회를 실은 뒤의 단조 경과.
-  sinceAnsweredMs(executorId: string): number | null;
+  sinceAnsweredMs(executorId: string, runId: string): number | null;
+  // 감독이 받은 그 실행의 결과 보고 가운데 보관소나 장부에 닿았는지 모르는(보관이 unknown, 장부가 던지거나 거절한) 것이 남아 있으면 true,
+  // 없으면 false. 같은 보고를 뒤에 장부가 받거나(ack) 보관 전에 확정 거절하면 지운다. 모르면 null.
+  unstoredResult(runId: string): boolean | null;
 }
 
 // 판정 자리가 보는 반영 전 결과 보고 하나. 장부의 pendingReports가 낸 차례(받은 시각, id) 그대로 넘긴다.
@@ -156,6 +166,8 @@ const isElapsed = (value: unknown): value is number => typeof value === "number"
 const isUuid = (value: unknown): value is string => typeof value === "string" && UUID.test(value);
 const isRefusal = (value: unknown): value is LedgerRefusal => (LEDGER_REFUSALS as readonly unknown[]).includes(value);
 const isState = (value: unknown): value is LedgerRunState => (LEDGER_RUN_STATES as readonly unknown[]).includes(value);
+// 실행기가 상태 답에 싣는 실행 상태(계약 v1).
+const isExecutorState = (value: unknown): boolean => (RUN_STATES as readonly unknown[]).includes(value);
 
 // 진행 중인 박자. 박자 안에 await가 없으므로 겹치는 길은 포트 안에서 다시 부르는 것뿐이다. 장부 객체로 가르지 않고 모듈 단위로 세운다:
 // 장부 객체를 얻는 ports.ledger 접근자도 외부 코드다.
@@ -260,7 +272,8 @@ type Judged = { readonly outcome: ResultCheckOutcome | null; readonly halt: Resu
 
 // 결과 없음 판정의 기한 시작(D-123): 종료 영수증 시각(since)·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이 인정된 시각 가운데
 // 가장 늦은 때. 그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기가 지나지 않았거나(정각부터 지난 것으로 본다), 그 연결에서
-// 실행기가 답한 조회를 기한 시작 + 재전송 한 주기 이후에 싣지 않았거나, 하나라도 모르면 null(기다림)이다. 감독이 멈춰 있던 동안이나
+// 실행기가 그 실행을 물은 조회에 답하지 않았거나 그 조회를 기한 시작 + 재전송 한 주기 이후에 싣지 않았거나, 그 답이 ready_result이거나,
+// 감독이 보관하지 못한 그 실행의 결과 보고가 남았거나, 하나라도 모르면 null(기다림)이다. 감독이 멈춰 있던 동안이나
 // 실행기 연결이 끊긴 동안은 실행기가 결과 보고를 장부에 닿게 할 수 없으므로 기한에 넣지 않는다. 단조 경과도 같은 조건(인정 뒤 한 주기,
 // 세 기준 모두에서 기한, 세 기준 모두에서 한 주기 뒤에 실은 답한 조회)을 넘어야 한다. 장부 시계만 보면 벽시계가 앞으로 뛴 만큼 실행기가
 // 실제로 기다린 시간 없이 기한이 지난다. 포트의 칸과 호출마다 한 번만 읽고, 던짐은 모름이다.
@@ -287,11 +300,16 @@ function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now:
     if (earliest < wait) return null;
     const from = Math.max(since, restoredAt, greetedAt);
     // 답한 조회. 실은 시각이 지금보다 뒤면 장부 시계가 뒤로 간 것이라 모름이다.
-    const answeredAt: unknown = reach.answeredAt(executorId);
+    const answeredAt: unknown = reach.answeredAt(executorId, run.runId);
     if (!isTime(answeredAt) || answeredAt > now || answeredAt - from < limits.RENEW_INTERVAL_MS) return null;
+    // 실행기는 결과 보고를 만든 실행을 ready_result로 답한다(src/executor/worker.ts의 statusOf). 그 보고는 아직 장부에 없다.
+    const answeredState: unknown = reach.answeredState(executorId, run.runId);
+    if (!isExecutorState(answeredState) || answeredState === "ready_result") return null;
     // 단조 경과는 다른 기준들보다 뒤에 읽는다: 읽기 사이에 흐른 시간이 실은 때와 기준 사이를 짧게 보이게 할 뿐 길게 보이게 하지 않는다.
-    const answeredMs: unknown = reach.sinceAnsweredMs(executorId);
+    const answeredMs: unknown = reach.sinceAnsweredMs(executorId, run.runId);
     if (!isElapsed(answeredMs) || earliest - answeredMs < limits.RENEW_INTERVAL_MS) return null;
+    // 감독이 받았지만 장부에 닿았는지 모르는 결과 보고. 판정 쓰기 직전의 마지막 읽기다(그 사이에 await가 없다).
+    if (reach.unstoredResult(run.runId) !== false) return null;
     return from;
   } catch {
     return null;

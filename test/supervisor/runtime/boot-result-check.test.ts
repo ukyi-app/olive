@@ -66,6 +66,52 @@ function answer(w: World, runId: string) {
   return requestId;
 }
 
+// 그 실행기가 지금 인정된 연결 7에서 runIds를 묻는 조회 하나를 실었다(등록부에 등록). 요청 ID를 돌려준다.
+function ask(w: World, runIds: string[]) {
+  const requestId = id();
+  w.captured.sink!.ports.queries.add({ requestId, recipient: EXECUTOR, runIds, connection: 7 });
+  return requestId;
+}
+
+// 그 조회에 실행기가 답한다(연결 판단이 검증해 넘긴 꼴). 등록하지 않는다.
+function replyTo(w: World, requestId: string, runs: { run_id: string; state: string; run_generation: number | null }[]) {
+  const header = { sender: EXECUTOR, action: "status_report", run_generation: 0, body_digest: digest(`status:${requestId}:${w.wall}`), issued_at: w.wall };
+  const body = { in_reply_to: requestId, runs: runs.map((run) => ({ ...run, last_receipt_id: null })) };
+  w.fake.options!.deliver({ kind: "forward", connection: 7, verified: { ok: true, action: "status_report", header, body } } as never);
+}
+
+const generationOf = (w: World, runId: string) => {
+  const read = w.opened!.getRun(runId);
+  if (!read.known || read.value === null) throw new Error("실행 없음");
+  return read.value.runGeneration;
+};
+
+// 조립이 답 줄의 기록기로 넘긴 함수에 영수증 처리 결과 하나를 넣는다(답 줄이 결과 보고를 처리한 뒤 부르는 그 자리).
+function noteReceipt(w: World, outcome: Record<string, unknown>) {
+  w.captured.lines!.ports.observe!({ kind: "receipt", connection: 7, outcome } as never);
+}
+
+// 판정의 다른 조건을 모두 채운 checking 실행: 인정·처음 본 때 + 한 주기 뒤 실은 조회에 실행기가 결과가 없다고 답했고, 장부 시각과 단조
+// 경과 모두 기한이 지났다. 박자 한 번이면 결과 없음으로 판정되는 자리다.
+async function ripe(settings: Partial<SupervisorSettings> = { resultCheck: RESULT_CHECK }) {
+  const b = await booted(settings);
+  greet(b.w);
+  const run = checking(b.ledger);
+  await b.beat();
+  await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+  b.w.wall = WALL + 1 + limits.RENEW_INTERVAL_MS;
+  answer(b.w, run.runId);
+  b.w.wall = WALL + 1 + RESULT_CHECK.reportWaitMs;
+  b.w.time.set(b.w.time.monoNow() + RESULT_CHECK.reportWaitMs);
+  const marks: unknown[] = [];
+  const mark = b.ledger.markResult.bind(b.ledger);
+  b.ledger.markResult = (input) => {
+    marks.push(input);
+    return mark(input);
+  };
+  return { w: b.w, running: b.run, ledger: b.ledger, beat: b.beat, run, marks };
+}
+
 const outcomes = (w: World) => w.events.filter((e) => e.event === "beat" && e.fields.resultCheck === "ran").map((e) => e.fields.resultCheckOutcomes);
 const alerts = (w: World) => w.events.filter((e) => e.event === "result_check_alert").map((e) => e.fields);
 
@@ -341,7 +387,7 @@ describe("결과 검사 박자 + 조립", () => {
 });
 
 describe("첫 관측 기록의 정리 대상 읽기 실패", () => {
-  test("기한이 찬 박자에서 첫 관측 기록의 정리 대상 읽기만 실패하면 판정 쓰기(markResult)가 0이고, 읽기가 돌아오면 판정한다", async () => {
+  test("기한이 찬 박자에서 첫 관측 기록의 정리 대상 읽기만 실패하면 결과 없음 판정(markResult(null))이 0회이고, 읽기가 돌아오면 판정한다", async () => {
     const b = await booted({ resultCheck: RESULT_CHECK });
     try {
       greet(b.w);
@@ -381,6 +427,158 @@ describe("첫 관측 기록의 정리 대상 읽기 실패", () => {
       expect([marks, stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([[{ runId: run.runId, resultDigest: null, now: b.w.wall }], "failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
     } finally {
       await b.run.stop();
+    }
+  });
+});
+
+describe("첫 관측 기록의 정리 대상 읽기 실패(수락 조건: 결과 없음 판정 0회)", () => {
+  test("같은 박자에 유효한 결과 보고가 있으면 그 digest로 판정한다: 결과를 보존하는 판정은 막지 않고 결과 없음 판정(markResult(null))만 0회다", async () => {
+    const b = await ripe();
+    try {
+      const body = "정리 실패 박자의 결과";
+      report(b.ledger, b.run, body, b.w.wall);
+      const keys = Map.prototype.keys;
+      let thrown = 0;
+      Map.prototype.keys = function (this: Map<unknown, unknown>) {
+        if (typeof this.get(b.run.runId) === "number" && (new Error().stack ?? "").includes("runtime/boot.ts")) {
+          thrown += 1;
+          throw new Error("정리 대상 읽기 실패");
+        }
+        return keys.call(this);
+      } as typeof keys;
+      try {
+        await b.beat();
+      } finally {
+        Map.prototype.keys = keys;
+      }
+      expect(thrown).toBeGreaterThan(0);
+      expect([b.marks.filter((input) => (input as { resultDigest: unknown }).resultDigest === null), b.marks.map((input) => (input as { resultDigest: unknown }).resultDigest), stateOf(b.ledger, b.run.runId), alerts(b.w)]).toEqual([[], [digest(body)], "ready_result", []]);
+    } finally {
+      await b.running.stop();
+    }
+  });
+});
+
+describe("결과 없음 판정의 근거는 그 실행을 물은 조회의 답이다", () => {
+  test("같은 연결에서 다른 실행만 물은 조회의 답은 이 실행의 근거가 아니고, 이 실행을 물은 조회의 답이 오면 판정한다", async () => {
+    const b = await booted({ resultCheck: RESULT_CHECK });
+    try {
+      greet(b.w);
+      const run = checking(b.ledger);
+      await b.beat();
+      await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+      b.w.wall = WALL + 1 + limits.RENEW_INTERVAL_MS;
+      const other = id();
+      replyTo(b.w, ask(b.w, [other]), [{ run_id: other, state: "not_known", run_generation: null }]);
+      b.w.wall = WALL + 1 + RESULT_CHECK.reportWaitMs;
+      b.w.time.set(b.w.time.monoNow() + RESULT_CHECK.reportWaitMs);
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect([outcomes(b.w).slice(-3), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], "checking", []]);
+      // 두 실행을 함께 물은 조회의 답은 이 실행의 근거다.
+      replyTo(b.w, ask(b.w, [other, run.runId]), [
+        { run_id: other, state: "not_known", run_generation: null },
+        { run_id: run.runId, state: "failed_stopped", run_generation: generationOf(b.w, run.runId) },
+      ]);
+      await b.beat();
+      expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
+    } finally {
+      await b.run.stop();
+    }
+  });
+
+  test("새 조회가 대체한 같은 실행·연결의 앞 조회는 등록부에서 끝나고, 그 늦은 답은 근거가 아니다(새 조회의 답이 오면 판정한다)", async () => {
+    const b = await booted({ resultCheck: RESULT_CHECK });
+    try {
+      greet(b.w);
+      const run = checking(b.ledger);
+      await b.beat();
+      await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+      b.w.wall = WALL + 1 + limits.RENEW_INTERVAL_MS;
+      const first = ask(b.w, [run.runId]);
+      const second = ask(b.w, [run.runId]);
+      expect(b.w.captured.queries!.pending().map((entry) => entry.requestId)).toEqual([second]);
+      const runs = [{ run_id: run.runId, state: "failed_stopped", run_generation: generationOf(b.w, run.runId) }];
+      replyTo(b.w, first, runs);
+      b.w.wall = WALL + 1 + RESULT_CHECK.reportWaitMs;
+      b.w.time.set(b.w.time.monoNow() + RESULT_CHECK.reportWaitMs);
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect([outcomes(b.w).slice(-3), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], "checking", []]);
+      // 대체한 쪽의 답은 근거다. 그 사이 수명 박자가 같은 실행을 다시 물어(가짜 서버라 싣지 못한다) 둘째 조회도 대체됐으므로 새로 묻고 답한다.
+      replyTo(b.w, ask(b.w, [run.runId]), runs);
+      await b.beat();
+      expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
+    } finally {
+      await b.run.stop();
+    }
+  });
+
+  test("그 실행을 물은 조회에 실행기가 ready_result로 답했으면 판정하지 않는다", async () => {
+    const b = await booted({ resultCheck: RESULT_CHECK });
+    try {
+      greet(b.w);
+      const run = checking(b.ledger);
+      await b.beat();
+      await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+      b.w.wall = WALL + 1 + limits.RENEW_INTERVAL_MS;
+      replyTo(b.w, ask(b.w, [run.runId]), [{ run_id: run.runId, state: "ready_result", run_generation: generationOf(b.w, run.runId) }]);
+      b.w.wall = WALL + 1 + RESULT_CHECK.reportWaitMs;
+      b.w.time.set(b.w.time.monoNow() + RESULT_CHECK.reportWaitMs);
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect([outcomes(b.w).slice(-3), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], "checking", []]);
+    } finally {
+      await b.run.stop();
+    }
+  });
+});
+
+describe("감독이 받고 보관하지 못한 결과 보고의 기억", () => {
+  test("보관 모름·장부 던짐·장부 거절은 그 실행만 막고, 같은 보고를 장부가 받거나 보관 전에 확정 거절하면 지운다", async () => {
+    const b = await ripe();
+    try {
+      const [r1, r2, r3, r4] = [id(), id(), id(), id()];
+      const runId = b.run.runId;
+      const steps: string[] = [];
+      const beat = async (name: string) => {
+        await b.beat();
+        steps.push(`${name}:${outcomes(b.w).at(-1)}`);
+      };
+      // 각 단계에서 남은 기억은 하나다: 그 단계의 적기·지우기 하나가 빠지면 그 단계나 마지막 단계의 결과가 바뀐다.
+      noteReceipt(b.w, { outcome: "result_unknown", id: r1, runId, at: "store" });
+      await beat("r1 보관 모름");
+      // 다른 동작의 같은 ID ack는 결과 보고의 기억을 지우지 않는다.
+      noteReceipt(b.w, { outcome: "ack", action: "receipt_stopped", id: r1, delivery: "new", ack: {} });
+      await beat("다른 동작 ack");
+      noteReceipt(b.w, { outcome: "ack", action: "report_result", id: r1, delivery: "new", ack: {} });
+      noteReceipt(b.w, { outcome: "ledger_refused", action: "report_result", id: r2, reason: "ledger_unwritable", runId });
+      await beat("r1 ack, r2 장부 거절");
+      noteReceipt(b.w, { outcome: "applied_without_ack", action: "report_result", id: r2, delivery: "duplicate", reason: "stop_generation_unknown" });
+      noteReceipt(b.w, { outcome: "ledger_failed", action: "report_result", id: r3, failure: "threw", runId });
+      await beat("r2 장부가 받음, r3 장부 던짐");
+      // 다른 실행의 보관하지 못한 보고는 이 실행을 막지 않는다.
+      noteReceipt(b.w, { outcome: "result_unknown", id: r4, runId: id(), at: "ledger_read" });
+      noteReceipt(b.w, { outcome: "result_refused", id: r3, runId, reason: "too_large" });
+      await beat("r3 확정 거절, 다른 실행 r4");
+      expect(steps).toEqual([
+        "r1 보관 모름:waiting=1",
+        "다른 동작 ack:waiting=1",
+        "r1 ack, r2 장부 거절:waiting=1",
+        "r2 장부가 받음, r3 장부 던짐:waiting=1",
+        "r3 확정 거절, 다른 실행 r4:no_result=1",
+      ]);
+      expect([b.marks, stateOf(b.ledger, runId)]).toEqual([[{ runId, resultDigest: null, now: b.w.wall }], "failed_stopped"]);
+    } finally {
+      await b.running.stop();
+    }
+  });
+
+  test("실행 ID 없이 장부가 결과 보고를 받지 않았다는 기록이 오면 어느 실행에 보관하지 못한 보고가 있는지 몰라 판정하지 않는다", async () => {
+    const b = await ripe();
+    try {
+      noteReceipt(b.w, { outcome: "ledger_failed", action: "report_result", id: id(), failure: "threw" });
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect([outcomes(b.w).slice(-3), b.marks, stateOf(b.ledger, b.run.runId)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], [], "checking"]);
+    } finally {
+      await b.running.stop();
     }
   });
 });

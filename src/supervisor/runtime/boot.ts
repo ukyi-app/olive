@@ -52,7 +52,7 @@ import { registrationsFrom } from "./assign-policy.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
-import { createQueryBook } from "./query-book.ts";
+import { createQueryBook, supersededBy } from "./query-book.ts";
 import { createSharedClock, type PeekableClock } from "./shared-clock.ts";
 import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer.ts";
 import { createWireSink, type WireSink } from "./sink.ts";
@@ -537,13 +537,20 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const greetedLinks = new Map<number, { readonly at: number | null; readonly mono: number | null }>();
   // 실행 ID → 결과 검사가 그 실행을 결과 없음 판정을 기다리는 checking으로 처음 물은 단조 시각.
   const seenWaiting = new Map<string, number>();
-  // 상태 조회의 요청 ID → 내보내기 포트가 그 조회를 등록한(연결에 싣기 직전) 순간의 연결 번호·장부 시각·단조 시각. 같은 요청 ID를 다시
-  // 실으면 처음 값을 둔다: 답이 어느 싣기에 대한 것인지 모르므로 이른 쪽이 답을 만든 때의 하한이다. 등록부에 그 요청 ID가 남아 있는
-  // 동안만 쥔다.
-  const queryStamps = new Map<string, { readonly connection: number; readonly at: number | null; readonly mono: number | null }>();
-  // 연결 번호 → 그 연결에서 실행기가 답해 대조된(status_matched) 조회 가운데 가장 늦게 실은 것의 두 시각. 결과 검사가 결과 없음 판정
-  // 전에 그 실행기와 실제로 주고받을 수 있었는지 본다(ResultReach.answeredAt). 철회되면 지운다.
-  const answeredLinks = new Map<number, { readonly at: number; readonly mono: number }>();
+  // 상태 조회의 요청 ID → 내보내기 포트가 그 조회를 등록한(연결에 싣기 직전) 순간의 연결 번호·물은 실행 ID·장부 시각·단조 시각. 같은
+  // 요청 ID를 다시 실으면 처음 값을 둔다: 답이 어느 싣기에 대한 것인지 모르므로 이른 쪽이 답을 만든 때의 하한이다. 등록부에 그 요청 ID가
+  // 남아 있는 동안만 쥔다(새 조회가 대체한 요청 ID도 곧바로 지운다: 그 늦은 답은 근거가 아니다).
+  const queryStamps = new Map<string, { readonly connection: number; readonly runIds: readonly string[]; readonly at: number | null; readonly mono: number | null }>();
+  // 연결 번호 → 실행 ID → 그 연결에서 실행기가 답해 대조된(status_matched) 조회 가운데 그 실행을 물은 것 중 가장 늦게 실은 것의 두 시각과
+  // 그 답에서 실행기가 말한 그 실행의 상태. 결과 검사가 결과 없음 판정 전에 그 실행기와 그 실행에 대해 실제로 주고받았는지 본다
+  // (ResultReach.answeredAt·answeredState). 같은 연결의 다른 실행만 물은 답은 그 실행의 근거가 아니다. 철회되면 지운다.
+  const answeredLinks = new Map<number, Map<string, { readonly at: number; readonly mono: number; readonly state: string }>>();
+  // 보고 ID → 실행 ID. 감독이 받은 결과 보고 가운데 보관소나 장부에 닿았는지 모르는 것(보관 unknown·장부 던짐·장부 거절). 같은 보고를
+  // 장부가 받으면(ack) 또는 보관 전에 확정 거절하면 지운다. 결과 검사는 이 기억이 있는 실행을 결과 없음으로 판정하지 않는다
+  // (ResultReach.unstoredResult). 메모리뿐이라 감독이 다시 뜨면 비고, 실행기는 ack를 받을 때까지 같은 보고를 다시 보낸다.
+  const unstoredResults = new Map<string, string>();
+  // 기억을 적다 던졌다. 그 뒤로는 어느 실행에 보관하지 못한 보고가 있는지 모른다(unstoredResult가 null).
+  let unstoredLost = false;
   // 서버의 출력을 답 줄에 넘기기 전에 본다. 후보는 판단이 연결을 greeted로 옮긴 같은 동기 구간에서 온다. 던지면 서버가 그 연결을
   // 닫으므로 여기서는 던지지 않는다.
   const noteLink = (output: Delivered) => {
@@ -687,18 +694,24 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     const connection = need(server).recognized(executorId);
     return connection === null ? undefined : greetedLinks.get(connection);
   };
-  // greetedAt과 같은 연결 번호에서 그 실행기가 답한 조회. 다른 연결의 답은 쓰지 않는다.
-  const answerOf = (executorId: string) => {
+  // greetedAt과 같은 연결 번호에서 그 실행기가 그 실행을 물은 조회에 답한 것. 다른 연결의 답과 다른 실행만 물은 답은 쓰지 않는다.
+  const answerOf = (executorId: string, runId: string) => {
     const connection = need(server).recognized(executorId);
-    return connection === null ? undefined : answeredLinks.get(connection);
+    return connection === null ? undefined : answeredLinks.get(connection)?.get(runId);
   };
   const reach: ResultReach = {
     restoredAt: () => restoredAt,
     greetedAt: (executorId) => linkOf(executorId)?.at ?? null,
     sinceRestoredMs: () => monoSince(restoredMono),
     sinceGreetedMs: (executorId) => monoSince(linkOf(executorId)?.mono ?? null),
-    answeredAt: (executorId) => answerOf(executorId)?.at ?? null,
-    sinceAnsweredMs: (executorId) => monoSince(answerOf(executorId)?.mono ?? null),
+    answeredAt: (executorId, runId) => answerOf(executorId, runId)?.at ?? null,
+    answeredState: (executorId, runId) => answerOf(executorId, runId)?.state ?? null,
+    sinceAnsweredMs: (executorId, runId) => monoSince(answerOf(executorId, runId)?.mono ?? null),
+    unstoredResult: (runId) => {
+      if (unstoredLost) return null;
+      for (const held of unstoredResults.values()) if (held === runId) return true;
+      return false;
+    },
     sinceSeenMs: (runId) => {
       const at = monoRead();
       if (at === null) return null;
@@ -720,8 +733,9 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       // 기록 정리일 뿐이다.
     }
   };
-  // 상태 조회의 답이 대조됐으면(status_matched) 그 조회를 실은 때를 그 연결의 답한 조회로 적는다. 실은 때를 모르는 조회와 다른 연결로
-  // 실은 조회는 적지 않는다(결과 검사는 적힌 것이 없으면 결과 없음 판정을 하지 않는다).
+  // 상태 조회의 답이 대조됐으면(status_matched) 그 조회가 물은 실행마다 그 조회를 실은 때와 그 답의 상태를 그 연결의 답한 조회로 적는다.
+  // 실은 때를 모르는 조회, 다른 연결로 실은 조회, 물은 실행 집합과 답의 실행 집합이 다른 답은 적지 않는다(결과 검사는 적힌 것이 없으면
+  // 결과 없음 판정을 하지 않는다). 답의 상태는 처리기가 이번 답으로 낸 마지막 사본(settled의 끝)에서 읽는다.
   const noteAnswered = (note: AnswerNote): void => {
     try {
       if (note.kind !== "status" || note.outcome.outcome !== "status_matched") return;
@@ -729,10 +743,36 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       const stamp = queryStamps.get(note.outcome.queryRequestId);
       if (stamp === undefined || stamp.connection !== connection || note.connection !== connection || stamp.at === null || stamp.mono === null) return;
       if (!greetedLinks.has(connection)) return;
-      const prior = answeredLinks.get(connection);
-      if (prior === undefined || stamp.mono >= prior.mono) answeredLinks.set(connection, { at: stamp.at, mono: stamp.mono });
+      const copy = note.outcome.settled.at(-1)?.answer;
+      if (copy === undefined || copy.connection !== connection || copy.sender !== note.outcome.executor) return;
+      const asked = new Set(stamp.runIds);
+      const states = new Map(copy.runs.map((run) => [run.run_id, run.state] as const));
+      if (states.size !== asked.size || [...states.keys()].some((runId) => !asked.has(runId))) return;
+      const byRun = answeredLinks.get(connection) ?? new Map<string, { readonly at: number; readonly mono: number; readonly state: string }>();
+      for (const [runId, state] of states) {
+        const prior = byRun.get(runId);
+        if (prior === undefined || stamp.mono >= prior.mono) byRun.set(runId, { at: stamp.at, mono: stamp.mono, state });
+      }
+      answeredLinks.set(connection, byRun);
     } catch {
       // 적지 못한 답은 결과 없음 판정의 근거가 되지 않는다.
+    }
+  };
+  // 결과 보고를 처리한 결과로 보관하지 못한 보고의 기억을 고친다. 모름(보관 unknown·장부 던짐·장부 거절)은 적고, 장부가 받은 것(ack·
+  // applied_without_ack)과 보관 전의 확정 거절(result_refused)은 지운다. 장부 거절도 적는 까닭: ledger_unwritable처럼 장부에 닿지 않은
+  // 거절이 있다. 적다 던지면 그 뒤로 모름이다.
+  const noteStored = (note: AnswerNote): void => {
+    try {
+      if (note.kind !== "receipt") return;
+      const outcome = note.outcome;
+      if (outcome.outcome === "result_unknown") unstoredResults.set(outcome.id, outcome.runId);
+      else if ((outcome.outcome === "ledger_failed" || outcome.outcome === "ledger_refused") && outcome.action === "report_result") {
+        if (outcome.runId === undefined) unstoredLost = true;
+        else unstoredResults.set(outcome.id, outcome.runId);
+      } else if ((outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") && outcome.action === "report_result") unstoredResults.delete(outcome.id);
+      else if (outcome.outcome === "result_refused") unstoredResults.delete(outcome.id);
+    } catch {
+      unstoredLost = true;
     }
   };
   const beats: CycleBeats = {
@@ -887,11 +927,20 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
           try {
             if (!queryStamps.has(query.requestId)) {
               const seen = shared.peek();
-              queryStamps.set(query.requestId, { connection: query.connection, at: seen.state === "ok" ? seen.at : null, mono: monoRead() });
+              queryStamps.set(query.requestId, { connection: query.connection, runIds: [...query.runIds], at: seen.state === "ok" ? seen.at : null, mono: monoRead() });
             }
           } catch {
             // 시각을 적지 못한 조회의 답은 결과 없음 판정의 근거가 되지 않는다.
           }
+          // 같은 실행·연결의 앞 조회는 이 조회가 대체한다(query-book.ts의 supersededBy): 미결 조회는 그 실행·연결에 하나뿐이고, 대체된
+          // 조회의 늦은 답은 대조되지 않아 결과 없음 판정의 근거가 되지 않는다. 내보내기 포트는 쓰기 전에 더하므로 끝내 싣지 못한(거둔) 새
+          // 조회도 앞 조회를 끝낸 뒤다: 그 연결에서 answerTimeoutMs 넘게 답이 없던 조회의 답을 버리는 쪽이다. 끝내다 던지면 남긴다.
+          try {
+            for (const held of supersededBy(queries.pending(), query)) settle.call(queries, held);
+          } catch {
+            // 남은 앞 조회는 답이 오거나 연결이 철회되면 끝난다.
+          }
+          pruneStamps();
         },
         remove: (query: Parameters<typeof remove>[0]) => {
           remove.call(queries, query);
@@ -955,6 +1004,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
         else if (note.kind === "hello") log("hello", { outcome: note.outcome.kind });
         // 답 줄은 장부 반영·ack 초안·줄의 상태를 정한 뒤에 기록하고 기록의 예외를 삼킨다(answers.ts의 note). 그래서 경보 줄은 ack·장부·줄을 바꾸지 않는다.
         // 답한 조회는 등록부가 그 항목을 끝내기 전에 적는다(답 줄은 이 기록 뒤에 항목을 끝낸다).
+        noteStored(note);
         noteAnswered(note);
         alertLedger(note);
       },
