@@ -18,7 +18,7 @@
 //    기존 실행의 정리(종료·조회·끊김·D-90·재전송)는 박자 유효 문만, 새 일(접수·시작·갱신·자격 값)과 결과 판정은 접수 문을 본다. D-90의 새 인사
 //    닫기(연결 하나 닫기)는 발급 깃발과 박자 유효 문을 함께 본다(서버는 발급 깃발을 모른다). 박자 여섯은
 //    장부에 쓰기 직전(마지막 외부 호출 뒤의 같은 동기 구간)에 박자 유효 문을 다시 본다(beatValid 포트).
-import { executorName, type Role } from "../../contract/v1/index.ts";
+import { executorName, parsePrincipal, type Role } from "../../contract/v1/index.ts";
 import {
   type InputRecord,
   type Ledger,
@@ -52,7 +52,7 @@ import { registrationsFrom } from "./assign-policy.ts";
 import { testFactSource } from "./test-assign.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
-import { createPeers, type FrontPeers, peerWaitUntil } from "./peers.ts";
+import { createPeers, type FrontPeers } from "./peers.ts";
 import { createQueryBook } from "./query-book.ts";
 import { createSharedClock, type PeekableClock } from "./shared-clock.ts";
 import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer.ts";
@@ -265,6 +265,17 @@ export function waitUntil<T>(work: Promise<T>, limit: number, clocks: Clocks, si
   });
 }
 
+// 복원 2단계를 부르기 전에 필수 실행기가 연결 표에 모이기를 기다리는 상한(D-142, kickRestore). 감독이 다시 뜨면 붙어 있던 실행기는
+// 끊겼다가 재접속 간격(1초부터 두 배씩, src/main/executor.ts)에 맞춰 다시 붙는다. 2단계를 부른 순간의 표만 세면 곧 붙을 실행기를 빠진
+// 이웃으로 닫고 그 프로세스 동안 접수가 닫힌 채 남는다. 기다리는 동안은 2단계 전이라 답 줄의 보류 해제·D-90·박자 여섯(기존 실행의 정지
+// 지시·상태 조회)이 그만큼 늦으므로, 그 지연을 이 값으로 묶는다. 끝나면 모였든 아니든 2단계를 부르고 2단계는 자기 기한을 새로 받는다.
+const PEER_WAIT_MS = 25_000;
+
+const isExecutorPeer = (peer: string): boolean => {
+  const kind = parsePrincipal(peer)?.kind;
+  return kind === "worker_executor" || kind === "session_executor";
+};
+
 const isPositive = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
 const TIMING_FIELDS = ["beatEveryMs", "beatWaitMs", "restoreStepWaitMs", "startupWaitMs", "stopWaitMs"] as const;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
@@ -430,6 +441,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     return fail("registry", SUPERVISOR_EXIT.registry, "settings_or_document");
   }
   if (requiredPeers.length === 0 || new Set(requiredPeers).size !== requiredPeers.length) return fail("registry", SUPERVISOR_EXIT.registry, "required_peers");
+  // 2단계 앞 기다림이 세는 실행기. 복원기가 전체 점유를 요구하는 이웃(requiredPeers 가운데 실행기 주체, restore.ts)과 같은 셈이다.
+  const requiredExecutors = requiredPeers.filter(isExecutorPeer);
   log("boot_step", { step: "registry", requiredPeers: requiredPeers.length });
   // 배정의 등록행은 방금 적용한 같은 바이트와 그 상태에서만 만든다. 설정의 registrations 칸은 쓰지 않는다: 명단을 채우는 길은 적용 하나다(D-63).
   // 만들지 못하면 빈 목록이라 배정이 보류될 뿐 기동은 계속한다(assign-policy.ts). 등록표는 기동 때 한 번 읽으므로 프로세스 동안 같다.
@@ -494,36 +507,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     });
   };
   const front = deps.frontDoor;
-  // 끝 차례가 시작될 때 부를 것. 2단계의 이웃 포트가 기다리는 현관 답·잠을 깨운다(finish).
-  const stopWakers = new Set<() => void>();
   let restorer: Restorer;
   try {
-    // 2단계는 필수 이웃이 모일 때까지 그 단계 기한 안에서 기다린다(D-141, peers.ts). 끝 시각은 기다림 전체에 하나이고, 끝 차례는
-    // 기다림을 깨운다. 점유 포트도 같은 값이다: 기다리는 동안 표로 본 실행의 차단 근거를 그 연결이 사라져도 판정에 넘긴다.
-    const neighbours = createPeers({
-      front: { contracts: () => inStep(() => front.peers.contracts()) },
-      table,
-      get restorer() {
-        return restorer;
-      },
-      expectedPolicy: settings.expectedPolicyRevision,
-      wait: {
-        required: requiredPeers,
-        until: () => (stepLimit === null ? null : peerWaitUntil(stepLimit, timing.restoreStepWaitMs)),
-        now: () => deps.monoNow(),
-        setTimer: (ms, fire) => deps.setTimer(ms, fire),
-        stopping: () => stopping,
-        onStop: (wake) => {
-          stopWakers.add(wake);
-          return () => void stopWakers.delete(wake);
-        },
-      },
-    });
     const ports: RestorePorts = {
       stopAuthority: { latestStop: () => inStep(() => front.stopAuthority.latestStop()) },
       publications: { lookup: (frontJobId) => inStep(() => front.publications.lookup(frontJobId)) },
-      peers: neighbours,
-      occupancy: neighbours,
+      peers: createPeers({ front: { contracts: () => inStep(() => front.peers.contracts()) }, table, get restorer() { return restorer; }, expectedPolicy: settings.expectedPolicyRevision }),
+      occupancy: { occupancy: async () => table().occupancy(restorer) },
     };
     restorer = make.restorer(ledger, ports, ledgerClock, requiredPeers);
   } catch {
@@ -867,13 +857,6 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     markFatal(why);
     stopping = true;
     wake();
-    for (const fire of [...stopWakers]) {
-      try {
-        fire();
-      } catch {
-        // 깨우지 못한 기다림도 답·잠 뒤에 stopping을 보고 던진다. 끝 차례를 막지 않는다.
-      }
-    }
     ending = (async () => {
       // shutdown()을 부른 시점. 자격 값 쪽 intake_closed가 깃발 때문인지 진짜 접수 닫힘인지 가르는 기준이다.
       const reading = shared.read();
@@ -906,9 +889,55 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   };
 
   const restoreSteps = [() => restorer.step1(), () => restorer.step2(), () => restorer.step3(), () => restorer.step4(), () => restorer.step5()] as const;
+  // 2단계 앞 기다림(D-142). 처음 기다리기 시작한 단조 시각이다. 한 번 끝나면(모임, 상한, 시각·표를 읽지 못함) 이 프로세스에서 다시
+  // 기다리지 않는다: 2단계가 모름으로 실패해 다시 부를 때는 곧바로 부른다.
+  let peerWaitSince: number | null = null;
+  let peerWaitOver = requiredExecutors.length === 0;
+  // 연결 표에서 전체 점유가 정확히 하나가 아닌 필수 실행기의 수. 2단계의 occupancy_unconfirmed와 같은 셈이다. 연결 표만 동기로 읽는다
+  // (현관 호출·장부 쓰기·복원기의 관측 기록 없음). 표를 읽지 못하면 null이다.
+  const missingExecutors = (): number | null => {
+    try {
+      const full = new Map<string, number>();
+      for (const answer of table().occupancy(restorer)) if (answer.coverage === "full") full.set(answer.executorId, (full.get(answer.executorId) ?? 0) + 1);
+      return requiredExecutors.filter((executor) => full.get(executor) !== 1).length;
+    } catch {
+      return null;
+    }
+  };
+  // 이번 주기에 2단계를 미루는가. 모였거나, 상한이 지났거나, 시각이나 표를 읽지 못하면 기다림을 끝내고 2단계를 부르게 한다(모름을
+  // 시간이 남은 것으로 읽지 않는다. 그 뒤는 예전과 같아 2단계 기한을 정하지 못하면 restore_unarmed다).
+  const holdForPeers = (): boolean => {
+    if (peerWaitOver) return false;
+    const missing = missingExecutors();
+    let at: number | null = null;
+    try {
+      const read = deps.monoNow();
+      if (Number.isFinite(read)) at = read;
+    } catch {
+      at = null;
+    }
+    if (peerWaitSince === null) {
+      if (missing !== null && missing > 0 && at !== null) {
+        peerWaitSince = at;
+        log("restore_wait", { step: 2, missing });
+        return true;
+      }
+      peerWaitOver = true;
+      return false;
+    }
+    const waitedMs = at === null ? null : at - peerWaitSince;
+    if (missing !== null && missing > 0 && waitedMs !== null && waitedMs < PEER_WAIT_MS) return true;
+    peerWaitOver = true;
+    const outcome = missing === 0 ? "gathered" : waitedMs === null || missing === null ? "unknown" : "lapsed";
+    log("restore_wait_end", { step: 2, outcome, missing, waitedMs: waitedMs === null ? null : Math.max(0, Math.floor(waitedMs)) });
+    return false;
+  };
   const kickRestore = () => {
     if (restoring || stage >= 5 || stopping) return;
     const index = stage;
+    // 다음이 2단계면 필수 실행기가 모일 때까지 다음 주기에 다시 본다. 기다림이 끝난 뒤의 2단계는 아래에서 새 기한을 받는다.
+    // 함정: 기다림을 끝내는 같은 동기 구간(표·시계 읽기, 기록 포트)에서 끝 차례가 시작될 수 있어 멈춤을 다시 본다.
+    if (index === 1 && (holdForPeers() || stopping)) return;
     // 단계의 기한은 부르기 전에 정한다: 5단계의 판정·허가는 첫 호출 안에서 동기로 끝나므로, 부른 뒤에 정하면 그 비용이 상한에서 빠진다.
     const limit = deadline(timing.restoreStepWaitMs);
     if (limit === null) return void finish("restore_unarmed");
