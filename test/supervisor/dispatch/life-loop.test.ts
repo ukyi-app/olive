@@ -2183,6 +2183,130 @@ describe("정지 세대를 건넌 확정: 지금 세대의 확정이 없으면 �
       expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
     }
   });
+  // 장부의 공개 쓰기는 이 꼴을 입력 단계에서 거절하지만, 이 읽기는 이미 적힌 줄을 그대로 낸다. 꼴 밖의 본문을 싣고 쓰기를 부르면
+  // 읽은 값이 틀렸다는 원인이 기록 여부를 모른다(finalize_record_unknown)는 결과로 바뀐다.
+  test("성공 확정: 앞 지시 줄의 digest가 계약 꼴(소문자 16진수 64자리)이 아니거나 보관 시각이 양의 정수가 아니면 쓰기를 부르지 않는다", async () => {
+    const variants: [string, (rebuild: Record<string, unknown>) => Record<string, unknown>][] = [
+      ["digest 꼴 밖", (rebuild) => ({ ...rebuild, resultDigest: "invalid" })],
+      ["digest 대문자", (rebuild) => ({ ...rebuild, resultDigest: String(rebuild.resultDigest).toUpperCase() })],
+      ["보관 시각 0", (rebuild) => ({ ...rebuild, storedAt: 0 })],
+    ];
+    for (const [name, bend] of variants) {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          const instructions = read.value.instructions.map((item) => (item.action === "result_finalize" ? { ...item, rebuild: bend(item.rebuild as never) } : item));
+          return { known: true, value: { ...read.value, instructions } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      const sentBefore = w.sent.length;
+      expect([name, only(await tick(w), s.runId)]).toEqual([name, { runId: s.runId, outcome: "read_unknown", read: "instruction_times" }]);
+      expect([name, writes(w)]).toEqual([name, ["recordFinalizeInstruction"]]);
+      expect([name, w.sent.length]).toEqual([name, sentBefore]);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0]);
+    }
+    // 읽기 포트를 바꾸지 않은 실제 장부: 꼴 밖의 digest를 담은 확정 줄이 파일에 있다(무결성 검사는 지난다).
+    {
+      const path = tempPath();
+      const before = world(path);
+      const s = settledRun(before);
+      before.ledger.close();
+      const db = new Database(path);
+      try {
+        db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at, outcome, result_digest, stored_at) VALUES (?, ?, 'result_finalize', 0, ?, 'succeeded', ?, ?)").run(id(), s.runId, NOW + 10_000, "invalid", NOW + 2);
+        expect((db.query("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check).toBe("ok");
+      } finally {
+        db.close();
+      }
+      const w = world(path);
+      expect(finalizes(w).map((row) => (row.rebuild as { resultDigest?: unknown } | null)?.resultDigest)).toEqual(["invalid"]);
+      raise(w, 1, NOW + 12_000);
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual([]);
+      expect(w.sent.length).toBe(0);
+      expect(finalizes(w).length).toBe(1);
+    }
+  });
+
+  test("다른 실행의 지시 항목은 실행 ID·동작만 읽는다: 그 항목의 세대·본문 칸 읽기가 던져도 대상 실행의 확정을 막지 않고, 대상 항목 자체의 읽기 실패는 모름이다", async () => {
+    // 다른 장부에서 읽은 다른 실행의 시작 지시 줄을 대상 실행의 읽기 결과에 끼운다. 세대·본문 칸은 접근하면 던진다.
+    {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      const other = world();
+      const o = started(other);
+      const otherRow = unanswered(other).find((item) => item.runId === o.runId);
+      expect(otherRow?.action).toBe("task_start");
+      raise(w, 1, NOW + 12_000);
+      let otherReads = 0;
+      const foreign = {
+        runId: otherRow?.runId,
+        action: otherRow?.action,
+        requestId: otherRow?.requestId,
+        get stopGeneration(): never {
+          otherReads += 1;
+          throw new Error("다른 실행의 세대 칸 읽기 실패");
+        },
+        get rebuild(): never {
+          otherReads += 1;
+          throw new Error("다른 실행의 본문 칸 읽기 실패");
+        },
+      };
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          return { known: true, value: { ...read.value, instructions: [foreign, ...read.value.instructions] } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      expect(otherReads).toBe(0);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0, 1]);
+    }
+    // 대상 실행의 확정 항목 자체의 본문 칸 읽기가 던지면 어느 본문인지 모른다.
+    {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          const instructions = read.value.instructions.map((item) =>
+            item.action === "result_finalize"
+              ? {
+                  runId: item.runId,
+                  action: item.action,
+                  stopGeneration: item.stopGeneration,
+                  get rebuild(): never {
+                    throw new Error("대상 실행의 본문 칸 읽기 실패");
+                  },
+                }
+              : item,
+          );
+          return { known: true, value: { ...read.value, instructions } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      const sentBefore = w.sent.length;
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+      expect(w.sent.length).toBe(sentBefore);
+    }
+  });
   test("새 세대 확정도 지금 결과가 확정 가능할 때만 적는다: 결과 보관·확정 사실을 정하지 못하면 앞 지시 줄의 본문이 있어도 적지 않는다", async () => {
     const cases: [string, (w: World) => Started, (w: World) => Partial<LifeLoopLedger>, string][] = [
       ["성공", (w) => settledRun(w), () => ({ settledResult: (() => ({ known: true, value: null })) as never }), "wait"],

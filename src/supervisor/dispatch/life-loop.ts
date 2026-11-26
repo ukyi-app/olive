@@ -573,9 +573,11 @@ function finalizeRecords(ledger: LifeLoopLedger, runId: string, stopGeneration: 
     let earlier: FinalizeBody | null = null;
     for (const item of instructions as unknown[]) {
       if (!isObject(item)) return null;
-      const { runId: of, action, stopGeneration: generation, rebuild } = item;
+      // 다른 실행·다른 동작의 항목은 실행 ID와 동작만 읽는다. 세대·본문 칸까지 먼저 꺼내면 그 항목의 읽기 실패가 이 실행의 확정을 막는다.
+      const { runId: of, action } = item;
       if (typeof of !== "string" || typeof action !== "string") return null;
       if (of !== runId || action !== "result_finalize") continue;
+      const { stopGeneration: generation, rebuild } = item;
       if (!Number.isSafeInteger(generation) || (generation as number) < 0) return null;
       if (generation === stopGeneration) current = true;
       if (rebuild === null) continue;
@@ -594,8 +596,10 @@ function finalizeRebuildOf(value: unknown): FinalizeBody | null {
   if (!isObject(value) || value.action !== "result_finalize") return null;
   const { outcome, resultDigest, storedAt } = value;
   const known = FINALIZE_OUTCOMES.find((o) => o === outcome);
-  if (known === undefined || !Number.isSafeInteger(storedAt) || (storedAt as number) < 0) return null;
-  if (resultDigest !== null && typeof resultDigest !== "string") return null;
+  // 장부의 공개 쓰기가 받는 꼴(양의 시각, 소문자 16진수 64자리)만 받는다. 꼴 밖의 값을 실어 쓰기를 부르면 장부가 거절하고, 원인이
+  // 읽은 값이 아니라 기록 여부 모름(finalize_record_unknown)으로 남는다.
+  if (known === undefined || !isTime(storedAt)) return null;
+  if (resultDigest !== null && !isDigest(resultDigest)) return null;
   if ((known === "succeeded") !== (resultDigest !== null)) return null;
   return { outcome: known, resultDigest, storedAt: storedAt as number };
 }
