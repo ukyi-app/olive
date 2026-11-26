@@ -56,7 +56,7 @@ ResultCheckTickResult =
 - **Q-H1(감독이 직접 검사할 범위):** 지금은 "반영 전 결과 보고가 정확히 한 digest인가"만 본다. 역할 일치·출처 참조·비밀 패턴은 보지 않는다.
 - **Q-H3(보고 없는 `checking`):** 지금은 기다린다(`waiting`). 기한과 `markResult(null)`은 넣지 않았다.
 - **Q-H5(결과 `outcome`이 `failed`·`needs_input`인 결과):** 장부의 보고 줄에는 결과의 `outcome`이 없고 이 박자는 보관소의 본문을 읽지 않으므로 digest가 있는 결과는 모두 통과다. `outcome`으로 가르기로 하면 이 함수와 함께 보관소 읽기 포트가 필요하다.
-- **Q-H4(`failed_stopped` 확정 본문):** 이 박자는 `failed_stopped`를 만들지 않는다(`markResult(null)`을 부르지 않는다).
+- **Q-H4(`failed_stopped` 확정 본문):** D-114로 정했고 수명 박자가 장부 이력(`failedStop`)으로 낸다(`life-loop.md` "실패 확정"). 이 박자는 `failed_stopped`를 만들지 않는다(`markResult(null)`을 부르지 않는다).
 
 ## 시험
 

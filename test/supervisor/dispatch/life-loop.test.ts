@@ -63,6 +63,7 @@ function world(): World {
       listInputs: port("listInputs"),
       instructionTimes: port("instructionTimes"),
       settledResult: port("settledResult"),
+      failedStop: port("failedStop"),
       recordRenewInstruction: port("recordRenewInstruction"),
       recordStopInstruction: port("recordStopInstruction"),
       recordFinalizeInstruction: port("recordFinalizeInstruction"),
@@ -281,15 +282,17 @@ describe("보장 1: 의도 하나, 장부에 적은 뒤에만 지시", () => {
     expect(w.sent.map((e) => [e.header.action, e.header.stop_generation])).toEqual([["task_cancel", 1]]);
   });
 
-  test("판단이 확정을 내도 확정을 적거나 내보내지 않는다", async () => {
+  test("종료 영수증이 곧바로 failed_stopped로 옮긴 실행(exit failed)은 요청 취소가 없어도 장부의 exit로 outcome failed를 정해 적고 내보낸다", async () => {
     const w = world();
     const s = started(w);
     accept(w, s);
     must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "failed", bodyDigest: digest("stopped"), now: NOW + 1 }, s.from));
     expect(state(w, s.runId)).toBe("failed_stopped");
-    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "not_ready_result" });
-    expect(w.log).toEqual([]);
-    expect(times(w, s.runId).lastFinalizeAt).toBeNull();
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId)).toMatchObject({ runId: s.runId, outcome: "finalize_sent", issuedAt: NOW + 10_000 });
+    expect(w.log).toEqual(["recordFinalizeInstruction", "seal", "send"]);
+    expect((w.sent[0] as Envelope).body).toEqual({ run_id: s.runId, outcome: "failed", result_digest: null, stored_at: NOW + 1 });
+    expect(times(w, s.runId).lastFinalizeAt).toBe(NOW + 10_000);
   });
 
   // 결과 보고가 받아들여지고 판정이 끝나도 보고가 저장 자리와 함께 반영되지 않았으면(markResult는 보고 없이도 판정한다) 확정 의도가
@@ -1572,5 +1575,194 @@ describe("확정: 결과 보관이 장부에 반영된 ready_result만 적고 �
       expect(finalizes(w), name).toHaveLength(recorded);
       expect(w.sent, name).toEqual([]);
     }
+  });
+});
+
+// failed_stopped 실행을 만든다. no_result: completed 종료(NOW + 1) 뒤 결과 없음 판정(NOW + 3). exit: 그 exit의 종료 영수증(NOW + 1).
+// requested·deadline·unknown: 그 사유(unknown은 사유 없음)의 취소 지시를 NOW + 1에 적고 exit(기본 cancelled)의 종료 영수증을 NOW + 2에 적는다.
+function failedRun(w: World, how: "no_result" | "exit" | "requested" | "deadline" | "unknown", exit: "completed" | "cancelled" | "deadline" | "failed" = "cancelled") {
+  const s = started(w);
+  accept(w, s);
+  const stopped = (kind: typeof exit, at: number) =>
+    must(w.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: kind, bodyDigest: digest(`stopped:${kind}`), now: at }, s.from));
+  if (how === "no_result") {
+    stopped("completed", NOW + 1);
+    must(w.ledger.markResult({ runId: s.runId, resultDigest: null, now: NOW + 3 }));
+    return s;
+  }
+  if (how === "exit") {
+    stopped(exit, NOW + 1);
+    return s;
+  }
+  const reason = how === "unknown" ? {} : { reason: how };
+  must(w.ledger.recordStopInstruction({ runId: s.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1, ...reason }));
+  stopped(exit, NOW + 2);
+  if (exit === "completed") must(w.ledger.markResult({ runId: s.runId, resultDigest: null, now: NOW + 3 }));
+  return s;
+}
+
+describe("실패 확정(D-114): failed_stopped 실행의 확정 본문은 장부 이력으로", () => {
+  test("결과 없음으로 판정된 실행은 outcome failed, stored_at은 판정 시각으로 적은 뒤 내보낸다", async () => {
+    const w = world();
+    const s = failedRun(w, "no_result");
+    w.setClock(NOW + 10_000);
+    const outcome = only(await tick(w), s.runId);
+    expect(outcome).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 10_000, executorId: WORKER_EXECUTOR });
+    expect(w.log).toEqual(["recordFinalizeInstruction", "seal", "send"]);
+    const [envelope] = w.sent as [Envelope];
+    expect(envelope.header).toMatchObject({ action: "result_finalize", recipient: WORKER_EXECUTOR, request_id: (outcome as { requestId: string }).requestId });
+    expect(envelope.body).toEqual({ run_id: s.runId, outcome: "failed", result_digest: null, stored_at: NOW + 3 });
+    expect(finalizes(w)).toEqual([expect.objectContaining({ rebuild: { action: "result_finalize", outcome: "failed", resultDigest: null, storedAt: NOW + 3 } })]);
+    // 확정은 자리를 풀지 않는다(정리 영수증이 풀어 준다).
+    expect(state(w, s.runId)).toBe("failed_stopped");
+  });
+
+  test("사유 requested의 취소 지시가 적혔으면 exit와 무관하게 outcome cancelled, stored_at은 failed_stopped가 된 시각이다", async () => {
+    for (const [exit, storedAt] of [
+      ["cancelled", NOW + 2],
+      ["failed", NOW + 2],
+      ["completed", NOW + 3],
+    ] as const) {
+      const w = world();
+      const s = failedRun(w, "requested", exit);
+      w.setClock(NOW + 10_000);
+      expect([exit, only(await tick(w), s.runId).outcome]).toEqual([exit, "finalize_sent"]);
+      expect([exit, (w.sent[0] as Envelope).body]).toEqual([exit, { run_id: s.runId, outcome: "cancelled", result_digest: null, stored_at: storedAt }]);
+    }
+  });
+
+  test("D-114 글자대로: 사유 requested의 취소 지시가 없어도 종료 영수증 exit가 cancelled면 cancelled, 그 밖의 exit면 failed다", async () => {
+    const cases: [string, (w: World) => Started, "cancelled" | "failed", number][] = [
+      ["exit completed 뒤 결과 없음 판정", (w) => failedRun(w, "no_result"), "failed", NOW + 3],
+      ["exit cancelled, 취소 지시 없음", (w) => failedRun(w, "exit", "cancelled"), "cancelled", NOW + 1],
+      ["exit deadline", (w) => failedRun(w, "exit", "deadline"), "failed", NOW + 1],
+      ["exit failed", (w) => failedRun(w, "exit", "failed"), "failed", NOW + 1],
+      ["사유 deadline의 취소 지시 뒤 exit cancelled", (w) => failedRun(w, "deadline", "cancelled"), "cancelled", NOW + 2],
+      ["사유 deadline의 취소 지시 뒤 exit deadline", (w) => failedRun(w, "deadline", "deadline"), "failed", NOW + 2],
+      ["사유 없는 취소 지시 뒤 exit cancelled", (w) => failedRun(w, "unknown", "cancelled"), "cancelled", NOW + 2],
+    ];
+    for (const [name, make, outcome, storedAt] of cases) {
+      const w = world();
+      const s = make(w);
+      w.setClock(NOW + 10_000);
+      expect([name, only(await tick(w), s.runId).outcome]).toEqual([name, "finalize_sent"]);
+      expect([name, (w.sent[0] as Envelope).body]).toEqual([name, { run_id: s.runId, outcome, result_digest: null, stored_at: storedAt }]);
+      expect(finalizes(w), name).toEqual([expect.objectContaining({ rebuild: { action: "result_finalize", outcome, resultDigest: null, storedAt } })]);
+    }
+  });
+
+  test("곧바로 failed_stopped가 된 실행은 확정과 정리 영수증으로 finalized가 되어 작업자 자리가 풀린다", async () => {
+    const w = world();
+    const s = failedRun(w, "exit", "deadline");
+    expect(w.ledger.slotFree("worker")).toEqual({ known: true, value: false });
+    w.setClock(NOW + 10_000);
+    const outcome = only(await tick(w), s.runId);
+    expect(outcome).toMatchObject({ outcome: "finalize_sent" });
+    const requestId = (outcome as { requestId: string }).requestId;
+    must(w.ledger.applyReceipt({ action: "receipt_cleaned", receiptId: id(), runId: s.runId, instructionRequestId: requestId, bodyDigest: digest("cleaned"), now: NOW + 10_001 }, s.from));
+    expect(state(w, s.runId)).toBe("finalized");
+    expect(w.ledger.slotFree("worker")).toEqual({ known: true, value: true });
+  });
+
+  test("outcome을 정하지 못하면(사유 없는 취소 지시에 exit가 cancelled가 아님, exit 모름) 적거나 내보내지 않는다", async () => {
+    const exitUnknown = (w: World) => {
+      const s = failedRun(w, "exit", "failed");
+      // 판 8 전에 종료 확인을 받은 줄처럼 장부가 exit를 모르는 답(failedStop의 exit null).
+      w.wrap({
+        failedStop: ((runId: string) => {
+          const real = w.ledger.failedStop(runId);
+          return real.known && real.value !== null ? { known: true, value: { ...real.value, exit: null } } : real;
+        }) as never,
+      });
+      return s;
+    };
+    const cases: [string, (w: World) => Started][] = [
+      ["사유 없는 취소 지시 뒤 결과 없음", (w) => failedRun(w, "unknown", "completed")],
+      ["사유 없는 취소 지시 뒤 exit failed", (w) => failedRun(w, "unknown", "failed")],
+      ["exit 모름, 취소 지시 없음", exitUnknown],
+    ];
+    for (const [name, make] of cases) {
+      const w = world();
+      const s = make(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId), name).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "outcome_unknown" });
+      expect(w.log, name).toEqual([]);
+      expect(finalizes(w), name).toEqual([]);
+      expect(w.ledger.slotFree("worker"), name).toEqual({ known: true, value: false });
+    }
+  });
+
+  test("확정 사실 읽기가 모름·던짐·값 없음·꼴 틀림·다른 실행이면 read_unknown(result)이고 아무것도 적지 않는다", async () => {
+    const variants: [string, (real: Record<string, unknown>) => unknown][] = [
+      ["모름", () => ({ known: false, reason: "db_error" })],
+      ["던짐", () => {
+        throw new Error("읽기 실패");
+      }],
+      ["값 없음", () => ({ known: true, value: null })],
+      ["다른 실행", (real) => ({ known: true, value: { ...real, runId: id() } })],
+      ["시각 틀림", (real) => ({ known: true, value: { ...real, stoppedAt: 0 } })],
+      ["취소 칸 틀림", (real) => ({ known: true, value: { ...real, requestedCancel: "yes" } })],
+      ["exit 칸 틀림", (real) => ({ known: true, value: { ...real, exit: "aborted" } })],
+    ];
+    for (const [name, answer] of variants) {
+      const w = world();
+      const s = failedRun(w, "no_result");
+      const real = w.ledger.failedStop(s.runId);
+      if (!real.known || real.value === null) throw new Error("확정 사실을 읽지 못함");
+      const value = { ...real.value } as Record<string, unknown>;
+      w.wrap({ failedStop: (() => answer(value)) as never });
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId), name).toEqual({ runId: s.runId, outcome: "read_unknown", read: "result" });
+      expect(w.log, name).toEqual([]);
+    }
+  });
+
+  test("쓰기 직전에 다시 읽은 확정 사실이 처음과 다르면 superseded이고 적지 않는다", async () => {
+    for (const change of [{ stoppedAt: NOW + 4 }, { requestedCancel: true }, { exit: null }]) {
+      const w = world();
+      const s = failedRun(w, "no_result");
+      let calls = 0;
+      w.wrap({
+        failedStop: ((runId: string) => {
+          calls += 1;
+          const real = w.ledger.failedStop(runId);
+          return calls === 2 && real.known && real.value !== null ? { known: true, value: { ...real.value, ...change } } : real;
+        }) as never,
+      });
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId), JSON.stringify(change)).toEqual({ runId: s.runId, outcome: "superseded", planned: "finalize" });
+      expect(writes(w)).toEqual([]);
+    }
+  });
+
+  test("확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고, 접수가 닫혔으면 적지 않는다", async () => {
+    const w = world();
+    const s = failedRun(w, "no_result");
+    w.setIntake(false);
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "intake_closed" });
+    expect(w.log).toEqual([]);
+    w.setIntake(true);
+    expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+    w.setClock(NOW + 10_000 + POLICY.answerTimeoutMs);
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "finalize_withheld", reason: "already_recorded" });
+    expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+    expect(finalizes(w)).toHaveLength(1);
+  });
+
+  test("확정 사실은 failed_stopped 실행에만 읽는다: 그 읽기가 던져도 진행 중 실행의 갱신을 막지 않는다", async () => {
+    const w = world();
+    const s = started(w);
+    accept(w, s);
+    let reads = 0;
+    w.wrap({
+      failedStop: (() => {
+        reads += 1;
+        throw new Error("읽기 실패");
+      }) as never,
+    });
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId).outcome).toBe("renew_sent");
+    expect(reads).toBe(0);
   });
 });
