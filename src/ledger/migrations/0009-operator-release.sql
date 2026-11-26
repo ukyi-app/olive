@@ -2,11 +2,14 @@
 -- 표 재작성이고 이름 없는 CHECK는 빼거나 넓히지 못한다, 이관 0006 머리의 주석). 늘어날 수 있는 집합(사유·확인 방법·앞 상태)은
 -- 트리거에 둔다. 올라간 장부의 새 표는 비어 있고 기존 줄은 바뀌지 않는다.
 -- (가) result_abandons: 종료는 확인됐는데 결과가 끝내 오지 않는 작업자 실행(checking)의 결과를 관리자가 버린다. 근거 줄을 넣는 문장이
---     실행 줄을 failed_stopped로 옮긴다. 확정은 수명 박자가 D-114 그대로 낸다(이 판은 확정을 적지 않는다).
+--     실행 줄을 failed_stopped로 옮긴다. 확정은 수명 박자가 D-114 그대로 낸다(이 판은 확정을 적지 않는다). 감독이 이미 받아 둔 결과
+--     보고가 있거나(D-168) 확정 outcome을 정할 수 없는 실행(D-148)은 버리지 않는다.
+--     abandoned_result_reports: 결과를 버린 실행에 뒤늦게 온 결과 보고를 본문 보관 없이 받은 기록(D-169). 감독은 이 줄을 커밋한
+--     뒤에 ack한다.
 -- (나) operator_closures의 트리거를 넓힌다: 실행기가 영영 돌아오지 않을 때 종료가 확인된 실행(checking·ready_result·
 --     failed_stopped)을 저장소 비움(store_reset) 근거로 not_started로 닫는다. 표와 칸은 판 7 그대로다.
 -- (다) slot_hold_releases: 점유 관측(slot_holds)을 파드 교체 근거로 푼다(holds_slot = 0). 줄은 남아 그 실행 ID는 계속 시작하지 않는다.
--- 세 표 모두 근거 줄은 고치거나 지울 수 없다. 장부는 사람이 넘긴 사실(결과를 버릴 까닭, 저장소를 비웠는지, 파드를 바꿨는지와 그
+-- 네 표 모두 줄은 고치거나 지울 수 없다. 장부는 사람이 넘긴 사실(결과를 버릴 까닭, 저장소를 비웠는지, 파드를 바꿨는지와 그
 -- 시각)을 확인하지 못한다: 근거 줄은 사람이 했다는 기록이다(D-93과 같다).
 -- 값의 검사는 판 7과 같은 꼴이다: 정수 칸은 ANY로 받아 트리거가 typeof를 먼저 보고, 값의 검사는 "(조건) IS NOT 1"·"IS NOT 0", 다른
 -- 표와의 대조는 "=로 맞는 줄의 NOT EXISTS"로 써서 NULL이 섞이면 막는 쪽으로 간다(까닭은 이관 0007 머리의 "NULL을 막는 것"·"정수
@@ -34,7 +37,7 @@ CREATE TABLE result_abandons (
 -- 있음, 정지 기록이 없거나 정지 세대가 그 기록과 다름.
 -- 앞 상태는 checking 하나다. 판 8 전에 failed_stopped가 되어 확정을 못 내는 줄은 다루지 않는다(D-162, 장부 초기화로 넘긴다).
 -- 이 트리거가 보지 않는 것: 장부가 건강한지, 접수 닫힘·사본 보류·정지 중인지(ledger.ts의 abandonResult가 쓰기 모드로 장부 실패만
--- 거절한다), 그 실행에 받은 결과 보고가 미반영으로 남았는지(남았으면 아래 AFTER 트리거가 반영하지 않고 마친다: 그 결과도 버린다).
+-- 거절한다). 받아 둔 결과 보고와 확정 outcome은 아래 두 트리거가 따로 본다(직접 SQL에도 까닭이 다른 문구로 보인다).
 CREATE TRIGGER result_abandons_proven BEFORE INSERT ON result_abandons
 WHEN (typeof(NEW.stop_generation) = 'integer' AND typeof(NEW.abandoned_at) = 'integer') IS NOT 1
   OR EXISTS (SELECT 1 FROM result_abandons a WHERE a.run_id = NEW.run_id)
@@ -46,20 +49,37 @@ BEGIN
   SELECT RAISE(ABORT, 'result_abandon_unproven');
 END;
 
+-- 그 실행에 받아 두고 판정에 아직 반영하지 않은 결과 보고(applied_at이 빈 report_result 줄)가 있으면 버리지 않는다(D-168). 그 보고의
+-- 본문은 감독 보관소에 있고 실행기는 ack를 받았다: 결과가 끝내 오지 않는 실행이 아니라 결과 검사 박자가 ready_result로 판정할 실행이다.
+-- 근거·실행 줄·보고는 그대로 남는다.
+CREATE TRIGGER result_abandons_report_pending BEFORE INSERT ON result_abandons
+WHEN EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = NEW.run_id AND d.action = 'report_result' AND d.applied_at IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'result_abandon_report_pending');
+END;
+
+-- 버린 뒤 수명 박자가 D-114 확정 본문을 만들 수 없는 실행은 버리지 않는다(D-148). 버린 실행의 exit는 늘 completed다(checking의
+-- stop_exit는 completed이거나 판 8 전의 줄이라 비었고, 비면 failed_stopped_at이 있어 completed로 읽는다: ledger.ts의 stopFacts). 그래서
+-- outcome을 못 정하는 것은 사유 requested의 취소 지시는 없고 사유 없이 적힌 취소 지시(task_cancel)가 있을 때뿐이다(requested였을 수 있다:
+-- life-loop.ts의 failedOutcome). 버리면 그 실행은 확정도 정리도 없이 자리를 쥔 채 남는다.
+CREATE TRIGGER result_abandons_outcome_known BEFORE INSERT ON result_abandons
+WHEN EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'task_cancel' AND i.reason IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'task_cancel' AND i.reason = 'requested')
+BEGIN
+  SELECT RAISE(ABORT, 'result_abandon_outcome_unknown');
+END;
+
 -- 근거 줄을 넣는 문장 안에서 실행 줄을 checking → failed_stopped로 옮기고 failed_stopped_at에 버린 시각을 적는다. 이 쓰기는 판 8의
 -- runs_failed_stopped_at_fixed가 허락하는 꼴(checking에서 옮기며 updated_at과 같은 값)이고 전이는 판 1의 줄이다. 그래서 failedStop이
 -- stoppedAt = abandoned_at, exit = completed(판 8 뒤의 종료 확인이면 칸의 값, 판 8 전이면 칸이 비어 completed로 읽는다)를 내고,
 -- 수명 박자가 D-114대로 확정한다(사유 requested의 취소 지시가 있으면 cancelled, 아니면 failed).
--- 그 실행의 미반영 결과 보고는 반영하지 않고 마친다(applied_at = abandoned_at): 판정이 끝난 실행의 처리 목록(pendingReports)과
--- 복원 3단계에 남지 않게 한다. 다른 실행의 보고와 결과 밖의 보고는 건드리지 않는다.
+-- 보고 줄은 건드리지 않는다: 미반영 결과 보고가 있는 실행은 위 트리거가 이미 막았다.
 -- 옮기는 전이가 거절되거나 옮긴 뒤 상태가 다르면 문장 전체가 되돌아가 근거 줄도 남지 않는다.
 CREATE TRIGGER result_abandons_fail_run AFTER INSERT ON result_abandons
 BEGIN
   UPDATE runs SET state = 'failed_stopped', updated_at = NEW.abandoned_at, failed_stopped_at = NEW.abandoned_at WHERE run_id = NEW.run_id;
   SELECT RAISE(ABORT, 'result_abandon_unproven')
   WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id = NEW.run_id AND r.state = 'failed_stopped' AND r.failed_stopped_at = NEW.abandoned_at);
-  UPDATE deliveries SET applied_at = NEW.abandoned_at
-  WHERE run_id = NEW.run_id AND applied_at IS NULL AND action = 'report_result';
 END;
 
 CREATE TRIGGER result_abandons_fixed BEFORE UPDATE ON result_abandons
@@ -70,6 +90,46 @@ END;
 CREATE TRIGGER result_abandons_permanent BEFORE DELETE ON result_abandons
 BEGIN
   SELECT RAISE(ABORT, 'result_abandon_unproven');
+END;
+
+-- 결과를 버린 실행에 온 결과 보고의 받은 기록(D-169). 보고마다 한 줄이고 본문과 저장 자리는 없다: 버린 결과라 보관하지 않고, 보관소에
+-- 장애가 이어져도(사유 unstorable) 실행기가 ack를 받아 다시 보내기를 멈춘다. 결과 보고의 deliveries 줄은 저장 자리와 결과 digest를
+-- 요구해(이관 0001) 거기 적지 못한다.
+-- - report_id: 보고 ID. deliveries의 ID와 겹치지 않는다(아래 트리거). 같은 ID의 재전송은 body_digest로 같은 보고인지 가른다(ledger.ts의
+--   #redelivery가 두 표를 함께 본다): 같으면 duplicate ack, 다르면 충돌(receipt_conflicts)이고 ack가 없다.
+-- - sender·run_generation: 검증된 봉투의 낸 쪽과 실행 세대. 그 실행의 지정 실행기·세대와 같아야 들어간다.
+-- - body_digest: 봉투 본문의 digest(소문자 16진 64자).
+-- - received_at: 받은 시각(감독의 시계).
+CREATE TABLE abandoned_result_reports (
+  report_id TEXT NOT NULL PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs (run_id),
+  sender TEXT NOT NULL,
+  run_generation ANY NOT NULL CHECK (typeof(run_generation) = 'integer' AND run_generation BETWEEN 0 AND 9007199254740991),
+  body_digest TEXT NOT NULL,
+  received_at ANY NOT NULL CHECK (typeof(received_at) = 'integer' AND received_at BETWEEN 1 AND 9007199254740991)
+) STRICT, WITHOUT ROWID;
+
+-- 행으로 다시 보는 확인. 하나라도 맞으면 들어가지 않는다: 정수 칸 둘 가운데 정수가 아닌 것(NULL 포함), 같은 보고 ID가 이 표나
+-- deliveries에 이미 있음(INSERT OR REPLACE 포함), digest가 꼴 밖, 그 실행에 결과 포기 근거가 없거나 낸 쪽·세대가 실행 줄과 다름.
+CREATE TRIGGER abandoned_result_reports_proven BEFORE INSERT ON abandoned_result_reports
+WHEN (typeof(NEW.run_generation) = 'integer' AND typeof(NEW.received_at) = 'integer') IS NOT 1
+  OR EXISTS (SELECT 1 FROM abandoned_result_reports x WHERE x.report_id = NEW.report_id)
+  OR EXISTS (SELECT 1 FROM deliveries d WHERE d.id = NEW.report_id)
+  OR (length(NEW.body_digest) = 64 AND NEW.body_digest NOT GLOB '*[^0-9a-f]*') IS NOT 1
+  OR NOT EXISTS (SELECT 1 FROM result_abandons a JOIN runs r ON r.run_id = a.run_id WHERE a.run_id = NEW.run_id
+    AND r.executor_id = NEW.sender AND r.run_generation = NEW.run_generation)
+BEGIN
+  SELECT RAISE(ABORT, 'abandoned_report_unproven');
+END;
+
+CREATE TRIGGER abandoned_result_reports_fixed BEFORE UPDATE ON abandoned_result_reports
+BEGIN
+  SELECT RAISE(ABORT, 'abandoned_report_unproven');
+END;
+
+CREATE TRIGGER abandoned_result_reports_permanent BEFORE DELETE ON abandoned_result_reports
+BEGIN
+  SELECT RAISE(ABORT, 'abandoned_report_unproven');
 END;
 
 -- ---- (나) 저장소 비움 근거의 관리자 닫기 ----
@@ -86,6 +146,9 @@ INSERT INTO run_transitions (kind, from_state, to_state) VALUES
 -- - store_reset(D-158): 관리자가 그 실행기 저장소를 비우고 작업자 파드를 새로 띄웠다. checking·ready_result·failed_stopped, 종료
 --   확인 있음. 종료가 확인돼 프로세스는 0개이고, 저장소를 비웠으니 실행기가 그 실행의 정리 영수증을 낼 기록도 없다. 정리 영수증을
 --   기다리면 자리가 영영 묶이는 실행을 닫는 길이다. 종료가 확인되지 않은 실행에는 받지 않는다(그런 실행은 pod_replaced로 닫는다).
+--   failed_stopped는 실패 시각(runs.failed_stopped_at)이 있는 줄만 받는다. 그 칸이 빈 줄은 판 8 전에 실패 상태가 된 줄(원 SQL로 칸 없이
+--   옮긴 줄 포함)이고 D-162가 이 판에서 다루지 않기로 한 줄이다(장부 초기화로 넘긴다). 판 8 전에 checking이었다가 판 8 뒤에 결과 없음·
+--   결과 포기로 실패 상태가 된 줄은 그 쓰기가 칸을 채워 받는다.
 -- 파드 이름·뜬 시각 칸은 새로 띄운 작업자 파드의 값이다. 닫을 수 있게 되는 시각(발행 최댓값 + 31000)과 두 시각의 순서는 두 방법에
 -- 같게 본다: 종료가 확인된 실행에는 띄울 시작이 남지 않지만, 같은 식은 닫는 쪽으로만 틀린다.
 -- 그 밖의 조건은 판 7의 트리거와 같다(이관 0007의 주석). 판 7의 근거 줄은 그대로 읽힌다.
@@ -103,6 +166,7 @@ WHEN (typeof(NEW.pod_started_at) = 'integer' AND typeof(NEW.stop_generation) = '
   OR (instr(NEW.pod_name, '..') + instr(NEW.pod_name, '.-') + instr(NEW.pod_name, '-.') + instr(NEW.pod_name, char(0))) IS NOT 0
   OR NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id = NEW.run_id AND r.kind = 'worker' AND r.state = NEW.from_state
     AND ((NEW.checked_by = 'pod_replaced' AND r.stop_receipt_id IS NULL) OR (NEW.checked_by = 'store_reset' AND r.stop_receipt_id IS NOT NULL)))
+  OR (NEW.from_state = 'failed_stopped' AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id = NEW.run_id AND r.failed_stopped_at IS NOT NULL))
   OR NOT EXISTS (SELECT 1 FROM stop_state s WHERE s.id = 1 AND s.generation = NEW.stop_generation)
   OR NOT EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'task_start')
   OR EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'session_start')

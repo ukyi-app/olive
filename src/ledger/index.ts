@@ -3,6 +3,7 @@
 export { classify, type Faults, LedgerUnavailableError, UNAVAILABLE_REASONS, type UnavailableReason } from "./errors.ts";
 export { type CredentialRef, LedgerInputError, type SourceRef } from "./input.ts";
 export {
+  type AbandonedReportInput,
   type AdmitRunInput,
   type AnswerAlarm,
   type AnswerSightingsInput,
