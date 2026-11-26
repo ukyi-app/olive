@@ -1,4 +1,4 @@
-// 복원 2단계의 PeersPort(ledger/restore.ts). 현관·관측 중계의 행은 현관 포트에서, 실행기의 행은 연결 표에서 만든다. 설명 문서는 boot.md다.
+// 복원 2단계의 PeersPort·OccupancyPort(ledger/restore.ts). 현관·관측 중계의 행은 현관 포트에서, 실행기의 행과 점유는 연결 표에서 만든다. 설명 문서는 boot.md다.
 //
 // 실행기 행은 연결 표의 candidates(지금의 복원기)만 쓴다. 그 행은 TLS로 확인한 배포 신원에 등록된 키로 서명이 맞은 인사의 낸 쪽이고
 // (connections.ts), 같은 복원기로 맞춘 뒤 받은 인사다. 그래서 "인증 연결의 신원과 검증한 인사의 낸 쪽을 맞춘 것만" 이웃으로 센다.
@@ -7,24 +7,31 @@
 //
 // 필수 이웃 기다림(D-141): 감독이 다시 뜨면 실행기는 끊겼다가 재접속 간격(1초부터 두 배씩)에 맞춰 다시 붙으므로, 2단계를 부른 순간의
 // 표만 세면 곧 붙을 실행기를 빠진 이웃으로 닫고 그 프로세스 동안 접수가 닫힌 채 남는다. 그래서 이 포트가 필수 이웃이 모두 모일 때까지
-// 다시 읽고, 모였거나 기다림의 끝에 이르면 마지막 읽기를 낸다. 복원기는 이 포트와 점유 포트를 한 번씩 읽어 한 번 판정한다: 기다리는 동안
-// 읽은 행은 모였는지 보는 데만 쓰고 복원기에 넘기지 않는다(그동안 받은 인사의 관측은 답 줄이 2단계 뒤에 반영한다, boot.md 정한 것 4).
-import { CONTRACT, executorName, parsePrincipal } from "../../contract/v1/index.ts";
-import type { OccupancyAnswer, PeerContractAnswer, PeerPolicy, PeersPort } from "../../ledger/index.ts";
+// 다시 읽는다. 복원기는 이 포트의 두 읽기(contracts, occupancy)를 한 번씩 불러 한 번 판정한다.
+// - 끝 시각은 기다림 전체에 하나다: 끝 시각에 진행 중인 현관 답이나 다시 읽기 타이머를 기다리지 않고, 마지막으로 끝난 현관 답과 그때의
+//   연결 표로 판정에 넘긴다. 끝 시각 뒤에 온 현관 답은 버린다. 첫 현관 답만은 끝 시각에도 기다린다(넘길 앞선 답이 없다).
+// - 모였는지는 그때의 연결 표로 센다. 다만 이 복원기의 2단계에서 표로 본 실행은 연결이 끊기거나 빈 full로 다시 붙어도 기억했다가 점유
+//   읽기에 partial 행으로 더한다: 답 줄은 끊긴 연결의 인사로 장부 밖 실행·점유 차단을 적지 않는다(recordAnswerSightings).
+// - 끝 차례가 시작되면 진행 중인 현관 답·잠을 깨워, 판정에 넘기지 않고 던진다(복원기는 장부를 건드리기 전에 모름으로 실패한다).
+import { CONTRACT, executorName, parsePrincipal, type RunStatus } from "../../contract/v1/index.ts";
+import type { OccupancyAnswer, OccupancyPort, PeerContractAnswer, PeerPolicy, PeersPort } from "../../ledger/index.ts";
 import type { Connections, StopGenerationSource } from "../transport/connections.ts";
 
-// 단계 기한보다 이만큼 앞에서 기다림을 끝낸다. 기다림 뒤에도 마지막 읽기(현관 답 하나), 복원기의 판정과 장부 쓰기(점유 차단·양성 관측),
-// 늦게 깨는 타이머가 남는다. 이것들이 단계 기한을 넘기면 감독이 restore_lapsed(96)로 끝난다.
+// 단계 기한보다 이만큼 앞이 기다림의 끝 시각이다. 끝 시각 뒤에 남는 일은 끝 타이머가 늦게 깬 만큼, 연결 표 읽기, 복원기의 판정과 장부
+// 쓰기(점유 차단·양성 관측)뿐이고, 이것들이 합쳐 이 값 미만이어야 단계 기한 안이다. 이벤트 루프가 이만큼 멈추거나 장부 쓰기가 이만큼
+// 걸리면 지금처럼 restore_lapsed(96)다. 첫 현관 답이 끝 시각 뒤에 오면 남는 시간은 이보다 짧다.
 export const PEER_WAIT_MARGIN_MS = 5_000;
 // 단계 기한을 늘려도 이보다 오래 기다리지 않는다. 기다리는 동안은 5단계 전이라 박자가 돌지 않아 기존 실행의 정지·상태 조회도 그만큼 늦다.
 // 지금의 단계 기한(30초)에서 여유를 뺀 값과 같다.
 export const PEER_WAIT_MAX_MS = 25_000;
-// 다시 읽는 간격. 필수 이웃이 붙은 뒤 판정까지 더 걸리는 시간과 멈춤을 알아채는 데 걸리는 시간의 상한이다.
+// 현관 답을 받은 뒤 다시 묻기까지의 간격. 필수 이웃이 붙은 뒤 판정까지 더 걸리는 시간은 이 값과 현관 답 하나의 시간이다.
 // 한 번 읽기는 현관 포트 한 번과 메모리의 연결 표라 이 간격으로 되풀이해도 무겁지 않다.
 export const PEER_POLL_MS = 250;
 
+const STOPPED = "peer_wait_stopped";
+
 // 현관이 아는 이웃(현관 자신, 관측 중계)의 행. 현관 조각(O08)이 만든다. 던지면 2단계가 모름으로 실패한다.
-// 함정: 기다리는 동안 PEER_POLL_MS마다 다시 불린다.
+// 함정: 기다리는 동안 답을 받을 때마다 PEER_POLL_MS 뒤에 다시 불린다. 끝 시각에 진행 중인 답은 버려진다(취소하지 않는다).
 export interface FrontPeers {
   contracts(): Promise<PeerContractAnswer[]>;
 }
@@ -36,10 +43,12 @@ export interface PeerWait {
   // 기다림을 끝낼 시각. 포트를 부를 때 한 번 읽는다. null이면 기다리지 않는다.
   readonly until: () => number | null;
   readonly now: () => number;
-  // ms 뒤에 이행한다. 타이머를 걸지 못하면 거부한다.
-  readonly sleep: (ms: number) => Promise<void>;
+  // ms 뒤에 fire를 한 번 부른다. 돌려준 함수는 취소다. 걸지 못하면 던진다.
+  readonly setTimer: (ms: number, fire: () => void) => () => void;
   // 끝 차례가 시작됐는가.
   readonly stopping: () => boolean;
+  // 끝 차례가 시작되면 wake를 부르게 건다. 돌려준 함수는 떼기다.
+  readonly onStop: (wake: () => void) => () => void;
 }
 
 export interface PeersSource {
@@ -76,45 +85,154 @@ export function peersGathered(required: readonly string[], rows: readonly PeerCo
   return true;
 }
 
-export function createPeers(source: PeersSource): PeersPort {
-  const read = async () => {
+// 실행기·실행 ID·세대. 장부의 점유 차단·양성 관측이 한 실행을 가르는 열쇠와 같다.
+const runKey = (executorId: string, status: RunStatus): string => JSON.stringify([executorId, status.run_id, status.run_generation]);
+
+const quietly = (fn: () => void): void => {
+  try {
+    fn();
+  } catch {
+    // 떼기·취소가 던져도 판정은 바뀌지 않는다(늦게 깬 콜백은 이미 끝난 기다림을 바꾸지 못한다).
+  }
+};
+
+type Settled<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown } | null;
+
+export function createPeers(source: PeersSource): PeersPort & OccupancyPort {
+  // 이 복원기의 2단계에서 연결 표로 본 실행. 열쇠마다 마지막으로 본 상태다. 끊김·빈 full로 지우지 않는다: 그래야 그사이 끝난 연결이
+  // 답한 장부 밖 실행·정리 중 실행의 차단이 판정에 남는다. 2단계를 다시 불러도(모름 뒤) 같은 기억을 쓴다.
+  const seen = new Map<string, { readonly executorId: string; readonly status: RunStatus }>();
+  const remember = (answers: readonly OccupancyAnswer[]) => {
+    for (const answer of answers) for (const status of answer.runs) seen.set(runKey(answer.executorId, status), { executorId: answer.executorId, status: { ...status } });
+  };
+  const askFront = async (): Promise<PeerContractAnswer[]> => {
     const front = await source.front.contracts();
     if (!Array.isArray(front)) throw new TypeError("현관 이웃 행의 꼴이 틀렸다");
-    // 연결 표는 현관의 답을 받은 뒤에 읽는다. 기다리는 동안 붙은 실행기도, 그동안 끊긴 실행기의 빠짐도 그 순간의 표로 센다.
-    // 행과 점유를 같은 표 값 하나에서 읽는다(표는 불변 값이다).
+    return front;
+  };
+  // 현관 행에 그 순간의 연결 표로 실행기 행을 더한다. 행과 점유를 같은 표 값 하나에서 읽는다(표는 불변 값이다). 본 점유는 기억한다.
+  const look = (front: readonly PeerContractAnswer[]) => {
     const table = source.table();
-    const rows: PeerContractAnswer[] = [];
+    const occupancy = table.occupancy(source.restorer);
+    remember(occupancy);
+    const rows: PeerContractAnswer[] = [...front];
     for (const candidate of table.candidates(source.restorer)) {
       const principal = candidate.principal;
       if (principal.kind !== "worker_executor") continue;
       const policy: PeerPolicy = source.expectedPolicy === null ? "unknown" : candidate.hello.policy_revision === source.expectedPolicy ? "match" : "mismatch";
       rows.push({ peer: executorName(principal.role, principal.instance, principal.storage), contract: CONTRACT, policy });
     }
-    return { rows: [...front, ...rows], table };
+    return { rows, occupancy };
   };
-  return {
-    async contracts(): Promise<PeerContractAnswer[]> {
-      const wait = source.wait;
-      const until = wait === undefined ? null : wait.until();
-      for (;;) {
-        const { rows, table } = await read();
-        if (wait === undefined || until === null || peersGathered(wait.required, rows, table.occupancy(source.restorer))) return rows;
-        // 시각을 읽지 못하거나 타이머를 걸지 못하면 더 기다리지 않고 지금 읽은 행으로 판정하게 한다.
-        let left: number;
-        try {
-          left = until - wait.now();
-        } catch {
-          left = Number.NaN;
-        }
-        if (!(left > 0)) return rows;
-        try {
-          await wait.sleep(Math.min(PEER_POLL_MS, left));
-        } catch {
-          return rows;
-        }
-        // 멈춤이면 판정하지 않는다: 던지면 복원기는 모름으로 실패하고(장부를 건드리기 전), 조립은 멈춤 중이라 그 단계를 다시 부르지 않는다.
-        if (wait.stopping()) throw new Error("peer_wait_stopped");
+
+  const contracts = async (): Promise<PeerContractAnswer[]> => {
+    const wait = source.wait;
+    if (wait === undefined) return look(await askFront()).rows;
+    if (wait.stopping()) throw new Error(STOPPED);
+    const until = wait.until();
+    let halted = false;
+    let ended = false;
+    let wake: () => void = () => {};
+    let off: () => void = () => {};
+    let cancelEnd: () => void = () => {};
+    try {
+      off = wait.onStop(() => {
+        halted = true;
+        wake();
+      });
+    } catch {
+      // 걸지 못하면 깨우지 못할 뿐이다: 답·잠 뒤마다 stopping()을 다시 본다.
+    }
+    const stopped = () => halted || wait.stopping();
+    // work가 끝나거나 멈춤·끝 시각이 깨우면 이행한다(깨우면 null). 깨운 뒤에 끝난 work의 결과는 버린다.
+    const settle = <T>(work: Promise<T>) =>
+      new Promise<Settled<T>>((resolve) => {
+        wake = () => resolve(null);
+        if (halted || ended) resolve(null);
+        work.then(
+          (value) => resolve({ ok: true, value }),
+          (error: unknown) => resolve({ ok: false, error }),
+        );
+      });
+    // 끝 시각이 지났는가. 시각을 읽지 못하면 지난 것으로 본다(모름을 시간이 남은 것으로 읽지 않는다).
+    const past = (end: number): boolean => {
+      try {
+        const at = wait.now();
+        return !(Number.isFinite(at) && at < end);
+      } catch {
+        return true;
       }
+    };
+    try {
+      const first = await settle(askFront());
+      if (first === null || stopped()) throw new Error(STOPPED);
+      if (!first.ok) throw first.error;
+      let last = first.value;
+      let read = look(last);
+      if (until === null || peersGathered(wait.required, read.rows, read.occupancy)) return read.rows;
+      // 시각을 읽지 못하거나 끝 타이머를 걸지 못하면 더 기다리지 않고 이 읽기로 판정하게 한다.
+      let left: number;
+      try {
+        left = until - wait.now();
+      } catch {
+        left = Number.NaN;
+      }
+      if (!(left > 0)) return read.rows;
+      try {
+        cancelEnd = wait.setTimer(Math.ceil(left), () => {
+          ended = true;
+          wake();
+        });
+      } catch {
+        return read.rows;
+      }
+      for (;;) {
+        let cancelPoll: () => void = () => {};
+        const slept = await settle(
+          new Promise<void>((resolve, reject) => {
+            try {
+              cancelPoll = wait.setTimer(PEER_POLL_MS, () => resolve());
+            } catch (error) {
+              reject(error);
+            }
+          }),
+        );
+        quietly(cancelPoll);
+        if (stopped()) throw new Error(STOPPED);
+        // 끝 시각이 깨웠거나, 다시 읽기 타이머를 걸지 못했거나, 끝 시각이 지났으면 새로 묻지 않는다.
+        if (slept === null || !slept.ok || past(until)) return look(last).rows;
+        const next = await settle(askFront());
+        if (stopped()) throw new Error(STOPPED);
+        // 끝 시각에 진행 중이던 답과 끝 시각 뒤에 온 답은 판정에 넘기지 않는다.
+        if (next === null || past(until)) return look(last).rows;
+        if (!next.ok) throw next.error;
+        last = next.value;
+        read = look(last);
+        if (peersGathered(wait.required, read.rows, read.occupancy)) return read.rows;
+      }
+    } finally {
+      quietly(off);
+      quietly(cancelEnd);
+    }
+  };
+
+  return {
+    contracts,
+    // 그때의 연결 표의 full 행에, 이번 2단계에서 본 실행 가운데 그 표에 같은 열쇠가 없는 것을 실행기마다 partial 행 하나로 더한다.
+    // partial이라 필수 실행기의 전체 점유로 세지 않는다(옛 full을 지금 연결 수에 더하지 않는다). 복원기는 이 행도 같은 규칙으로 대조해
+    // 장부 밖·불일치 실행을 막고, 지정 실행기·같은 세대의 항목은 양성 관측으로 적는다.
+    async occupancy(): Promise<OccupancyAnswer[]> {
+      // 판정에 넘기기 전 마지막 확인. 이 뒤의 판정과 장부 쓰기는 복원기의 동기 구간이다.
+      if (source.wait?.stopping() === true) throw new Error(STOPPED);
+      const current = source.table().occupancy(source.restorer);
+      remember(current);
+      const now = new Set(current.flatMap((answer) => answer.runs.map((status) => runKey(answer.executorId, status))));
+      const kept = new Map<string, RunStatus[]>();
+      for (const [key, { executorId, status }] of seen) {
+        if (now.has(key)) continue;
+        kept.set(executorId, [...(kept.get(executorId) ?? []), { ...status }]);
+      }
+      return [...current, ...[...kept].map(([executorId, runs]): OccupancyAnswer => ({ executorId, coverage: "partial", runs }))];
     },
   };
 }

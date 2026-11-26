@@ -494,31 +494,36 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     });
   };
   const front = deps.frontDoor;
+  // 끝 차례가 시작될 때 부를 것. 2단계의 이웃 포트가 기다리는 현관 답·잠을 깨운다(finish).
+  const stopWakers = new Set<() => void>();
   let restorer: Restorer;
   try {
+    // 2단계는 필수 이웃이 모일 때까지 그 단계 기한 안에서 기다린다(D-141, peers.ts). 끝 시각은 기다림 전체에 하나이고, 끝 차례는
+    // 기다림을 깨운다. 점유 포트도 같은 값이다: 기다리는 동안 표로 본 실행의 차단 근거를 그 연결이 사라져도 판정에 넘긴다.
+    const neighbours = createPeers({
+      front: { contracts: () => inStep(() => front.peers.contracts()) },
+      table,
+      get restorer() {
+        return restorer;
+      },
+      expectedPolicy: settings.expectedPolicyRevision,
+      wait: {
+        required: requiredPeers,
+        until: () => (stepLimit === null ? null : peerWaitUntil(stepLimit, timing.restoreStepWaitMs)),
+        now: () => deps.monoNow(),
+        setTimer: (ms, fire) => deps.setTimer(ms, fire),
+        stopping: () => stopping,
+        onStop: (wake) => {
+          stopWakers.add(wake);
+          return () => void stopWakers.delete(wake);
+        },
+      },
+    });
     const ports: RestorePorts = {
       stopAuthority: { latestStop: () => inStep(() => front.stopAuthority.latestStop()) },
       publications: { lookup: (frontJobId) => inStep(() => front.publications.lookup(frontJobId)) },
-      // 2단계는 필수 이웃이 모일 때까지 그 단계 기한 안에서 기다린다(D-141, peers.ts). 멈춤은 다시 읽기 전에 본다.
-      peers: createPeers({
-        front: { contracts: () => inStep(() => front.peers.contracts()) },
-        table,
-        get restorer() {
-          return restorer;
-        },
-        expectedPolicy: settings.expectedPolicyRevision,
-        wait: {
-          required: requiredPeers,
-          until: () => (stepLimit === null ? null : peerWaitUntil(stepLimit, timing.restoreStepWaitMs)),
-          now: () => deps.monoNow(),
-          sleep: (ms) =>
-            new Promise<void>((resolve) => {
-              deps.setTimer(ms, () => resolve());
-            }),
-          stopping: () => stopping,
-        },
-      }),
-      occupancy: { occupancy: async () => table().occupancy(restorer) },
+      peers: neighbours,
+      occupancy: neighbours,
     };
     restorer = make.restorer(ledger, ports, ledgerClock, requiredPeers);
   } catch {
@@ -862,6 +867,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     markFatal(why);
     stopping = true;
     wake();
+    for (const fire of [...stopWakers]) {
+      try {
+        fire();
+      } catch {
+        // 깨우지 못한 기다림도 답·잠 뒤에 stopping을 보고 던진다. 끝 차례를 막지 않는다.
+      }
+    }
     ending = (async () => {
       // shutdown()을 부른 시점. 자격 값 쪽 intake_closed가 깃발 때문인지 진짜 접수 닫힘인지 가르는 기준이다.
       const reading = shared.read();
