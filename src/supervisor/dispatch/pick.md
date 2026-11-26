@@ -71,7 +71,11 @@ AssignmentInput = Omit<AssignToolRequestInput, "runId">
 | 스스로 고치는 작성인데 근거 문이 닫힘(D-34) | 사실 `self_fix_basis_closed`. 없으면 보류 | 없음 |
 | 앞 실행의 종료 미확인 | 사실 `prior_run_end_unconfirmed`. 없으면 보류 | 없음(실행 목록을 받지 않음) |
 
-이 사실을 채우는 어댑터는 아직 없고, 지금의 운영 경로에서 이 함수를 부르는 곳도 없다. 함수 자체는 여섯 사실이 모두 `false`로 확인되어 들어오면 고른다. 틀리는 방향은 늘 "배정하지 않음"이다.
+사실을 채우는 어댑터는 시험 값의 `runtime/test-assign.ts` 하나다(README "시험 배정 값"). 값마다 결과가 다르다.
+
+- **운영 값:** 조립이 여섯 사실을 모두 모름으로 넘겨 늘 보류한다.
+- **시험 값, 고정 T1 부탁(D-130):** `prior_run_end_unconfirmed`는 장부의 실행 줄·점유 관측으로 채운다. 부탁이 재시도 키까지 고정 T1 부탁과 같고 앞 실행을 끝까지 읽었을 때만 나머지 다섯을 `false`로 채운다. 실행·점유를 읽지 못하면 여섯 모두 비운다.
+- **시험 값, 나머지 부탁:** `prior_run_end_unconfirmed`만 채우고 다섯은 판정할 원천이 감독에 없어(위 표의 "근거 입력") 비운다. 고르기는 `true`인 사실을 누락보다 먼저 보므로 결과가 앞 실행 사실로 갈린다: `true`면 `refused`/`prior_run_end_unconfirmed`, `false`면 다섯 이름의 `evidence_missing` 보류, 실행·점유를 읽지 못하면(여섯 모두 비움) 여섯 이름의 `evidence_missing` 보류다. 함수 자체는 여섯 사실이 모두 `false`로 확인되어 들어오면 고른다. 틀리는 방향은 늘 "배정하지 않음"이다.
 
 ## 기한과 예산
 

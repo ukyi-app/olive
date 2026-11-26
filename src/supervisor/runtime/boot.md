@@ -159,7 +159,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 - **관리 통로(M1a):** 상태는 조립의 기록(`restore_step`, `beat`의 D-90 건수·사유, `fatal`)과 같은 값을 읽는다. 도구 처리기 포트(`tools`)를 관리 명령에 다시 쓰지 않는다. 감독의 두 번째 듣기라 `test/entrypoints.test.ts`의 "감독에서 닿는 코드" 단언에 한 칸과 까닭을 더한다.
 - **시험 작업 넣기(M1t):** 운영 값에서는 켜지 않는다(차트 CI가 막을 일). 접수 판단(`intake`)은 공개 면(`RunningSupervisor`)에 더하지 않았다: 조립이 `settings.testJobs`일 때만 만드는 `testJob` 포트의 문(`gate`)이 조립 변수(끝 차례·끝낼 사유·5단계·받아들인 허가 `granted`)와 박자 기한·요청 기한만 보고, 접수 허가·정지는 장부가 쓰기 트랜잭션 안에서 다시 본다(쓰기 모드 `start`, README "감독 관리 통로"). 문은 래치(`look()`·`haltReason()`)를 부르지 않고 장부를 읽지 않는다. 복원기를 직접 읽지 않는다: 기한을 넘긴 5단계의 허가는 장부에 남아 있을 수 있다.
 - **도구 처리기를 부르는 길(O10):** `RunningSupervisor.tools`로만 포트를 만들고 처리기 문맥의 `now`도 거기서 읽는다. 처리기 호출을 박자와 겹치지 않게 부른다.
-- **역할 프로필(O11·O12):** 배정 정책에서 연결한 것은 등록행(적용한 등록표에서), 기대 프로필 revision(`OLIVE_PROFILE_REVISIONS`), 고정 계정(`OLIVE_ACCOUNT_NAME`)과 자격 판(`OLIVE_ACCOUNT_REVISION`), 자격 참조 포트(`credentialPort`)다(`assign-policy.md`). 값이 없으면 각각 닫힌 값이다. 남은 것은 실행 계획·요청 한도·배정 전 사실이고 지금은 닫힌 값이다: 요청 한도 0이라 배정 박자가 `policy_rejected`로 끝난다.
+- **역할 프로필(O11·O12):** 배정 정책에서 연결한 것은 등록행(적용한 등록표에서), 기대 프로필 revision(`OLIVE_PROFILE_REVISIONS`), 고정 계정(`OLIVE_ACCOUNT_NAME`)과 자격 판(`OLIVE_ACCOUNT_REVISION`), 자격 참조 포트(`credentialPort`)다(`assign-policy.md`). 값이 없으면 각각 닫힌 값이다. 실행 계획·요청 한도·배정 전 사실은 운영 값에서 닫힌 값이다: 요청 한도 0이라 배정 박자가 `policy_rejected`로 끝나고, 사실 포트는 모두 모름이다. 시험 값(설정 `testAssign`)에서만 시험 숫자와 시험 사실 공급자(`test-assign.ts`: 앞 실행의 종료 미확인은 장부에서, 나머지 다섯은 고정 T1 부탁일 때만 `false`, D-130)를 쓴다(README "시험 배정 값").
 
 ## 남는 한계
 
