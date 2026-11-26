@@ -416,6 +416,40 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
   return { kind: "ran", starts, requests, halted: null, haltedAt: null };
 }
 
+// 자격만 빠져 보류된 답. 자격 없이(null) 고른 답이 이것이면 자격 앞의 검사를 모두 통과한 후보와 고정 계정이 있다.
+const awaitsCredential = (outcome: RequestOutcome): boolean => outcome.outcome === "skipped" && outcome.pick.kind === "held" && outcome.pick.reason === "credential_unknown";
+
+// 지금의 접수와 맡기지 않을 실행기를 다시 읽고 고른다. 비동기 포트(사실·자격)를 기다린 뒤마다 부른다: 그 사이 닫혔거나 바뀌었을 수 있다.
+// 고른 답(assign)이면 그 답을, 아니면 그 부탁의 결과를 낸다.
+function decide(
+  ports: AssignLoopPorts,
+  ref: string,
+  given: Omit<PickInput, "connections" | "intakeOpen">,
+  connections: readonly Candidate[],
+): Extract<PickResult, { kind: "assign" }> | RequestOutcome | "intake_closed" {
+  const open = intakeOpen(ports.intake);
+  if (open !== true) return "intake_closed";
+  // 접수가 닫혔으면 이보다 먼저 멈춘다.
+  const withheld = readWithheld(ports);
+  if (withheld === null) return { ref, outcome: "withheld", reason: "withheld_unknown", executorId: null };
+  const input = { ...given, intakeOpen: open };
+  const kept = withoutWithheld(connections, withheld);
+  let picked = pickAssignment({ ...input, connections: kept });
+  // 거르지 않았으면(같은 참조) 길이를 다시 읽지 않는다: 읽기마다 답이 다른 목록이면 그 읽기가 박자를 멈춘다.
+  if (picked.kind === "held" && picked.reason === "no_executor" && kept !== connections && kept.length < connections.length) {
+    // 뺀 실행기가 맞았는지만 가린다(이 답으로는 잇지 않는다). 맞았다면 no_executor와 구별해 내고,
+    // 아니면 빼지 않은 고르기의 답(맞는 실행기 없음, 자격 모름 등)을 그대로 싣는다.
+    const unfiltered = pickAssignment({ ...input, connections });
+    if (unfiltered.kind === "assign") return { ref, outcome: "withheld", reason: "listed", executorId: unfiltered.input.executorId };
+    picked = unfiltered;
+  }
+  if (picked.kind === "intake_closed") return "intake_closed";
+  if (picked.kind !== "assign") return { ref, outcome: "skipped", pick: picked };
+  // 고른 실행기를 같은 집합과 한 번 더 대조한다. 후보의 주체를 거를 때 읽지 못해 남긴 후보를 고르기가 고를 수 있다.
+  if (withheld.has(picked.input.executorId)) return { ref, outcome: "withheld", reason: "listed", executorId: picked.input.executorId };
+  return picked;
+}
+
 async function assignOne(
   ports: AssignLoopPorts,
   policy: AssignLoopPolicy,
@@ -430,7 +464,20 @@ async function assignOne(
   } catch {
     facts = {};
   }
-  // 고르기가 대조할 자격 참조. 계정은 고르기와 같은 selectAccount로 정하고, 고르기가 다시 골라 대조한다(다르면 credential_mismatch).
+  const given: Omit<PickInput, "connections" | "intakeOpen" | "credential"> = {
+    request: { ref, role: request.role, inputDigest: request.inputDigest, input: request.input },
+    assignment: policy.assignment,
+    accounts: policy.accounts,
+    plans: policy.plans,
+    facts,
+    now,
+  };
+  // 자격은 자격 앞의 검사(부탁·사실·역할·대상·허용 표·등록행·기대 revision·계정)를 통과한 후보가 있을 때만 묻는다. 실제 포트는
+  // 계정의 자격 파일을 읽으므로 맞는 실행기가 없는 부탁마다 파일을 열지 않게 한다. 그래서 자격 없이(null) 먼저 고르고, 그 답이
+  // credential_unknown일 때만 묻는다. 맡기지 않을 실행기를 빼서 후보가 없어도 빼지 않은 고르기가 자격까지 닿으면 묻는다: 그래야 listed를 가린다.
+  const first = decide(ports, ref, { ...given, credential: null }, connections);
+  if (first === "intake_closed" || ("outcome" in first && !awaitsCredential(first))) return first;
+  // 계정은 고르기와 같은 selectAccount로 정하고, 고르기가 다시 골라 대조한다(다르면 credential_mismatch).
   // 모르면 null이고 고르기가 credential_unknown으로 보류한다.
   let credential: CredentialRef | null = null;
   const account = selectAccount(request.role, policy.accounts);
@@ -443,35 +490,9 @@ async function assignOne(
       credential = null;
     }
   }
-  const given: Omit<PickInput, "connections"> = {
-    request: { ref, role: request.role, inputDigest: request.inputDigest, input: request.input },
-    assignment: policy.assignment,
-    accounts: policy.accounts,
-    credential,
-    plans: policy.plans,
-    facts,
-    // 비동기 포트를 기다린 뒤라 지금의 접수를 다시 읽어 넘긴다.
-    intakeOpen: intakeOpen(ports.intake),
-    now,
-  };
-  if (given.intakeOpen !== true) return "intake_closed";
-  // 같은 까닭으로 맡기지 않을 실행기도 고르기 직전에 다시 읽는다. 접수가 닫혔으면 이보다 먼저 멈춘다.
-  const withheld = readWithheld(ports);
-  if (withheld === null) return { ref, outcome: "withheld", reason: "withheld_unknown", executorId: null };
-  const kept = withoutWithheld(connections, withheld);
-  let picked = pickAssignment({ ...given, connections: kept });
-  // 거르지 않았으면(같은 참조) 길이를 다시 읽지 않는다: 읽기마다 답이 다른 목록이면 그 읽기가 박자를 멈춘다.
-  if (picked.kind === "held" && picked.reason === "no_executor" && kept !== connections && kept.length < connections.length) {
-    // 뺀 실행기가 맞았는지만 가린다(이 답으로는 잇지 않는다). 맞았다면 no_executor와 구별해 내고,
-    // 아니면 빼지 않은 고르기의 답(맞는 실행기 없음, 자격 모름 등)을 그대로 싣는다.
-    const unfiltered = pickAssignment({ ...given, connections });
-    if (unfiltered.kind === "assign") return { ref, outcome: "withheld", reason: "listed", executorId: unfiltered.input.executorId };
-    picked = unfiltered;
-  }
-  if (picked.kind === "intake_closed") return "intake_closed";
-  if (picked.kind !== "assign") return { ref, outcome: "skipped", pick: picked };
-  // 고른 실행기를 같은 집합과 한 번 더 대조한다. 후보의 주체를 거를 때 읽지 못해 남긴 후보를 고르기가 고를 수 있다.
-  if (withheld.has(picked.input.executorId)) return { ref, outcome: "withheld", reason: "listed", executorId: picked.input.executorId };
+  // 조회를 기다리는 사이 접수가 닫히거나 맡기지 않을 실행기가 바뀌었을 수 있다. decide가 둘을 다시 읽고 처음부터 다시 고른다.
+  const picked = decide(ports, ref, { ...given, credential }, connections);
+  if (picked === "intake_closed" || "outcome" in picked) return picked;
 
   const runId = freshUuid(ports.random);
   if (runId === null) return { ref, outcome: "assign_failed", failure: "random_unavailable" };

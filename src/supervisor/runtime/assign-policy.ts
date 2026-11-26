@@ -2,6 +2,7 @@
 // 진입점(src/main/supervisor.ts)이 환경 값을, 조립(boot.ts)이 적용한 등록표를 넘긴다. 파일·환경·시계를 읽지 않는다.
 // 값이 없거나 맞지 않으면 채우기 전의 닫힌 값(보류·모름)과 같은 결과를 낸다. 틀리는 방향은 늘 "배정하지 않음"이다.
 import { executorName, type Role, ROLES } from "../../contract/v1/index.ts";
+import { ACCOUNT_NAME, type AccountRef } from "../accounts/fixed.ts";
 import { type AssignmentContext, type Registration, REVISION } from "../roles/assign.ts";
 import type { RegistryState, RegistryTarget } from "../transport/registry.ts";
 
@@ -13,6 +14,15 @@ export type ProfileRevisions = { readonly [R in Role]?: string };
 // 기대 프로필 revision을 어떻게 썼는가. none: 칸이 없다. single: 모든 칸이 한 값이다. split: 칸마다 값이 달라 하나로 고르지 못했다.
 export type ProfileUse = "none" | "single" | "split";
 
+// 고정 계정의 별칭(D-126). 계정 Secret을 붙이는 차트 값(supervisor.account.name)을 감독 env로도 렌더한 것이다.
+// 없거나 빈 값이면 계정 없음(null), 계정 폴더 이름 꼴(accounts/fixed.ts의 ACCOUNT_NAME)이 아니면 틀림이다. 차트 스키마는 끝의 "-"까지 막아
+// 이보다 좁으므로 차트가 렌더한 값은 모두 지난다. 방식은 구독 하나다: 차트의 계정 키가 CLAUDE_CODE_OAUTH_TOKEN 하나로 고정돼 있고
+// 진입점의 자격 정책도 그 방식의 키만 둔다.
+export function accountFromEnv(raw: string | undefined): EnvValue<AccountRef | null> {
+  if (raw === undefined || raw === "") return { ok: true, value: null };
+  return ACCOUNT_NAME.test(raw) ? { ok: true, value: Object.freeze({ account: raw, method: "subscription" }) } : { ok: false };
+}
+
 // 계정 자격의 판(D-111). 없거나 빈 값이면 모름(null)이고, v1 revision 꼴이 아니면 틀림이다.
 export function accountRevisionFromEnv(raw: string | undefined): EnvValue<string | null> {
   if (raw === undefined || raw === "") return { ok: true, value: null };
@@ -20,8 +30,10 @@ export function accountRevisionFromEnv(raw: string | undefined): EnvValue<string
 }
 
 // 역할별 기대 프로필 revision. JSON 객체 { "<v1 역할>": "<revision>" }이다. 없거나 빈 값이면 빈 객체다.
-// 모르는 역할 이름(상속 이름 "__proto__" 포함), 꼴이 틀린 revision, 객체가 아닌 값은 틀림이다.
-// 함정: JSON.parse는 같은 이름의 칸이 거듭되면 뒤의 값을 조용히 고른다. 차트가 맵에서 렌더하는 값이라 거듭될 수 없다고 본다.
+// 모르는 역할 이름(상속 이름 "__proto__" 포함), 꼴이 틀린 revision, 객체가 아닌 값, 거듭된 칸 이름은 틀림이다.
+// 함정: JSON.parse는 같은 이름의 칸이 거듭되면 앞의 값을 조용히 버린다(앞의 값이 틀렸어도 지난다). 차트가 맵에서 렌더하면 거듭될 수 없지만
+// 직접 넣은 값은 거듭될 수 있다. 그래서 원문의 문자열 토큰 수를 센다: 거듭됨이 없고 값이 모두 문자열이면 정확히 칸 수의 두 배이고,
+// 거듭된 칸은 이름 토큰을 하나 이상 더한다(이스케이프로 쓴 같은 이름도 토큰 하나다).
 export function profileRevisionsFromEnv(raw: string | undefined): EnvValue<ProfileRevisions> {
   if (raw === undefined || raw === "") return { ok: true, value: Object.freeze({}) };
   let parsed: unknown;
@@ -32,17 +44,21 @@ export function profileRevisionsFromEnv(raw: string | undefined): EnvValue<Profi
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { ok: false };
   const out: { [R in Role]?: string } = {};
-  for (const [role, revision] of Object.entries(parsed)) {
+  const entries = Object.entries(parsed);
+  for (const [role, revision] of entries) {
     if (!(ROLES as readonly string[]).includes(role) || typeof revision !== "string" || !REVISION.test(revision)) return { ok: false };
     out[role as Role] = revision;
   }
+  // 해석에 성공한 JSON이라 큰따옴표는 문자열의 경계나 이스케이프로만 나온다. 왼쪽부터 훑으면 문자열 토큰을 빠짐없이 센다.
+  if ((raw.match(/"(?:[^"\\]|\\.)*"/g) ?? []).length !== entries.length * 2) return { ok: false };
   return { ok: true, value: Object.freeze(out) };
 }
 
 // 배정 판단의 허용 표와 기대 revision. 등록행은 비운다: 등록행은 적용한 등록표에서만 만든다(registrationsFrom).
 // 함정: 배정 판단(roles/assign.ts의 judgeAssignment)은 기대 revision을 역할과 무관하게 하나만 받는다. 그래서 칸이 모두 한 값일 때만
 // 그 값을 기대값으로 두고 허용 표에서 칸이 없는 역할을 뺀다(그 역할의 실행기가 같은 값을 내도 후보가 되지 않게).
-// 칸마다 값이 다르면 기대값을 비운다: 모든 연결이 expected_revision_missing으로 보류된다. 역할마다 견주려면 판단을 바꿔야 한다.
+// 칸마다 값이 다르면 기대값을 비운다: 모든 연결이 보류되고, 그 앞의 역할·대상·허용 표·등록행 검사를 통과한 연결의 사유가
+// expected_revision_missing이다(앞에서 걸린 연결은 그 사유, 예: not_registered). 역할마다 견주려면 판단을 바꿔야 한다.
 export function assignmentFrom(
   targets: readonly RegistryTarget[],
   profiles: ProfileRevisions,

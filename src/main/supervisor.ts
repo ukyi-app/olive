@@ -14,7 +14,7 @@ import { type AdminFs, type AdminListening, AdminListenRefused, listenAdmin } fr
 import { ADMIN_SOCKET_MODE, ADMIN_SOCKET_PATH } from "../supervisor/admin/protocol.ts";
 import { bootSupervisor, type FrontDoorPorts, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
 import { testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
-import { accountRevisionFromEnv, assignmentFrom, type ProfileUse, profileRevisionsFromEnv } from "../supervisor/runtime/assign-policy.ts";
+import { accountFromEnv, accountRevisionFromEnv, assignmentFrom, type ProfileUse, profileRevisionsFromEnv } from "../supervisor/runtime/assign-policy.ts";
 import { RENEW_MARGIN_MS } from "../supervisor/scheduler/lifecycle.ts";
 import { createFileResultBackend } from "../supervisor/scheduler/result-store-file.ts";
 import { RegistryState, type RegistryTarget } from "../supervisor/transport/registry.ts";
@@ -37,15 +37,17 @@ export const SUPERVISOR_ENV = [
   "OLIVE_RESULT_DIR",
 ] as const;
 // 없어도 되는 환경. README "감독 진입점"의 표에서 필수 이름 뒤에 이 차례로 둔다.
+// OLIVE_ACCOUNT_NAME: 고정 계정의 별칭(D-126, 계정 Secret을 붙이는 차트 값 supervisor.account.name을 같이 렌더한다). 계정 폴더 이름 꼴이다.
+// 없거나 빈 값이면 계정이 없어 배정이 no_account로 보류하고 자격 파일을 읽지 않는다. 별칭과 판이 함께 있어야 자격 참조가 생긴다.
 // OLIVE_ACCOUNT_REVISION: 고정 계정 자격의 판(D-111, 차트 값 하나를 사람 PR이 계정 Secret과 함께 올린다). v1 revision 꼴이다.
 // OLIVE_PROFILE_REVISIONS: 역할별 기대 프로필 revision의 JSON 객체 { "<v1 역할>": "<revision>" }(역할 프로필 차트가 렌더한다).
-// 두 값은 없거나 빈 값이면 모름이고 배정은 채우기 전처럼 보류된다. 꼴이 틀리면 다른 이름처럼 91이다: 오타가 "값 없음"과 같은
+// 세 값은 없거나 빈 값이면 모름이고 배정은 채우기 전처럼 보류된다. 꼴이 틀리면 다른 이름처럼 91이다: 오타가 "값 없음"과 같은
 // 보류로 조용히 남으면 켜는 사람이 원인을 찾지 못한다.
 // OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
 // 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
 // OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"일 때만 받는다.
 // 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다) 그것 없이 켜면 운영 값으로 보고 91이다.
-export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_ACCOUNT_REVISION", "OLIVE_PROFILE_REVISIONS", "OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
+export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_ACCOUNT_NAME", "OLIVE_ACCOUNT_REVISION", "OLIVE_PROFILE_REVISIONS", "OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 장부 파일 이름은 장부 초기화 진입점과 함께 쓴다(ledger-path.ts).
 // 서명 키의 이름은 차트의 Secret 키 이름과 맞춰야 한다(차트 짝에서 맞춘다).
@@ -117,6 +119,8 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (settingsRejected(registry)) return invalid("OLIVE_TARGETS");
   const policyRevision = value("OLIVE_POLICY_REVISION");
   if (!REVISION.test(policyRevision)) return invalid("OLIVE_POLICY_REVISION");
+  const account = accountFromEnv(env.OLIVE_ACCOUNT_NAME);
+  if (!account.ok) return invalid("OLIVE_ACCOUNT_NAME");
   const accountRevision = accountRevisionFromEnv(env.OLIVE_ACCOUNT_REVISION);
   if (!accountRevision.ok) return invalid("OLIVE_ACCOUNT_REVISION");
   const profileRevisions = profileRevisionsFromEnv(env.OLIVE_PROFILE_REVISIONS);
@@ -159,13 +163,13 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
         revisionOf: () => revision,
       },
       // 배정 정책. 허용 표와 기대 revision은 대상 표·역할별 기대 프로필 revision에서(runtime/assign-policy.ts의 assignmentFrom), 등록행은
-      // 조립이 적용한 등록표에서 채운다(여기서는 비운다). 계정은 비어 있다: 고정 계정의 별칭을 감독이 어디서 읽을지 정하지 않았다
-      // (차트는 별칭을 계정 폴더의 마운트 자리로만 쓴다). 계정이 없으면 고르기가 no_account로 보류하고 자격 참조를 묻지 않는다.
-      // 실행 계획·요청 한도·배정 전 사실은 시험 배정 값 조각 전까지 비어 있어 시작하지 않는다.
+      // 조립이 적용한 등록표에서 채운다(여기서는 비운다). 계정은 별칭 env 하나에서 고정 계정 하나다(D-126). 별칭이 없으면 비어 있고
+      // 고르기가 no_account로 보류하며 자격 참조를 묻지 않는다. 별칭만 있고 판이 없으면 자격 참조는 파일을 열기 전에 모름이다.
+      // 실행 계획·요청 한도·배정 전 사실은 시험 배정 값 조각 전까지 비어 있다. 요청 한도 0은 planNext가 거절해 박자가 policy_rejected로 끝난다.
       // 접수 출처는 시험 현관 대역일 때만 그 대역의 출처 하나를 관리자 요청으로 본다(D-109). 그 밖은 늘 모름이라 입력의 일을 보류한다.
       assign: {
         assignment: assignment.context,
-        accounts: [],
+        accounts: account.value === null ? [] : [account.value],
         plans: [],
         queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 0, alert: 0 } },
         originOf: frontDoor === "test_double" ? testOriginOf : () => undefined,

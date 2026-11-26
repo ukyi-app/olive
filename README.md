@@ -388,7 +388,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 ### 환경
 
-빈 값은 없는 것과 같다. 경로 칸은 절대 경로여야 한다. 꼴이 틀린 값도 91이다. 차례는 진입점이 보는 차례다(`test/supervisor/runtime/entry.test.ts`가 대조한다). 마지막 네 줄(`OLIVE_ACCOUNT_REVISION`·`OLIVE_PROFILE_REVISIONS`·`OLIVE_TEST_JOBS`·`OLIVE_TEST_FRONTDOOR`)만 없어도 된다.
+빈 값은 없는 것과 같다. 경로 칸은 절대 경로여야 한다. 꼴이 틀린 값도 91이다. 차례는 진입점이 보는 차례다(`test/supervisor/runtime/entry.test.ts`가 대조한다). 마지막 다섯 줄(`OLIVE_ACCOUNT_NAME`·`OLIVE_ACCOUNT_REVISION`·`OLIVE_PROFILE_REVISIONS`·`OLIVE_TEST_JOBS`·`OLIVE_TEST_FRONTDOOR`)만 없어도 된다.
 
 | 이름 | 뜻 | 출처 | 없을 때 |
 |---|---|---|---|
@@ -403,8 +403,9 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | `OLIVE_TARGETS` | 대상 표 JSON 배열 `[{ "target", "namespace", "roles" }]`(등록표와 배정이 같은 배열을 쓴다) | 차트 짝(N5c) | 91 |
 | `OLIVE_POLICY_REVISION` | 실행기의 인사에서 기대하는 정책 revision(v1 revision 꼴). 복원 2단계의 정책 대조 | 차트 짝(N5c) | 91 |
 | `OLIVE_RESULT_DIR` | 결과 보관 폴더(미리 만든 실제 폴더, 그 폴더를 쓰는 감독은 하나). 기동은 마지막 경로 요소만 본다. 상위 경로에 링크가 없는 것은 배포 전제(N5c) | 차트 짝(N5c) | 91, 마지막 요소가 링크이거나 실제 폴더가 아니면 94 |
-| `OLIVE_ACCOUNT_REVISION` | 고정 계정 자격의 판(D-111, v1 revision 꼴). 배정이 고른 계정의 자격 참조(`credential`의 `revision`)에 싣는다. 계정 Secret을 바꾸는 사람 PR이 이 값을 함께 올린다 | 차트(homelab이 렌더할 이름. 값 자리는 `supervisor.account.revision`, D-111) | 모름: 자격 참조를 만들지 않아 새 실행 0. 꼴이 틀리면 91 |
-| `OLIVE_PROFILE_REVISIONS` | 역할별 기대 프로필 revision의 JSON 객체 `{ "<v1 역할>": "<revision>" }`. 실행기 인사의 `profile_revision`과 견준다. 칸이 없는 역할은 배정하지 않고, 칸의 값이 모두 같을 때만 쓴다(아래 "이 진입점에 없는 것"의 배정 정책) | 차트(homelab 역할 프로필 조각이 렌더할 이름) | 기대값 없음: 모든 연결이 보류. JSON 객체가 아니거나 모르는 역할·꼴이 틀린 revision이면 91 |
+| `OLIVE_ACCOUNT_NAME` | 고정 계정의 별칭(D-126). 계정 폴더 아래 `<별칭>` 폴더의 이름이고, 배정이 고르는 계정 하나(`subscription` 방식)가 된다. 꼴은 계정 폴더 이름 규칙 `^[a-z0-9][a-z0-9-]{0,31}$`(`src/supervisor/accounts/fixed.ts`의 `ACCOUNT_NAME`) | 차트(homelab 차트 `supervisor.account.name`이 렌더. 계정 Secret을 붙이는 같은 값이고, 차트 스키마는 끝의 `-`까지 막아 더 좁다) | 계정 없음: 배정이 `no_account`로 보류하고 자격 파일을 읽지 않는다. 꼴이 틀리면 91 |
+| `OLIVE_ACCOUNT_REVISION` | 고정 계정 자격의 판(D-111, v1 revision 꼴). 배정이 고른 계정의 자격 참조(`credential`의 `revision`)에 싣는다. 계정 Secret을 바꾸는 사람 PR이 이 값을 함께 올린다 | 차트(homelab이 렌더할 이름. 값 자리는 `supervisor.account.revision`, D-111) | 모름: 자격 참조를 만들지 않아(파일을 열지 않는다) 새 실행 0. 별칭(`OLIVE_ACCOUNT_NAME`)과 판이 함께 있어야 자격 참조가 생긴다. 꼴이 틀리면 91 |
+| `OLIVE_PROFILE_REVISIONS` | 역할별 기대 프로필 revision의 JSON 객체 `{ "<v1 역할>": "<revision>" }`. 실행기 인사의 `profile_revision`과 견준다. 칸이 없는 역할은 배정하지 않고, 칸의 값이 모두 같을 때만 쓴다(아래 "이 진입점에 없는 것"의 배정 정책) | 차트(homelab 역할 프로필 조각이 렌더할 이름) | 기대값 없음: 모든 연결이 보류. JSON 객체가 아니거나 모르는 역할·꼴이 틀린 revision·거듭된 역할 칸이면 91 |
 | `OLIVE_TEST_JOBS` | 시험 작업 넣기(D-98·D-101). `on`이면 관리 통로의 `test-job`을 받는다. 없거나 빈 값·`off`면 꺼짐이고 그 명령은 늘 `disabled`로 거절된다(장부 쓰기 포트를 만들지 않는다) | 차트(시험 값에서만. 운영 값에서 켜면 CI가 거절한다: 아래 "감독 관리 통로") | 꺼짐. `on`·`off` 밖의 값은 91 |
 | `OLIVE_TEST_FRONTDOOR` | 시험 현관 대역(D-109). `on`이면 현관 포트 대신 대역을 쓴다(아래 "시험 현관 대역"). 없거나 빈 값·`off`면 대역 없음이고 현관 포트는 늘 모름이다. **`on`은 `OLIVE_TEST_JOBS=on`일 때만 받는다** | 차트(시험 값에서만. 운영 값에서 켜면 CI가 거절한다) | 대역 없음. `on`·`off` 밖의 값, 그리고 `OLIVE_TEST_JOBS`가 `on`이 아닌데 `on`이면 91 |
 
@@ -492,7 +493,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 - **현관(O08):** 권위 정지 기록·게시 결과·현관과 관측 중계의 이웃 행을 주는 포트. 대역 없음(기본)에서는 셋 다 던진다(모름). 시험 값에서는 시험 현관 대역(위)이 대신한다.
 - **새 시작 지시(D-90 자동 닫기와의 관계):** D-90 박자의 증거 포트는 이 진입점에 있다(같은 답 줄의 증거·맡기지 않을 실행기, 프로세스당 증거 장부 하나). 그래도 지금은 장부에 이미 있는 시작(앞 프로세스가 적은 것)이 닫히지 않는다: 순서기는 복원 5단계를 받아들인 뒤에만 박자를 부르는데, 현관(O08)이 없어 복원 1단계를 되풀이하므로 D-90 박자는 늘 `skipped:restore_not_done`이고 그 실행은 그 상태(`preparing` 등) 그대로 남는다. 복원을 마친 뒤에도 닫히는 것은 D-90 조건을 모두 충족한 기존 시작뿐이다: 시한 뒤 반영된 빈 전체 인사가 그 실행을 싣지 않았고, **다른 장부 열기(앞 프로세스)의 송신 표식이 없어야 한다**. 앞 프로세스가 표식을 적고 실었을 수 있는 시작은 장부가 `sent_by_other_open`으로 거절해 닫지 않는다. 같은 박자의 새 인사 갈래(그 실행기의 인사가 시한 전뿐이면 연결을 한 번 닫아 다시 인사하게 함)도 복원 5단계 뒤에만 돌고, 장부가 거절할 시작이어도 연결은 닫힐 수 있다(`src/supervisor/dispatch/unreceived.md` "새 인사를 부르는 갈래"). 반영된 전체 인사가 아예 없는 실행기(`no_full`)는 이 갈래가 닫지 않으므로, 그 실행기의 받은 적 없는 시작은 관리자 닫기(D-91)로 간다. 이 진입점에서 새로 닫힐 시작이 생기지 않는 것은 증거가 아니라 위 현관이 없어 접수가 열리지 않고, 아래 배정 정책이 계정·실행 계획·배정 전 사실을 비워 새 시작이 적히지 않기 때문이다.
-- **배정 정책의 빈 칸(계정, 실행 계획·요청 한도·배정 전 사실):** 채운 칸은 셋이다(`src/supervisor/runtime/assign-policy.md`). 등록행은 조립이 적용한 등록표 문서의 활성 행에서 만들고 키 식별은 등록표 상태(`keyFor`)의 답만 쓴다. 기대 프로필 revision은 `OLIVE_PROFILE_REVISIONS`에서, 자격 판은 `OLIVE_ACCOUNT_REVISION`에서 오고, 자격 참조 포트는 값 송신과 같은 파일 포트·정책의 `credentialPort`다. **고정 계정은 비어 있다:** 별칭을 감독이 어디서 읽을지 정하지 않았다(차트는 별칭을 계정 폴더의 마운트 자리로만 쓴다). 그래서 고르기가 `no_account`로 보류하고 자격 참조는 불리지 않는다. 실행 계획·요청 한도·배정 전 사실은 시험 배정 값 조각의 일이다. 고르기는 배정 전 사실을 먼저 보므로 지금 부탁은 `evidence_missing`으로 보류된다. 기존 실행 줄의 값 송신(`borrowCredentialValue`)은 revision을 보지 않고 계정·방식·지문과 실행 상태·접수 문으로 판단한다. 기동 기록 `assign_inputs`(판 값이 있는가, 기대 revision의 쓰임 `none`·`single`·`split`, 계정 수)와 `assign_policy`(등록행 수)에 채운 것이 남는다.
+- **배정 정책의 빈 칸(실행 계획·요청 한도·배정 전 사실):** 채운 칸은 넷이다(`src/supervisor/runtime/assign-policy.md`). 등록행은 조립이 적용한 등록표 문서의 활성 행에서 만들고 키 식별은 등록표 상태(`keyFor`)의 답만 쓴다. 기대 프로필 revision은 `OLIVE_PROFILE_REVISIONS`에서, 고정 계정은 `OLIVE_ACCOUNT_NAME`에서(D-126. 없으면 비어 있어 고르기가 `no_account`로 보류한다), 자격 판은 `OLIVE_ACCOUNT_REVISION`에서 오고, 자격 참조 포트는 값 송신과 같은 파일 포트·정책의 `credentialPort`다. **자격은 후보가 있을 때만 묻는다:** 배정 박자는 자격 없이 먼저 고르고, 부탁·배정 전 사실·역할·대상·허용 표·등록행·기대 revision과 고정 계정을 모두 통과한 후보가 있을 때만 자격 참조를 묻는다(`src/supervisor/dispatch/assign-loop.md` "잇기"). 맞는 실행기가 없는 부탁에서는 자격 파일을 열지 않는다. 실행 계획·요청 한도·배정 전 사실은 시험 배정 값 조각의 일이다. **지금 박자는 부탁을 고르기 전에 멈춘다:** 진입점의 요청 한도가 `{ admin: 0, alert: 0 }`이라, 접수가 열리고 박자 처음의 읽기가 모두 알려져도 `planNext`가 그 정책을 거절해 박자 전체가 `not_run`/`policy_rejected`로 끝난다. 한도를 양으로 주면 그다음은 배정 전 사실이 비어 부탁이 `evidence_missing`으로 보류된다(고르기는 사실을 역할·등록보다 먼저 본다). 기존 실행 줄의 값 송신(`borrowCredentialValue`)은 revision을 보지 않고 계정·방식·지문과 실행 상태·접수 문으로 판단한다. 기동 기록 `assign_inputs`(판 값이 있는가, 기대 revision의 쓰임 `none`·`single`·`split`, 계정 수)와 `assign_policy`(등록행 수)에 채운 것이 남는다.
 - **도구 처리기를 부르는 길:** 처리기 포트를 만드는 자리(`RunningSupervisor.tools`)만 있다.
 - **장부 경보 `closed_run_started`의 전달(E16): 관리자 결정 대기.** 영수증 처리기는 이 칸을 넘기지 않는다.
 - **닫힌 실행의 "아직 돈다"는 답(E17): 관리자 결정 대기.** 지금은 관측만 남는다.

@@ -4,8 +4,11 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { type Role } from "../../../src/contract/v1/index.ts";
 import { SUPERVISOR_ENV, settingsFromEnv } from "../../../src/main/supervisor.ts";
+import { credentialPort } from "../../../src/supervisor/accounts/credential-ref.ts";
+import { type AssignLoopPolicy, type AssignLoopPorts, assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop.ts";
+import { PRE_ASSIGN_FACTS } from "../../../src/supervisor/dispatch/pick.ts";
 import { type AuthenticatedConnection, judgeAssignment } from "../../../src/supervisor/roles/assign.ts";
-import { accountRevisionFromEnv, assignmentFrom, profileRevisionsFromEnv, registrationsFrom } from "../../../src/supervisor/runtime/assign-policy.ts";
+import { accountFromEnv, accountRevisionFromEnv, assignmentFrom, profileRevisionsFromEnv, registrationsFrom } from "../../../src/supervisor/runtime/assign-policy.ts";
 import { RegistryState, type RegistryTarget } from "../../../src/supervisor/transport/registry.ts";
 import { executorKey, FILES, world } from "./boot-world.ts";
 
@@ -280,4 +283,114 @@ test("조립: 자격 참조 포트는 주입한 파일 포트와 설정의 자�
   const unknown = await capturedAssign({ deps: { credentialFiles }, settings: { credentials: { ...settingsOf({}).settings.credentials, dir: "/accounts" } } });
   expect(await unknown.seen.ports.credentials.reference({ account: "acct-a", method: "subscription" })).toEqual({ known: false });
   expect(reads).toEqual([]);
+});
+
+test("별칭 환경: 없음·빈 값은 계정 없음, 계정 폴더 이름 꼴이면 구독 방식의 고정 계정 하나, 그 밖은 틀림이다", () => {
+  expect([accountFromEnv(undefined), accountFromEnv("")]).toEqual([
+    { ok: true, value: null },
+    { ok: true, value: null },
+  ]);
+  for (const good of ["claude-work", "a", "0", "acct-7", "a".repeat(32)]) expect([good, accountFromEnv(good)]).toEqual([good, { ok: true, value: { account: good, method: "subscription" } }]);
+  for (const bad of ["-acct", "Claude", "acct_1", "acct.1", "acct/1", "..", " acct", "acct ", "a".repeat(33), "계정"]) expect([bad, accountFromEnv(bad)]).toEqual([bad, { ok: false }]);
+});
+
+test("진입점: 별칭은 배정 정책의 고정 계정 하나로 간다. 꼴이 틀리면 그 이름으로 invalid이고, 정책 revision 뒤·판 앞의 차례다", () => {
+  expect(settingsOf({ OLIVE_ACCOUNT_NAME: "claude-work" }).settings.assign.accounts).toEqual([{ account: "claude-work", method: "subscription" }]);
+  expect([settingsOf({ OLIVE_ACCOUNT_NAME: "" }).settings.assign.accounts, settingsOf({}).settings.assign.accounts]).toEqual([[], []]);
+  expect(settingsFromEnv({ ...FULL, OLIVE_ACCOUNT_NAME: "Claude_Work" })).toEqual({ ok: false, name: "OLIVE_ACCOUNT_NAME", problem: "invalid" });
+  expect(settingsFromEnv({ ...FULL, OLIVE_POLICY_REVISION: "-bad", OLIVE_ACCOUNT_NAME: "-bad" })).toEqual({ ok: false, name: "OLIVE_POLICY_REVISION", problem: "invalid" });
+  expect(settingsFromEnv({ ...FULL, OLIVE_ACCOUNT_NAME: "-bad", OLIVE_ACCOUNT_REVISION: "-bad" })).toEqual({ ok: false, name: "OLIVE_ACCOUNT_NAME", problem: "invalid" });
+});
+
+test("역할별 프로필 환경: 거듭된 역할 칸은 앞 값이 맞든 틀리든, 이스케이프로 쓴 같은 이름이어도 틀림이다", () => {
+  const bad = [
+    '{"diagnosis":null,"diagnosis":"p1"}',
+    '{"diagnosis":"p1","diagnosis":"p1"}',
+    '{"diagnosis":"p0","diagnosis":"p1"}',
+    '{"diagnosis":{"x":"y"},"diagnosis":"p1"}',
+    '{"diagnosis":[],"diagnosis":"p1"}',
+    '{"diagnosis":"p1","diagnosi\\u0073":"p2"}',
+    '{"diagnosis":"p1","code_author":"p1","diagnosis":"p1"}',
+  ];
+  for (const raw of bad) expect([raw, profileRevisionsFromEnv(raw)]).toEqual([raw, { ok: false }]);
+  expect(settingsFromEnv({ ...FULL, OLIVE_PROFILE_REVISIONS: bad[0] })).toEqual({ ok: false, name: "OLIVE_PROFILE_REVISIONS", problem: "invalid" });
+  // 공백·이스케이프만 다른 정상 객체는 받는다.
+  expect(profileRevisionsFromEnv(' { "diagnosis" : "p\\u0031" ,\n "code_author":"p2" } ')).toEqual({ ok: true, value: { diagnosis: "p1", code_author: "p2" } });
+});
+
+// 진입점이 만든 정책·자격 정책으로 실제 배정 박자를 한 번 돌린다. 장부·연결·송신은 효과를 세는 가짜이고 자격 파일 포트만 바꾼다.
+async function entryTick(env: Record<string, string>, over: (policy: AssignLoopPolicy) => AssignLoopPolicy) {
+  const parsed = settingsOf({ OLIVE_PROFILE_REVISIONS: JSON.stringify({ diagnosis: "prof-1" }), ...env });
+  const reads: string[] = [];
+  let writes = 0;
+  const credentials = credentialPort(
+    {
+      read: async (location) => {
+        reads.push(`${location.dir}/${location.account}/${location.key}`);
+        return { kind: "bytes", bytes: new TextEncoder().encode("token-bytes\n") };
+      },
+    },
+    parsed.settings.credentials,
+  );
+  const empty = () => ({ known: true as const, value: [] });
+  const request = { ref: "00000000-0000-4000-8000-000000000001", owner: "00000000-0000-4000-8000-000000000002", role: "diagnosis", inputDigest: "d".repeat(64), input: { cancelled: false, expiresAt: 1_800_000_060_000 } };
+  const ports = {
+    ledger: {
+      listWaitingToolRequests: () => ({ known: true, value: [request] }),
+      queueView: () => ({ known: true, value: { runs: [] } }),
+      listRuns: empty,
+      slotHolds: empty,
+      listInputs: empty,
+      assignToolRequest: (input: { runId: string; executorId: string }) => {
+        writes += 1;
+        return { ok: true, outcome: "assigned", run: { runId: input.runId, executorId: input.executorId } };
+      },
+      startRun: () => {
+        writes += 1;
+        throw new Error("x");
+      },
+    },
+    intake: { intakeOpen: () => true, stopGeneration: () => 1 },
+    connections: { candidates: () => ({ known: true, value: [{ connection: 1, ...connection("diagnosis", "d1", "s1", "key-d", "prof-1") }] }) },
+    withheld: { executors: empty },
+    facts: { facts: () => Object.fromEntries(PRE_ASSIGN_FACTS.map((fact) => [fact, false])) },
+    credentials,
+    random: { bytes: (length: number) => new Uint8Array(length).fill(7) },
+  } as unknown as AssignLoopPorts;
+  const row = { target: "diagnosis", role: "diagnosis" as const, instance: "d1", storage: "s1", keyId: "key-d", active: true };
+  const policy = parsed.settings.assign;
+  const result = await assignAndStartTick(ports, over({ ...policy, assignment: { ...policy.assignment, registrations: [row] } }), 1_800_000_000_000);
+  return { result, reads, writes };
+}
+
+test("진입점 정책: 지금의 요청 한도 0에서는 별칭·판이 있어도 박자가 policy_rejected로 끝난다(자격 파일 읽기 0, 쓰기 0)", async () => {
+  const envs: Record<string, string>[] = [{}, { OLIVE_ACCOUNT_NAME: "acct-a" }, { OLIVE_ACCOUNT_REVISION: "acct-7" }, { OLIVE_ACCOUNT_NAME: "acct-a", OLIVE_ACCOUNT_REVISION: "acct-7" }];
+  for (const env of envs) {
+    const { result, reads, writes } = await entryTick(env, (policy) => policy);
+    expect([env, result, reads, writes]).toEqual([env, { kind: "not_run", reason: "policy_rejected" }, [], 0]);
+  }
+});
+
+test("진입점 정책: 별칭과 판이 함께 있어야 자격 파일을 읽고 잇는다. 하나라도 없으면 읽기 0, 쓰기 0이다", async () => {
+  const positive = (policy: AssignLoopPolicy): AssignLoopPolicy => ({
+    ...policy,
+    plans: [{ role: "diagnosis", snapshotDigest: "b".repeat(64), budgetLeft: 10, runDurationMs: 60_000 }],
+    queue: { ...policy.queue, requestBudget: { admin: 1, alert: 1 } },
+  });
+  const cases: [Record<string, string>, unknown, string[], number][] = [
+    [{}, { outcome: "skipped", pick: { kind: "held", reason: "no_account", account: "no_account_injected" } }, [], 0],
+    [{ OLIVE_ACCOUNT_REVISION: "acct-7" }, { outcome: "skipped", pick: { kind: "held", reason: "no_account", account: "no_account_injected" } }, [], 0],
+    [{ OLIVE_ACCOUNT_NAME: "acct-a" }, { outcome: "skipped", pick: { kind: "held", reason: "credential_unknown" } }, [], 0],
+    [
+      { OLIVE_ACCOUNT_NAME: "acct-a", OLIVE_ACCOUNT_REVISION: "acct-7" },
+      { outcome: "assigned", runId: expect.any(String), executorId: "executor/diagnosis/d1/s1" },
+      ["/etc/olive/accounts/acct-a/CLAUDE_CODE_OAUTH_TOKEN"],
+      1,
+    ],
+  ];
+  for (const [env, outcome, expectedReads, expectedWrites] of cases) {
+    const { result, reads, writes } = await entryTick(env, positive);
+    expect([env, result as unknown]).toEqual([env, { kind: "ran", starts: [], requests: [{ ref: "00000000-0000-4000-8000-000000000001", ...(outcome as object) }], halted: null, haltedAt: null }]);
+    expect([env, reads, writes]).toEqual([env, expectedReads, expectedWrites]);
+  }
 });
