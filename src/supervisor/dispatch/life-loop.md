@@ -140,8 +140,8 @@ LifeTickResult =
 
 `failed_stopped` 실행의 본문은 장부 이력에서 온다. 읽기는 장부의 `failedStop` 하나다(`src/ledger/ledger.md` "스케줄러가 쓰는 읽기"). `failed_stopped` 실행에만 읽는다: 그 읽기의 고장이 다른 상태의 갱신·종료를 막지 않는다.
 
-- **`outcome`(`failedOutcome`).** 그 실행에 사유 `requested`의 취소 지시(`task_cancel`)가 적혔으면 `cancelled`. 아니면 종료 영수증 `exit`가 `completed`인 실행(결과 검사가 보고 없이 기한이 지나 결과 없음으로 판정한 실행, `result-check.md`)이 `failed`다.
-- **정하지 못하면 적지 않는다**(`finalize_withheld`, `outcome_unknown`). 장부에는 종료 영수증의 `exit` 칸이 없어, 영수증이 곧바로 `failed_stopped`로 옮긴 실행의 `exit`가 `cancelled`(그러면 `cancelled`)인지 `deadline`·`failed`(그러면 `failed`)인지 모른다. 사유 없이 적힌 취소 지시(판 4 전의 줄, 사유를 넘기지 않은 기록)는 `requested`였을 수 있다. 그 실행은 자리를 쥔 채 남는다. `exit`로 가르려면 장부 이관으로 그 칸을 두어야 한다.
+- **`outcome`(`failedOutcome`).** 그 실행에 사유 `requested`의 취소 지시(`task_cancel`)가 적혔거나 종료 영수증 `exit`가 `cancelled`면 `cancelled`. 그 밖의 `exit`(`deadline`·`failed`, 그리고 결과 검사가 보고 없이 기한이 지나 결과 없음으로 판정한 `completed`, `result-check.md`)는 `failed`다. `exit`는 장부가 종료 확인 영수증을 반영할 때 실행 줄에 함께 적은 값이다(판 8, D-124). 그래서 영수증이 곧바로 `failed_stopped`로 옮긴 실행도 확정을 적고, 실행기의 정리 영수증이 `finalized`로 옮기면 자리가 풀린다.
+- **정하지 못하면 적지 않는다**(`finalize_withheld`, `outcome_unknown`). 사유 없이 적힌 취소 지시(판 4 전의 줄, 사유를 넘기지 않은 기록)는 `requested`였을 수 있어, `exit`가 `cancelled`가 아니면 정하지 못한다. 장부가 `exit`를 모르는 줄(판 8 전에 종료 확인을 받았고 시각으로도 `completed`를 가리지 못한 줄, `src/ledger/ledger.md`의 `failedStop`)도 `cancelled`였을 수 있어, 사유 `requested`의 취소 지시가 없으면 정하지 못한다. 그 실행은 자리를 쥔 채 남는다.
 - **`stored_at`은 실행 줄이 `failed_stopped`가 된 장부 시각이다**(그 상태인 동안의 `updated_at`). 실행기는 `succeeded`가 아닌 확정의 `stored_at`·digest를 대조하지 않는다(`src/executor/worker.ts`의 정리 길). 확정을 적으면 본문 세 칸이 지시 줄에 고정되므로, 뒤 전이(`finalized`·`cleanup_pending`)가 `updated_at`을 바꿔도 재전송의 본문은 같다.
 - **같은 실행에 한 번, 접수가 열렸을 때만.** `already_recorded`·`intake_closed`·쓰기 직전의 확인은 `ready_result`와 같다. `already_recorded`를 `outcome_unknown`보다 먼저 본다.
 

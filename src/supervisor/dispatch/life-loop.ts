@@ -18,10 +18,10 @@
 //    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 쓰기를 부른 뒤 내보내기의 결과가
 //    정해지기 전의 어느 줄에서 던져도 그 항목까지 싣고 halted로 멈춘다.
 // 5. 확정(result_finalize)은 ready_result 실행에는 장부의 settledResult가 "결과 보고가 저장 자리와 함께 반영됐고 digest가 실행 줄과
-//    같다"를 낼 때만(succeeded), failed_stopped 실행에는 장부의 failedStop으로 outcome을 정할 수 있을 때만(D-114: 요청 취소가 적혔으면
-//    cancelled, 아니면 종료 영수증 exit가 completed일 때 failed, stored_at은 failed_stopped가 된 장부 시각) 적고 내보낸다. 읽기가 모름이면
-//    확정하지 않는다. 확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고(다시 보내는 것은 재전송 박자의 일), 접수가 닫혔으면(정지 포함)
-//    적지 않는다. cleanup_pending의 확정은 내지 않는다(정리 확인이 정해지지 않았다).
+//    같다"를 낼 때만(succeeded), failed_stopped 실행에는 장부의 failedStop으로 outcome을 정할 수 있을 때만(D-114: 요청 취소가 적혔거나
+//    종료 영수증 exit가 cancelled면 cancelled, 그 밖의 exit(completed·deadline·failed)면 failed, stored_at은 failed_stopped가 된 장부
+//    시각) 적고 내보낸다. 읽기가 모름이면 확정하지 않는다. 확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고(다시 보내는 것은
+//    재전송 박자의 일), 접수가 닫혔으면(정지 포함) 적지 않는다. cleanup_pending의 확정은 내지 않는다(정리 확인이 정해지지 않았다).
 import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
   type FailedStop,
@@ -34,6 +34,7 @@ import {
   type Restorer,
   type Run,
   type SettledResult,
+  STOP_EXITS,
   type TaskCancelReason,
 } from "../../ledger/index.ts";
 import { type LifecycleIntent, type LifecyclePolicy, type LifecycleView, nextIntent, RENEW_MARGIN_MS } from "../scheduler/lifecycle.ts";
@@ -501,20 +502,21 @@ function readFailed(ledger: LifeLoopLedger, run: RunRow): FailedStop | undefined
     const { runId, stoppedAt, requestedCancel, exit } = value;
     if (runId !== run.runId || !isTime(stoppedAt)) return undefined;
     if (!(requestedCancel === true || requestedCancel === false || requestedCancel === null)) return undefined;
-    if (!(exit === "completed" || exit === null)) return undefined;
-    return { runId, stoppedAt, requestedCancel, exit };
+    if (!(exit === null || (STOP_EXITS as readonly unknown[]).includes(exit))) return undefined;
+    return { runId, stoppedAt, requestedCancel, exit: exit as FailedStop["exit"] };
   } catch {
     return undefined;
   }
 }
 
-// D-114: failed_stopped 실행의 확정 outcome. 사유 requested의 취소 지시가 적혔으면 cancelled, 아니면 종료 영수증 exit가 completed(결과
-// 검사가 결과 없음으로 판정한 실행)일 때 failed. 그 밖은 null(정하지 못함): 장부에 exit 칸이 없어 종료 영수증이 곧바로 failed_stopped로
-// 옮긴 실행의 exit가 cancelled(그러면 cancelled)인지 deadline·failed(그러면 failed)인지 모르고, 사유 없이 적힌 취소 지시는 requested였을 수 있다.
+// D-114: failed_stopped 실행의 확정 outcome. 사유 requested의 취소 지시가 적혔거나 종료 영수증 exit가 cancelled면 cancelled, 그 밖의
+// exit(deadline·failed, 그리고 결과 검사가 결과 없음으로 판정한 completed)면 failed. 둘 중 하나만 맞아도 cancelled라 취소 쪽을 먼저 본다.
+// 정하지 못하면 null: 사유 없이 적힌 취소 지시가 있으면 requested였을 수 있고, exit를 모르는 줄(판 8 전에 종료 확인을 받았고 시각으로도
+// completed를 가리지 못한 줄)은 cancelled였을 수 있다.
 export function failedOutcome(facts: Pick<FailedStop, "requestedCancel" | "exit">): Exclude<FinalizeOutcome, "succeeded"> | null {
-  if (facts.requestedCancel === true) return "cancelled";
-  if (facts.requestedCancel === null) return null;
-  return facts.exit === "completed" ? "failed" : null;
+  if (facts.requestedCancel === true || facts.exit === "cancelled") return "cancelled";
+  if (facts.requestedCancel === null || facts.exit === null) return null;
+  return "failed";
 }
 
 // 한 실행의 판단 재료. 소유자 입력이 없는 실행은 취소 요청이 없다. 입력에 이어졌는데 그 줄이 없거나 모름이면 모름이다.
