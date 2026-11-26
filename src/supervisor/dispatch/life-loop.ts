@@ -123,8 +123,9 @@ export type WritingIntent = "renew_lease" | "stop" | "finalize";
 
 // 확정을 적지 않은 이유. 모두 장부를 부르기 전이다. not_ready_result: cleanup_pending(이 박자가 확정을 열지 않은 상태),
 // outcome_unknown: failed_stopped인데 장부의 사실로 outcome을 정하지 못한다(failedOutcome이 null),
+// stored_at_unknown: outcome은 정했지만 failed_stopped가 된 장부 시각을 모른다(failedStop의 stoppedAt이 null),
 // already_recorded: 그 실행에 확정 지시가 이미 적혔다(같은 요청 ID로 다시 보내는 것은 재전송 박자의 일), intake_closed: 접수가 닫혔다(정지 포함).
-export type FinalizeWithheld = "not_ready_result" | "outcome_unknown" | "already_recorded" | "intake_closed";
+export type FinalizeWithheld = "not_ready_result" | "outcome_unknown" | "stored_at_unknown" | "already_recorded" | "intake_closed";
 
 // 갱신을 적지 않은 이유. 모두 장부를 부르기 전이다. no_connection은 연결 포트의 거절, link_unknown은 그 답을 모른다.
 export type RenewWithheld = "start_not_accepted" | "deadline_within_margin" | "intake_closed" | "no_connection" | "link_unknown" | "margin_lost" | "clock_unavailable";
@@ -497,7 +498,7 @@ function readFailed(ledger: LifeLoopLedger, run: RunRow): FailedStop | undefined
     const value: unknown = answer.value;
     if (!isObject(value)) return undefined;
     const { runId, stoppedAt, requestedCancel, exit } = value;
-    if (runId !== run.runId || !isTime(stoppedAt)) return undefined;
+    if (runId !== run.runId || !(stoppedAt === null || isTime(stoppedAt))) return undefined;
     if (!(requestedCancel === true || requestedCancel === false || requestedCancel === null)) return undefined;
     if (!(exit === null || (STOP_EXITS as readonly unknown[]).includes(exit))) return undefined;
     return { runId, stoppedAt, requestedCancel, exit: exit as FailedStop["exit"] };
@@ -544,7 +545,7 @@ function finalizeBodyOf(facts: Facts): FinalizeBody | null {
   if (facts.run.state === "ready_result") return facts.settled === null ? null : { outcome: "succeeded", resultDigest: facts.settled.resultDigest, storedAt: facts.settled.storedAt };
   if (facts.run.state !== "failed_stopped" || facts.failed === null) return null;
   const outcome = failedOutcome(facts.failed);
-  return outcome === null ? null : { outcome, resultDigest: null, storedAt: facts.failed.stoppedAt };
+  return outcome === null || facts.failed.stoppedAt === null ? null : { outcome, resultDigest: null, storedAt: facts.failed.stoppedAt };
 }
 
 // 확정의 근거가 박자 처음에 읽은 것과 같은가. ready_result는 결과 보관 셋, failed_stopped는 확정 사실 셋을 대조한다.
@@ -723,8 +724,11 @@ async function act(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcom
       if (run.state !== "ready_result" && run.state !== "failed_stopped") return { runId: run.runId, outcome: "finalize_withheld", reason: "not_ready_result" };
       // 확정이 이미 적힌 실행에 새 요청 ID의 확정을 또 적지 않는다(장부는 새 요청 ID면 받아 준다). 답이 없는 확정은 재전송 박자가 같은 요청 ID로 다시 보낸다.
       if (times !== null && times.lastFinalizeAt !== null) return { runId: run.runId, outcome: "finalize_withheld", reason: "already_recorded" };
-      // failed_stopped인데 outcome을 정하지 못하면 적지 않는다(failedOutcome). 그 실행은 자리를 쥔 채 남는다.
-      if (run.state === "failed_stopped" && finalizeBodyOf(plan.facts) === null) return { runId: run.runId, outcome: "finalize_withheld", reason: "outcome_unknown" };
+      // failed_stopped인데 outcome이나 stored_at을 정하지 못하면 적지 않는다(failedOutcome, failedStop의 stoppedAt). 그 실행은 자리를 쥔 채 남는다.
+      if (run.state === "failed_stopped" && finalizeBodyOf(plan.facts) === null) {
+        const known = plan.facts.failed !== null && failedOutcome(plan.facts.failed) !== null;
+        return { runId: run.runId, outcome: "finalize_withheld", reason: known ? "stored_at_unknown" : "outcome_unknown" };
+      }
       return finalizeOne(ctx, plan, trace);
     case "query":
       return queryOne(ctx, run, "intent");

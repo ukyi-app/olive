@@ -51,8 +51,8 @@ function facts(ledger: Ledger, runId: string) {
   return read.value;
 }
 
-const withoutStopExit = (list: unknown[]): unknown[] => list.map((row) => {
-  const { stop_exit: _, ...rest } = row as Record<string, unknown>;
+const withoutStopColumns = (list: unknown[]): unknown[] => list.map((row) => {
+  const { stop_exit: _, failed_stopped_at: __, ...rest } = row as Record<string, unknown>;
   return rest;
 });
 
@@ -77,7 +77,8 @@ test("판 7 장부를 열어 판 8로 올리면 실행·영수증·지시 줄은
   ]);
   const runsAfter = rows(path, "SELECT * FROM runs ORDER BY run_id");
   expect(runsAfter.map((row) => (row as { stop_exit: unknown }).stop_exit)).toEqual([null, null]);
-  expect(withoutStopExit(runsAfter)).toEqual(runsBefore);
+  expect(runsAfter.map((row) => (row as { failed_stopped_at: unknown }).failed_stopped_at)).toEqual([null, null]);
+  expect(withoutStopColumns(runsAfter)).toEqual(runsBefore);
   expect(rows(path, "SELECT * FROM deliveries ORDER BY id")).toEqual(deliveriesBefore);
   expect(rows(path, "SELECT * FROM instructions ORDER BY request_id")).toEqual(instructionsBefore);
   expect(rows(path, "SELECT run_id, state FROM runs WHERE run_id IN (?, ?) ORDER BY state", direct.runId, queued)).toEqual([
@@ -113,11 +114,11 @@ test("판 8 이관이 커밋 전에 끊기면 판 7 장부 그대로이고(판 7
   expect(resumed).toMatchObject({ ok: true, migrated: { from: VERSION - 1, to: VERSION } });
   if (resumed.ok) resumed.ledger.close();
   expect(versions()).toEqual([...versionsBefore, { version: VERSION }]);
-  expect(withoutStopExit(runs())).toEqual(runsBefore);
+  expect(withoutStopColumns(runs())).toEqual(runsBefore);
   expect(rows(path, "SELECT state, stop_exit FROM runs WHERE run_id = ?", s.runId)).toEqual([{ state: "failed_stopped", stop_exit: null }]);
 });
 
-test("판 8 뒤 원 SQL로 exit 없이 적은 종료 확인도 모름(NULL)으로 읽히고, 취소 우선과 시각 추론으로 확정 outcome이 정해진다", () => {
+test("판 8 뒤 원 SQL로 exit 없이 적은 종료 확인도 모름(NULL)으로 읽히고, 취소 우선과 뒤 판정의 실패 시각으로 확정 outcome이 정해진다", () => {
   // 장부 코드는 종료 확인과 exit를 늘 함께 적는다. 원 SQL은 exit를 비운 채 종료 확인만 적을 수 있다(트리거가 막지 않는다).
   const confirmRaw = (path: string, runId: string, state: "checking" | "failed_stopped", at: number) => {
     const receiptId = id();
@@ -141,7 +142,7 @@ test("판 8 뒤 원 SQL로 exit 없이 적은 종료 확인도 모름(NULL)으�
   expect(requestedFacts).toEqual({ runId: requested.s.runId, stoppedAt: NOW + 2, requestedCancel: true, exit: null });
   expect(failedOutcome(requestedFacts as NonNullable<typeof requestedFacts>)).toBe("cancelled");
 
-  // checking을 거쳐 영수증보다 늦게 결과 없음으로 판정되면 completed로 추론해 failed다.
+  // checking에서 결과 없음으로 판정되면 그 판정이 실패 시각을 적어 exit를 completed로 읽고 failed다.
   const judged = made(() => {}, "checking");
   must(judged.ledger.markResult({ runId: judged.s.runId, resultDigest: null, now: NOW + 60_002 }));
   const judgedFacts = facts(judged.ledger, judged.s.runId);
@@ -155,7 +156,7 @@ test("판 8 뒤 원 SQL로 exit 없이 적은 종료 확인도 모름(NULL)으�
   expect(failedOutcome(directFacts as NonNullable<typeof directFacts>)).toBeNull();
 });
 
-test("옛 줄(판 8 전에 종료 확인)의 exit는 모름이다: 곧바로 failed_stopped면 null이라 확정 outcome을 정하지 않고, 판정 시각이 늦으면 completed다", () => {
+test("옛 줄(판 8 전에 종료 확인)의 exit는 모름이다: 곧바로 failed_stopped면 null이라 확정 outcome을 정하지 않고, 판정 시각이 늦으면 시각도 몰라 정하지 않는다", () => {
   const directPath = tempPath();
   const a = ready(open(directPath, { migrations: BEFORE() }));
   const direct = startedWorker(a);
@@ -174,8 +175,8 @@ test("옛 줄(판 8 전에 종료 확인)의 exit는 모름이다: 곧바로 fai
   b.close();
   const upgradedB = ready(open(judgedPath));
   const judgedFacts = facts(upgradedB, judged.runId);
-  expect(judgedFacts).toEqual({ runId: judged.runId, stoppedAt: NOW + 60_001, requestedCancel: false, exit: "completed" });
-  expect(failedOutcome(judgedFacts as NonNullable<typeof judgedFacts>)).toBe("failed");
+  expect(judgedFacts).toEqual({ runId: judged.runId, stoppedAt: null, requestedCancel: false, exit: null });
+  expect(failedOutcome(judgedFacts as NonNullable<typeof judgedFacts>)).toBeNull();
 });
 
 test("판 8로 올린 뒤에 받은 종료 확인은 exit를 적는다(올리기 전에 시작한 실행 포함)", () => {
@@ -258,7 +259,51 @@ test("SQL이 막는 것: 적힌 exit 바꾸기·비우기, 옛 줄 채우기, �
   expect(rows(second, "SELECT state, stop_exit FROM runs WHERE run_id = ?", live.runId)).toEqual([{ state: "checking", stop_exit: "completed" }]);
 });
 
-test("판 7 장부를 8로 올리면 정의가 바뀌는 것은 runs 하나, 새 객체는 트리거 하나다. 판 8 장부는 판 7까지 아는 코드로 열지 않는다(too_new)", () => {
+test("SQL이 막는 것: 실패 시각 칸의 옛 줄 채우기·바꾸기·비우기, failed_stopped 밖의 값, updated_at과 다른 값, exit 없이 checking 밖에서 옮기며 적기", () => {
+  // 판 8 전에 failed_stopped가 된 줄은 나중에 채우지 않는다(값이 그 줄의 updated_at이어도).
+  const legacyPath = tempPath();
+  const old = ready(open(legacyPath, { migrations: BEFORE() }));
+  const legacy = startedWorker(old);
+  stop(old, legacy, "failed", NOW + 3);
+  old.close();
+  open(legacyPath).close();
+  expect(() => rawWrite(legacyPath, "UPDATE runs SET failed_stopped_at = updated_at WHERE run_id = ?", legacy.runId)).toThrow("run_evidence_mismatch");
+
+  // 적힌 값은 바꾸거나 비우지 못하고, failed_stopped가 아닌 줄에는 넣지 못한다.
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const fresh = startedWorker(ledger);
+  stop(ledger, fresh, "failed", NOW + 7);
+  ledger.close();
+  // 작업자 자리가 하나라 checking 쪽은 다른 장부에 적는다.
+  const checkingPath = tempPath();
+  const third = ready(open(checkingPath));
+  const checking = startedWorker(third);
+  stop(third, checking, "completed", NOW + 7);
+  third.close();
+  expect(rows(path, "SELECT failed_stopped_at FROM runs WHERE run_id = ?", fresh.runId)).toEqual([{ failed_stopped_at: NOW + 7 }]);
+  expect(rows(checkingPath, "SELECT failed_stopped_at FROM runs WHERE run_id = ?", checking.runId)).toEqual([{ failed_stopped_at: null }]);
+  expect(() => rawWrite(path, "UPDATE runs SET failed_stopped_at = ? WHERE run_id = ?", NOW + 8, fresh.runId)).toThrow("run_evidence_mismatch");
+  expect(() => rawWrite(path, "UPDATE runs SET failed_stopped_at = NULL WHERE run_id = ?", fresh.runId)).toThrow("run_evidence_mismatch");
+  expect(() => rawWrite(checkingPath, "UPDATE runs SET failed_stopped_at = updated_at WHERE run_id = ?", checking.runId)).toThrow("run_evidence_mismatch");
+  // checking에서 옮길 때는 그 UPDATE의 updated_at만 들어간다.
+  expect(() => rawWrite(checkingPath, "UPDATE runs SET state = 'failed_stopped', failed_stopped_at = ?, updated_at = ? WHERE run_id = ?", NOW + 8, NOW + 9, checking.runId)).toThrow("run_evidence_mismatch");
+  rawWrite(checkingPath, "UPDATE runs SET state = 'failed_stopped', failed_stopped_at = ?, updated_at = ? WHERE run_id = ?", NOW + 9, NOW + 9, checking.runId);
+  expect(rows(checkingPath, "SELECT state, stop_exit, failed_stopped_at FROM runs WHERE run_id = ?", checking.runId)).toEqual([{ state: "failed_stopped", stop_exit: "completed", failed_stopped_at: NOW + 9 }]);
+
+  // 첫 종료 확인으로 곧바로 옮길 때는 exit와 함께일 때만 들어간다(그래서 exit가 빈 줄의 실패 시각은 checking에서 온 것이다).
+  const second = tempPath();
+  const other = ready(open(second));
+  const live = startedWorker(other);
+  other.close();
+  const receiptId = id();
+  rawWrite(second, "INSERT INTO deliveries (id, action, run_id, body_digest, received_at) VALUES (?, 'receipt_stopped', ?, ?, ?)", receiptId, live.runId, digest("stopped"), NOW + 1);
+  expect(() => rawWrite(second, "UPDATE runs SET state = 'failed_stopped', stop_receipt_id = ?, failed_stopped_at = ?, updated_at = ? WHERE run_id = ?", receiptId, NOW + 1, NOW + 1, live.runId)).toThrow("run_evidence_mismatch");
+  rawWrite(second, "UPDATE runs SET state = 'failed_stopped', stop_receipt_id = ?, stop_exit = 'cancelled', failed_stopped_at = ?, updated_at = ? WHERE run_id = ?", receiptId, NOW + 1, NOW + 1, live.runId);
+  expect(rows(second, "SELECT state, stop_exit, failed_stopped_at FROM runs WHERE run_id = ?", live.runId)).toEqual([{ state: "failed_stopped", stop_exit: "cancelled", failed_stopped_at: NOW + 1 }]);
+});
+
+test("판 7 장부를 8로 올리면 정의가 바뀌는 것은 runs 하나, 새 객체는 트리거 둘이다. 판 8 장부는 판 7까지 아는 코드로 열지 않는다(too_new)", () => {
   const path = tempPath();
   open(path, { migrations: BEFORE() }).close();
   const objects = () => new Map((rows(path, "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL") as { name: string; sql: string }[]).map((o) => [o.name, o.sql]));
@@ -266,7 +311,7 @@ test("판 7 장부를 8로 올리면 정의가 바뀌는 것은 runs 하나, 새
   open(path).close();
   const eight = objects();
   expect([...seven].filter(([name, sql]) => eight.get(name) !== sql).map(([name]) => name)).toEqual(["runs"]);
-  expect([...eight.keys()].filter((name) => !seven.has(name))).toEqual(["runs_stop_exit_fixed"]);
+  expect([...eight.keys()].filter((name) => !seven.has(name))).toEqual(["runs_stop_exit_fixed", "runs_failed_stopped_at_fixed"]);
   expect(rows(path, "PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
   expect(openLedger(path, { clock, mode: "reopen", migrations: BEFORE() })).toMatchObject({ ok: false, reason: "too_new" });
 });
@@ -278,7 +323,10 @@ test("장부 초기화 진입점이 만든 장부는 판 8까지 적용했고 ex
   const path = `${dir}/${LEDGER_FILE}`;
   expect(rows(path, "SELECT max(version) AS version FROM ledger_migrations")).toEqual([{ version: loadMigrations().length }]);
   expect(rows(path, "SELECT name FROM ledger_migrations WHERE version = ?", VERSION)).toEqual([{ name: FILE }]);
-  expect(rows(path, "SELECT name, type FROM pragma_table_info('runs') WHERE name = 'stop_exit'")).toEqual([{ name: "stop_exit", type: "TEXT" }]);
+  expect(rows(path, "SELECT name, type FROM pragma_table_info('runs') WHERE name IN ('stop_exit', 'failed_stopped_at') ORDER BY name")).toEqual([
+    { name: "failed_stopped_at", type: "INTEGER" },
+    { name: "stop_exit", type: "TEXT" },
+  ]);
   const reopened = ready(open(path));
   const s = startedWorker(reopened);
   stop(reopened, s, "cancelled", NOW + 2);

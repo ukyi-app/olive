@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
 import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
-import type { InstructionTimes, Ledger } from "../../../src/ledger/index.ts";
+import { type InstructionTimes, type Ledger, loadMigrations } from "../../../src/ledger/index.ts";
 import { type LifeLoopLedger, type LifeLoopPorts, type LifeTickResult, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
 import type { Random, SendOutcome, Signer } from "../../../src/supervisor/dispatch/ports.ts";
 import type { LifecyclePolicy } from "../../../src/supervisor/scheduler/lifecycle.ts";
-import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
+import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 // 정책 숫자와 키는 이 시험이 지어 넣는 자료다. 운영값이 아니다.
 const POLICY: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 20_000 };
@@ -31,10 +31,10 @@ interface World {
   wrap(over: Partial<LifeLoopLedger>): void;
 }
 
-function world(): World {
+function world(path = tempPath()): World {
   let clockAt = NOW;
   const queued: number[] = [];
-  const ledger = ready(open(tempPath(), { clock: () => clockAt }));
+  const ledger = ready(open(path, { clock: () => clockAt }));
   const log: string[] = [];
   const sent: Envelope[] = [];
   let intake = true;
@@ -1764,5 +1764,82 @@ describe("실패 확정(D-114): failed_stopped 실행의 확정 본문은 장부
     w.setClock(NOW + 10_000);
     expect(only(await tick(w), s.runId).outcome).toBe("renew_sent");
     expect(reads).toBe(0);
+  });
+});
+
+// 판 8(종료 영수증 exit·실패 시각 칸) 전까지의 판 목록. 이 목록으로 연 장부는 판 8 전에 종료 확인·판정을 받은 장부와 같은 줄을 남긴다.
+const BEFORE_STOP_EXIT = () => loadMigrations().filter((m) => m.version < 8);
+
+type LedgerStep = (ledger: Ledger, s: ReturnType<typeof startedWorker>) => void;
+const stopAt = (exit: "completed" | "cancelled", at: number): LedgerStep => (ledger, s) =>
+  void must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit, bodyDigest: digest(`stopped:${exit}:${at}`), now: at }, s.from));
+const budgetAt = (at: number): LedgerStep => (ledger, s) => void must(ledger.recordBudget({ runId: s.runId, budgetLeft: 7, now: at }));
+const judgeAt = (at: number): LedgerStep => (ledger, s) => void must(ledger.markResult({ runId: s.runId, resultDigest: null, now: at }));
+const requestedAt = (at: number): LedgerStep => (ledger, s) =>
+  void must(ledger.recordStopInstruction({ runId: s.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: at, reason: "requested" }));
+
+// 장부 파일을 version 판까지로 만들어 before를 적고 닫은 뒤, 전체 판으로 다시 열어(판 7이면 여기서 판 8로 올라간다) after를 적고 박자를 한 번 돌린다.
+async function finalizeOf(version: 7 | 8, before: LedgerStep[], after: LedgerStep[] = []) {
+  const path = tempPath();
+  const ledger = ready(open(path, version === 7 ? { migrations: BEFORE_STOP_EXIT() } : {}));
+  const s = startedWorker(ledger);
+  for (const step of before) step(ledger, s);
+  ledger.close();
+  const w = world(path);
+  for (const step of after) step(w.ledger, s);
+  const read = w.ledger.failedStop(s.runId);
+  w.setClock(NOW + 30);
+  const outcome = only(await tick(w), s.runId);
+  const { runId: _, ...rest } = outcome;
+  return { facts: read.known && read.value !== null ? { stoppedAt: read.value.stoppedAt, exit: read.value.exit } : read, outcome: rest, writes: writes(w), bodies: w.sent.map((e) => e.body) };
+}
+
+const sentAs = (outcome: "cancelled" | "failed", storedAt: number) => ({ outcome: { outcome: "finalize_sent" }, bodies: [expect.objectContaining({ outcome, result_digest: null, stored_at: storedAt })] });
+const withheldAs = (reason: "outcome_unknown" | "stored_at_unknown") => ({ outcome: { outcome: "finalize_withheld", reason }, writes: [], bodies: [] });
+
+describe("실패 확정의 stored_at(D-114): 예산 기록 같은 뒤 쓰기가 failed_stopped가 된 시각과 옛 줄의 exit를 바꾸지 않는다", () => {
+  // 리뷰 재현의 네 대조군: 취소 지시 없이 exit cancelled 영수증을 NOW + 2에 적고, 예산 기록이 있으면 NOW + 19에 적는다.
+  // 판 7 줄은 실패 시각 칸이 없고 updated_at이 영수증 시각과 다르면 결과 없음 판정인지 예산 기록인지 가를 근거가 없어 보류한다.
+  const controls: [7 | 8, boolean, Record<string, unknown>, Record<string, unknown>][] = [
+    [8, false, { stoppedAt: NOW + 2, exit: "cancelled" }, sentAs("cancelled", NOW + 2)],
+    [8, true, { stoppedAt: NOW + 2, exit: "cancelled" }, sentAs("cancelled", NOW + 2)],
+    [7, false, { stoppedAt: NOW + 2, exit: null }, withheldAs("outcome_unknown")],
+    [7, true, { stoppedAt: null, exit: null }, withheldAs("outcome_unknown")],
+  ];
+  for (const [version, budget, facts, expected] of controls) {
+    test(`판 ${version}, 예산 기록 ${budget ? "있음" : "없음"}: exit cancelled로 곧바로 끝난 실행`, async () => {
+      const got = await finalizeOf(version, [stopAt("cancelled", NOW + 2), ...(budget ? [budgetAt(NOW + 19)] : [])]);
+      expect(got).toMatchObject({ facts, ...expected });
+    });
+  }
+
+  test("판 8: 결과 없음 판정 뒤의 예산 기록은 stored_at(판정 시각)을 바꾸지 않는다", async () => {
+    const got = await finalizeOf(8, [stopAt("completed", NOW + 1), judgeAt(NOW + 3), budgetAt(NOW + 19)]);
+    expect(got).toMatchObject({ facts: { stoppedAt: NOW + 3, exit: "completed" }, ...sentAs("failed", NOW + 3) });
+  });
+
+  test("판 7에서 checking이던 실행을 판 8에서 판정하면 판정 시각·exit completed로 확정한다(뒤 예산 기록과 무관)", async () => {
+    const got = await finalizeOf(7, [stopAt("completed", NOW + 1)], [judgeAt(NOW + 3), budgetAt(NOW + 19)]);
+    expect(got).toMatchObject({ facts: { stoppedAt: NOW + 3, exit: "completed" }, ...sentAs("failed", NOW + 3) });
+  });
+
+  test("판 7에서 결과 없음으로 판정된 정상 옛 줄은 예산 기록이 있는 대조군과 장부에서 같은 모양이라 확정을 보류한다", async () => {
+    const judged = await finalizeOf(7, [stopAt("completed", NOW + 1), judgeAt(NOW + 3)]);
+    const budgeted = await finalizeOf(7, [stopAt("cancelled", NOW + 1), budgetAt(NOW + 3)]);
+    expect(judged).toMatchObject({ facts: { stoppedAt: null, exit: null }, ...withheldAs("outcome_unknown") });
+    expect(budgeted).toEqual(judged);
+  });
+
+  test("판 7 줄의 사유 requested 취소: 영수증 시각 그대로면 그 시각으로 cancelled, 뒤 쓰기로 시각이 바뀌었으면 stored_at을 몰라 보류한다", async () => {
+    const plain = await finalizeOf(7, [requestedAt(NOW + 1), stopAt("cancelled", NOW + 2)]);
+    expect(plain).toMatchObject({ facts: { stoppedAt: NOW + 2, exit: null }, ...sentAs("cancelled", NOW + 2) });
+    for (const [name, after] of [
+      ["예산 기록", budgetAt(NOW + 19)],
+      ["결과 없음 판정", judgeAt(NOW + 19)],
+    ] as const) {
+      const exit = name === "예산 기록" ? "cancelled" : "completed";
+      const got = await finalizeOf(7, [requestedAt(NOW + 1), stopAt(exit, NOW + 2), after]);
+      expect([name, got]).toMatchObject([name, { facts: { stoppedAt: null, exit: null }, ...withheldAs("stored_at_unknown") }]);
+    }
   });
 });

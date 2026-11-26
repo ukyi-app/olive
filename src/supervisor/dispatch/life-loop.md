@@ -33,7 +33,7 @@ LifeTickResult =
 | `wait` | 판단이 기다림을 냈다. 아무것도 쓰지 않았다 |
 | `not_worker` | 세션 실행. 세션의 수명은 세션 계약 작업이 연다 |
 | `read_unknown` + `read` | 그 실행의 판단 읽기(`runs`: 실행 줄의 꼴이 틀리거나 같은 실행의 줄이 둘 이상이거나 쓰기 직전의 줄이 아래 "쓰기 직전"의 검증을 지나지 못함, `instruction_times`, `inputs`, `result`: `ready_result` 실행의 결과 보관 읽기나 `failed_stopped` 실행의 확정 사실 읽기)가 모름이다. 쓰지도 내보내지도 않았다 |
-| `finalize_withheld` + `reason` | 판단이 확정을 냈지만 적지 않았다(아래 "확정"): `not_ready_result`(`cleanup_pending`), `already_recorded`(그 실행에 확정이 이미 적힘), `outcome_unknown`(`failed_stopped`인데 장부의 사실로 `outcome`을 정하지 못함), `intake_closed`(접수가 닫힘, 정지 포함). 장부를 부르지 않았다 |
+| `finalize_withheld` + `reason` | 판단이 확정을 냈지만 적지 않았다(아래 "확정"): `not_ready_result`(`cleanup_pending`), `already_recorded`(그 실행에 확정이 이미 적힘), `outcome_unknown`(`failed_stopped`인데 장부의 사실로 `outcome`을 정하지 못함), `stored_at_unknown`(`outcome`은 정했지만 `failed_stopped`가 된 장부 시각을 모름), `intake_closed`(접수가 닫힘, 정지 포함). 장부를 부르지 않았다 |
 | `superseded` + `planned` | 쓰기 직전에 다시 읽은 실행 줄·입력 취소·지시 이력(확정이면 결과 보관이나 확정 사실도)으로 판단하니 계획한 의도(`renew_lease`·`stop`·`finalize`)가 아니었다. 쓰지 않았다. 다음 박자가 그때의 의도를 옮긴다 |
 | `beat_closed` + `planned` | 장부 호출 바로 앞에서 본 박자 유효 문이 닫혔다(아래 "쓰기 직전"). 쓰지 않았다 |
 | `renew_withheld` + `reason` | 갱신을 적지 않았다: `start_not_accepted`, `deadline_within_margin`, `intake_closed`, `no_connection`(연결 포트가 문자열 `reason`과 함께 거절), `link_unknown`(연결 포트가 던지거나 답이 정의 밖. 문자열 `reason`이 없는 `ok: false` 포함), `margin_lost`(같은 사실로 기록 시각에 잰 여유가 모자람), `clock_unavailable`. 장부를 부르지 않았다 |
@@ -67,7 +67,7 @@ LifeTickResult =
 | `renew_lease` | 아래 "갱신"의 조건을 모두 지난 뒤 `recordRenewInstruction` → `renewDraft` → `sealDraft` → 송신 규칙 → `sink.send` |
 | `stop` | 이미 종료 지시가 적힌 실행이면 조회로 간다. 아니면 쓰기 직전의 확인 → `recordStopInstruction`(사유 함께) → 대기 실행이면 끝, 아니면 `stopDraft` → `sealDraft` → `sink.send` |
 | `query` | 간격을 지났으면 `statusQueryDraft` → `sealDraft` → `sink.send`. 장부에 쓰지 않는다 |
-| `finalize` | `ready_result`이고 그 실행에 확정이 아직 적히지 않았으면 쓰기 직전의 확인(접수 포함) → `recordFinalizeInstruction`(`outcome: "succeeded"`, 결과 보관의 digest·시각 함께) → `finalizeDraft` → `sealDraft` → `sink.send`. 그 밖은 `finalize_withheld` |
+| `finalize` | 그 실행에 확정이 아직 적히지 않았고, `ready_result`이거나 `failed_stopped`에서 본문(`outcome`·`stored_at`)이 정해지면(아래 "실패 확정") 쓰기 직전의 확인(접수 포함) → `recordFinalizeInstruction`(`ready_result`는 `outcome: "succeeded"`와 결과 보관의 digest·시각, `failed_stopped`는 `outcome` `failed`·`cancelled`와 digest `null`, `failed_stopped`가 된 장부 시각) → `finalizeDraft` → `sealDraft` → `sink.send`. 그 밖은 `finalize_withheld` |
 
 판단에 넘기는 값: `lease`는 장부가 끝을 아는 임대만(`expiresAt`이 `"unknown"`이거나 지시가 없거나 그 실행이 `unsentRenews`에 있으면 `null`이라 판단은 조회로 간다), `lastInstructionAt`은 `stopping`이면 `lastStopAt`, 결과 쪽 상태면 `lastFinalizeAt`(그 밖의 상태에서 판단은 이 값을 쓰지 않는다), `resultSettled`는 `ready_result` 실행의 결과 보관이 장부에 반영됐을 때만 `true`(아래 "확정"), `cancelRequested`는 이어진 입력의 `cancelled`(입력이 없는 실행은 `false`).
 
@@ -141,10 +141,12 @@ LifeTickResult =
 
 - **`outcome`(`failedOutcome`).** 그 실행에 사유 `requested`의 취소 지시(`task_cancel`)가 적혔거나 종료 영수증 `exit`가 `cancelled`면 `cancelled`. 둘 중 하나만 맞아도 `cancelled`라 취소 쪽을 먼저 본다. 그 밖의 `exit`(`deadline`·`failed`, 그리고 `completed`로 `checking`이 된 뒤 결과 없음 판정 `markResult(null)`로 `failed_stopped`가 된 실행)는 `failed`다. 지금 감독에는 `markResult(null)`을 부르는 자리가 없다(결과 검사 박자는 결과 보고가 있는 `checking`만 판정한다, `result-check.md`). 그래서 결과 보고가 끝내 오지 않는 `checking`은 이 확정에 닿지 않고 자리를 쥔다. `exit`는 장부가 종료 확인 영수증을 반영할 때 실행 줄에 함께 적은 값이다(판 8, D-124). 그래서 영수증이 곧바로 `failed_stopped`로 옮긴 실행도 확정을 적고, 실행기의 정리 영수증이 `finalized`로 옮기면 자리가 풀린다(실행기가 연결돼 있고 확정 뒤 정리를 확인해야 한다, 아래 "확정 뒤 정리 확인을 잇는다").
 - **`cancelled`는 사용자가 취소했다는 뜻이 아니다.** 실행기는 사유 `requested` 밖의 취소 지시(`budget`·`emergency_stop`)에도, 준비·자격·spawn 사이에 정지 세대가 바뀌어 띄우지 않고 끝낸 실행에도 `exit` `cancelled`를 낸다(`src/executor/worker.ts`의 `launchBlocked`·`onCancel`). 그래서 취소 지시가 없거나 `requested`가 아닌 실행도 `exit`만으로 `cancelled` 확정과 정리를 받는다. D-114의 두 조건 가운데 영수증 조건 하나로 충분하므로 그대로 둔다.
-- **정하지 못하면 적지 않는다**(`finalize_withheld`, `outcome_unknown`). 사유 없이 적힌 취소 지시(판 4 전의 줄, 사유를 넘기지 않은 기록)는 `requested`였을 수 있어, `exit`가 `cancelled`가 아니면 정하지 못한다. 장부가 `exit`를 모르는 줄(`runs.stop_exit`이 NULL이고 시각으로도 `completed`를 가리지 못한 줄, `src/ledger/ledger.md`의 `failedStop`)도 `cancelled`였을 수 있어, 사유 `requested`의 취소 지시가 없으면 정하지 못한다. 그 실행은 자리를 쥔 채 남는다.
-- **`exit` 칸이 NULL인 줄도 같은 규칙으로 확정된다.** 판 8 전에 종료 확인을 받은 줄과 판 8 뒤 원 SQL로 `exit` 없이 종료 확인만 적은 줄이 여기에 든다(장부 코드는 둘을 늘 함께 적는다). 그 줄은 사유 `requested`의 취소 지시가 있으면 `cancelled`, 종료 확인 영수증을 받은 시각보다 늦게 결과 없음으로 판정됐으면(시각 추론 `completed`) `failed`로 확정되고, 그 밖은 위처럼 정하지 않는다.
-- **`stored_at`은 실행 줄이 `failed_stopped`가 된 장부 시각이다**(그 상태인 동안의 `updated_at`). 실행기는 `succeeded`가 아닌 확정의 `stored_at`·digest를 대조하지 않는다(`src/executor/worker.ts`의 정리 길). 확정을 적으면 본문 세 칸이 지시 줄에 고정되므로, 뒤 전이(`finalized`·`cleanup_pending`)가 `updated_at`을 바꿔도 재전송의 본문은 같다.
-- **같은 실행에 한 번, 접수가 열렸을 때만.** `already_recorded`·`intake_closed`·쓰기 직전의 확인은 `ready_result`와 같다. `already_recorded`를 `outcome_unknown`보다 먼저 본다.
+- **정하지 못하면 적지 않는다**(`finalize_withheld`). `outcome_unknown`: 사유 없이 적힌 취소 지시(판 4 전의 줄, 사유를 넘기지 않은 기록)는 `requested`였을 수 있어, `exit`가 `cancelled`가 아니면 정하지 못한다. 장부가 `exit`를 모르는 줄(아래, `src/ledger/ledger.md`의 `failedStop`)도 `cancelled`였을 수 있어, 사유 `requested`의 취소 지시가 없으면 정하지 못한다. `stored_at_unknown`: `outcome`은 정했지만 `failed_stopped`가 된 장부 시각을 모른다(아래). 둘 다 그 실행은 자리를 쥔 채 남는다.
+- **`exit`·실패 시각 칸이 빈 줄.** 판 8 전에 종료 확인을 받거나 `failed_stopped`가 된 줄, 원 SQL로 그 칸 없이 적은 줄이다(장부 코드는 늘 함께 적는다).
+  - **판 8 전에 `completed`로 `checking`이 되고 판 8 뒤에 결과 없음으로 판정된 줄**은 실패 시각 칸이 있어 `exit`를 `completed`로 읽는다. 사유 `requested`의 취소 지시가 있으면 `cancelled`, `completed`로 읽었고 `requestedCancel === false`(취소 지시가 없거나 다른 사유뿐)면 `failed`, 사유 없는 취소 지시만 있으면(`requestedCancel === null`) 정하지 않는다(`outcome_unknown`).
+  - **판 8 전에 `failed_stopped`가 된 줄**은 `exit`를 모르므로 `failed`로 확정하지 않는다. 사유 `requested`의 취소 지시가 있고 `updated_at`이 종료 확인 영수증을 받은 시각과 같으면 그 시각으로 `cancelled`를 적는다. `updated_at`이 영수증 시각과 다르면 뒤의 결과 없음 판정인지 예산 기록(`recordBudget`) 같은 다른 쓰기인지 장부가 가를 근거가 없어 시각도 `exit`도 모른다: 취소 지시가 없거나 다른 사유뿐이면 `outcome_unknown`, 사유 `requested`가 있으면 `stored_at_unknown`. 시각으로 `completed`를 추론하지 않는 까닭은 `cancelled`로 곧바로 끝난 뒤 예산이 적힌 실행을 `failed`로 확정하지 않기 위해서다. 지금 감독에는 `markResult(null)`·`recordBudget`을 부르는 자리가 없어, 운영 감독이 적은 판 7 장부의 `failed_stopped` 줄은 영수증이 곧바로 옮긴 줄(`updated_at`이 영수증 시각과 같음)이다.
+- **`stored_at`은 실행 줄이 `failed_stopped`가 된 장부 시각이다.** 판 8부터는 그 전이와 같은 UPDATE가 `runs.failed_stopped_at`에 적고 그 뒤로 바뀌지 않는다. `updated_at`으로 읽지 않는다: 예산 기록 같은 뒤 쓰기가 상태와 무관하게 그 칸을 바꾼다. 실행기는 `succeeded`가 아닌 확정의 `stored_at`·digest를 대조하지 않는다(`src/executor/worker.ts`의 정리 길). 확정을 적으면 본문 세 칸이 지시 줄에 고정되므로, 뒤 전이(`finalized`·`cleanup_pending`)가 `updated_at`을 바꿔도 재전송의 본문은 같다.
+- **같은 실행에 한 번, 접수가 열렸을 때만.** `already_recorded`·`intake_closed`·쓰기 직전의 확인은 `ready_result`와 같다. `already_recorded`를 `outcome_unknown`·`stored_at_unknown`보다 먼저 본다.
 
 ## 겹쳐 부르기
 

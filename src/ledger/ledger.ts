@@ -159,10 +159,14 @@ function storedExit(value: unknown): StopExit {
   return value as StopExit;
 }
 
-// exit 칸이 NULL인 줄(판 8 전에 종료 확인을 받은 줄, 판 8 뒤 원 SQL로 exit 없이 종료 확인만 적은 줄)의 대체: 시각으로 "completed"만
-// 가린다(FailedStop.exit의 주석).
-function inferredExit(stoppedAt: number, receipt: { received_at: number } | null): "completed" | null {
-  return receipt !== null && stoppedAt > safe(receipt.received_at, "deliveries.received_at") ? "completed" : null;
+// failed_stopped가 된 장부 시각과 종료 영수증 exit(FailedStop의 두 칸 주석). 실패 상태가 된 시각 칸(판 8 runs.failed_stopped_at)이
+// 있으면 그 값이고, 그때 exit 칸이 비었으면 completed다(트리거가 그 칸을 exit와 함께 적는 첫 종료 확인이나 checking에서 옮기는 쓰기에만
+// 허락한다). 시각 칸이 빈 줄은 updated_at이 종료 확인 영수증을 받은 시각과 같을 때만 그 시각이고, 다르면 시각을 모른다(null).
+function stopFacts(row: RunRow, receipt: { received_at: number } | null): Pick<FailedStop, "stoppedAt" | "exit"> {
+  const exit = row.stop_exit === undefined || row.stop_exit === null ? null : storedExit(row.stop_exit);
+  if (row.failed_stopped_at !== undefined && row.failed_stopped_at !== null) return { stoppedAt: safe(row.failed_stopped_at, "runs.failed_stopped_at"), exit: exit ?? "completed" };
+  const updated = safe(row.updated_at, "runs.updated_at");
+  return { stoppedAt: receipt !== null && updated === safe(receipt.received_at, "deliveries.received_at") ? updated : null, exit };
 }
 
 // ---- 장부의 값 ----
@@ -235,8 +239,9 @@ interface RunRow {
   stop_receipt_id: string | null;
   cleaned_receipt_id: string | null;
   result_digest: string | null;
-  // 판 8(0008-stop-exit)의 칸. 판 목록을 그 앞에서 끊어 연 장부에는 칸이 없어 undefined다.
+  // 판 8(0008-stop-exit)의 칸 둘. 판 목록을 그 앞에서 끊어 연 장부에는 칸이 없어 undefined다.
   stop_exit?: string | null;
+  failed_stopped_at?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -565,20 +570,22 @@ export interface SettledResult {
 // failed_stopped 작업자 실행의 확정 본문(outcome·stored_at)을 정하는 데 쓰는 장부 사실. failedStop만 낸다.
 export interface FailedStop {
   runId: string;
-  // 실행 줄이 failed_stopped가 된 장부 시각: 상태가 failed_stopped인 동안의 runs.updated_at. 그 상태로 옮긴 쓰기(종료 확인 영수증 또는
-  // markResult의 결과 없음 판정)가 넘긴 시각이다. 다음 전이(finalized·cleanup_pending)가 이 칸을 바꾸므로 그 뒤에는 이 읽기가 null이다.
-  // 함정: recordBudget은 상태와 무관하게 updated_at을 바꾼다. 지금 부르는 코드는 없지만, failed_stopped 줄에 부르면 이 값과 판 8 전 줄의
-  // exit 추론이 틀린다.
-  stoppedAt: number;
+  // 실행 줄이 failed_stopped가 된 장부 시각: 그 상태로 옮긴 쓰기(종료 확인 영수증 또는 markResult의 결과 없음 판정)가 넘긴 시각이다.
+  // 판 8부터는 그 쓰기가 runs.failed_stopped_at에 함께 적고 그 뒤로 바뀌지 않는다. runs.updated_at으로 읽지 않는다: recordBudget 같은
+  // 뒤 쓰기가 상태와 무관하게 그 칸을 바꾼다.
+  // 그 칸이 빈 줄(판 8 전에 failed_stopped가 된 줄, 원 SQL로 그 칸 없이 옮긴 줄)은 updated_at이 종료 확인 영수증을 받은 시각과 같을
+  // 때만 그 시각이다. 종료 확인 쓰기는 그 영수증을 받은 시각을 같은 트랜잭션에서 updated_at으로 적으므로, 같으면 그 뒤에 다른 시각의
+  // 쓰기가 없었고 곧바로 옮겼든 같은 밀리초에 판정했든 그 시각에 failed_stopped가 됐다(뒤 쓰기가 앞선 시각을 넘기지 않는다고 본다).
+  // 다르면 null(모름): 뒤의 결과 없음 판정인지 예산 기록 같은 다른 쓰기인지 장부가 가를 근거가 없다.
+  stoppedAt: number | null;
   // 그 실행에 사유 requested의 취소 지시(task_cancel)가 적혔으면 true, 취소 지시가 없거나 다른 사유뿐이면 false. requested는 없고
   // 사유 없이 적힌 취소 지시가 있으면 null(모름: requested였을 수 있다. 판 4 전의 줄이거나 사유를 넘기지 않은 기록).
   requestedCancel: boolean | null;
   // 종료 확인 영수증의 exit. 판 8(0008-stop-exit)부터는 그 영수증을 반영한 쓰기가 실행 줄에 함께 적은 값(runs.stop_exit)이다.
-  // 그 칸이 NULL인 줄(판 8 전에 종료 확인을 받은 줄, 판 8 뒤 원 SQL로 exit 없이 적은 줄)은 시각으로 "completed"만 가린다:
-  // completed 영수증은 checking으로, 그 밖의 영수증은 곧바로 failed_stopped로 옮기고, 어느 쪽이든 그 영수증을 받은 시각
-  // (deliveries.received_at)을 같은 트랜잭션에서 updated_at으로 적는다.
-  // 그래서 stoppedAt이 그 시각보다 늦으면 checking에서 뒤의 판정이 옮긴 것이다. 같거나 이르면 null(cancelled·deadline·failed 가운데
-  // 무엇인지 모른다. 같은 밀리초에 판정한 checking 실행도 여기에 든다).
+  // 그 칸이 NULL인데 failed_stopped_at이 있는 줄(판 8 전에 completed로 checking이 됐고 판 8 뒤에 결과 없음으로 판정된 줄)은 "completed"다:
+  // 트리거가 failed_stopped_at을 exit 없이 적는 쓰기를 checking에서 옮길 때만 허락한다.
+  // 두 칸이 다 빈 줄은 null(모름)이다. 시각으로 completed를 추론하지 않는다: updated_at이 영수증보다 늦은 것은 결과 없음 판정과 예산
+  // 기록 같은 다른 쓰기가 같은 모양이라, cancelled로 곧바로 끝난 실행을 failed로 확정할 수 있다.
   exit: StopExit | null;
 }
 
@@ -1589,6 +1596,8 @@ export class Ledger {
   // 판 8(0008-stop-exit)의 종료 영수증 exit 칸. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 종료 확인만 적고 exit는
   // 판 8 전에 받은 줄처럼 모름으로 읽는다. 기본 판 목록으로 연 장부에는 늘 있다.
   readonly #stopExitColumn: boolean;
+  // 판 8의 실패 상태가 된 시각 칸. 위와 같이 판 목록을 끊어 연 장부에는 없어서 적지 않고, 그 줄은 판 8 전의 줄처럼 읽는다.
+  readonly #failedAtColumn: boolean;
   // 이 장부 객체의 열기 ID. 송신 표식이 "이 열기가 실었다"를 적는 값이다. 열 때마다(객체마다) 새로 만들어 다시 열면 달라진다.
   // 장부의 식별(ledger_id)·사본 ID와 같이 장부가 스스로 만드는 식별이라 crypto.randomUUID()로 만든다(업무 참조처럼 부르는 쪽이
   // 넘기게 하면 다시 연 객체가 앞 열기의 값을 쓸 수 있다). 파일에는 표식·닫기 근거 줄에만 남는다.
@@ -1605,6 +1614,7 @@ export class Ledger {
     this.#closures = sqlOf(db, "unreceived_closures") !== null;
     this.#operatorClosures = sqlOf(db, "operator_closures") !== null;
     this.#stopExitColumn = db.query("SELECT 1 AS x FROM pragma_table_info('runs') WHERE name = 'stop_exit'").get() !== null;
+    this.#failedAtColumn = db.query("SELECT 1 AS x FROM pragma_table_info('runs') WHERE name = 'failed_stopped_at'").get() !== null;
     this.#openId = crypto.randomUUID();
   }
 
@@ -1701,7 +1711,9 @@ export class Ledger {
     if (!mayTransition(row.kind, row.state, to)) throw new Refuse("transition_denied");
     const sets = ["state = $state", "updated_at = $now"];
     const params: Record<string, string | number | null> = { state: to, now, run_id: row.run_id };
-    for (const [key, value] of Object.entries(extra)) {
+    // failed_stopped가 된 시각은 그 전이와 같은 UPDATE에서만 적힌다(판 8의 트리거). 실패 확정의 stored_at이 이 값이다(failedStop).
+    const columns: Record<string, string | number | null | undefined> = to === "failed_stopped" && this.#failedAtColumn ? { ...extra, failed_stopped_at: now } : extra;
+    for (const [key, value] of Object.entries(columns)) {
       sets.push(`${key} = $${key}`);
       params[key] = value ?? null;
     }
@@ -3407,8 +3419,7 @@ export class Ledger {
         this.#db.query(`SELECT ${this.#rebuildColumns ? "reason" : "NULL AS reason"} FROM instructions WHERE run_id = ? AND action = 'task_cancel'`).all(runId) as { reason: string | null }[]
       ).map((cancel) => cancel.reason);
       const requestedCancel = reasons.includes("requested") ? true : reasons.includes(null) ? null : false;
-      const stoppedAt = safe(row.updated_at, "runs.updated_at");
-      const exit = row.stop_exit === undefined || row.stop_exit === null ? inferredExit(stoppedAt, receipt) : storedExit(row.stop_exit);
+      const { stoppedAt, exit } = stopFacts(row, receipt);
       return { runId, stoppedAt, requestedCancel, exit };
     });
   }

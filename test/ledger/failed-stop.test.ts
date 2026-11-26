@@ -39,7 +39,7 @@ describe("failedStop", () => {
     }
   });
 
-  test("completed로 checking이 된 뒤 결과 없음으로 판정된 failed_stopped는 판정 시각, exit completed다. 판 8 전의 줄이면 같은 밀리초의 판정은 exit 모름이다", () => {
+  test("completed로 checking이 된 뒤 결과 없음으로 판정된 failed_stopped는 판정 시각, exit completed다. 판 8 전의 줄이면 exit 모름이고 시각은 영수증 시각과 같을 때만 안다", () => {
     const ledger = ready(open(tempPath()));
     const s = started(ledger);
     stopped(ledger, s, "completed", NOW + 1);
@@ -53,15 +53,16 @@ describe("failedStop", () => {
     must(same.markResult({ runId: t.runId, resultDigest: null, now: NOW + 1 }));
     expect(same.failedStop(t.runId)).toEqual({ known: true, value: { runId: t.runId, stoppedAt: NOW + 1, requestedCancel: false, exit: "completed" } });
 
-    for (const [judgedAt, exit] of [
-      [NOW + 60_001, "completed"],
-      [NOW + 1, null],
+    // 판 8 전의 줄은 실패 시각 칸이 없다. 영수증보다 늦은 updated_at은 결과 없음 판정과 예산 기록이 같은 모양이라 시각·exit 모두 모른다.
+    for (const [judgedAt, stoppedAt] of [
+      [NOW + 60_001, null],
+      [NOW + 1, NOW + 1],
     ] as const) {
       const old = ready(open(tempPath(), { migrations: BEFORE_STOP_EXIT() }));
       const u = started(old);
       stopped(old, u, "completed", NOW + 1);
       must(old.markResult({ runId: u.runId, resultDigest: null, now: judgedAt }));
-      expect(old.failedStop(u.runId)).toEqual({ known: true, value: { runId: u.runId, stoppedAt: judgedAt, requestedCancel: false, exit } });
+      expect(old.failedStop(u.runId)).toEqual({ known: true, value: { runId: u.runId, stoppedAt, requestedCancel: false, exit: null } });
     }
   });
 
@@ -96,6 +97,28 @@ describe("failedStop", () => {
     const run = ledger.getRun(s.runId);
     expect(run.known && run.value !== null ? [run.value.state, run.value.updatedAt] : run).toEqual(["finalized", NOW + 9]);
     expect(ledger.failedStop(s.runId)).toEqual({ known: true, value: null });
+  });
+
+  test("예산 기록(recordBudget)은 failed_stopped가 된 시각을 바꾸지 않는다. 판 8 전의 줄이면 시각과 exit를 모르게 된다", () => {
+    const ledger = ready(open(tempPath()));
+    const direct = started(ledger);
+    stopped(ledger, direct, "cancelled", NOW + 2);
+    must(ledger.recordBudget({ runId: direct.runId, budgetLeft: 7, now: NOW + 19 }));
+    expect(ledger.failedStop(direct.runId)).toEqual({ known: true, value: { runId: direct.runId, stoppedAt: NOW + 2, requestedCancel: false, exit: "cancelled" } });
+    // 작업자 자리가 하나라 판정 쪽은 다른 장부에 적는다.
+    const other = ready(open(tempPath()));
+    const judged = started(other);
+    stopped(other, judged, "completed", NOW + 1);
+    must(other.recordBudget({ runId: judged.runId, budgetLeft: 8, now: NOW + 2 }));
+    must(other.markResult({ runId: judged.runId, resultDigest: null, now: NOW + 3 }));
+    must(other.recordBudget({ runId: judged.runId, budgetLeft: 7, now: NOW + 19 }));
+    expect(other.failedStop(judged.runId)).toEqual({ known: true, value: { runId: judged.runId, stoppedAt: NOW + 3, requestedCancel: false, exit: "completed" } });
+
+    const old = ready(open(tempPath(), { migrations: BEFORE_STOP_EXIT() }));
+    const legacy = started(old);
+    stopped(old, legacy, "cancelled", NOW + 2);
+    must(old.recordBudget({ runId: legacy.runId, budgetLeft: 7, now: NOW + 19 }));
+    expect(old.failedStop(legacy.runId)).toEqual({ known: true, value: { runId: legacy.runId, stoppedAt: null, requestedCancel: false, exit: null } });
   });
 
   test("닫힌 장부는 모름이다", () => {
