@@ -561,7 +561,7 @@ const JOB: TestJobRequest = {
   sourceRef: TEST_T1_REQUEST.sourceRef,
   inputDigest: TEST_T1_REQUEST.inputDigest,
 };
-const OTHER_JOB: TestJobRequest = { ...JOB, key: "t1-other", inputDigest: T1_OTHER.inputDigest };
+const OTHER_JOB: TestJobRequest = { ...JOB, inputDigest: T1_OTHER.inputDigest };
 const OTHER_KEY_JOB: TestJobRequest = { ...JOB, key: T1_OTHER.dedupeKey };
 
 async function bootT1(assign: Pick<SupervisorSettings, "testAssign"> & Pick<AssignLoopPolicy, "plans" | "queue">): Promise<{
@@ -643,6 +643,9 @@ describe("실제 조립", () => {
   });
 
   test("시험 값: 고정 T1 부탁과 digest만 또는 재시도 키만 다른 시험 작업은 고르기까지 가서, 다섯 사실로 evidence_missing 보류된다(앞 실행 종료는 장부에서 확인)", async () => {
+    // 사례마다 칸 하나의 효과만 보려면 JOB과 다른 칸이 정확히 하나여야 한다. 둘이 다르면 한쪽 비교만으로 보류돼 다른 쪽 비교를 증명하지 못한다.
+    const changed = (job: TestJobRequest) => (Object.keys(JOB) as (keyof TestJobRequest)[]).filter((field) => job[field] !== JOB[field]);
+    expect([changed(OTHER_JOB), changed(OTHER_KEY_JOB)]).toEqual([["inputDigest"], ["key"]]);
     for (const [name, job] of [
       ["digest", OTHER_JOB],
       ["key", OTHER_KEY_JOB],
