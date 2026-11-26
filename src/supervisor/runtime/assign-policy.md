@@ -36,5 +36,5 @@ registrationsFrom(content, registry, targets): readonly Registration[]
 ## 이 모듈에 없는 것
 
 - **둘 이상의 계정과 계정별 판:** 별칭도 판도 하나다. 계정의 순서·전환과 계정별 판은 O17의 일이다.
-- **실행 계획·요청 한도·배정 전 사실:** 시험 값(`OLIVE_TEST_JOBS=on`)에서만 `test-assign.ts`가 채운다(README "시험 배정 값"). 운영 값의 진입점은 실행 계획이 없고 요청 한도가 `{ admin: 0, alert: 0 }`이라 `planNext`가 그 정책을 거절하고, 박자는 부탁을 고르기 전에 `not_run`/`policy_rejected`로 끝난다. 시험 값에서는 한도가 양수라 그다음 고르기가 배정 전 사실을 먼저 보고, 근거 원천이 없는 다섯 사실로 부탁이 `evidence_missing`으로 보류된다.
+- **실행 계획·요청 한도·배정 전 사실:** 시험 값(`OLIVE_TEST_JOBS=on`)에서만 `test-assign.ts`가 채운다(README "시험 배정 값"). 운영 값의 진입점은 실행 계획이 없고 요청 한도가 `{ admin: 0, alert: 0 }`이라 `planNext`가 그 정책을 거절하고, 박자는 부탁을 고르기 전에 `not_run`/`policy_rejected`로 끝난다. 시험 값에서는 한도가 양수라 그다음 고르기가 배정 전 사실을 먼저 본다. 재시도 키까지 고정 T1 부탁(D-130)과 같고 앞 실행의 종료를 장부에서 확인한 부탁만 다섯 사실을 지나 역할·등록·계정 고르기로 가고, 그 밖의 부탁(그리고 실행·점유를 읽지 못한 박자의 고정 부탁)은 근거 원천이 없는 다섯 사실로 `evidence_missing` 보류된다.
 - **자격 참조 포트 자체:** 조립이 `credentialPort(deps.credentialFiles, settings.credentials)`로 한 번 만든다(`accounts/credential-ref.md`). 값 송신과 같은 파일 포트·정책이다.
