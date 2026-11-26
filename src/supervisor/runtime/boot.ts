@@ -657,7 +657,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   // 배정이 고른 계정의 자격 참조. 값 송신(issuance)과 같은 파일 포트·같은 정책이라 참조와 송신이 같은 계정 폴더 규칙을 본다.
   // 정책의 revisionOf가 모름이면 파일을 열지 않고 모름이다(credential-ref.md). 박자마다 새로 만들지 않는다.
   const credentials = credentialPort(deps.credentialFiles, settings.credentials);
-  // 배정 전 사실. 시험 배정 값이면 장부에서 근거가 있는 칸만 채우는 시험 공급자이고, 아니면 모두 모름이다: 고르기가 보류하고 시작하지 않는다.
+  // 배정 전 사실. 시험 배정 값이면 시험 공급자(앞 실행의 종료는 장부에서, 다섯 사실은 고정 T1 부탁일 때만, D-130)이고, 아니면 모두 모름이다:
+  // 고르기가 보류하고 시작하지 않는다.
   // 박자마다 새로 만들지 않는다.
   const facts: FactSource = settings.testAssign === true ? testFactSource(ledger) : { facts: () => ({}) };
   const assignPorts = () => ({

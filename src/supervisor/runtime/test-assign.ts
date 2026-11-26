@@ -5,13 +5,14 @@
 //
 // 숫자는 T1(시험 클러스터 한 바퀴)의 시험 숫자이고 T1 실측 뒤 조정한다(README "시험 배정 값").
 //
-// 배정 전 사실은 실제 근거가 있는 칸만 채운다. 지금 근거가 있는 것은 장부의 실행 줄·점유 관측으로 판정하는 "앞 실행의 종료 미확인" 하나다.
-// 나머지 다섯(역할·목적 조합, 원본 고정, 자기 저장소 작성, 외부 코드 실행, 스스로 고치는 작성의 근거 문)은 판정할 원천이 감독에 없어 비운다.
-// 그래서 고르기는 그 다섯으로 evidence_missing 보류를 낸다. 시험 값이라는 이유로 그 안전 검사를 "통과"로 채우는 것은 관리자 결정이다.
+// 배정 전 사실 여섯 가운데 "앞 실행의 종료 미확인"은 장부의 실행 줄·점유 관측으로 판정한다. 나머지 다섯(역할·목적 조합, 원본 고정, 자기 저장소
+// 작성, 외부 코드 실행, 스스로 고치는 작성의 근거 문)은 판정할 원천이 감독에 없다. 관리자 결정 D-130에 따라 장부에서 읽은 부탁이 이 파일의
+// 고정 T1 부탁(TEST_T1_REQUEST)과 칸마다 같을 때만 그 다섯을 false(해당 없음)로 채운다. 알고 정한 것: D-118(모델 없는 고정 프로그램)을 근거로
+// 시험 값에서 그 안전 검사 다섯을 실제로 하지 않고 건너뛴다. 하나라도 다르거나 읽지 못하면 다섯은 비우고 고르기는 evidence_missing으로 보류한다.
 import type { Role } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger, type LedgerRunState } from "../../ledger/index.ts";
 import type { FactSource } from "../dispatch/assign-loop.ts";
-import type { PreAssignFacts, RunPlan } from "../dispatch/pick.ts";
+import type { PreAssignFact, PreAssignFacts, RunPlan } from "../dispatch/pick.ts";
 import type { Origin } from "../scheduler/queue.ts";
 
 // T1 역할. D-118의 고정 프로그램(모델 없음)을 돌릴 역할이다. 고정 계정의 방식이 구독 하나라(OLIVE_ACCOUNT_NAME, D-126) 구독을 받는 역할이어야
@@ -34,6 +35,30 @@ export const TEST_ASSIGN_NUMBERS = Object.freeze({
 // 함정: snapshot을 실제로 읽는 역할 프로그램을 이 값으로 돌리면 실행 줄이 없는 출처를 적는다.
 export const TEST_ASSIGN_SNAPSHOT_DIGEST = "e29c49f950c7cef9df8e1e61aa70b25ccc4e9cb41a413d56516d45500f38c703";
 
+// 고정 T1 부탁(D-130). 시험 값에서 배정 전 사실 다섯을 false로 채우는 부탁은 아래 다섯 칸이 모두 이 값과 같은 것뿐이다. 이 자리 하나에서만 정한다.
+// 시험 작업 넣기(homelab olive test-job → admin/test-job.ts)는 값을 그대로 장부에 적으므로 이 값을 넣으면 이 부탁이 된다(README "시험 배정 값").
+// 재시도 키는 보지 않는다: 같은 부탁을 다시 넣을 때의 이름이고, 장부도 같은 키의 같은 부탁인지를 키 밖의 칸으로 가른다(existing·conflict).
+// 함정: 값 하나를 바꾸면 그 값으로 넣은 시험 작업은 다시 evidence_missing으로 보류된다. README의 명령과 함께 바꾼다.
+export const TEST_T1_REQUEST: Readonly<{ owner: string; role: Role; purpose: string; sourceRef: string; inputDigest: string }> = Object.freeze({
+  // 시험 현관 대역의 소유자 입력(frontdoor/test-double.ts의 TEST_FRONT_DOOR_OWNER. 시험이 같은지 대조한다).
+  owner: "00000000-0000-4000-8000-000000000109",
+  role: TEST_ASSIGN_ROLE,
+  purpose: "t1_fixed_program",
+  // 그 입력의 원문 참조. 대역이 입력에 적는 값과 같다.
+  sourceRef: "test-front-door/00000000-0000-4000-8000-000000000109",
+  // 고정 표지 "olive-test-assign/t1-input"의 SHA-256(시험이 다시 계산한다). 고정 프로그램은 입력 원문을 읽지 않는다.
+  inputDigest: "921cb0367f6529305ab67ccde99dcf9e5629777718b3d9f309d32c052502b5aa",
+});
+
+// 고정 T1 부탁에서만 false로 채우는 다섯 사실. prior_run_end_unconfirmed는 부탁 내용이 아니라 장부의 최신 실행 근거라 따로 읽는다.
+export const FIXED_T1_FACTS: readonly PreAssignFact[] = Object.freeze([
+  "role_purpose_not_allowed",
+  "source_not_pinned",
+  "self_repo_write",
+  "external_code",
+  "self_fix_basis_closed",
+]);
+
 // 진입점이 시험 값에서만 넣는 실행 계획과 요청 한도. 부를 때마다 새로 얼린 값이다.
 export function testAssignPolicy(): { readonly plans: readonly RunPlan[]; readonly requestBudget: Readonly<Record<Origin, number>> } {
   const plan: RunPlan = Object.freeze({
@@ -51,9 +76,10 @@ export function testAssignPolicy(): { readonly plans: readonly RunPlan[]; readon
 // queued는 아직 시작하지 않았고, not_started·finalized는 끝났다.
 export const END_UNCONFIRMED: readonly LedgerRunState[] = Object.freeze(["preparing", "running", "stopping", "unknown_running"]);
 
-export type TestFactLedger = Pick<Ledger, "listRuns" | "slotHolds">;
+export type TestFactLedger = Pick<Ledger, "listRuns" | "slotHolds" | "readToolRequest">;
 
 const UNKNOWN: PreAssignFacts = Object.freeze({});
+const FIXED_T1_CLEAR: PreAssignFacts = Object.freeze(Object.fromEntries(FIXED_T1_FACTS.map((fact) => [fact, false])));
 const KINDS: readonly unknown[] = ["worker", "session"];
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
@@ -103,8 +129,35 @@ function priorRunFacts(ledger: TestFactLedger): PreAssignFacts {
   }
 }
 
-// 배정 전 사실의 시험 공급자. 부탁 내용과 무관한 장부 사실이라 부탁마다 장부를 새로 읽는다(dispatch/pick.md "뒤 조각이 지킬 것").
-// 같은 박자에서 시작을 먼저 하므로(assign-loop.ts) 그 박자에 시작한 실행도 이 읽기에 보인다.
+// 부탁이 고정 T1 부탁인가. 고르기와 배정이 쓰는 대기 목록의 항목(소유자·역할·digest)과 장부에서 다시 읽은 부탁 줄(목적·원본 참조까지)을
+// 둘 다 대조한다: 항목에는 목적·원본 참조가 없고, 줄만 보면 고르기가 쓰는 항목의 값과 어긋나도 다섯을 채운다.
+// 칸마다 한 번만 읽고 그 값만 견준다. 꼴이 틀리거나 읽기가 모름·던짐이면 아니다(다섯 모름).
+function isFixedT1(ledger: TestFactLedger, request: unknown): boolean {
+  const t1 = TEST_T1_REQUEST;
+  try {
+    if (!isObject(request)) return false;
+    const ref: unknown = request.ref;
+    if (typeof ref !== "string") return false;
+    if (request.owner !== t1.owner || request.role !== t1.role || request.inputDigest !== t1.inputDigest) return false;
+    const answer: unknown = ledger.readToolRequest({ owner: t1.owner, ref });
+    if (!isObject(answer) || answer.known !== true) return false;
+    const row: unknown = answer.value;
+    if (!isObject(row)) return false;
+    return row.ref === ref && row.owner === t1.owner && row.role === t1.role && row.purpose === t1.purpose && row.sourceRef === t1.sourceRef && row.inputDigest === t1.inputDigest;
+  } catch {
+    return false;
+  }
+}
+
+// 배정 전 사실의 시험 공급자. 앞 실행의 종료는 부탁 내용과 무관한 장부 사실이라 부탁마다 장부를 새로 읽는다(dispatch/pick.md "뒤 조각이 지킬 것").
+// 같은 박자에서 시작을 먼저 하므로(assign-loop.ts) 그 박자에 시작한 실행도 이 읽기에 보인다. 다섯 사실은 고정 T1 부탁일 때만 채우고,
+// 앞 실행의 종료를 모르는 것과 따로 본다(한쪽의 모름이 다른 쪽을 지우지 않는다. 고르기는 어느 칸이든 비면 보류한다).
 export function testFactSource(ledger: TestFactLedger): FactSource {
-  return { facts: () => priorRunFacts(ledger) };
+  return {
+    facts: (request) => {
+      const prior = priorRunFacts(ledger);
+      if (!isFixedT1(ledger, request)) return prior;
+      return Object.freeze({ ...prior, ...FIXED_T1_CLEAR });
+    },
+  };
 }

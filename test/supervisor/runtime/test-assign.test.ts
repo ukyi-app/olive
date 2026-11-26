@@ -1,36 +1,42 @@
 // 시험 배정 값(src/supervisor/runtime/test-assign.ts)의 시험: 시험 숫자와 T1 역할, 진입점 설정(시험 값에서만 채우고 운영 값은 닫힌 값 그대로),
-// 사실 공급자(앞 실행의 종료 미확인 하나만, 모르면 비움), 읽기 지점마다 던짐·모름을 넣는 훑기, 실제 조립에서 시험 작업 하나가 고르기까지 가서
-// 근거 없는 다섯 사실로 보류되는 것과 운영 값의 policy_rejected, 진입점·조립의 연결 글.
+// 사실 공급자(앞 실행의 종료 미확인은 장부에서, 다섯 사실은 고정 T1 부탁일 때만 false(D-130), 모르면 비움), 읽기 지점마다 던짐·모름과 칸 흔들기를
+// 넣는 훑기, 가짜 포트로 고정 T1 부탁이 배정 쓰기까지 가는 것, 실제 조립에서 고정 부탁은 사실을 지나고 다른 시험 작업은 다섯 사실로 보류되는 것과
+// 운영 값의 policy_rejected, 진입점·조립의 연결 글.
 // 진입점을 실제로 띄워 기동 기록 test_assign 한 줄을 보는 것은 test/entrypoints.test.ts가 한다.
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, getRandomValues } from "node:crypto";
+import { sealEnvelope } from "../../../src/contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger } from "../../../src/ledger/index.ts";
+import { REF, SHA256, SOURCE_REF, UUID } from "../../../src/ledger/input.ts";
 import { frontDoorFor, SUPERVISOR_ENV, settingsFromEnv } from "../../../src/main/supervisor.ts";
 import { type AskOutcome, exitFor } from "../../../src/supervisor/admin/client.ts";
 import { answerLine, createAdminHandlers } from "../../../src/supervisor/admin/commands.ts";
 import { ADMIN_LIMITS, parseReply, type TestJobRequest } from "../../../src/supervisor/admin/protocol.ts";
-import { type AssignLoopPolicy, type AssignLoopPorts, assignAndStartTick, type TickResult } from "../../../src/supervisor/dispatch/assign-loop.ts";
+import { TEST_JOB_PURPOSE } from "../../../src/supervisor/admin/test-job.ts";
+import { type AssignLoopLedger, type AssignLoopPolicy, type AssignLoopPorts, assignAndStartTick, type TickResult } from "../../../src/supervisor/dispatch/assign-loop.ts";
 import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { linkLossTick } from "../../../src/supervisor/dispatch/link-loss.ts";
 import { pickAssignment, PRE_ASSIGN_FACTS, type PreAssignFact, type PreAssignFacts } from "../../../src/supervisor/dispatch/pick.ts";
 import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
 import { resultCheckTick } from "../../../src/supervisor/dispatch/result-check.ts";
 import { unreceivedTick } from "../../../src/supervisor/dispatch/unreceived.ts";
-import { TEST_FRONT_DOOR_OWNER, testOriginOf } from "../../../src/supervisor/frontdoor/test-double.ts";
+import { TEST_FRONT_DOOR_OWNER, TEST_FRONT_DOOR_SOURCE, testOriginOf } from "../../../src/supervisor/frontdoor/test-double.ts";
 import { ROLE_POLICIES } from "../../../src/supervisor/roles/policy.ts";
 import type { RunningSupervisor, SupervisorSettings } from "../../../src/supervisor/runtime/boot.ts";
 import {
   END_UNCONFIRMED,
+  FIXED_T1_FACTS,
   TEST_ASSIGN_NUMBERS,
   TEST_ASSIGN_ROLE,
   TEST_ASSIGN_SNAPSHOT_DIGEST,
+  TEST_T1_REQUEST,
   type TestFactLedger,
   testAssignPolicy,
   testFactSource,
 } from "../../../src/supervisor/runtime/test-assign.ts";
 import { planNext } from "../../../src/supervisor/scheduler/queue.ts";
 import { list, readText } from "../../files.ts";
-import { digest } from "../../ledger/helpers.ts";
+import { digest, id, must, NOW, open, ready, tempPath } from "../../ledger/helpers.ts";
 import { type World, world } from "./boot-world.ts";
 
 const FULL: Record<(typeof SUPERVISOR_ENV)[number], string> = {
@@ -266,15 +272,245 @@ describe("하네스 훑기", () => {
   });
 });
 
-// 실제 조립(boot.ts)과 실제 장부, 시험 현관 대역. 배정 박자의 결과와 넘긴 포트를 적는다.
-const JOB: TestJobRequest = {
-  owner: TEST_FRONT_DOOR_OWNER,
-  key: "t1-1",
-  role: TEST_ASSIGN_ROLE,
-  purpose: "t1_fixed_program",
-  sourceRef: `test-front-door/${TEST_FRONT_DOOR_OWNER}`,
+// 고정 T1 부탁(D-130). 다섯 사실은 대기 항목과 장부의 부탁 줄이 모두 이 부탁일 때만 false다.
+const T1 = TEST_T1_REQUEST;
+const T1_REF = "22222222-2222-4222-8222-222222222222";
+const T1_ENTRY = { ref: T1_REF, owner: T1.owner, role: T1.role, inputDigest: T1.inputDigest, input: { cancelled: false, expiresAt: 1_800_003_600_000 } };
+const T1_ROW = { ref: T1_REF, owner: T1.owner, dedupeKey: "t1-1", role: T1.role, purpose: T1.purpose, sourceRef: T1.sourceRef, inputDigest: T1.inputDigest, phase: "waiting_assignment" };
+const OTHER_UUID = "00000000-0000-4000-8000-000000000110";
+const OTHER_REF = "33333333-3333-4333-8333-333333333333";
+type T1Fields = Record<"owner" | "role" | "purpose" | "sourceRef" | "inputDigest", string>;
+// 칸마다 고정 값과 다른 값 하나. 모두 장부가 받는 꼴이라 장부를 지나도 다른 부탁이 된다.
+const T1_OTHER: T1Fields = {
+  owner: OTHER_UUID,
+  role: "isolated_reader",
+  purpose: "t1_fixed_program_b",
+  sourceRef: `${TEST_FRONT_DOOR_SOURCE}/${OTHER_UUID}`,
   inputDigest: digest("t1"),
 };
+const ENTRY_FIELDS = ["ref", "owner", "role", "inputDigest"] as const;
+const ROW_FIELDS = ["ref", "owner", "role", "purpose", "sourceRef", "inputDigest"] as const;
+const otherOf = (field: (typeof ROW_FIELDS)[number]) => (field === "ref" ? OTHER_REF : T1_OTHER[field]);
+const CLEAR_FIVE: PreAssignFacts = Object.fromEntries(SOURCELESS.map((fact) => [fact, false]));
+
+type ReadTool = TestFactLedger["readToolRequest"];
+const t1Facts = (entry: unknown, read: unknown, runs: unknown = known([])) =>
+  testFactSource({ listRuns: () => runs, slotHolds: () => known([]), readToolRequest: read } as unknown as TestFactLedger).facts(entry as never) as PreAssignFacts;
+const rowRead = (row: unknown) => (() => known(row)) as unknown as ReadTool;
+// 다섯 사실 가운데 칸이 있는 것(값과 무관하게). 고정 부탁이 아니면 비어야 한다.
+const filled = (facts: PreAssignFacts) => FIXED_T1_FACTS.filter((fact) => Object.hasOwn(facts, fact));
+
+describe("고정 T1 부탁(D-130)", () => {
+  test("상수는 시험 현관 대역의 소유자 입력에 묶인 진단 부탁이고, 칸마다 장부·관리 명령이 받는 꼴이다", () => {
+    expect(TEST_T1_REQUEST).toEqual({
+      owner: TEST_FRONT_DOOR_OWNER,
+      role: "diagnosis",
+      purpose: "t1_fixed_program",
+      sourceRef: `${TEST_FRONT_DOOR_SOURCE}/${TEST_FRONT_DOOR_OWNER}`,
+      inputDigest: createHash("sha256").update("olive-test-assign/t1-input").digest("hex"),
+    });
+    expect([Object.isFrozen(TEST_T1_REQUEST), Object.isFrozen(FIXED_T1_FACTS)]).toEqual([true, true]);
+    expect([UUID.test(T1.owner), TEST_JOB_PURPOSE.test(T1.purpose), SOURCE_REF.test(T1.sourceRef), SHA256.test(T1.inputDigest)]).toEqual([true, true, true, true]);
+    // homelab olive test-job은 값마다 장부 참조의 글자 집합(1~200자)만 거른다. 다섯 값 모두 그 안이다.
+    expect(Object.values(TEST_T1_REQUEST).filter((value) => !REF.test(value))).toEqual([]);
+    expect([...FIXED_T1_FACTS]).toEqual([...SOURCELESS]);
+  });
+
+  test("대기 항목과 부탁 줄이 모두 고정 부탁이면 다섯 사실이 false이고, 앞 실행의 종료는 장부에서 따로 채운다", () => {
+    expect(t1Facts(T1_ENTRY, rowRead(T1_ROW))).toEqual({ ...CLEAR_FIVE, prior_run_end_unconfirmed: false });
+    expect(t1Facts(T1_ENTRY, rowRead(T1_ROW), known([run("worker", "running")]))).toEqual({ ...CLEAR_FIVE, prior_run_end_unconfirmed: true });
+    // 앞 실행을 모르면 그 칸만 빈다. 고르기는 그 한 칸으로 보류한다.
+    expect(t1Facts(T1_ENTRY, rowRead(T1_ROW), { known: false })).toEqual(CLEAR_FIVE);
+    const queries: unknown[] = [];
+    t1Facts(T1_ENTRY, (query: unknown) => {
+      queries.push(query);
+      return known(T1_ROW);
+    });
+    expect(queries).toEqual([{ owner: T1.owner, ref: T1_REF }]);
+  });
+
+  test("칸 하나라도 다르면 다섯 사실을 비운다: 대기 항목의 참조·소유자·역할·digest, 부탁 줄의 참조·소유자·역할·목적·원본 참조·digest 각각", () => {
+    for (const field of ENTRY_FIELDS) {
+      expect([`entry.${field}`, t1Facts({ ...T1_ENTRY, [field]: otherOf(field) }, rowRead(T1_ROW))]).toEqual([`entry.${field}`, { prior_run_end_unconfirmed: false }]);
+    }
+    for (const field of ROW_FIELDS) {
+      expect([`row.${field}`, t1Facts(T1_ENTRY, rowRead({ ...T1_ROW, [field]: otherOf(field) }))]).toEqual([`row.${field}`, { prior_run_end_unconfirmed: false }]);
+    }
+    // 대기 항목의 참조가 문자열이 아니면 장부가 같은 값을 돌려줘도 아니다.
+    expect(t1Facts({ ...T1_ENTRY, ref: 42 }, rowRead({ ...T1_ROW, ref: 42 }))).toEqual({ prior_run_end_unconfirmed: false });
+  });
+
+  test("부탁 읽기가 던짐·모름·없음이거나 답의 꼴이 틀리면 다섯 사실을 비운다. 대기 항목이 다르면 장부를 읽지 않는다", () => {
+    const cases: [string, unknown][] = [
+      [
+        "던짐",
+        () => {
+          throw new Error("x");
+        },
+      ],
+      ["모름", () => ({ known: false, reason: "io" })],
+      ["known 문자열", () => ({ known: "true", value: T1_ROW })],
+      ["줄 없음", () => known(null)],
+      ["줄 문자열", () => known("row")],
+      ["답 없음", () => undefined],
+      ["포트 없음", undefined],
+    ];
+    for (const [name, read] of cases) expect([name, t1Facts(T1_ENTRY, read)]).toEqual([name, { prior_run_end_unconfirmed: false }]);
+    for (const entry of [{}, null, "x", { ...T1_ENTRY, role: "code_author" }]) {
+      let reads = 0;
+      const facts = t1Facts(entry, () => {
+        reads += 1;
+        return known(T1_ROW);
+      });
+      expect([facts, reads]).toEqual([{ prior_run_end_unconfirmed: false }, 0]);
+    }
+  });
+});
+
+describe("하네스 훑기: 고정 부탁 판정", () => {
+  test("대기 항목·부탁 읽기의 지점마다 던짐·모름을 넣고 칸마다 값을 흔들어도, 고정 부탁이 아닌 답에 다섯 사실이 채워진 것 0", () => {
+    const fresh = (fault: Fault, seen: string[]) => {
+      const port = faulty({ readToolRequest: (_query: unknown) => known(structuredClone(T1_ROW)) }, fault, seen);
+      const entry = faulty(structuredClone(T1_ENTRY), fault, seen);
+      return t1Facts(entry, (query: unknown) => port.readToolRequest(query));
+    };
+    const seen: string[] = [];
+    expect(fresh(null, seen)).toEqual({ ...CLEAR_FIVE, prior_run_end_unconfirmed: false });
+    const violations: string[] = [];
+    let cases = 0;
+    const check = (name: string, facts: PreAssignFacts) => {
+      cases += 1;
+      if (filled(facts).length > 0) violations.push(name);
+    };
+    for (let at = 0; at < seen.length; at += 1) {
+      for (const mode of ["throw", "unknown"] as const) check(`${mode}@${at}:${seen[at]}`, fresh({ at, mode }, []));
+    }
+    // 고정 값 옆의 값: 없음·다른 타입, 앞뒤 공백, 대문자, 한 글자 덜·더, 문자열 객체, 배열·객체로 감싼 값, 다른 칸의 정상 값.
+    const wobble = (value: unknown): unknown[] => {
+      const s = String(value);
+      return [undefined, null, 0, true, "", ` ${s}`, `${s} `, s.toUpperCase(), s.slice(0, -1), `${s}0`, `x${s}`, new String(s), [s], { value: s }, OTHER_REF, ...Object.values(T1_OTHER), ...Object.values(T1)].filter((v) => v !== value);
+    };
+    for (const field of ENTRY_FIELDS) for (const value of wobble(T1_ENTRY[field])) check(`entry.${field}=${String(value)}`, t1Facts({ ...T1_ENTRY, [field]: value }, rowRead(T1_ROW)));
+    for (const field of ROW_FIELDS) for (const value of wobble(T1_ROW[field])) check(`row.${field}=${String(value)}`, t1Facts(T1_ENTRY, rowRead({ ...T1_ROW, [field]: value })));
+    for (const answer of [{ known: "true", value: T1_ROW }, { known: 1, value: T1_ROW }, { value: T1_ROW }, { known: true }, { known: true, value: [T1_ROW] }, { known: true, value: JSON.stringify(T1_ROW) }, null, [], "x"]) {
+      check(`answer=${JSON.stringify(answer)}`, t1Facts(T1_ENTRY, () => answer));
+    }
+    expect(seen.length).toBeGreaterThan(10);
+    expect(cases).toBeGreaterThan(200);
+    expect(violations).toEqual([]);
+  });
+});
+
+// 가짜 포트(실제 장부에 실행기 연결·자격·서명·내보내기는 시험이 지은 값)로 배정 박자 한 번을 돌리고 장부 쓰기 호출을 센다.
+const T1_KEYS = generateKeyPairSync("ed25519");
+const T1_POLICY: AssignLoopPolicy = {
+  assignment: {
+    allowed: [{ target: "diagnosis", roles: ["diagnosis"] }],
+    registrations: [{ target: "diagnosis", role: "diagnosis", instance: "d1", storage: "s1", keyId: "key-d", active: true }],
+    expected: { profile_revision: "prof-1", policy_revision: "pol-1" },
+  },
+  accounts: [{ account: "acct-a", method: "subscription" }],
+  plans: testAssignPolicy().plans,
+  queue: { alertMaxWaitMs: 60_000, requestBudget: testAssignPolicy().requestBudget },
+  originOf: testOriginOf,
+};
+
+async function t1Tick(fields: T1Fields, over: { policy?: AssignLoopPolicy; prodFacts?: boolean; read?: unknown } = {}): Promise<{ tick: TickResult; writes: string[] }> {
+  const ledger = ready(open(tempPath()));
+  for (const owner of new Set([TEST_FRONT_DOOR_OWNER, fields.owner])) {
+    must(ledger.enqueueInput({ requestId: owner, source: TEST_FRONT_DOOR_SOURCE, sourceRef: { ref: `${TEST_FRONT_DOOR_SOURCE}/${owner}`, expiresAt: NOW + 3_600_000 }, receivedAt: NOW }));
+  }
+  must(ledger.recordToolRequest({ ref: id(), dedupeKey: "t1-1", ...fields, sessionId: "admin-test-job", callId: id(), now: NOW }));
+  const writes: string[] = [];
+  const port = (name: keyof AssignLoopLedger) =>
+    ((...args: unknown[]) => {
+      if (name === "assignToolRequest" || name === "startRun") writes.push(name);
+      return (ledger[name] as (...a: unknown[]) => unknown).apply(ledger, args);
+    }) as never;
+  const factLedger = { listRuns: () => ledger.listRuns(), slotHolds: () => ledger.slotHolds(), readToolRequest: over.read ?? ((query: never) => ledger.readToolRequest(query)) } as unknown as TestFactLedger;
+  const random = { bytes: (length: number) => getRandomValues(new Uint8Array(length)) };
+  const ports: AssignLoopPorts = {
+    ledger: {
+      listWaitingToolRequests: port("listWaitingToolRequests"),
+      assignToolRequest: port("assignToolRequest"),
+      queueView: port("queueView"),
+      listRuns: port("listRuns"),
+      slotHolds: port("slotHolds"),
+      listInputs: port("listInputs"),
+      startRun: port("startRun"),
+      markStartDispatch: port("markStartDispatch"),
+    },
+    intake: { intakeOpen: () => ledger.intakeOpen(), stopGeneration: () => 0 },
+    connections: {
+      candidates: () => ({
+        known: true,
+        value: [{ connection: 1, target: "diagnosis", principal: { kind: "worker_executor", role: "diagnosis", instance: "d1", storage: "s1" }, keyId: "key-d", hello: { profile_revision: "prof-1", policy_revision: "pol-1" } }],
+      }),
+    },
+    withheld: { executors: () => ({ known: true, value: [] }) },
+    facts: over.prodFacts === true ? { facts: () => ({}) } : testFactSource(factLedger),
+    credentials: { reference: async () => ({ known: true, credential: { account: "acct-a", method: "subscription", revision: "cred-1", digest: "c".repeat(64) } }) },
+    random,
+    signer: { seal: (input) => sealEnvelope(input, T1_KEYS.privateKey) },
+    sink: { send: async () => "sent" },
+  };
+  return { tick: await assignAndStartTick(ports, over.policy ?? T1_POLICY, NOW), writes };
+}
+
+const heldFive = { kind: "held", reason: "evidence_missing", missing: [...SOURCELESS] };
+const requestsOf = (tick: TickResult) => (tick.kind === "ran" ? tick.requests : tick);
+
+describe("가짜 포트로 배정 박자", () => {
+  test("고정 T1 부탁은 사실 여섯을 지나 배정 쓰기 하나로 이어진다", async () => {
+    const { tick, writes } = await t1Tick({ ...T1 });
+    expect(requestsOf(tick)).toEqual([{ ref: expect.any(String), outcome: "assigned", runId: expect.any(String), executorId: "executor/diagnosis/d1/s1" }]);
+    expect(writes).toEqual(["assignToolRequest"]);
+  });
+
+  test("칸 하나씩 다른 부탁(역할·목적·원본 참조·digest·소유자)은 다섯 사실로 보류되고 배정 쓰기 0", async () => {
+    for (const field of ["role", "purpose", "sourceRef", "inputDigest", "owner"] as const) {
+      const { tick, writes } = await t1Tick({ ...T1, [field]: T1_OTHER[field] });
+      expect<unknown>([field, requestsOf(tick), writes]).toEqual([field, [{ ref: expect.any(String), outcome: "skipped", pick: heldFive }], []]);
+    }
+  });
+
+  test("부탁 읽기가 던짐·모름·없음이면 고정 부탁도 다섯 사실로 보류되고 배정 쓰기 0", async () => {
+    const reads: [string, unknown][] = [
+      [
+        "던짐",
+        () => {
+          throw new Error("x");
+        },
+      ],
+      ["모름", () => ({ known: false, reason: "io" })],
+      ["없음", () => known(null)],
+    ];
+    for (const [name, read] of reads) {
+      const { tick, writes } = await t1Tick({ ...T1 }, { read });
+      expect<unknown>([name, requestsOf(tick), writes]).toEqual([name, [{ ref: expect.any(String), outcome: "skipped", pick: heldFive }], []]);
+    }
+  });
+
+  test("운영 값: 진입점의 운영 설정이면 고정 부탁도 policy_rejected이고, 운영 사실 포트(모두 모름)면 여섯 사실로 보류된다. 배정 쓰기 0", async () => {
+    const prod = settingsOf({});
+    const rejected = await t1Tick({ ...T1 }, { policy: { ...T1_POLICY, plans: prod.assign.plans, queue: prod.assign.queue }, prodFacts: true });
+    expect([rejected.tick, rejected.writes]).toEqual([{ kind: "not_run", reason: "policy_rejected" }, []]);
+    const held = await t1Tick({ ...T1 }, { prodFacts: true });
+    expect([requestsOf(held.tick), held.writes]).toEqual([[{ ref: expect.any(String), outcome: "skipped", pick: { kind: "held", reason: "evidence_missing", missing: [...PRE_ASSIGN_FACTS] } }], []]);
+  });
+});
+
+// 실제 조립(boot.ts)과 실제 장부, 시험 현관 대역. 배정 박자의 결과와 넘긴 포트를 적는다.
+// 고정 T1 부탁의 시험 작업(README "시험 배정 값"의 명령과 같은 값)과 digest만 다른 시험 작업.
+const JOB: TestJobRequest = {
+  owner: TEST_T1_REQUEST.owner,
+  key: "t1-1",
+  role: TEST_T1_REQUEST.role,
+  purpose: TEST_T1_REQUEST.purpose,
+  sourceRef: TEST_T1_REQUEST.sourceRef,
+  inputDigest: TEST_T1_REQUEST.inputDigest,
+};
+const OTHER_JOB: TestJobRequest = { ...JOB, key: "t1-other", inputDigest: T1_OTHER.inputDigest };
 
 async function bootT1(assign: Pick<SupervisorSettings, "testAssign"> & Pick<AssignLoopPolicy, "plans" | "queue">): Promise<{
   w: World;
@@ -333,8 +569,8 @@ async function bootT1(assign: Pick<SupervisorSettings, "testAssign"> & Pick<Assi
 async function cycles(w: World, n: number): Promise<void> {
   for (let i = 0; i < n; i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
 }
-const jobOf = (w: World, running: RunningSupervisor) => {
-  const reply = parseReply(answerLine(JSON.stringify({ command: "test-job", ...JOB }), createAdminHandlers(running.admin, running.testJob), w.deps.monoNow() + ADMIN_LIMITS.serverWaitMs).slice(0, -1));
+const jobOf = (w: World, running: RunningSupervisor, job: TestJobRequest = JOB) => {
+  const reply = parseReply(answerLine(JSON.stringify({ command: "test-job", ...job }), createAdminHandlers(running.admin, running.testJob), w.deps.monoNow() + ADMIN_LIMITS.serverWaitMs).slice(0, -1));
   return { reply, code: exitFor({ kind: "reply", reply } as AskOutcome, "test-job").code };
 };
 const lastRequests = (ticks: readonly TickResult[]) => {
@@ -343,11 +579,22 @@ const lastRequests = (ticks: readonly TickResult[]) => {
 };
 
 describe("실제 조립", () => {
-  test("시험 값: T1 역할의 시험 작업 하나가 고르기까지 가서, 근거 원천이 없는 다섯 사실로 evidence_missing 보류된다(앞 실행 종료는 장부에서 확인)", async () => {
+  test("시험 값: 고정 T1 부탁의 시험 작업은 관리 명령으로 넣어져 배정 전 사실 여섯을 지나 실행기 고르기에 닿는다(이 조립에는 연결이 없어 no_executor)", async () => {
     const test = testAssignPolicy();
     const { w, running, ticks } = await bootT1({ testAssign: true, plans: test.plans, queue: { alertMaxWaitMs: 60_000, requestBudget: test.requestBudget } });
     await cycles(w, 10);
     expect(jobOf(w, running)).toMatchObject({ code: 0, reply: { kind: "test_job", outcome: "created" } });
+    await cycles(w, 3);
+    expect(lastRequests(ticks)).toEqual([{ ref: expect.any(String), outcome: "skipped", pick: { kind: "held", reason: "no_executor", holds: [] } }]);
+    expect(w.names()).not.toContain("fatal");
+    expect(await running.stop()).toBe(0);
+  });
+
+  test("시험 값: 고정 T1 부탁과 digest만 다른 시험 작업은 고르기까지 가서, 다섯 사실로 evidence_missing 보류된다(앞 실행 종료는 장부에서 확인)", async () => {
+    const test = testAssignPolicy();
+    const { w, running, ticks } = await bootT1({ testAssign: true, plans: test.plans, queue: { alertMaxWaitMs: 60_000, requestBudget: test.requestBudget } });
+    await cycles(w, 10);
+    expect(jobOf(w, running, OTHER_JOB)).toMatchObject({ code: 0, reply: { kind: "test_job", outcome: "created" } });
     await cycles(w, 3);
     const requests = lastRequests(ticks);
     expect(requests).toEqual([{ ref: expect.any(String), outcome: "skipped", pick: { kind: "held", reason: "evidence_missing", missing: [...SOURCELESS] } }]);
@@ -356,7 +603,7 @@ describe("실제 조립", () => {
     expect(await running.stop()).toBe(0);
   });
 
-  test("시험 숫자만 있고 사실 공급자가 꺼지면(testAssign 거짓) 여섯 사실이 모두 모름이다", async () => {
+  test("시험 숫자만 있고 사실 공급자가 꺼지면(testAssign 거짓) 고정 T1 부탁도 여섯 사실이 모두 모름이다", async () => {
     const test = testAssignPolicy();
     const { w, running, ticks } = await bootT1({ testAssign: false, plans: test.plans, queue: { alertMaxWaitMs: 60_000, requestBudget: test.requestBudget } });
     await cycles(w, 10);
@@ -366,7 +613,7 @@ describe("실제 조립", () => {
     expect(await running.stop()).toBe(0);
   });
 
-  test("운영 값(진입점의 운영 설정): 대기 부탁이 있어도 박자는 policy_rejected이고 사실 포트는 장부를 읽지 않고 모름이다. 배정·시작 쓰기 0", async () => {
+  test("운영 값(진입점의 운영 설정): 고정 T1 부탁이 대기해도 박자는 policy_rejected이고 사실 포트는 장부를 읽지 않고 모름이다. 배정·시작 쓰기 0", async () => {
     const prod = settingsOf({});
     const { w, running, ticks, ports, ledgerCalls } = await bootT1({ testAssign: prod.testAssign, plans: prod.assign.plans, queue: prod.assign.queue });
     await cycles(w, 10);
