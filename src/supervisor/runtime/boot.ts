@@ -31,7 +31,7 @@ import {
   RestoreStepError,
   type StopAuthorityPort,
 } from "../../ledger/index.ts";
-import type { CredentialFiles, CredentialRefPolicy } from "../accounts/credential-ref.ts";
+import { type CredentialFiles, type CredentialRefPolicy, credentialPort } from "../accounts/credential-ref.ts";
 import { type AssignLoopPolicy, assignAndStartTick, type CandidateSource } from "../dispatch/assign-loop.ts";
 import type { CancelDelivery } from "../dispatch/cancel.ts";
 import { lifeTick } from "../dispatch/life-loop.ts";
@@ -48,6 +48,7 @@ import type { ConnectionSettings } from "../transport/connections.ts";
 import { RegistryState, type RegistrySettings } from "../transport/registry.ts";
 import type { ConnectionServer, ConnectionServerOptions, Delivered, StartResult } from "../transport/server.ts";
 import { type AnswerLines, type AnswerNote, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
+import { registrationsFrom } from "./assign-policy.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
@@ -426,6 +427,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   }
   if (requiredPeers.length === 0 || new Set(requiredPeers).size !== requiredPeers.length) return fail("registry", SUPERVISOR_EXIT.registry, "required_peers");
   log("boot_step", { step: "registry", requiredPeers: requiredPeers.length });
+  // 배정의 등록행은 방금 적용한 같은 바이트와 그 상태에서만 만든다. 설정의 registrations 칸은 쓰지 않는다: 명단을 채우는 길은 적용 하나다(D-63).
+  // 만들지 못하면 빈 목록이라 배정이 보류될 뿐 기동은 계속한다(assign-policy.ts). 등록표는 기동 때 한 번 읽으므로 프로세스 동안 같다.
+  const assignPolicy: AssignLoopPolicy = {
+    ...settings.assign,
+    assignment: { ...settings.assign.assignment, registrations: registrationsFrom(registryRead.value, registry, settings.registry.targets) },
+  };
+  log("assign_policy", { registrations: assignPolicy.assignment.registrations.length });
 
   // 4. 공유 시계 하나, 장부 열기 하나(reopen만), 결과 보관, 복원기 하나(단계는 아직 부르지 않아 세대 null).
   if (signal.aborted) return aborted("ledger");
@@ -636,20 +644,23 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       const answered = need(lines);
       return make.ticks.unreceived({ ledger, evidence: answered.evidence, withheld: answered.withheld, intake, observationsSettled: unreceivedSettled, beatValid: effectsOpen, rehello }, now);
     },
-    assign: (now) => make.ticks.assign(assignPorts(), settings.assign, now),
+    assign: (now) => make.ticks.assign(assignPorts(), assignPolicy, now),
   };
   // 세대를 모르면 "후보 없음"이 아니라 모름이다(assign-loop.ts의 CandidateSource).
   const candidates: CandidateSource = {
     candidates: () => (restorer.stopGeneration() === null ? { known: false } : { known: true, value: table().candidates(restorer) }),
   };
-  // 배정 전 사실과 자격 참조는 그 조각(역할 프로필·계정) 전까지 모름으로 닫는다: 고르기가 보류하고 시작하지 않는다.
+  // 배정이 고른 계정의 자격 참조. 값 송신(issuance)과 같은 파일 포트·같은 정책이라 참조와 송신이 같은 계정 폴더 규칙을 본다.
+  // 정책의 revisionOf가 모름이면 파일을 열지 않고 모름이다(credential-ref.md). 박자마다 새로 만들지 않는다.
+  const credentials = credentialPort(deps.credentialFiles, settings.credentials);
+  // 배정 전 사실은 그 조각(시험 배정 값) 전까지 모름으로 닫는다: 고르기가 보류하고 시작하지 않는다.
   const assignPorts = () => ({
     ledger,
     intake,
     connections: candidates,
     withheld: need(lines).withheld,
     facts: { facts: () => ({}) },
-    credentials: { reference: async () => ({ known: false as const }) },
+    credentials,
     random: deps.random,
     signer: signing.signer,
     sink: need(wire).sink,
