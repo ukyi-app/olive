@@ -96,6 +96,39 @@ test("entrypoints: supervisor는 배정 판 값의 꼴이 틀리면 91로, 없�
   }
 });
 
+// 시험 배정 값(O-D). 운영 값(OLIVE_TEST_JOBS 없음·빈 값·off)은 실행 계획 0·요청 한도 0·사실 모름(mode=off) 그대로이고, 시험 값(on)에서만 시험 숫자다.
+// 환경을 지나 재료 읽기에서 92로 끝나기 전에 기록 test_assign 한 줄을 남긴다. 값과 조립의 사실 공급자는 test/supervisor/runtime/test-assign.test.ts가 본다.
+test("entrypoints: supervisor는 운영 값에서 시험 배정 값을 쓰지 않고(mode=off·계획 0·한도 0), 시험 값에서만 시험 숫자를 쓴다", () => {
+  const env = {
+    OLIVE_SUPERVISOR_PORT: "8443",
+    OLIVE_LEDGER_DIR: "/olive-absent/ledger",
+    OLIVE_SIGNING_KEY_DIR: "/olive-absent/signing",
+    OLIVE_ACCOUNTS_DIR: "/olive-absent/accounts",
+    OLIVE_TLS_DIR: "/olive-absent/tls",
+    OLIVE_TRUST_DIR: "/olive-absent/trust",
+    OLIVE_REGISTRY_FILE: "/olive-absent/registry.json",
+    OLIVE_ENVIRONMENT: "home",
+    OLIVE_TARGETS: JSON.stringify([{ target: "diagnosis", namespace: "olive-diagnosis", roles: ["diagnosis"] }]),
+    OLIVE_POLICY_REVISION: "policy-1",
+    OLIVE_RESULT_DIR: "/olive-absent/results",
+  };
+  const spawn = (extra: Record<string, string>) =>
+    Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
+  const off = "olive supervisor: test_assign mode=off plans=0 requestBudget=admin:0,alert:0";
+  const on = "olive supervisor: test_assign mode=on plans=1 requestBudget=admin:1000,alert:1000";
+  for (const [extra, line] of [
+    [{}, off],
+    [{ OLIVE_TEST_JOBS: "" }, off],
+    [{ OLIVE_TEST_JOBS: "off" }, off],
+    [{ OLIVE_TEST_JOBS: "on" }, on],
+    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, on],
+  ] as const) {
+    const result = spawn(extra);
+    const lines = result.stderr.toString().split("\n");
+    expect([JSON.stringify(extra), result.exitCode, lines[2]]).toEqual([JSON.stringify(extra), 92, line]);
+  }
+});
+
 // 장부 초기화 진입점(D-110)은 환경이 없으면 장부를 열기 전에 91로 끝난다. 만들기·거절·바이트 무변화는 test/ledger-init.test.ts가 본다.
 test("entrypoints: ledger-init은 환경이 없으면 이름을 한 줄 찍고 91로 끝난다", () => {
   const result = run("src/main/ledger-init.ts");

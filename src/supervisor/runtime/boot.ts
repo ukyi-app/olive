@@ -32,7 +32,7 @@ import {
   type StopAuthorityPort,
 } from "../../ledger/index.ts";
 import { type CredentialFiles, type CredentialRefPolicy, credentialPort } from "../accounts/credential-ref.ts";
-import { type AssignLoopPolicy, assignAndStartTick, type CandidateSource } from "../dispatch/assign-loop.ts";
+import { type AssignLoopPolicy, assignAndStartTick, type CandidateSource, type FactSource } from "../dispatch/assign-loop.ts";
 import type { CancelDelivery } from "../dispatch/cancel.ts";
 import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
@@ -49,6 +49,7 @@ import { RegistryState, type RegistrySettings } from "../transport/registry.ts";
 import type { ConnectionServer, ConnectionServerOptions, Delivered, StartResult } from "../transport/server.ts";
 import { type AnswerLines, type AnswerNote, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
 import { registrationsFrom } from "./assign-policy.ts";
+import { testFactSource } from "./test-assign.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
@@ -123,6 +124,9 @@ export interface SupervisorSettings {
   readonly timing: SupervisorTiming;
   // 시험 작업 넣기(D-98·D-101). 참일 때만 관리 통로에 장부 쓰기 포트를 만든다. 없으면 꺼짐이다. 운영 값에서는 켜지 않는다(README "감독 관리 통로").
   readonly testJobs?: boolean;
+  // 시험 배정 값(O-D). 참일 때만 배정 전 사실을 시험 공급자(test-assign.ts)로 채운다. 없으면 사실은 모두 모름이다. 운영 값에서는 켜지 않는다
+  // (README "시험 배정 값"). 실행 계획·요청 한도는 assign 칸에 진입점이 넣는다.
+  readonly testAssign?: boolean;
 }
 
 export type LogFields = Readonly<Record<string, string | number | boolean | null>>;
@@ -653,13 +657,15 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   // 배정이 고른 계정의 자격 참조. 값 송신(issuance)과 같은 파일 포트·같은 정책이라 참조와 송신이 같은 계정 폴더 규칙을 본다.
   // 정책의 revisionOf가 모름이면 파일을 열지 않고 모름이다(credential-ref.md). 박자마다 새로 만들지 않는다.
   const credentials = credentialPort(deps.credentialFiles, settings.credentials);
-  // 배정 전 사실은 그 조각(시험 배정 값) 전까지 모름으로 닫는다: 고르기가 보류하고 시작하지 않는다.
+  // 배정 전 사실. 시험 배정 값이면 장부에서 근거가 있는 칸만 채우는 시험 공급자이고, 아니면 모두 모름이다: 고르기가 보류하고 시작하지 않는다.
+  // 박자마다 새로 만들지 않는다.
+  const facts: FactSource = settings.testAssign === true ? testFactSource(ledger) : { facts: () => ({}) };
   const assignPorts = () => ({
     ledger,
     intake,
     connections: candidates,
     withheld: need(lines).withheld,
-    facts: { facts: () => ({}) },
+    facts,
     credentials,
     random: deps.random,
     signer: signing.signer,

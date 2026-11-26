@@ -36,5 +36,5 @@ registrationsFrom(content, registry, targets): readonly Registration[]
 ## 이 모듈에 없는 것
 
 - **둘 이상의 계정과 계정별 판:** 별칭도 판도 하나다. 계정의 순서·전환과 계정별 판은 O17의 일이다.
-- **실행 계획·요청 한도·배정 전 사실:** 시험 배정 값 조각의 일이다. 지금 진입점의 요청 한도는 `{ admin: 0, alert: 0 }`이라 `planNext`가 그 정책을 거절하고, 박자는 부탁을 고르기 전에 `not_run`/`policy_rejected`로 끝난다. 한도를 양으로 주면 그다음은 고르기가 배정 전 사실을 먼저 보므로 부탁이 `evidence_missing`으로 보류된다.
+- **실행 계획·요청 한도·배정 전 사실:** 시험 값(`OLIVE_TEST_JOBS=on`)에서만 `test-assign.ts`가 채운다(README "시험 배정 값"). 운영 값의 진입점은 실행 계획이 없고 요청 한도가 `{ admin: 0, alert: 0 }`이라 `planNext`가 그 정책을 거절하고, 박자는 부탁을 고르기 전에 `not_run`/`policy_rejected`로 끝난다. 시험 값에서는 한도가 양수라 그다음 고르기가 배정 전 사실을 먼저 보고, 근거 원천이 없는 다섯 사실로 부탁이 `evidence_missing`으로 보류된다.
 - **자격 참조 포트 자체:** 조립이 `credentialPort(deps.credentialFiles, settings.credentials)`로 한 번 만든다(`accounts/credential-ref.md`). 값 송신과 같은 파일 포트·정책이다.

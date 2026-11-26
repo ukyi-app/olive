@@ -29,8 +29,9 @@ export interface WaitingRequest {
 
 // 설계(supervisor.md §4 start_worker 행)가 배정 전에 거절하라고 한 조건 가운데 이 판단의 다른 입력으로 판정할 수 없는 것.
 // 값은 "그 조건에 해당한다"다: true면 거절, false면 통과, 칸이 없거나 boolean이 아니면 모름(보류).
-// 이 사실을 채우는 어댑터는 아직 없고 운영 경로에서 이 함수를 부르는 곳도 아직 없다. 함수 자체는 여섯 칸이 모두 false로
-// 확인되면 고른다. 앞 실행의 종료는 고정된 부탁 내용이 아니라 장부의 최신 실행·종료 근거라 박자마다 새로 읽어야 한다.
+// 운영 값의 조립은 여섯 칸을 모두 모름으로 넘겨 늘 보류한다. 시험 값(runtime/test-assign.ts)만 장부에서 근거가 있는 prior_run_end_unconfirmed
+// 하나를 채운다. 함수 자체는 여섯 칸이 모두 false로 확인되면 고른다. 앞 실행의 종료는 고정된 부탁 내용이 아니라 장부의 최신 실행·종료 근거라
+// 박자마다 새로 읽어야 한다.
 export const PRE_ASSIGN_FACTS = [
   // 허용되지 않은 역할·목적 조합
   "role_purpose_not_allowed",
