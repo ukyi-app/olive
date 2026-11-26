@@ -20,7 +20,7 @@
 | `receipt_accepted` | 둘 다 | 없음 | `ledger_receipt` | `applyReceipt` | 장부가 `ok`일 때 |
 | `receipt_started` | 둘 다 | 없음 | `ledger_receipt` | `applyReceipt` | 장부가 `ok`일 때 |
 | `receipt_stopped` | 작업자 | 없음 | `ledger_receipt` | `applyReceipt` | 장부가 `ok`일 때 |
-| `receipt_cleaned` | 작업자 | 없음 | `ledger_receipt` | `applyReceipt` | 장부가 `ok`일 때 |
+| `receipt_cleaned` | 작업자 | 없음 | `ledger_receipt` | `applyReceipt` | 장부가 `ok`일 때. 이미 정리가 확정된 실행에 온 다른 id의 유효한 정리 영수증(정지 세대를 건너 확정을 다시 낸 실행에서 확정 요청마다 하나)도 장부가 받은 기록만 남기고 `new`로 답해 ack한다(`src/ledger/ledger.md` "증거") |
 | `receipt_session_takeover` | 세션(앞 세션 또는 대기 세션 실행의 지정 실행기, 재전송은 처음 낸 쪽) | 없음 | `ledger_receipt` | `applyReceipt` | 장부가 `ok`일 때. 인수 증거의 저장만 확인한다 |
 | `report_session_broken` | 세션 | 없음 | `ledger_report` | `recordReport`(`signal`: 원인, 표식 digest, 관측 시각) | 장부가 `ok`일 때 |
 | `report_hook_event` | 세션 | 없음 | `ledger_report` | `recordReport`(`signal`: 사건, `session_id`, 턴 ID = `prompt_id`, 오류 종류, 관측 시각) | 장부가 `ok`일 때 |

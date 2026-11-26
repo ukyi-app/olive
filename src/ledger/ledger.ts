@@ -3275,6 +3275,10 @@ export class Ledger {
         return;
       }
       case "receipt_cleaned":
+        // 정리 확인은 실행 하나에 한 번이다. 정지 세대를 건너 확정을 다시 낸 실행에는 확정 요청마다 실행기의 정리 영수증이 따로 올 수 있어
+        // (같은 정리, 다른 영수증 id), 이미 정리 증거가 있으면 받은 기록(위의 deliveries 줄)만 남기고 상태와 첫 증거는 다시 쓰지 않는다.
+        // 거절하면 ack가 없어 실행기가 그 영수증을 끝없이 다시 보낸다. 발신자·실행 세대·확정 지시의 대조는 위에서 이미 지났다.
+        if (row.cleaned_receipt_id !== null) return;
         this.#setState(row, "finalized", r.now, { cleaned_receipt_id: r.receiptId });
         return;
       case "receipt_session_takeover": {

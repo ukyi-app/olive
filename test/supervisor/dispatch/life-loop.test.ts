@@ -2,13 +2,17 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
 import { copyFileSync } from "node:fs";
-import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
+import { type Envelope, resultDigest, sealEnvelope, verifyEnvelope } from "../../../src/contract/v1/index.ts";
 import { type InstructionTimes, type Ledger, loadMigrations } from "../../../src/ledger/index.ts";
 import { type LifeLoopLedger, type LifeLoopPorts, type LifeTickResult, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
 import type { Random, SendOutcome, Signer } from "../../../src/supervisor/dispatch/ports.ts";
+import { handleForward } from "../../../src/supervisor/dispatch/receipts.ts";
 import { type ResendPorts, resendTick } from "../../../src/supervisor/dispatch/resend.ts";
 import type { LifecyclePolicy } from "../../../src/supervisor/scheduler/lifecycle.ts";
-import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
+import { createFileResultBackend, nodeFilePort } from "../../../src/supervisor/scheduler/result-store-file.ts";
+import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
+import { executorKeys } from "../../executor/support.ts";
+import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempDir, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 // 정책 숫자와 키는 이 시험이 지어 넣는 자료다. 운영값이 아니다.
 const POLICY: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 20_000 };
@@ -2066,6 +2070,145 @@ describe("정지 세대를 건넌 확정: 지금 세대의 확정이 없으면 �
       w.setClock(NOW + 10_000);
       expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
       expect(reads).toBe(0);
+    }
+  });
+
+  // 재기동하면 공유 시계의 하한이 그 프로세스에서 새로 시작해(shared-clock.ts) 같은 결과를 다른 보고 ID로, 먼저 받은 보고보다 이른 감독
+  // 시각에 받을 수 있다. 장부의 결과 보관 읽기(settledResult)는 그 보고를 고르지만, 이미 낸 확정의 본문은 지시 줄에 고정된 세 칸이다.
+  test("성공 확정: 재기동 뒤 같은 결과를 다른 보고 ID·더 이른 시각으로 받아도 새 세대 확정의 본문은 옛 확정과 같다", async () => {
+    const path = tempPath();
+    const dir = tempDir();
+    const backend = () => {
+      const made = createFileResultBackend({ dir, maxRecordBytes: 32 * 1024, files: nodeFilePort });
+      if (made.status !== "ok") throw new Error(made.status);
+      return made.backend;
+    };
+    const first = world(path);
+    const s = started(first, { inputRequestId: input(first) });
+    accept(first, s);
+    must(first.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "completed", bodyDigest: digest("stop"), now: NOW + 1 }, s.from));
+    const result = { role: "diagnosis" as const, outcome: "completed" as const, summary: "시험", items: [], refs: [] };
+    // 실행기가 서명한 결과 보고를 감독의 보고 처리기(보관소와 장부)에 넘긴다.
+    const report = async (w: World, at: number, reportId: string, stopGeneration: number) => {
+      const nonce = Buffer.from(getRandomValues(new Uint8Array(16))).toString("hex");
+      const body = { run_id: s.runId, report_id: reportId, result };
+      const head = { sender: s.from.sender, recipient: "supervisor", action: "report_result", request_id: id(), stop_generation: stopGeneration, run_generation: s.from.runGeneration, issued_at: at, nonce };
+      const e = sealEnvelope({ ...head, body } as never, executorKeys.privateKey);
+      const v = await verifyEnvelope(e, {
+        now: at,
+        expectedRecipient: "supervisor",
+        publicKeyFor: (name) => (name === s.from.sender ? executorKeys.publicKey : undefined),
+        stopGeneration,
+        runGeneration: (runId) => w.ledger.runGeneration(runId),
+        nonces: { consume: () => true },
+      });
+      if (!v.ok) throw new Error(v.reason);
+      const answer = handleForward(
+        { forward: { verified: v, connection: 1 }, now: at, stopGeneration, pendingQueries: [], links: { current: () => true }, backlog: [] } as never,
+        { ledger: w.ledger, results: { backend: backend(), ledger: w.ledger }, random: w.ports.random } as never,
+      );
+      expect(answer).toMatchObject({ outcome: "ack", delivery: "new", id: reportId });
+    };
+    const firstClock = createSharedClock(first.ports.clock);
+    first.setClock(NOW + 2);
+    const firstReport = id();
+    await report(first, firstClock.now(), firstReport, 0);
+    must(first.ledger.markResult({ runId: s.runId, reportId: firstReport, resultDigest: resultDigest(result), now: NOW + 3 }));
+    first.setClock(NOW + 10_000);
+    expect(only(await tick(first), s.runId).outcome).toBe("finalize_sent");
+    const [old] = first.sent as [Envelope];
+    expect(old.body).toMatchObject({ stored_at: NOW + 2 });
+    first.ledger.close();
+    // 새 감독: 같은 장부와 보관소를 다시 연다.
+    const again = world(path);
+    const againClock = createSharedClock(again.ports.clock);
+    again.setClock(NOW + 1);
+    raise(again, 1, againClock.now());
+    await report(again, againClock.now(), id(), 1);
+    expect(again.ledger.settledResult(s.runId)).toMatchObject({ known: true, value: { storedAt: NOW + 1 } });
+    again.setClock(NOW + 40_000);
+    expect(only(await tick(again), s.runId)).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 40_000 });
+    const [fresh] = again.sent as [Envelope];
+    expect(fresh.header).toMatchObject({ stop_generation: 1, issued_at: NOW + 40_000 });
+    expect(fresh.header.request_id).not.toBe(old.header.request_id);
+    expect(fresh.body).toEqual(old.body);
+    const rows = finalizes(again);
+    expect(rows.map((row) => row.stopGeneration)).toEqual([0, 1]);
+    expect(rows[1]?.rebuild).toEqual(rows[0]?.rebuild as never);
+  });
+
+  test("실패 확정: 확정 사실이 다르게 읽혀도 새 세대 확정의 본문은 앞 지시 줄의 세 칸이다. 그 칸의 꼴이 틀리면 적지 않는다", async () => {
+    // 이미 낸 확정 뒤 장부의 확정 사실(failedStop)이 다른 시각을 내는 경우. 한 박자 안의 두 읽기는 서로 같아 근거 대조는 지난다.
+    const shifted = (w: World) =>
+      ((runId: string) => {
+        const read = w.ledger.failedStop(runId);
+        if (!read.known || read.value === null || read.value.stoppedAt === null) return read;
+        return { known: true, value: { ...read.value, stoppedAt: read.value.stoppedAt + 5 } };
+      }) as never;
+    {
+      const w = world();
+      const s = failedRun(w, "exit", "deadline");
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      const [old] = w.sent as [Envelope];
+      raise(w, 1, NOW + 12_000);
+      w.wrap({ failedStop: shifted(w) });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      const fresh = w.sent.at(-1) as Envelope;
+      expect(fresh.header.stop_generation).toBe(1);
+      expect(fresh.body).toEqual(old.body);
+      expect(finalizes(w).map((row) => [row.stopGeneration, row.rebuild])).toEqual([
+        [0, finalizes(w)[0]?.rebuild],
+        [1, finalizes(w)[0]?.rebuild],
+      ] as never);
+    }
+    // 앞 지시 줄의 본문 칸을 읽었는데 꼴이 틀리면 어느 본문인지 모른다: 지금 사실로 다시 만들지 않고 적지 않는다.
+    {
+      const w = world();
+      const s = failedRun(w, "exit", "deadline");
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          const instructions = read.value.instructions.map((item) => (item.action === "result_finalize" ? { ...item, rebuild: { action: "result_finalize", outcome: "unknown", resultDigest: null, storedAt: 1 } } : item));
+          return { known: true, value: { ...read.value, instructions } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+    }
+  });
+  test("새 세대 확정도 지금 결과가 확정 가능할 때만 적는다: 결과 보관·확정 사실을 정하지 못하면 앞 지시 줄의 본문이 있어도 적지 않는다", async () => {
+    const cases: [string, (w: World) => Started, (w: World) => Partial<LifeLoopLedger>, string][] = [
+      ["성공", (w) => settledRun(w), () => ({ settledResult: (() => ({ known: true, value: null })) as never }), "wait"],
+      [
+        "실패",
+        (w) => failedRun(w, "exit", "deadline"),
+        (w) => ({
+          failedStop: ((runId: string) => {
+            const read = w.ledger.failedStop(runId);
+            return read.known && read.value !== null ? { known: true, value: { ...read.value, stoppedAt: null } } : read;
+          }) as never,
+        }),
+        "stored_at_unknown",
+      ],
+    ];
+    for (const [kind, make, over, expected] of cases) {
+      const w = world();
+      const s = make(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap(over(w));
+      w.setClock(NOW + 40_000);
+      expect([kind, reasonOf(only(await tick(w), s.runId))]).toEqual([kind, expected]);
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0]);
     }
   });
 });

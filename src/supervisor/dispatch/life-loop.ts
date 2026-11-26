@@ -23,6 +23,7 @@
 //    접수가 닫혔으면(정지 포함) 적지 않는다. cleanup_pending의 확정은 내지 않는다(정리 확인이 정해지지 않았다).
 import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
+  FINALIZE_OUTCOMES,
   type FailedStop,
   type FinalizeOutcome,
   type InstructionTimes,
@@ -549,31 +550,54 @@ function factsOf(ledger: LifeLoopLedger, run: RunRow, cancels: Map<string, boole
   return { run, times, cancelRequested: cancelled, settled, failed: null };
 }
 
-// 그 실행에 지금 정지 세대로 적힌 확정 지시가 있는가(지시 줄의 stop_generation, 장부의 unansweredInstructions). 확정 지시는 그 요청 ID의
-// 정리 영수증이 오기 전까지 이 읽기에 남고 정리 영수증은 실행을 finalized로 옮기므로, ready_result·failed_stopped 실행의 확정은 세대와
-// 무관하게 모두 여기 나온다. 옛 세대의 확정만 있으면 false다: 재전송 박자는 그 확정을 봉하지 않고(stop_generation_mismatch), 새 세대를
-// 적용한 실행기는 그 확정으로 정리 영수증을 내지 않아, 지금 세대로 새로 적지 않으면 그 실행이 자리를 쥔 채 남는다.
-// 읽기가 모름이거나 던지거나, 항목의 실행 ID·동작을 읽지 못하거나, 그 실행의 확정 항목의 세대 칸이 틀리면 null(모름)이다. 건너뛰면 지금
-// 세대의 확정을 놓쳐 같은 세대에 둘째 확정을 적는다.
-function currentFinalize(ledger: LifeLoopLedger, runId: string, stopGeneration: number): boolean | null {
+// 그 실행에 적힌 확정 지시들(장부의 unansweredInstructions, 지시 줄의 stop_generation과 본문 칸 rebuild). 확정 지시는 그 요청 ID의 정리
+// 영수증이 오기 전까지 이 읽기에 남고 정리 영수증은 실행을 finalized로 옮기므로, ready_result·failed_stopped 실행의 확정은 세대와 무관하게
+// 모두 여기 나온다.
+// - current: 지금 정지 세대로 적힌 확정이 있는가. 옛 세대의 확정만 있으면 false다: 재전송 박자는 그 확정을 봉하지 않고
+//   (stop_generation_mismatch), 새 세대를 적용한 실행기는 그 확정으로 정리 영수증을 내지 않아, 지금 세대로 새로 적지 않으면 그 실행이
+//   자리를 쥔 채 남는다.
+// - earlier: 앞서 적힌 확정 가운데 본문 칸이 있는 첫 지시의 본문 세 칸. 새 세대의 확정은 이 본문을 그대로 싣는다. 지금의 장부 사실로
+//   다시 만들면 재기동 뒤 다른 보고 ID로 더 이른 시각에 받은 같은 결과가 stored_at을 바꾼다(settledResult는 가장 이른 보고를 고른다).
+//   본문 칸이 모두 없으면(판 4 전에 적힌 줄, 칸을 넘기지 않고 적힌 줄) null이고 부르는 쪽은 지금 사실의 본문을 쓴다(그 줄의 본문은
+//   장부에 없다).
+// 읽기가 모름이거나 던지거나, 항목의 실행 ID·동작을 읽지 못하거나, 그 실행의 확정 항목의 세대 칸이나 본문 칸의 꼴이 틀리면 null(모름)이다.
+// 건너뛰면 지금 세대의 확정을 놓쳐 같은 세대에 둘째 확정을 적거나, 앞 확정과 다른 본문을 싣는다.
+type FinalizeRecords = { readonly current: boolean; readonly earlier: FinalizeBody | null };
+function finalizeRecords(ledger: LifeLoopLedger, runId: string, stopGeneration: number): FinalizeRecords | null {
   try {
     const answer: unknown = ledger.unansweredInstructions();
     if (!isObject(answer) || answer.known !== true || !isObject(answer.value)) return null;
     const instructions: unknown = answer.value.instructions;
     if (!Array.isArray(instructions)) return null;
-    let found = false;
+    let current = false;
+    let earlier: FinalizeBody | null = null;
     for (const item of instructions as unknown[]) {
       if (!isObject(item)) return null;
-      const { runId: of, action, stopGeneration: generation } = item;
+      const { runId: of, action, stopGeneration: generation, rebuild } = item;
       if (typeof of !== "string" || typeof action !== "string") return null;
       if (of !== runId || action !== "result_finalize") continue;
       if (!Number.isSafeInteger(generation) || (generation as number) < 0) return null;
-      if (generation === stopGeneration) found = true;
+      if (generation === stopGeneration) current = true;
+      if (rebuild === null) continue;
+      const body = finalizeRebuildOf(rebuild);
+      if (body === null) return null;
+      earlier ??= body;
     }
-    return found;
+    return { current, earlier };
   } catch {
     return null;
   }
+}
+
+// 확정 지시 줄의 본문 칸(InstructionRebuild의 result_finalize)을 본문으로 읽는다. 계약이 받지 않는 꼴이면 null.
+function finalizeRebuildOf(value: unknown): FinalizeBody | null {
+  if (!isObject(value) || value.action !== "result_finalize") return null;
+  const { outcome, resultDigest, storedAt } = value;
+  const known = FINALIZE_OUTCOMES.find((o) => o === outcome);
+  if (known === undefined || !Number.isSafeInteger(storedAt) || (storedAt as number) < 0) return null;
+  if (resultDigest !== null && typeof resultDigest !== "string") return null;
+  if ((known === "succeeded") !== (resultDigest !== null)) return null;
+  return { outcome: known, resultDigest, storedAt: storedAt as number };
 }
 
 // 확정 본문(outcome·resultDigest·storedAt). ready_result는 결과 보관에서(succeeded), failed_stopped는 확정 사실에서(failed·cancelled,
@@ -761,11 +785,11 @@ async function act(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcom
       // cleanup_pending의 정리 확인(O13)이 정해지지 않아 ready_result·failed_stopped만 연다.
       if (run.state !== "ready_result" && run.state !== "failed_stopped") return { runId: run.runId, outcome: "finalize_withheld", reason: "not_ready_result" };
       // 지금 정지 세대의 확정이 적힌 실행에 새 요청 ID의 확정을 또 적지 않는다(장부는 새 요청 ID면 받아 준다). 답이 없는 확정은 재전송 박자가
-      // 같은 요청 ID로 다시 보낸다. 옛 세대의 확정만 있으면 아래로 가서 지금 세대로 한 건을 적는다(currentFinalize).
+      // 같은 요청 ID로 다시 보낸다. 옛 세대의 확정만 있으면 아래로 가서 지금 세대로 한 건을 적는다(finalizeRecords).
       if (times !== null && times.lastFinalizeAt !== null) {
-        const recorded = currentFinalize(ctx.ports.ledger, run.runId, ctx.stopGeneration);
-        if (recorded === null) return { runId: run.runId, outcome: "read_unknown", read: "instruction_times" };
-        if (recorded) return { runId: run.runId, outcome: "finalize_withheld", reason: "already_recorded" };
+        const records = finalizeRecords(ctx.ports.ledger, run.runId, ctx.stopGeneration);
+        if (records === null) return { runId: run.runId, outcome: "read_unknown", read: "instruction_times" };
+        if (records.current) return { runId: run.runId, outcome: "finalize_withheld", reason: "already_recorded" };
       }
       // failed_stopped인데 outcome이나 stored_at을 정하지 못하면 적지 않는다(failedOutcome, failedStop의 stoppedAt). 그 실행은 자리를 쥔 채 남는다.
       if (run.state === "failed_stopped" && finalizeBodyOf(plan.facts) === null) {
@@ -1005,8 +1029,8 @@ async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<R
   const fresh = reread(ctx.ports, plan.facts.run);
   if ("read" in fresh) return { runId, outcome: "read_unknown", read: fresh.read };
   // 다시 읽기의 일부다: 박자 처음의 읽기 뒤에 다른 경로가 지금 세대의 확정을 적었으면 아래에서 superseded다.
-  const recorded = fresh.times !== null && fresh.times.lastFinalizeAt !== null ? currentFinalize(ctx.ports.ledger, runId, ctx.stopGeneration) : false;
-  if (recorded === null) return { runId, outcome: "read_unknown", read: "instruction_times" };
+  const records = fresh.times !== null && fresh.times.lastFinalizeAt !== null ? finalizeRecords(ctx.ports.ledger, runId, ctx.stopGeneration) : { current: false, earlier: null };
+  if (records === null) return { runId, outcome: "read_unknown", read: "instruction_times" };
   // 장부는 확정을 정지 중에도 접수가 닫혀도 받지만(continue) 이 박자는 접수가 열렸을 때만 연다: 확정은 되돌릴 수 없는 정리를 부르고,
   // 정지 세대를 적용하기 전의 실행기는 받지 않는다. 갱신과 같이 쓰기 직전에만 본다(정지 세대의 변경은 장부의 대조가 거절한다).
   if (!intakeOpen(ctx.ports.intake)) return { runId, outcome: "finalize_withheld", reason: "intake_closed" };
@@ -1014,12 +1038,15 @@ async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<R
   if (recordAt === null) return { runId, outcome: "finalize_failed", failure: "clock_unavailable" };
   // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 다시 읽은 것으로도 판단이 확정이고, 확정의 근거(결과 보관
   // 또는 확정 사실)가 처음 읽은 것과 같고, 본문을 정할 수 있고, 그 사이 지금 세대의 확정이 적히지 않았을 때만 적는다. 마지막 시계 읽기 안에서 일어난
-  // 외부 쓰기는 보지 못한다(종료와 같다). 옛 세대의 확정은 막지 않는다(본문은 같은 장부 근거라 옛 확정과 같다).
-  const body = finalizeBodyOf(fresh);
+  // 외부 쓰기는 보지 못한다(종료와 같다). 옛 세대의 확정은 막지 않는다.
+  // 지금 사실로 본문을 정할 수 있어야 적고(현재 결과가 확정 가능한지의 검증), 앞서 적은 확정이 있으면 본문은 그 지시 줄에 고정된 세 칸이다:
+  // 같은 실행의 확정은 세대가 달라도 요청 ID·정지 세대·발행 시각만 다르다.
+  const settledBody = finalizeBodyOf(fresh);
+  const body = settledBody === null ? null : (records.earlier ?? settledBody);
   if (
     !sameBasis(plan.facts, fresh) ||
     body === null ||
-    recorded ||
+    records.current ||
     nextIntent(viewOf(fresh, recordAt, ctx.unsentRenews), ctx.policy).intent !== "finalize"
   ) {
     return { runId, outcome: "superseded", planned: "finalize" };
