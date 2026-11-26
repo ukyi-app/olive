@@ -2,7 +2,7 @@
 //
 //   storage-id            저장소 ID. 없으면 새로 만든다. 주체 이름의 마지막 칸이 이 값이라, 폴더가 초기화되면 옛 지시는 wrong_recipient다.
 //   stop-generation.json  정지 세대. 파일이 없으면 세대 없음(null)이다. 0도 파일로 적는다(0은 "한 번도 정지하지 않음"이라는 알려진 값).
-//   runs/<run_id>.json    실행 기록(세대, 상태, 마지막 영수증 id, 정리 의도 등)
+//   runs/<run_id>.json    실행 기록(세대, 상태, 마지막 영수증 id, 정리 의도 등). 정리 의도의 pod_uid는 아래 CleanupIntent.
 //   outbox/<id>.json      보낸 영수증·보고의 본문과 그 사건의 최초 순번. 같은 id와 같은 본문으로 다시 보낸다
 //   nonces/<hash>         쓴 nonce 하나가 빈 파일 하나다
 //   ledger-hold           설명할 수 없는 장부의 표식. 운영자가 장부를 대조하고 이 파일을 지울 때까지 접수를 열지 않는다
@@ -52,10 +52,14 @@ export type StoredRunState = Exclude<RunState, "not_known">;
 export const HOLDS_SLOT: readonly StoredRunState[] = ["preparing", "running", "stopping", "checking", "unknown_running", "cleanup_pending"];
 
 // 폴더를 지우기 전에 적는 정리 의도. 영수증 ID를 미리 정해 두어 재시작해도 같은 ID로 잇는다.
+// pod_uid는 의도를 처음 적은 파드의 UID다(D-155). 지금 파드와 다르면 worker가 대리에 묻지 않고 지운 것으로 본다(worker.ts의 podReplaced).
+// 이 칸이 없는 의도는 칸을 쓰기 전의 판이 적은 것이라 어느 파드에서 적혔는지 모른다.
+// 함정: 그 전의 판은 칸이 셋이 아닌 의도를 store_corrupt(83)로 거절한다. 이 칸을 한 번 적은 저장소는 비우지 않고는 그 판으로 되돌릴 수 없다.
 export interface CleanupIntent {
   request_id: string;
   instruction_digest: string;
   receipt_id: string;
+  pod_uid?: string;
 }
 
 export interface RunRecord {
@@ -137,6 +141,8 @@ export interface RestartRequest {
 
 // 세대 표식의 꼴: 32바이트 난수의 소문자 16진수 64자. init(src/main/agent-install.ts)이 쓰고 조립이 읽는다.
 export const GENERATION_MARKER = /^[0-9a-f]{64}$/;
+// 파드 UID의 꼴: API 서버가 정한 metadata.uid(소문자 UUID). 진입점(OLIVE_POD_UID)과 정리 의도의 pod_uid가 같은 꼴을 본다.
+export const POD_UID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RESTART_FILE = "restart-request.json";
 
 export interface StoreOptions {
@@ -236,7 +242,8 @@ function validIntent(value: unknown): boolean {
     SHA256.test(c.instruction_digest) &&
     typeof c.receipt_id === "string" &&
     UUID.test(c.receipt_id) &&
-    Object.keys(c).length === 3
+    (c.pod_uid === undefined || (typeof c.pod_uid === "string" && POD_UID.test(c.pod_uid))) &&
+    Object.keys(c).length === (c.pod_uid === undefined ? 3 : 4)
   );
 }
 

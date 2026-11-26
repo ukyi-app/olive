@@ -18,7 +18,7 @@ import { ExecutorStore } from "../../src/executor/store.ts";
 import { GENERATION_TARGET } from "../../src/main/agent-install.ts";
 import { makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
 import { FakeProc, type FakeProcess, SELF } from "./fake-proc.ts";
-import { executorKeys, onDiskEvents, onDiskRun, supervisorKeys, T0 } from "./support.ts";
+import { executorKeys, onDiskEvents, onDiskRun, POD_UID, supervisorKeys, T0 } from "./support.ts";
 
 const space = (proc: FakeProc) => PidSweep.establish({ self: SELF, reader: proc, kill: proc.kill }, { graceMs: 20, killMs: 40, pollMs: 1 });
 async function recorded(extra: Record<number, FakeProcess>, proc = new FakeProc()) {
@@ -527,6 +527,7 @@ if (problem !== null) {
       OLIVE_SIGNING_KEY_FILE: join(root, "signing.pem"),
       OLIVE_PROFILE_FILE: join(root, "profile.json"),
       OLIVE_AGENT_SOCKET: join(root, "link", "agent.sock"),
+      OLIVE_POD_UID: POD_UID,
     };
 
     // 1. 표식이 같다(제어만 다시 떴다): 94, 닫지 않음, 요청은 남는다. 대리 소켓을 열기 전에 끝난다.

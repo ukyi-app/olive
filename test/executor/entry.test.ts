@@ -40,6 +40,7 @@ const FULL: Record<(typeof EXECUTOR_ENV)[number], string> = {
   OLIVE_SIGNING_KEY_FILE: join(dir, "signing.pem"),
   OLIVE_PROFILE_FILE: join(dir, "profile.json"),
   OLIVE_AGENT_SOCKET: join(dir, "link", "agent.sock"),
+  OLIVE_POD_UID: "3c8f0a52-9d1e-4b7a-a6f2-1e5d7c9b0a34",
 };
 
 async function run(env: Record<string, string>) {
@@ -56,7 +57,7 @@ async function run(env: Record<string, string>) {
 }
 
 test("실행기 진입점: 환경이 하나씩 빠질 때마다 81로 끝나고 그 이름을 한 줄 찍으며 감독 연결은 0이다", async () => {
-  expect(EXECUTOR_ENV).toHaveLength(12);
+  expect(EXECUTOR_ENV).toHaveLength(13);
   for (const name of EXECUTOR_ENV) {
     const env: Record<string, string> = { ...FULL };
     delete env[name];
@@ -109,6 +110,18 @@ test("실행기 진입점: 계약 v1이 거절할 값(정책 revision, 감독 �
   expect(accepted.count).toBe(0);
   // 대조군: 같은 값들의 맞는 꼴은 환경 단계를 지난다.
   expect(settingsFromEnv(FULL).ok).toBe(true);
+});
+
+test("실행기 진입점: 파드 UID(OLIVE_POD_UID)가 소문자 UUID가 아니면(파드 이름, 대문자, 줄바꿈 붙음) 저장소를 열기 전에 81, 감독 연결 0", async () => {
+  // 파드 UID는 API 서버가 정한 metadata.uid다(D-155). 정리 의도에 적히는 값이라 꼴이 틀린 채 뜨지 않는다.
+  for (const value of ["executor-diagnosis-6d4f9c7b8-x2k9p", "3C8F0A52-9D1E-4B7A-A6F2-1E5D7C9B0A34", `${FULL.OLIVE_POD_UID}\n`]) {
+    const result = await run({ ...FULL, OLIVE_POD_UID: value });
+    expect(result.code, value).toBe(EXECUTOR_EXIT.config);
+    expect(result.stderr, value).toContain("환경 OLIVE_POD_UID이(가) 틀렸다");
+    expect(await Bun.file(join(FULL.OLIVE_STORE_DIR, "storage-id")).exists()).toBe(false);
+  }
+  expect(accepted.count).toBe(0);
+  expect(settingsFromEnv({ ...FULL, OLIVE_POD_UID: "3C8F0A52-9D1E-4B7A-A6F2-1E5D7C9B0A34" })).toMatchObject({ ok: false, name: "OLIVE_POD_UID", problem: "invalid" });
 });
 
 test("실행기 진입점: 환경이 다 있어도 재료 파일이 없으면 82로 끝나고 감독 연결·저장소 폴더가 없다", async () => {
@@ -178,6 +191,7 @@ test("실행기 진입점: 환경의 폴더에서 차트가 붙이는 파일 이
     serverName: FULL.OLIVE_SUPERVISOR_SERVER_NAME,
     uri: FULL.OLIVE_SUPERVISOR_URI,
   });
+  expect(parsed.settings.podUid).toBe(FULL.OLIVE_POD_UID);
   // worker와 원격에 넘기는 응답 상한은 하나다.
   expect(parsed.settings.timing.replyWaitMs).toBeGreaterThan(0);
 });

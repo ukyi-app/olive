@@ -9,7 +9,7 @@ import { limits, parsePrincipal, type Role } from "../contract/v1/index.ts";
 import { listenForAgent, type UnixListening } from "../executor/agent-listener.ts";
 import type { RemoteAgent } from "../executor/remote-agent.ts";
 import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, isRole, REVISION, type RunningExecutor, startExecutor } from "../executor/runtime.ts";
-import { ExecutorStore } from "../executor/store.ts";
+import { ExecutorStore, POD_UID } from "../executor/store.ts";
 import { createTlsClient } from "../transport/tls-client.ts";
 import { parseIdentityUri } from "../transport/tls-policy.ts";
 import { GENERATION_TARGET } from "./agent-install.ts";
@@ -28,6 +28,7 @@ export const EXECUTOR_ENV = [
   "OLIVE_SIGNING_KEY_FILE",
   "OLIVE_PROFILE_FILE",
   "OLIVE_AGENT_SOCKET",
+  "OLIVE_POD_UID",
 ] as const;
 
 // 운영 숫자의 임시값. socket.md가 기본값을 두지 않은 정책을 여기서 정한다. 실측 뒤 바꾼다.
@@ -88,6 +89,8 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (addr === null || !isIpv4(addr[1]!) || port < 1 || port > 65_535) return invalid("OLIVE_SUPERVISOR_ADDR");
   if (!DNS_NAME.test(value("OLIVE_SUPERVISOR_SERVER_NAME"))) return invalid("OLIVE_SUPERVISOR_SERVER_NAME");
   if (parseIdentityUri(value("OLIVE_SUPERVISOR_URI"))?.kind !== "supervisor") return invalid("OLIVE_SUPERVISOR_URI");
+  // 파드 교체의 증거(D-155). 꼴이 틀린 값이 정리 의도에 적히면 다음 기동의 저장소 열기가 그 기록을 store_corrupt(83)로 거절하므로 여기서 거른다.
+  if (!POD_UID.test(value("OLIVE_POD_UID"))) return invalid("OLIVE_POD_UID");
   for (const name of ["OLIVE_STORE_DIR", "OLIVE_TLS_DIR", "OLIVE_TRUST_DIR", "OLIVE_SIGNING_KEY_FILE", "OLIVE_PROFILE_FILE", "OLIVE_AGENT_SOCKET"] as const) {
     if (!isAbsolute(value(name))) return invalid(name);
   }
@@ -102,6 +105,7 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       supervisor: { address: addr[1]!, port, serverName: value("OLIVE_SUPERVISOR_SERVER_NAME"), uri: value("OLIVE_SUPERVISOR_URI") },
       storeDir: value("OLIVE_STORE_DIR"),
       agentSocket: value("OLIVE_AGENT_SOCKET"),
+      podUid: value("OLIVE_POD_UID"),
       // 환경이 아니라 init과 같은 상수다. 두 컨테이너가 다른 경로를 보면 표식이 늘 "모름"이 되어 회복이 닫지 못한다.
       generationMarker: GENERATION_TARGET,
       files: {

@@ -125,6 +125,8 @@ export interface ExecutorSettings {
   readonly agentSocket: string;
   // init이 쓰는 세대 표식 파일(제어 전용 폴더 안, D-104). 진입점이 init과 같은 상수를 넘긴다.
   readonly generationMarker: string;
+  // 이 파드의 UID(차트가 downward API metadata.uid로 넘김, D-155). 꼴은 store.ts의 POD_UID다. worker가 정리 의도에 적고 파드 교체를 가른다.
+  readonly podUid: string;
   readonly files: MaterialFiles;
   readonly timing: ExecutorTiming;
   // 감독 소켓의 정책. 기본값이 없다(socket.md). 진입점이 임시값을 넘긴다.
@@ -540,6 +542,8 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
       credentials: inbox,
       cleanup,
       space,
+      podUid: settings.podUid,
+      log: deps.log,
       launcher,
       now: deps.wallNow,
       exitWaitMs: timing.replyWaitMs,
