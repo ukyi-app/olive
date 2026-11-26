@@ -250,8 +250,10 @@ const AGENT_PLANS: Readonly<Record<string, LaunchPlan>> = {
   "agent-nondumpable": sh(PROBE),
   // 실제 역할이 작업 공간에 파일을 쓴다: cwd(대리가 만드는 하위 폴더)와 HOME 아래, 숨김 파일, 깊은 폴더, 루트 밖을 가리키는 링크,
   // UTF-8이 아닌 이름(Latin-1의 é 한 바이트). cwd·HOME은 agentMain이 주입한 작업 공간 아래로 바꾼다.
+  // 링크 대상($OUTSIDE)은 시험이 만든 표식 폴더다. 이 공간은 호스트 루트를 쓰기 가능하게 보므로(--dev-bind / /),
+  // 정리가 링크를 따라가는 회귀가 생겨도 잃는 것이 시험 데이터뿐이도록 호스트 경로(/ 등)를 대상으로 두지 않는다.
   "agent-cleanfiles": sh(
-    'mkdir -p "$HOME/.config/cli" && echo token > "$HOME/.config/cli/credentials" && echo x > .hidden && mkdir -p deep/a/b && echo y > deep/a/b/leaf && ln -s / outside-link && printf x > "$(printf \'legacy\\351\')"',
+    'mkdir -p "$HOME/.config/cli" && echo token > "$HOME/.config/cli/credentials" && echo x > .hidden && mkdir -p deep/a/b && echo y > deep/a/b/leaf && ln -s "$OUTSIDE" outside-link && printf x > "$(printf \'legacy\\351\')"',
   ),
 };
 
@@ -298,7 +300,11 @@ async function agentMain(name: string): Promise<void> {
   const options = { enforceWaitMs: name === "agent-linkdrop" ? 50 : 5_000 };
   // 이 공간은 호스트의 /tmp를 그대로 본다(--dev-bind / /). 비어 있는 작업 공간이 띄우기의 조건이라(D-154) 빈 임시 폴더를 루트로 준다.
   const workspace = mkdtempSync(join(tmpdir(), "olive-agent-workspace-"));
-  const launch = name === "agent-cleanfiles" ? { ...plan, cwd: join(workspace, "work"), env: { ...plan.env, HOME: join(workspace, "home") } } : plan;
+  // 표식 폴더가 없으면 띄우지 않는다. 빈 값이면 링크 대상이 바뀌어 시험이 뜻을 잃는다.
+  const outside = process.env.OLIVE_CLEAN_OUTSIDE ?? "";
+  if (name === "agent-cleanfiles" && !outside.startsWith("/")) throw new Error("no_outside_marker");
+  const launch =
+    name === "agent-cleanfiles" ? { ...plan, cwd: join(workspace, "work"), env: { ...plan.env, HOME: join(workspace, "home"), OUTSIDE: outside } } : plan;
   const agent = await RoleAgent.prepare(runtime, productionParts({ graceMs: GRACE_MS, killMs: 3_000 }, workspace), options);
   if (agent === null) return;
   const control = new FakeControl();

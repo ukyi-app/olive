@@ -450,12 +450,23 @@ if (problem !== null) {
   });
 
   test("실제 프로세스 대리 cleanfiles: 실제 역할이 작업 공간에 쓴 파일을 끝내기·세기(0) 뒤 링크 clean이 모두 지워 left 0을 답하고, 대리와 따로 본 폴더도 비었다", () => {
-    const result = runScenario<AgentResult & { workspace: string; written: number; left: number | null; remaining: number }>("agent-cleanfiles", AS_PID_1);
+    // 역할의 링크가 가리킬 작업 공간 밖 형제 폴더와 표식 파일. 이 공간은 호스트 루트를 쓰기 가능하게 보므로 링크 대상을 이 시험의 것으로 한정한다.
+    const outside = mkdtempSync(join(tmpdir(), "olive-agent-outside-"));
+    writeFileSync(join(outside, "keep"), "outside");
+    const result = runScenario<AgentResult & { workspace: string; written: number; left: number | null; remaining: number }>("agent-cleanfiles", [
+      "--setenv",
+      "OLIVE_CLEAN_OUTSIDE",
+      outside,
+      ...AS_PID_1,
+    ]);
     expect(result.pid).toBe(1);
     expect(result.exited.code).toBe(0);
     expect(result.survivors).toBe(0);
     // work·home 아래 12개(숨김 파일, 깊은 폴더, 루트 밖 링크, UTF-8이 아닌 이름, HOME의 자격 파일). 써야 시험이 뜻을 가진다.
     expect(result.written).toBe(12);
+    // 정리는 링크 자신만 지우고 대상 폴더 안은 건드리지 않는다.
+    expect(readdirSync(outside)).toEqual(["keep"]);
+    expect(readFileSync(join(outside, "keep"), "utf8")).toBe("outside");
     expect(result.left).toBe(0);
     expect(result.remaining).toBe(0);
     // 공간 밖(이 시험 프로세스)에서도 따로 본다. 루트(마운트 지점 자리)는 남는다.
