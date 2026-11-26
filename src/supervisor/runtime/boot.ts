@@ -52,7 +52,7 @@ import { registrationsFrom } from "./assign-policy.ts";
 import { testFactSource } from "./test-assign.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
-import { createPeers, type FrontPeers } from "./peers.ts";
+import { createPeers, type FrontPeers, peerWaitUntil } from "./peers.ts";
 import { createQueryBook } from "./query-book.ts";
 import { createSharedClock, type PeekableClock } from "./shared-clock.ts";
 import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer.ts";
@@ -499,7 +499,25 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     const ports: RestorePorts = {
       stopAuthority: { latestStop: () => inStep(() => front.stopAuthority.latestStop()) },
       publications: { lookup: (frontJobId) => inStep(() => front.publications.lookup(frontJobId)) },
-      peers: createPeers({ front: { contracts: () => inStep(() => front.peers.contracts()) }, table, get restorer() { return restorer; }, expectedPolicy: settings.expectedPolicyRevision }),
+      // 2단계는 필수 이웃이 모일 때까지 그 단계 기한 안에서 기다린다(D-141, peers.ts). 멈춤은 다시 읽기 전에 본다.
+      peers: createPeers({
+        front: { contracts: () => inStep(() => front.peers.contracts()) },
+        table,
+        get restorer() {
+          return restorer;
+        },
+        expectedPolicy: settings.expectedPolicyRevision,
+        wait: {
+          required: requiredPeers,
+          until: () => (stepLimit === null ? null : peerWaitUntil(stepLimit, timing.restoreStepWaitMs)),
+          now: () => deps.monoNow(),
+          sleep: (ms) =>
+            new Promise<void>((resolve) => {
+              deps.setTimer(ms, () => resolve());
+            }),
+          stopping: () => stopping,
+        },
+      }),
       occupancy: { occupancy: async () => table().occupancy(restorer) },
     };
     restorer = make.restorer(ledger, ports, ledgerClock, requiredPeers);
