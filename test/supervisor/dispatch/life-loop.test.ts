@@ -2,12 +2,17 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
 import { copyFileSync } from "node:fs";
-import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
+import { type Envelope, resultDigest, sealEnvelope, verifyEnvelope } from "../../../src/contract/v1/index.ts";
 import { type InstructionTimes, type Ledger, loadMigrations } from "../../../src/ledger/index.ts";
 import { type LifeLoopLedger, type LifeLoopPorts, type LifeTickResult, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
 import type { Random, SendOutcome, Signer } from "../../../src/supervisor/dispatch/ports.ts";
+import { handleForward } from "../../../src/supervisor/dispatch/receipts.ts";
+import { type ResendPorts, resendTick } from "../../../src/supervisor/dispatch/resend.ts";
 import type { LifecyclePolicy } from "../../../src/supervisor/scheduler/lifecycle.ts";
-import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
+import { createFileResultBackend, nodeFilePort } from "../../../src/supervisor/scheduler/result-store-file.ts";
+import { createSharedClock } from "../../../src/supervisor/runtime/shared-clock.ts";
+import { executorKeys } from "../../executor/support.ts";
+import { digest, from, id, must, NOW, open, ready, SESSION_EXECUTOR, startedWorker, tempDir, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 // 정책 숫자와 키는 이 시험이 지어 넣는 자료다. 운영값이 아니다.
 const POLICY: LifecyclePolicy = { renewEveryMs: 10_000, answerTimeoutMs: 20_000 };
@@ -66,6 +71,7 @@ function world(path = tempPath()): World {
       instructionTimes: port("instructionTimes"),
       settledResult: port("settledResult"),
       failedStop: port("failedStop"),
+      unansweredInstructions: port("unansweredInstructions"),
       recordRenewInstruction: port("recordRenewInstruction"),
       recordStopInstruction: port("recordStopInstruction"),
       recordFinalizeInstruction: port("recordFinalizeInstruction"),
@@ -1882,6 +1888,452 @@ describe("실패 확정의 stored_at(D-114): 예산 기록 같은 뒤 쓰기가 
     // 판 8의 같은 이력은 실패 시각 칸이 판정 시각을 고정해 뒤 예산 기록과 무관하게 그 시각으로 보낸다.
     const fixed = await finalizeOf(8, [requestedAt(NOW + 1), stopAt("completed", NOW + 2), judgeAt(NOW + 19), budgetAt(NOW + 2)]);
     expect(fixed).toMatchObject({ facts: { stoppedAt: NOW + 19, exit: "completed" }, ...sentAs("cancelled", NOW + 19) });
+  });
+});
+
+// 정지 세대를 건넌 확정. 감독이 세대 0의 확정을 적은 뒤 복원기가 권위 기록의 세대 1을 합치면(접수는 다시 열린다), 재전송 박자는 옛 세대의
+// 확정을 봉하지 않고(stop_generation_mismatch) 새 세대를 적용한 실행기는 옛 세대 확정으로 정리 영수증을 내지 않는다.
+describe("정지 세대를 건넌 확정: 지금 세대의 확정이 없으면 새 요청 ID로 한 건, 같은 세대에서는 그 요청의 재전송만", () => {
+  // 재전송 박자를 같은 장부·접수·시계·서명·내보내기로 묶는다. 연결은 늘 지시를 낼 수 있다. 간격 기억은 넘기지 않는다(재검토 재현과 같다).
+  const resend = async (w: World) => {
+    const ports: ResendPorts = { ledger: w.ledger, intake: w.ports.intake, links: { mayIssue: () => ({ ok: true }) }, clock: w.ports.clock, random: w.ports.random, signer: w.ports.signer, sink: w.ports.sink };
+    const result = await resendTick(ports, { resendEveryMs: 5_000 }, { lastResends: [] });
+    if (result.kind !== "ran") throw new Error(`재전송 박자가 돌지 않음: ${JSON.stringify(result)}`);
+    return result.instructions.filter((item) => "action" in item && item.action === "result_finalize").map((item) => item.outcome);
+  };
+  // 복원기가 권위 기록의 세대를 합치고 접수를 다시 연 것과 같은 장부.
+  const raise = (w: World, generation: number, at: number) => {
+    must(w.ledger.mergeStop({ generation, stopped: false }, at));
+    ready(w.ledger);
+    w.setStopGeneration(generation);
+    expect(w.ledger.intakeOpen()).toBe(true);
+  };
+  const reasonOf = (outcome: RunOutcome) => (outcome.outcome === "finalize_withheld" ? outcome.reason : outcome.outcome);
+  const kinds: [string, (w: World) => Started][] = [
+    ["성공 확정", (w) => settledRun(w)],
+    ["실패 확정", (w) => failedRun(w, "exit", "deadline")],
+  ];
+
+  for (const [kind, make] of kinds) {
+    for (const generation of [0, 1]) {
+      test(`${kind}: 세대 ${generation === 0 ? "유지(대조군)" : "0 → 1"} 뒤 30·60·90초 박자에서 지금 세대의 확정은 요청 하나이고, 그 정리 영수증이 자리를 푼다`, async () => {
+        const w = world();
+        const s = make(w);
+        w.setClock(NOW + 10_000);
+        const first = only(await tick(w), s.runId);
+        expect(first).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 10_000 });
+        const firstId = (first as { requestId: string }).requestId;
+        const [firstEnvelope] = w.sent as [Envelope];
+        const [firstRow] = finalizes(w);
+        if (generation === 1) raise(w, 1, NOW + 12_000);
+        const before = w.sent.length;
+        const steps: { life: string; resend: string[] }[] = [];
+        for (const delta of [40_000, 70_000, 100_000]) {
+          w.setClock(NOW + delta);
+          const life = only(await tick(w), s.runId);
+          steps.push({ life: reasonOf(life), resend: await resend(w) });
+        }
+        const after = w.sent.slice(before).filter((e) => e.header.action === "result_finalize");
+        const current = after.filter((e) => e.header.stop_generation === generation);
+        if (generation === 0) {
+          // 대조군: 지금처럼 새 확정을 적지 않고 같은 요청을 다시 낸다.
+          expect(steps).toEqual([
+            { life: "already_recorded", resend: ["resent"] },
+            { life: "already_recorded", resend: ["resent"] },
+            { life: "already_recorded", resend: ["resent"] },
+          ]);
+          expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+          expect(finalizes(w)).toEqual([firstRow]);
+          expect(current.map((e) => e.header.request_id)).toEqual([firstId, firstId, firstId]);
+        } else {
+          // 40초 박자가 세대 1의 확정을 새 요청 ID로 한 번 적고 싣는다. 그 뒤로는 같은 세대라 새로 적지 않고 재전송 박자가 그 요청을 다시 낸다.
+          // 옛 세대 확정은 장부에 남지만 다시 나가지 않는다.
+          expect(steps).toEqual([
+            { life: "finalize_sent", resend: ["stop_generation_mismatch", "held"] },
+            { life: "already_recorded", resend: ["stop_generation_mismatch", "resent"] },
+            { life: "already_recorded", resend: ["stop_generation_mismatch", "resent"] },
+          ]);
+          expect(writes(w)).toEqual(["recordFinalizeInstruction", "recordFinalizeInstruction"]);
+          const rows = finalizes(w);
+          expect(rows).toHaveLength(2);
+          expect(rows[0]).toEqual(firstRow as never);
+          const fresh = rows[1];
+          expect(fresh).toMatchObject({ stopGeneration: 1, issuedAt: NOW + 40_000, rebuild: firstRow?.rebuild });
+          expect(fresh?.requestId).not.toBe(firstId);
+          expect(after.filter((e) => e.header.stop_generation !== 1)).toEqual([]);
+          expect(current.map((e) => e.header.request_id)).toEqual([fresh?.requestId, fresh?.requestId, fresh?.requestId]);
+          // 발행 시각은 판단과 같은 시계(장부에 적은 시각)이고, 본문은 옛 세대 확정과 같다.
+          expect(current[0]?.header.issued_at).toBe(NOW + 40_000);
+          for (const envelope of current) expect(envelope.body).toEqual(firstEnvelope.body);
+        }
+        const answeredId = current[0]?.header.request_id as string;
+        expect(w.ledger.slotFree("worker")).toEqual({ known: true, value: false });
+        must(w.ledger.applyReceipt({ action: "receipt_cleaned", receiptId: id(), runId: s.runId, instructionRequestId: answeredId, bodyDigest: digest("cleaned"), now: NOW + 100_001 }, s.from));
+        expect(state(w, s.runId)).toBe("finalized");
+        expect(w.ledger.slotFree("worker")).toEqual({ known: true, value: true });
+      });
+    }
+  }
+
+  test("세대가 두 번 바뀌어도 세대마다 확정은 하나다(0 → 1 → 2)", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+    raise(w, 1, NOW + 12_000);
+    const seen: string[] = [];
+    for (const [delta, change] of [[40_000, null], [70_000, 2], [100_000, null], [130_000, null]] as const) {
+      if (change !== null) raise(w, change, NOW + delta - 1);
+      w.setClock(NOW + delta);
+      seen.push(reasonOf(only(await tick(w), s.runId)));
+    }
+    expect(seen).toEqual(["finalize_sent", "finalize_sent", "already_recorded", "already_recorded"]);
+    expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0, 1, 2]);
+    expect(new Set(finalizes(w).map((row) => row.requestId)).size).toBe(3);
+  });
+
+  test("쓰기 직전의 다시 읽기에서 지금 세대의 확정이 새로 보이면 적지 않는다(superseded)", async () => {
+    const w = world();
+    const s = settledRun(w);
+    w.setClock(NOW + 10_000);
+    expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+    raise(w, 1, NOW + 12_000);
+    const other = id();
+    let calls = 0;
+    w.wrap({
+      instructionTimes: ((runId: string) => {
+        calls += 1;
+        // 박자 처음의 읽기 뒤, 쓰기 직전의 다시 읽기 전에 다른 경로가 세대 1의 확정을 적었다. 그 발행 시각은 answerTimeoutMs보다
+        // 오래돼 판단만으로는 막지 못한다(지금 세대의 확정 확인이 막는다).
+        if (calls === 2) must(w.ledger.recordFinalizeInstruction({ runId, requestId: other, stopGeneration: 1, now: NOW + 13_000, outcome: "succeeded", resultDigest: s.resultDigest, storedAt: NOW + 2 }));
+        return w.ledger.instructionTimes(runId);
+      }) as never,
+    });
+    w.setClock(NOW + 40_000);
+    const sentBefore = w.sent.length;
+    expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "superseded", planned: "finalize" });
+    expect(calls).toBe(2);
+    expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+    expect(w.sent.length).toBe(sentBefore);
+    expect(finalizes(w).filter((row) => row.stopGeneration === 1).map((row) => row.requestId)).toEqual([other]);
+  });
+
+  test("확정이 적힌 실행의 세대 읽기가 모름이면 적지 않는다. 확정이 한 번도 없는 실행은 그 읽기를 부르지 않는다", async () => {
+    const answers: [string, () => unknown][] = [
+      ["known: false", () => ({ known: false })],
+      ["던짐", () => {
+        throw new Error("읽기 실패");
+      }],
+      ["목록이 아님", () => ({ known: true, value: { stopGeneration: 1, instructions: null } })],
+    ];
+    for (const [name, answer] of answers) {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({ unansweredInstructions: answer as never });
+      w.setClock(NOW + 40_000);
+      expect([name, only(await tick(w), s.runId)]).toEqual([name, { runId: s.runId, outcome: "read_unknown", read: "instruction_times" }]);
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0]);
+    }
+    // 그 실행의 확정 항목 하나의 세대 칸이 틀리면 어느 세대의 확정인지 모른다. 다른 실행의 항목은 실행 ID와 동작만 읽는다.
+    {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          return { known: true, value: { ...read.value, instructions: read.value.instructions.map((item) => ({ ...item, stopGeneration: "1" })) } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+    }
+    // 대조군: 확정이 한 번도 적히지 않은 실행은 세대 읽기 없이 첫 확정을 적는다(그 읽기의 고장이 첫 확정을 막지 않는다).
+    {
+      const w = world();
+      const s = settledRun(w);
+      let reads = 0;
+      w.wrap({
+        unansweredInstructions: (() => {
+          reads += 1;
+          throw new Error("읽기 실패");
+        }) as never,
+      });
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      expect(reads).toBe(0);
+    }
+  });
+
+  // 재기동하면 공유 시계의 하한이 그 프로세스에서 새로 시작해(shared-clock.ts) 같은 결과를 다른 보고 ID로, 먼저 받은 보고보다 이른 감독
+  // 시각에 받을 수 있다. 장부의 결과 보관 읽기(settledResult)는 그 보고를 고르지만, 이미 낸 확정의 본문은 지시 줄에 고정된 세 칸이다.
+  test("성공 확정: 재기동 뒤 같은 결과를 다른 보고 ID·더 이른 시각으로 받아도 새 세대 확정의 본문은 옛 확정과 같다", async () => {
+    const path = tempPath();
+    const dir = tempDir();
+    const backend = () => {
+      const made = createFileResultBackend({ dir, maxRecordBytes: 32 * 1024, files: nodeFilePort });
+      if (made.status !== "ok") throw new Error(made.status);
+      return made.backend;
+    };
+    const first = world(path);
+    const s = started(first, { inputRequestId: input(first) });
+    accept(first, s);
+    must(first.ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: s.runId, exit: "completed", bodyDigest: digest("stop"), now: NOW + 1 }, s.from));
+    const result = { role: "diagnosis" as const, outcome: "completed" as const, summary: "시험", items: [], refs: [] };
+    // 실행기가 서명한 결과 보고를 감독의 보고 처리기(보관소와 장부)에 넘긴다.
+    const report = async (w: World, at: number, reportId: string, stopGeneration: number) => {
+      const nonce = Buffer.from(getRandomValues(new Uint8Array(16))).toString("hex");
+      const body = { run_id: s.runId, report_id: reportId, result };
+      const head = { sender: s.from.sender, recipient: "supervisor", action: "report_result", request_id: id(), stop_generation: stopGeneration, run_generation: s.from.runGeneration, issued_at: at, nonce };
+      const e = sealEnvelope({ ...head, body } as never, executorKeys.privateKey);
+      const v = await verifyEnvelope(e, {
+        now: at,
+        expectedRecipient: "supervisor",
+        publicKeyFor: (name) => (name === s.from.sender ? executorKeys.publicKey : undefined),
+        stopGeneration,
+        runGeneration: (runId) => w.ledger.runGeneration(runId),
+        nonces: { consume: () => true },
+      });
+      if (!v.ok) throw new Error(v.reason);
+      const answer = handleForward(
+        { forward: { verified: v, connection: 1 }, now: at, stopGeneration, pendingQueries: [], links: { current: () => true }, backlog: [] } as never,
+        { ledger: w.ledger, results: { backend: backend(), ledger: w.ledger }, random: w.ports.random } as never,
+      );
+      expect(answer).toMatchObject({ outcome: "ack", delivery: "new", id: reportId });
+    };
+    const firstClock = createSharedClock(first.ports.clock);
+    first.setClock(NOW + 2);
+    const firstReport = id();
+    await report(first, firstClock.now(), firstReport, 0);
+    must(first.ledger.markResult({ runId: s.runId, reportId: firstReport, resultDigest: resultDigest(result), now: NOW + 3 }));
+    first.setClock(NOW + 10_000);
+    expect(only(await tick(first), s.runId).outcome).toBe("finalize_sent");
+    const [old] = first.sent as [Envelope];
+    expect(old.body).toMatchObject({ stored_at: NOW + 2 });
+    first.ledger.close();
+    // 새 감독: 같은 장부와 보관소를 다시 연다.
+    const again = world(path);
+    const againClock = createSharedClock(again.ports.clock);
+    again.setClock(NOW + 1);
+    raise(again, 1, againClock.now());
+    await report(again, againClock.now(), id(), 1);
+    expect(again.ledger.settledResult(s.runId)).toMatchObject({ known: true, value: { storedAt: NOW + 1 } });
+    again.setClock(NOW + 40_000);
+    expect(only(await tick(again), s.runId)).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 40_000 });
+    const [fresh] = again.sent as [Envelope];
+    expect(fresh.header).toMatchObject({ stop_generation: 1, issued_at: NOW + 40_000 });
+    expect(fresh.header.request_id).not.toBe(old.header.request_id);
+    expect(fresh.body).toEqual(old.body);
+    const rows = finalizes(again);
+    expect(rows.map((row) => row.stopGeneration)).toEqual([0, 1]);
+    expect(rows[1]?.rebuild).toEqual(rows[0]?.rebuild as never);
+  });
+
+  test("실패 확정: 확정 사실이 다르게 읽혀도 새 세대 확정의 본문은 앞 지시 줄의 세 칸이다. 그 칸의 꼴이 틀리면 적지 않는다", async () => {
+    // 이미 낸 확정 뒤 장부의 확정 사실(failedStop)이 다른 시각을 내는 경우. 한 박자 안의 두 읽기는 서로 같아 근거 대조는 지난다.
+    const shifted = (w: World) =>
+      ((runId: string) => {
+        const read = w.ledger.failedStop(runId);
+        if (!read.known || read.value === null || read.value.stoppedAt === null) return read;
+        return { known: true, value: { ...read.value, stoppedAt: read.value.stoppedAt + 5 } };
+      }) as never;
+    {
+      const w = world();
+      const s = failedRun(w, "exit", "deadline");
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      const [old] = w.sent as [Envelope];
+      raise(w, 1, NOW + 12_000);
+      w.wrap({ failedStop: shifted(w) });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      const fresh = w.sent.at(-1) as Envelope;
+      expect(fresh.header.stop_generation).toBe(1);
+      expect(fresh.body).toEqual(old.body);
+      expect(finalizes(w).map((row) => [row.stopGeneration, row.rebuild])).toEqual([
+        [0, finalizes(w)[0]?.rebuild],
+        [1, finalizes(w)[0]?.rebuild],
+      ] as never);
+    }
+    // 앞 지시 줄의 본문 칸을 읽었는데 꼴이 틀리면 어느 본문인지 모른다: 지금 사실로 다시 만들지 않고 적지 않는다.
+    {
+      const w = world();
+      const s = failedRun(w, "exit", "deadline");
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          const instructions = read.value.instructions.map((item) => (item.action === "result_finalize" ? { ...item, rebuild: { action: "result_finalize", outcome: "unknown", resultDigest: null, storedAt: 1 } } : item));
+          return { known: true, value: { ...read.value, instructions } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+    }
+  });
+  // 장부의 공개 쓰기는 이 꼴을 입력 단계에서 거절하지만, 이 읽기는 이미 적힌 줄을 그대로 낸다. 꼴 밖의 본문을 싣고 쓰기를 부르면
+  // 읽은 값이 틀렸다는 원인이 기록 여부를 모른다(finalize_record_unknown)는 결과로 바뀐다.
+  test("성공 확정: 앞 지시 줄의 digest가 계약 꼴(소문자 16진수 64자리)이 아니거나 보관 시각이 양의 정수가 아니면 쓰기를 부르지 않는다", async () => {
+    const variants: [string, (rebuild: Record<string, unknown>) => Record<string, unknown>][] = [
+      ["digest 꼴 밖", (rebuild) => ({ ...rebuild, resultDigest: "invalid" })],
+      ["digest 대문자", (rebuild) => ({ ...rebuild, resultDigest: String(rebuild.resultDigest).toUpperCase() })],
+      ["보관 시각 0", (rebuild) => ({ ...rebuild, storedAt: 0 })],
+    ];
+    for (const [name, bend] of variants) {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          const instructions = read.value.instructions.map((item) => (item.action === "result_finalize" ? { ...item, rebuild: bend(item.rebuild as never) } : item));
+          return { known: true, value: { ...read.value, instructions } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      const sentBefore = w.sent.length;
+      expect([name, only(await tick(w), s.runId)]).toEqual([name, { runId: s.runId, outcome: "read_unknown", read: "instruction_times" }]);
+      expect([name, writes(w)]).toEqual([name, ["recordFinalizeInstruction"]]);
+      expect([name, w.sent.length]).toEqual([name, sentBefore]);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0]);
+    }
+    // 읽기 포트를 바꾸지 않은 실제 장부: 꼴 밖의 digest를 담은 확정 줄이 파일에 있다(무결성 검사는 지난다).
+    {
+      const path = tempPath();
+      const before = world(path);
+      const s = settledRun(before);
+      before.ledger.close();
+      const db = new Database(path);
+      try {
+        db.query("INSERT INTO instructions (request_id, run_id, action, stop_generation, issued_at, outcome, result_digest, stored_at) VALUES (?, ?, 'result_finalize', 0, ?, 'succeeded', ?, ?)").run(id(), s.runId, NOW + 10_000, "invalid", NOW + 2);
+        expect((db.query("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check).toBe("ok");
+      } finally {
+        db.close();
+      }
+      const w = world(path);
+      expect(finalizes(w).map((row) => (row.rebuild as { resultDigest?: unknown } | null)?.resultDigest)).toEqual(["invalid"]);
+      raise(w, 1, NOW + 12_000);
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual([]);
+      expect(w.sent.length).toBe(0);
+      expect(finalizes(w).length).toBe(1);
+    }
+  });
+
+  test("다른 실행의 지시 항목은 실행 ID·동작만 읽는다: 그 항목의 세대·본문 칸 읽기가 던져도 대상 실행의 확정을 막지 않고, 대상 항목 자체의 읽기 실패는 모름이다", async () => {
+    // 다른 장부에서 읽은 다른 실행의 시작 지시 줄을 대상 실행의 읽기 결과에 끼운다. 세대·본문 칸은 접근하면 던진다.
+    {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      const other = world();
+      const o = started(other);
+      const otherRow = unanswered(other).find((item) => item.runId === o.runId);
+      expect(otherRow?.action).toBe("task_start");
+      raise(w, 1, NOW + 12_000);
+      let otherReads = 0;
+      const foreign = {
+        runId: otherRow?.runId,
+        action: otherRow?.action,
+        requestId: otherRow?.requestId,
+        get stopGeneration(): never {
+          otherReads += 1;
+          throw new Error("다른 실행의 세대 칸 읽기 실패");
+        },
+        get rebuild(): never {
+          otherReads += 1;
+          throw new Error("다른 실행의 본문 칸 읽기 실패");
+        },
+      };
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          return { known: true, value: { ...read.value, instructions: [foreign, ...read.value.instructions] } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      expect(otherReads).toBe(0);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0, 1]);
+    }
+    // 대상 실행의 확정 항목 자체의 본문 칸 읽기가 던지면 어느 본문인지 모른다.
+    {
+      const w = world();
+      const s = settledRun(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap({
+        unansweredInstructions: (() => {
+          const read = w.ledger.unansweredInstructions();
+          if (!read.known) return read;
+          const instructions = read.value.instructions.map((item) =>
+            item.action === "result_finalize"
+              ? {
+                  runId: item.runId,
+                  action: item.action,
+                  stopGeneration: item.stopGeneration,
+                  get rebuild(): never {
+                    throw new Error("대상 실행의 본문 칸 읽기 실패");
+                  },
+                }
+              : item,
+          );
+          return { known: true, value: { ...read.value, instructions } };
+        }) as never,
+      });
+      w.setClock(NOW + 40_000);
+      const sentBefore = w.sent.length;
+      expect(only(await tick(w), s.runId)).toEqual({ runId: s.runId, outcome: "read_unknown", read: "instruction_times" });
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+      expect(w.sent.length).toBe(sentBefore);
+    }
+  });
+  test("새 세대 확정도 지금 결과가 확정 가능할 때만 적는다: 결과 보관·확정 사실을 정하지 못하면 앞 지시 줄의 본문이 있어도 적지 않는다", async () => {
+    const cases: [string, (w: World) => Started, (w: World) => Partial<LifeLoopLedger>, string][] = [
+      ["성공", (w) => settledRun(w), () => ({ settledResult: (() => ({ known: true, value: null })) as never }), "wait"],
+      [
+        "실패",
+        (w) => failedRun(w, "exit", "deadline"),
+        (w) => ({
+          failedStop: ((runId: string) => {
+            const read = w.ledger.failedStop(runId);
+            return read.known && read.value !== null ? { known: true, value: { ...read.value, stoppedAt: null } } : read;
+          }) as never,
+        }),
+        "stored_at_unknown",
+      ],
+    ];
+    for (const [kind, make, over, expected] of cases) {
+      const w = world();
+      const s = make(w);
+      w.setClock(NOW + 10_000);
+      expect(only(await tick(w), s.runId).outcome).toBe("finalize_sent");
+      raise(w, 1, NOW + 12_000);
+      w.wrap(over(w));
+      w.setClock(NOW + 40_000);
+      expect([kind, reasonOf(only(await tick(w), s.runId))]).toEqual([kind, expected]);
+      expect(writes(w)).toEqual(["recordFinalizeInstruction"]);
+      expect(finalizes(w).map((row) => row.stopGeneration)).toEqual([0]);
+    }
   });
 });
 
