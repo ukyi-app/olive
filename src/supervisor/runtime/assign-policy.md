@@ -21,7 +21,7 @@ registrationsFrom(content, registry, targets): readonly Registration[]
 | 고정 계정(`accounts`) | `OLIVE_ACCOUNT_NAME`(D-126, 계정 Secret을 붙이는 차트 값 `supervisor.account.name`. 계정 폴더 이름 꼴 `ACCOUNT_NAME`, 방식은 `subscription`) | 없음·빈 값: 빈 목록. 고르기가 `no_account`로 보류하고 자격 참조를 묻지 않는다(파일 읽기 0). 꼴이 틀리면 진입점 91 |
 | 자격 판(`credentials.revisionOf`) | `OLIVE_ACCOUNT_REVISION`(D-111, v1 revision 꼴) | 없음·빈 값: 모름(null). 자격 참조가 파일을 열지 않고 `revision_unknown`이라 배정이 `credential_unknown`으로 보류. 별칭과 판이 함께 있어야 자격 참조가 생긴다. 꼴이 틀리면 진입점 91 |
 | 허용 표·기대 프로필 revision(`assignment.allowed`·`expected`) | `OLIVE_PROFILE_REVISIONS`(JSON 객체 `{ "<v1 역할>": "<revision>" }`) | 없음·빈 값·빈 객체: 기대값이 비어 모든 연결이 보류된다. 사유는 판단의 차례대로라, 역할·대상·허용 표·등록행 검사를 통과한 연결이 `expected_revision_missing`이고 그 앞에서 걸린 연결은 그 사유다(허용 표에 없으면 `target_not_allowed`, 등록행이 없으면 `not_registered`). JSON 객체가 아니거나 모르는 역할·꼴이 틀린 revision·거듭된 역할 칸이면 진입점 91 |
-| 등록행(`assignment.registrations`) | 조립이 적용한 등록표 문서(같은 바이트)와 그 상태(`RegistryState.keyFor`) | 빈 목록: 모든 연결이 `not_registered` |
+| 등록행(`assignment.registrations`) | 조립이 적용한 등록표 문서(같은 바이트)와 그 상태(`RegistryState.keyFor`) | 빈 목록: 등록행 검사까지 도달한 연결이 `not_registered`다. 그 앞에서 걸린 연결은 그 사유다(역할이 허용 표에 없으면 `target_not_allowed`) |
 
 꼴이 틀린 환경을 91로 하는 것은 다른 감독 환경과 같은 규칙이다(README "감독 진입점"의 환경 표). 오타가 "값 없음"과 같은 보류로 조용히 남으면 켜는 사람이 원인을 찾지 못한다.
 

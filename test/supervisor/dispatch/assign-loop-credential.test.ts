@@ -1,6 +1,6 @@
 // 배정 박자가 자격 참조(실제 포트는 계정의 자격 파일 읽기)를 묻는 때와 그 뒤의 재검사.
 // 자격 앞의 검사(부탁·사실·역할·대상·허용 표·등록행·기대 revision·계정)를 통과한 후보가 있을 때만 묻는다. 고정 계정이 있어도
-// 후보가 없으면 파일 읽기 0, 장부 쓰기 0이다. 조회를 기다린 뒤에는 접수·맡기지 않을 실행기를 다시 읽고 처음부터 다시 고른다.
+// 후보가 없으면 파일 읽기 0, 장부 쓰기 0이다. 조회를 기다린 뒤에는 접수·맡기지 않을 실행기·후보 연결을 다시 읽고 처음부터 다시 고른다.
 import { expect, test } from "bun:test";
 import { type CredentialFiles, credentialPort } from "../../../src/supervisor/accounts/credential-ref.ts";
 import { type AssignLoopPolicy, type AssignLoopPorts, assignAndStartTick } from "../../../src/supervisor/dispatch/assign-loop.ts";
@@ -200,4 +200,108 @@ test("맡기지 않을 실행기만 맞는 부탁은 자격까지 보고 listed�
   mismatch.withheld = [EXECUTOR];
   expect((await requestOutcome(mismatch, POLICY)).requests).toEqual([{ ref: REF, outcome: "skipped", pick: expect.objectContaining({ kind: "held", reason: "no_executor" }) }]);
   expect(mismatch.count).toEqual({ fileReads: 0, references: 0, assigns: 0, starts: 0, sends: 0 });
+});
+
+// 후보 포트가 부를 때마다 그때의 목록을 새 배열로 낸다(실제 연결 표와 같다). 읽기 횟수와 장부 쓰기의 인자를 남긴다.
+function swappable(r: Rig, initial: readonly Candidate[]) {
+  const state = { current: initial, reads: 0, written: [] as { executorId: string; profileRevision: string }[] };
+  const assign = r.ports.ledger.assignToolRequest.bind(r.ports.ledger);
+  Object.assign(r.ports.ledger, {
+    assignToolRequest(input: Parameters<typeof assign>[0]) {
+      state.written.push({ executorId: input.executorId, profileRevision: input.profileRevision });
+      return assign(input);
+    },
+  });
+  Object.assign(r.ports, {
+    connections: {
+      candidates: () => {
+        state.reads += 1;
+        return { known: true, value: state.current.slice() };
+      },
+    },
+  });
+  return state;
+}
+
+// 같은 실행기가 끊고 다른 프로필로 다시 인사한 연결.
+const REPLACED = connection({ connection: 2, hello: { profile_revision: "prof-2", policy_revision: "pol-1" } });
+
+test("사실 조회 중 같은 실행기의 연결이 다른 프로필로 바뀌면 지금 연결로 다시 골라 자격 파일을 열지 않는다: 파일 읽기 0, 장부 쓰기 0", async () => {
+  const r = rig([]);
+  const state = swappable(r, [connection()]);
+  Object.assign(r.ports, {
+    facts: {
+      facts: async () => {
+        state.current = [REPLACED];
+        return CLEAR;
+      },
+    },
+  });
+  expect((await requestOutcome(r, POLICY)).requests).toEqual([{ ref: REF, outcome: "skipped", pick: expect.objectContaining({ kind: "held", reason: "no_executor" }) }]);
+  expect(r.count).toEqual({ fileReads: 0, references: 0, assigns: 0, starts: 0, sends: 0 });
+  // 박자 처음의 읽기와 사실 조회 뒤의 다시 읽기.
+  expect([state.reads, state.written]).toEqual([2, []]);
+});
+
+test("자격 조회 중 같은 실행기의 연결이 다른 프로필로 바뀌면 지금 연결로 다시 골라 잇지 않는다: 파일 읽기 1, 장부 쓰기 0", async () => {
+  const r = rig([]);
+  const state = swappable(r, [connection()]);
+  r.onReference = () => {
+    state.current = [REPLACED];
+  };
+  expect((await requestOutcome(r, POLICY)).requests).toEqual([{ ref: REF, outcome: "skipped", pick: expect.objectContaining({ kind: "held", reason: "no_executor" }) }]);
+  expect(r.count).toEqual({ fileReads: 1, references: 1, assigns: 0, starts: 0, sends: 0 });
+  expect([state.reads, state.written]).toEqual([3, []]);
+});
+
+test("대조군: 조회 중 같은 프로필로 다시 인사한 연결이면 그 연결로 잇는다. 적힌 기대 프로필은 지금 연결의 프로필이다", async () => {
+  for (const when of ["facts", "reference"] as const) {
+    const r = rig([]);
+    const state = swappable(r, [connection()]);
+    const reconnect = () => {
+      state.current = [connection({ connection: 2 })];
+    };
+    if (when === "facts") {
+      Object.assign(r.ports, {
+        facts: {
+          facts: async () => {
+            reconnect();
+            return CLEAR;
+          },
+        },
+      });
+    } else r.onReference = reconnect;
+    expect([when, (await requestOutcome(r, POLICY)).requests]).toEqual([when, [{ ref: REF, outcome: "assigned", runId: expect.any(String), executorId: EXECUTOR }]]);
+    expect([when, r.count, state.written]).toEqual([when, { fileReads: 1, references: 1, assigns: 1, starts: 0, sends: 0 }, [{ executorId: EXECUTOR, profileRevision: "prof-1" }]]);
+  }
+});
+
+test("고르기 직전에 다시 읽은 후보가 모름·예외·틀린 꼴이면 그 부탁은 candidates_unknown이고 그 뒤의 효과를 부르지 않는다", async () => {
+  // at은 후보 포트의 몇 번째 읽기에서 틀리는지다. 1은 박자 처음, 2는 사실 조회 뒤, 3은 자격 조회 뒤의 다시 읽기다.
+  const faults: [string, () => unknown][] = [
+    ["known_false", () => ({ known: false })],
+    ["threw", () => {
+      throw new Error("연결 표 실패");
+    }],
+    ["malformed", () => ({ known: true, value: [null] })],
+  ];
+  for (const [fault, answer] of faults) {
+    for (const at of [2, 3]) {
+      const r = rig([]);
+      let reads = 0;
+      Object.assign(r.ports, {
+        connections: {
+          candidates: () => {
+            reads += 1;
+            return reads === at ? answer() : { known: true, value: [connection()] };
+          },
+        },
+      });
+      const result = await requestOutcome(r, POLICY);
+      const label = `${fault}@${at}`;
+      expect([label, result.halted, result.requests]).toEqual([label, null, [{ ref: REF, outcome: "candidates_unknown" }]]);
+      const looked = at === 3 ? 1 : 0;
+      expect([label, reads, r.count]).toEqual([label, at, { fileReads: looked, references: looked, assigns: 0, starts: 0, sends: 0 }]);
+    }
+  }
 });
