@@ -58,6 +58,42 @@ test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거
   }
 });
 
+// 배정 판 값 두 환경(D-111의 계정 자격 판, 역할별 기대 프로필 revision). 꼴이 틀리면 아무 파일도 읽기 전에 91이고, 맞거나 없으면 환경을 지나
+// 재료 읽기에서 92로 끝난다(경로가 없다). 그 전에 채운 값의 요약을 기록에 한 줄 남긴다. 값마다의 경우는 test/supervisor/runtime/assign-policy.test.ts가 본다.
+test("entrypoints: supervisor는 배정 판 값의 꼴이 틀리면 91로, 없거나 맞으면 환경을 지나 92로 끝난다", () => {
+  const env = {
+    OLIVE_SUPERVISOR_PORT: "8443",
+    OLIVE_LEDGER_DIR: "/olive-absent/ledger",
+    OLIVE_SIGNING_KEY_DIR: "/olive-absent/signing",
+    OLIVE_ACCOUNTS_DIR: "/olive-absent/accounts",
+    OLIVE_TLS_DIR: "/olive-absent/tls",
+    OLIVE_TRUST_DIR: "/olive-absent/trust",
+    OLIVE_REGISTRY_FILE: "/olive-absent/registry.json",
+    OLIVE_ENVIRONMENT: "home",
+    OLIVE_TARGETS: JSON.stringify([{ target: "reader", namespace: "olive-reader", roles: ["isolated_reader"] }]),
+    OLIVE_POLICY_REVISION: "policy-1",
+    OLIVE_RESULT_DIR: "/olive-absent/results",
+  };
+  const spawn = (extra: Record<string, string>) =>
+    Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
+  for (const [extra, name] of [
+    [{ OLIVE_ACCOUNT_REVISION: "-bad" }, "OLIVE_ACCOUNT_REVISION"],
+    [{ OLIVE_PROFILE_REVISIONS: "not json" }, "OLIVE_PROFILE_REVISIONS"],
+    [{ OLIVE_PROFILE_REVISIONS: '{"no_role":"p"}' }, "OLIVE_PROFILE_REVISIONS"],
+  ] as const) {
+    const result = spawn(extra);
+    expect([name, result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([name, 91, "", `olive supervisor ${pkg.version}: 환경 ${name}이(가) 틀렸다\n`]);
+  }
+  for (const [extra, summary] of [
+    [{}, "accountRevision=false profileRevisions=none accounts=0"],
+    [{ OLIVE_ACCOUNT_REVISION: "acct-1", OLIVE_PROFILE_REVISIONS: '{"isolated_reader":"prof-1"}' }, "accountRevision=true profileRevisions=single accounts=0"],
+  ] as const) {
+    const result = spawn(extra);
+    const lines = result.stderr.toString().split("\n");
+    expect([summary, result.exitCode, lines[1]]).toEqual([summary, 92, `olive supervisor: assign_inputs ${summary}`]);
+  }
+});
+
 // 장부 초기화 진입점(D-110)은 환경이 없으면 장부를 열기 전에 91로 끝난다. 만들기·거절·바이트 무변화는 test/ledger-init.test.ts가 본다.
 test("entrypoints: ledger-init은 환경이 없으면 이름을 한 줄 찍고 91로 끝난다", () => {
   const result = run("src/main/ledger-init.ts");

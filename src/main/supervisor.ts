@@ -14,6 +14,7 @@ import { type AdminFs, type AdminListening, AdminListenRefused, listenAdmin } fr
 import { ADMIN_SOCKET_MODE, ADMIN_SOCKET_PATH } from "../supervisor/admin/protocol.ts";
 import { bootSupervisor, type FrontDoorPorts, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
 import { testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
+import { accountRevisionFromEnv, assignmentFrom, type ProfileUse, profileRevisionsFromEnv } from "../supervisor/runtime/assign-policy.ts";
 import { RENEW_MARGIN_MS } from "../supervisor/scheduler/lifecycle.ts";
 import { createFileResultBackend } from "../supervisor/scheduler/result-store-file.ts";
 import { RegistryState, type RegistryTarget } from "../supervisor/transport/registry.ts";
@@ -36,11 +37,15 @@ export const SUPERVISOR_ENV = [
   "OLIVE_RESULT_DIR",
 ] as const;
 // 없어도 되는 환경. README "감독 진입점"의 표에서 필수 이름 뒤에 이 차례로 둔다.
+// OLIVE_ACCOUNT_REVISION: 고정 계정 자격의 판(D-111, 차트 값 하나를 사람 PR이 계정 Secret과 함께 올린다). v1 revision 꼴이다.
+// OLIVE_PROFILE_REVISIONS: 역할별 기대 프로필 revision의 JSON 객체 { "<v1 역할>": "<revision>" }(역할 프로필 차트가 렌더한다).
+// 두 값은 없거나 빈 값이면 모름이고 배정은 채우기 전처럼 보류된다. 꼴이 틀리면 다른 이름처럼 91이다: 오타가 "값 없음"과 같은
+// 보류로 조용히 남으면 켜는 사람이 원인을 찾지 못한다.
 // OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
 // 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
 // OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"일 때만 받는다.
 // 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다) 그것 없이 켜면 운영 값으로 보고 91이다.
-export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
+export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_ACCOUNT_REVISION", "OLIVE_PROFILE_REVISIONS", "OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 장부 파일 이름은 장부 초기화 진입점과 함께 쓴다(ledger-path.ts).
 // 서명 키의 이름은 차트의 Secret 키 이름과 맞춰야 한다(차트 짝에서 맞춘다).
@@ -70,10 +75,15 @@ const CYCLE: SupervisorSettings["cycle"] = { judgeMs: limits.DISCONNECT_JUDGE_MS
 const REVISION = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 // frontDoor: 진입점이 조립에 넘길 현관 포트. absent(현관 전, 늘 모름)가 기본이고 test_double은 시험 현관 대역이다(frontDoorFor).
+// assignInputs: 배정 정책에 채운 배포 값의 요약(값은 싣지 않는다). 진입점이 기동 기록에 남긴다.
 export type EnvResult =
-  | { readonly ok: true; readonly settings: SupervisorSettings; readonly frontDoor: FrontDoorChoice }
+  | { readonly ok: true; readonly settings: SupervisorSettings; readonly frontDoor: FrontDoorChoice; readonly assignInputs: AssignInputs }
   | { readonly ok: false; readonly name: string; readonly problem: "missing" | "invalid" };
 export type FrontDoorChoice = "absent" | "test_double";
+export interface AssignInputs {
+  readonly accountRevision: boolean;
+  readonly profileRevisions: ProfileUse;
+}
 
 // 환경을 값으로 바꾼다. 처음 걸린 이름 하나를 돌려준다(값은 담지 않는다). 연결 전에 거를 수 있는 것(포트, 절대 경로, 등록표 설정,
 // revision의 꼴)까지 여기서 본다.
@@ -107,12 +117,18 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (settingsRejected(registry)) return invalid("OLIVE_TARGETS");
   const policyRevision = value("OLIVE_POLICY_REVISION");
   if (!REVISION.test(policyRevision)) return invalid("OLIVE_POLICY_REVISION");
+  const accountRevision = accountRevisionFromEnv(env.OLIVE_ACCOUNT_REVISION);
+  if (!accountRevision.ok) return invalid("OLIVE_ACCOUNT_REVISION");
+  const profileRevisions = profileRevisionsFromEnv(env.OLIVE_PROFILE_REVISIONS);
+  if (!profileRevisions.ok) return invalid("OLIVE_PROFILE_REVISIONS");
   const testJobs = env.OLIVE_TEST_JOBS ?? "";
   if (testJobs !== "" && testJobs !== "on" && testJobs !== "off") return invalid("OLIVE_TEST_JOBS");
   const testFrontDoor = env.OLIVE_TEST_FRONTDOOR ?? "";
   if (testFrontDoor !== "" && testFrontDoor !== "on" && testFrontDoor !== "off") return invalid("OLIVE_TEST_FRONTDOOR");
   if (testFrontDoor === "on" && testJobs !== "on") return invalid("OLIVE_TEST_FRONTDOOR");
   const frontDoor: FrontDoorChoice = testFrontDoor === "on" ? "test_double" : "absent";
+  const assignment = assignmentFrom(targets, profileRevisions.value, policyRevision);
+  const revision = accountRevision.value;
   const tlsDir = value("OLIVE_TLS_DIR");
   const trustDir = value("OLIVE_TRUST_DIR");
   return {
@@ -137,14 +153,18 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
         dir: value("OLIVE_ACCOUNTS_DIR"),
         keys: { subscription: "CLAUDE_CODE_OAUTH_TOKEN" },
         maxBytes: CREDENTIAL_MAX_BYTES,
-        // 자격 revision의 출처(계정 Secret의 판)가 정해지기 전이라 모름이다. 모르면 새 자격 참조를 만들지 않는다(credential-ref.md).
+        // 고정 계정 하나의 자격 판(D-111). 없으면 모름이고 새 자격 참조를 만들지 않는다(credential-ref.md). 계정·방식을 가리지 않는 것은
+        // 배정이 묻는 계정이 selectAccount가 고른 하나뿐이기 때문이다(둘 이상이면 고르지 않는다). 계정별 판이 필요해지면(O17) 원천을 새로 정한다.
         // 이미 접수된 실행의 값 송신(borrowCredentialValue)은 revision을 보지 않고 계정·방식·지문과 실행 상태·접수 문으로 판단한다.
-        revisionOf: () => null,
+        revisionOf: () => revision,
       },
-      // 배정 정책은 닫힌 값이다. 등록행·계정·실행 계획이 없어 후보가 없고 시작하지 않는다(역할 프로필 조각 전까지).
+      // 배정 정책. 허용 표와 기대 revision은 대상 표·역할별 기대 프로필 revision에서(runtime/assign-policy.ts의 assignmentFrom), 등록행은
+      // 조립이 적용한 등록표에서 채운다(여기서는 비운다). 계정은 비어 있다: 고정 계정의 별칭을 감독이 어디서 읽을지 정하지 않았다
+      // (차트는 별칭을 계정 폴더의 마운트 자리로만 쓴다). 계정이 없으면 고르기가 no_account로 보류하고 자격 참조를 묻지 않는다.
+      // 실행 계획·요청 한도·배정 전 사실은 시험 배정 값 조각 전까지 비어 있어 시작하지 않는다.
       // 접수 출처는 시험 현관 대역일 때만 그 대역의 출처 하나를 관리자 요청으로 본다(D-109). 그 밖은 늘 모름이라 입력의 일을 보류한다.
       assign: {
-        assignment: { allowed: targets.map((t) => ({ target: t.target, roles: t.roles })), registrations: [], expected: { profile_revision: "", policy_revision: policyRevision } },
+        assignment: assignment.context,
         accounts: [],
         plans: [],
         queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 0, alert: 0 } },
@@ -159,6 +179,7 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       testJobs: testJobs === "on",
     },
     frontDoor,
+    assignInputs: { accountRevision: revision !== null, profileRevisions: assignment.profile },
   };
 }
 
@@ -252,6 +273,8 @@ async function main(): Promise<never> {
   }
   // 시험 현관 대역이면 기록에 먼저 남긴다: 이 감독의 정지 아님 기록·이웃 행·소유자 입력이 지어낸 값이라는 것을 기록만 보고도 알게.
   productionDeps.log("front_door", { mode: parsed.frontDoor });
+  // 배정에 채운 배포 값의 요약. 값 없이 켜져 배정이 늘 보류되는 것을 기록만 보고도 알게.
+  productionDeps.log("assign_inputs", { accountRevision: parsed.assignInputs.accountRevision, profileRevisions: parsed.assignInputs.profileRevisions, accounts: parsed.settings.assign.accounts.length });
   const started = await bootSupervisor(parsed.settings, { ...productionDeps, frontDoor: frontDoorFor(parsed.frontDoor) }, stop.signal);
   if (!started.ok) {
     console.error(`olive supervisor ${pkg.version}: 기동 단계 ${started.step}에서 멈췄다(${started.reason})`);
