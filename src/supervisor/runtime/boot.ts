@@ -37,6 +37,7 @@ import type { CancelDelivery } from "../dispatch/cancel.ts";
 import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
+import type { AnswerSettlement, LedgerAlarm } from "../dispatch/receipts.ts";
 import { resendTick } from "../dispatch/resend.ts";
 import { type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
 import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
@@ -46,7 +47,7 @@ import type { ToolConfig, ToolPolicyPort, ToolPorts } from "../scheduler/tools.t
 import type { ConnectionSettings } from "../transport/connections.ts";
 import { RegistryState, type RegistrySettings } from "../transport/registry.ts";
 import type { ConnectionServer, ConnectionServerOptions, Delivered, StartResult } from "../transport/server.ts";
-import { type AnswerLines, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
+import { type AnswerLines, type AnswerNote, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
@@ -305,6 +306,24 @@ function unreceivedFields(value: Step<UnreceivedTickResult>): LogFields {
     run.outcome === "skipped" || run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome === "rehello" ? `rehello:${run.result}` : run.outcome,
   );
   return { unreceived: "ran", unreceivedOutcomes: tally(names), unreceivedHalted: result.halted };
+}
+
+// 장부가 답에 실은 닫힌 실행의 경보(D-127·D-128)를 기록 한 줄씩의 칸으로 옮긴다. 꼴은 result_check_alert와 같은 reason·runId이고,
+// 영수증은 delivery(new·duplicate), 실행기의 답은 coverage(상태 보고와 그 밀린 사본은 partial, 인사는 full)를 더한다.
+// 같은 경보가 영수증의 재전송이나 다시 온 답마다 다시 나오면 줄도 다시 남긴다(반복을 줄이는 규칙은 정하지 않았다).
+function ledgerAlerts(note: AnswerNote): LogFields[] {
+  const fields = (alarm: LedgerAlarm, extra: LogFields): LogFields => ({ reason: alarm.alarm, runId: alarm.runId, ...extra });
+  const applied = (settled: readonly AnswerSettlement[]): LogFields[] =>
+    settled.flatMap((item) => (item.settled === "applied" ? (item.alarms ?? []).map((alarm) => fields(alarm, { coverage: item.answer.coverage })) : []));
+  if (note.kind === "receipt") {
+    const outcome = note.outcome;
+    if ((outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") && outcome.alarm !== undefined) return [fields(outcome.alarm, { delivery: outcome.delivery })];
+    return [];
+  }
+  if (note.kind === "status") return note.outcome.outcome === "status_matched" ? applied(note.outcome.settled) : [];
+  if (note.kind === "backlog") return note.outcome.outcome === "backlog_settled" ? applied(note.outcome.settled) : [];
+  if (note.kind === "hello") return note.outcome.kind === "applied" ? (note.outcome.alarms ?? []).map((alarm) => fields(alarm, { coverage: "full" })) : [];
+  return [];
 }
 
 // 결과 검사 박자의 결과. 실행마다 판정·대기·충돌·거절·장부 고장을 세고, 멈춘 이유를 따로 싣는다.
@@ -733,6 +752,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       observe: (note) => {
         if (note.kind === "fault") log("answer_fault", { where: note.where });
         else if (note.kind === "hello") log("hello", { outcome: note.outcome.kind });
+        // 답 줄은 장부 반영·ack 초안·줄의 상태를 정한 뒤에 기록하고 기록의 예외를 삼킨다(answers.ts의 note). 그래서 경보 줄은 ack·장부·줄을 바꾸지 않는다.
+        for (const alert of ledgerAlerts(note)) log("ledger_alert", alert);
       },
       credentials: issuance.credentials,
     });
