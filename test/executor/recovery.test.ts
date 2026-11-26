@@ -29,20 +29,22 @@ const bodyOf = (dir: string, runId: string, action: string) => onDiskEvents(dir,
 
 // ---- R01 ----
 
-test("R01 stopped만 실패: 종료 영수증이 디스크에 없으면 ready_result도 결과도 남지 않고, 회복하면 같은 ID·같은 본문으로 잇는다", async () => {
+test("R01 stopped만 실패: 종료 영수증이 디스크에 없으면 ready_result가 남지 않고(결과 보고는 먼저 남는다), 회복하면 같은 ID·같은 본문으로 잇는다", async () => {
   const disk = scriptedIo();
   const heal = disk.fail(outboxWrite("receipt_stopped"));
   const r = await make({ io: disk.io });
   const { runId } = await start(r);
   await r.worker.idle();
   expect(onDiskRun(r.dir, runId).state).not.toBe("ready_result");
-  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).not.toContain("report_result");
+  // 결과 보고는 종료 영수증보다 앞 순번이라 먼저 적힌다(D-167). 장애가 남은 동안 보내지는 않는다.
+  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).toContain("report_result");
   expect(r.transport.of("receipt_stopped")).toHaveLength(0);
+  expect(r.transport.of("report_result")).toHaveLength(0);
   const [stopped] = idsOf(r, runId, "receipt_stopped");
   const [report] = idsOf(r, runId, "report_result");
   heal();
   expect(await r.worker.flush()).toBe(true);
-  expect(r.transport.actions().slice(-2)).toEqual(["receipt_stopped", "report_result"]);
+  expect(r.transport.actions().slice(-2)).toEqual(["report_result", "receipt_stopped"]);
   const again = await make({ dir: r.dir, clock: r.clock });
   await again.worker.recover();
   expect(again.store.run(runId)?.state).toBe("ready_result");
@@ -50,34 +52,43 @@ test("R01 stopped만 실패: 종료 영수증이 디스크에 없으면 ready_re
   expect(idsOf(again, runId, "report_result")).toEqual([report!]);
 });
 
-test("R01 stopped만 실패한 채 재시작: 없는 영수증을 전제로 성공 상태를 만들지 않고 남은 수를 다시 센다", async () => {
+test("R01 stopped만 실패한 채 재시작: 없는 영수증을 전제로 성공 상태를 만들지 않고 남은 수를 다시 세며, 먼저 남은 결과 보고로 맺는다", async () => {
   const disk = scriptedIo();
   disk.fail(outboxWrite("receipt_stopped"));
   const r = await make({ io: disk.io });
   const { runId } = await start(r);
   await r.worker.idle();
+  const [lost] = idsOf(r, runId, "receipt_stopped");
+  const [report] = idsOf(r, runId, "report_result");
   const again = await make({ dir: r.dir, clock: r.clock });
   await again.worker.recover();
   expect(again.cleanup.survivorChecks).toBeGreaterThan(0);
-  expect(again.store.run(runId)?.state).toBe("failed_stopped");
-  expect(idsOf(again, runId, "receipt_stopped")).toHaveLength(1);
-  expect(idsOf(again, runId, "report_result")).toHaveLength(0);
+  // 디스크에 없던 영수증 ID는 쓰지 않고 새 영수증을 낸다. 보고는 completed 종료에서만 나므로 새 영수증도 completed다(D-167).
+  const stopped = again.store.validEvents(runId).filter((e) => e.action === "receipt_stopped");
+  expect(stopped).toHaveLength(1);
+  expect(stopped[0]!.id).not.toBe(lost!);
+  expect(stopped[0]!.body.exit).toBe("completed");
+  expect(again.store.run(runId)?.state).toBe("ready_result");
+  expect(idsOf(again, runId, "report_result")).toEqual([report!]);
 });
 
-test("R01 result만 실패: 종료 영수증은 남아도 결과가 없으면 ready_result가 디스크에 없고, 재시작하면 같은 종료 영수증으로 실패로 맺는다", async () => {
+test("R01 result만 실패: 결과 보고를 적지 못하면 종료 영수증도 디스크에 남지 않고, 재시작하면 남은 수를 다시 세어 결과 없는 실패로 맺는다", async () => {
   const disk = scriptedIo();
   disk.fail(outboxWrite("report_result"));
   const r = await make({ io: disk.io });
   const { runId } = await start(r);
   await r.worker.idle();
   expect(onDiskRun(r.dir, runId).state).not.toBe("ready_result");
-  const stopped = bodyOf(r.dir, runId, "receipt_stopped");
-  expect(stopped).toBeDefined();
+  // 종료 영수증은 결과 보고 뒤 순번이라 앞이 실패하면 적히지 않는다(D-167). 영수증만 남은 디스크가 생기지 않는다.
+  expect(bodyOf(r.dir, runId, "receipt_stopped")).toBeUndefined();
+  const [lost] = idsOf(r, runId, "receipt_stopped");
   const again = await make({ dir: r.dir, clock: r.clock });
   await again.worker.recover();
+  expect(again.cleanup.survivorChecks).toBeGreaterThan(0);
   expect(again.store.run(runId)?.state).toBe("failed_stopped");
-  expect(bodyOf(again.dir, runId, "receipt_stopped")).toEqual(stopped!);
   expect(idsOf(again, runId, "receipt_stopped")).toHaveLength(1);
+  expect(idsOf(again, runId, "receipt_stopped")[0]).not.toBe(lost!);
+  expect(idsOf(again, runId, "report_result")).toEqual([]);
 });
 
 test("R01 복구 대조: 끝을 모른다고 적힌 실행도 같은 실행·세대의 종료 영수증이 지속돼 있으면 같은 ID로 최종 상태를 맺는다", async () => {
@@ -355,7 +366,7 @@ test("R05 서명 불가 항목: 그 사건의 실행은 통째로 보류하고, 
   const sentIds = sent.map((e) => (e.body as { receipt_id?: string; report_id?: string }).receipt_id ?? (e.body as { report_id: string }).report_id);
   expect(sentIds).not.toContain(stopped.id);
   expect(sent.filter((e) => (e.body as { run_id?: string }).run_id === runId)).toEqual([]);
-  expect(sent.map((e) => e.header.action)).toEqual(["receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
+  expect(sent.map((e) => e.header.action)).toEqual(["receipt_accepted", "receipt_started", "report_result", "receipt_stopped"]);
   expect(again.transport.of("hello")[0]!.body.unacked_ids).not.toContain(stopped.id);
 });
 

@@ -414,18 +414,21 @@ test("F06 정리 의도: 끝나지 않은 의도를 다른 요청이 덮지 않�
 
 // ---- F07 장애 중의 송신 ----
 
-test("F07 저장 장애 중에는 이미 적은 종료 영수증도 보내지 않고, 회복한 뒤 보낸다", async () => {
+test("F07 저장 장애 중에는 이미 적은 결과 보고도 보내지 않고, 회복한 뒤 보낸다", async () => {
   const disk = scriptedIo();
-  const heal = disk.fail(outboxWrite("report_result"));
+  // 결과 보고가 종료 영수증보다 앞 순번이라(D-167) 먼저 적힌다. 뒤의 종료 영수증 쓰기를 실패시킨다.
+  const heal = disk.fail(outboxWrite("receipt_stopped"));
   const r = await make({ io: disk.io });
   const { runId } = await start(r);
   await r.worker.idle();
-  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).toContain("receipt_stopped");
+  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).toContain("report_result");
   expect(r.store.healthy()).toBe(false);
+  expect(r.transport.of("report_result")).toHaveLength(0);
   expect(r.transport.of("receipt_stopped")).toHaveLength(0);
   r.clock.advance(limits.RENEW_INTERVAL_MS);
   r.worker.tick();
   await r.worker.flush();
+  expect(r.transport.of("report_result")).toHaveLength(0);
   expect(r.transport.of("receipt_stopped")).toHaveLength(0);
   heal();
   expect(await r.worker.flush()).toBe(true);
@@ -751,7 +754,8 @@ test("G06 실행 기록을 잃은 사건이 있으면 점유를 다 말할 수 �
 
 test("G07 쓰는 도중 세운 보류 판정은 그 뒤의 파일보다 먼저 지속한다", async () => {
   const disk = scriptedIo();
-  const writing = disk.hold(outboxWrite("receipt_stopped"));
+  // 한 전이의 첫 파일은 결과 보고다(D-167). 그 쓰기에 들어간 뒤 보류 판정을 세운다.
+  const writing = disk.hold(outboxWrite("report_result"));
   const r = await make({ io: disk.io });
   const { runId } = await start(r);
   await writing.entered;
@@ -759,13 +763,13 @@ test("G07 쓰는 도중 세운 보류 판정은 그 뒤의 파일보다 먼저 �
   r.store.markInconsistent("outbox_body");
   writing.open();
   await r.worker.idle();
-  // 이미 넘긴 쓰기 뒤의 결과 보고와 실행 기록은 표식이 지속되기 전에 쓰지 않는다.
-  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).not.toContain("report_result");
+  // 이미 넘긴 쓰기 뒤의 종료 영수증과 실행 기록은 표식이 지속되기 전에 쓰지 않는다.
+  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).not.toContain("receipt_stopped");
   expect(onDiskRun(r.dir, runId).state).not.toBe("ready_result");
   heal();
   await r.worker.flush();
   expect(JSON.parse(readFileSync(join(r.dir, "ledger-hold"), "utf8"))).toEqual({ reason: "outbox_body" });
-  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).toContain("report_result");
+  expect(onDiskEvents(r.dir, runId).map((e) => e.action)).toContain("receipt_stopped");
 });
 
 // ---- G08 서명 실패와 장부 손상 ----

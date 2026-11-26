@@ -13,6 +13,8 @@
 // - 자격은 받은 바이트의 SHA-256이 지시의 digest와 같을 때만 프로필의 이름 하나에 넣는다. 결과에 그 값이 그대로 있으면 결과를 버린다.
 // - 종료 확인 영수증(receipt_stopped)은 남은 프로세스 0개를 확인한 뒤에만 낸다. 아니면 unknown_running으로 두고 슬롯을 놓지 않는다.
 // - 상태와 사건은 store.commit 한 자리로만 남긴다. 적은 사건만 보낸다. 접수 영수증이 남기 전에는 자격을 받지도 띄우지도 않는다.
+// - 결과 보고는 같은 종료의 종료 영수증보다 앞 순번으로 적는다. 디스크에 종료 영수증이 있으면 그 종료의 보고도 있고,
+//   유효한 결과 보고가 있는 실행은 failed_stopped로 답하지 않는다(D-167, report-order.md).
 // - 아는 실행 ID의 시작 지시는 새 실행을 열지 않는다. 처음 접수한 지시와 본문이 같을 때만 같은 영수증을 다시 보낸다.
 //   결과가 없다는 이유로 다시 띄우지 않는다.
 import { generateKeyPairSync, type KeyObject, randomBytes, randomUUID } from "node:crypto";
@@ -556,19 +558,25 @@ export class WorkerExecutor {
       await this.transition(runId, { state: "unknown_running", exit });
       return;
     }
-    void this.transition(runId, { state: "checking", exit });
     const prior = (action: OutboxAction) => this.store.validEvents(runId).find((entry) => entry.action === action);
     const stopped = prior("receipt_stopped");
     const report = prior("report_result");
+    // 결과 보고는 completed 종료에서만 생긴다. 보고가 남았는데 영수증이 없는 실행(보고를 적은 뒤 영수증 전에 멈춘 기동, 그 사이의 볼륨 사본)을
+    // 다시 세면 실행 기록의 exit를 잃었어도(running에 머문 기록) 새 영수증은 completed다. failed 영수증을 받은 감독 장부는 그 보고를 거절한다.
+    const stopExit: ExitKind = stopped === undefined && report !== undefined ? "completed" : exit;
+    void this.transition(runId, { state: "checking", exit: stopExit });
+    // 결과 보고를 종료 영수증보다 앞 순번으로 싣는다. 저장소는 한 실행의 사건을 순번 차례로 적고 앞이 실패하면 뒤를 적지 않으므로,
+    // 디스크에 종료 영수증이 있으면 이 종료의 결과 보고도 있다(D-167). 그래서 영수증만 남은 저장소는 보고 없는 종료뿐이고 failed_stopped가 참이다.
+    // 보내는 차례도 순번이라 감독은 보고를 종료 영수증보다 먼저 받는다(장부는 판정 전 보고로 받아 둔다).
     const events: NewEvent[] = [];
-    if (stopped === undefined) events.push(this.event("receipt_stopped", runId, { run_id: runId, remaining_processes: 0, exit, stopped_at: this.now() }));
     let state: StoredRunState = launched ? "failed_stopped" : "not_started";
     if (report !== undefined) state = "ready_result";
     else if (exit === "completed" && stdout !== null) {
       events.push(this.event("report_result", runId, { run_id: runId, result: this.readResult(stdout, credential) }));
       state = "ready_result";
     }
-    await this.transition(runId, { state, exit }, events);
+    if (stopped === undefined) events.push(this.event("receipt_stopped", runId, { run_id: runId, remaining_processes: 0, exit: stopExit, stopped_at: this.now() }));
+    await this.transition(runId, { state, exit: stopExit }, events);
     for (const entry of [stopped, report]) if (entry !== undefined) this.transmit(entry);
   }
 
@@ -793,11 +801,19 @@ export class WorkerExecutor {
   }
 
   // 밖으로 말하는 상태는 파일에 적힌 것이다. 장부가 설명하지 못하는 실행은 끝을 모른다고 답하고 그 포인터를 쓰지 않는다.
+  // 유효한 결과 보고가 있는 실행은 failed_stopped로 답하지 않는다(D-167): 감독은 그 답을 "이 종료의 결과는 없고 앞으로도 없다"로 읽고 결과를 버린다.
+  // 그런 기록은 보고를 적기 전의 실행 기록이 보고와 함께 되살아난 디스크에서만 생긴다. 기록을 고치는 것은 재기동 대조(reconcile)이고, 그 전에도 이렇게 답한다.
   private statusOf(runId: string): RunStatus {
     const record = this.store.durableRun(runId);
     if (record === undefined) return { run_id: runId, state: "not_known", run_generation: null, last_receipt_id: null };
     if (this.store.suspectRun(runId)) return { run_id: runId, state: "unknown_running", run_generation: record.run_generation, last_receipt_id: null };
-    return { run_id: runId, state: record.state, run_generation: record.run_generation, last_receipt_id: record.last_receipt_id };
+    const state = record.state === "failed_stopped" && this.reported(runId) ? "ready_result" : record.state;
+    return { run_id: runId, state, run_generation: record.run_generation, last_receipt_id: record.last_receipt_id };
+  }
+
+  // 그 실행에 유효한(같은 세대, 본문까지 검증된) 결과 보고가 있는가. failed_stopped의 전제(종료 영수증)와 함께면 ready_result의 전제가 채워진다.
+  private reported(runId: string): boolean {
+    return this.store.validEvents(runId).some((entry) => entry.action === "report_result");
   }
 
   // ---- 시간 ----
@@ -899,6 +915,9 @@ export class WorkerExecutor {
       // 파일의 기록은 아직 completed다. 상태만 맞추면 실행 기록과 감독이 받은 영수증이 다른 종료 사유를 말한다.
       const exit = entries.findLast((entry) => entry.action === "receipt_stopped")!.body.exit as ExitKind;
       if (exit !== record.exit) patch.exit = exit;
+    } else if (record.state === "failed_stopped" && has("report_result")) {
+      // 결과 보고가 있는 종료를 결과 없음으로 맺은 기록이다(보고 전의 실행 기록이 되살아난 디스크). 남은 보고로 ready_result에 맞춘다(D-167).
+      patch.state = "ready_result";
     }
     const latest = entries.findLast((entry) => entry.action !== "report_result")?.id ?? null;
     if (latest !== record.last_receipt_id) patch.last_receipt_id = latest;

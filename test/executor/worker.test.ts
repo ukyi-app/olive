@@ -39,11 +39,11 @@ afterEach(async () => {
 const receipts = (r: Rig) => r.transport.sent.filter((e) => e.header.action.startsWith("receipt_") || e.header.action === "report_result");
 const stateOf = (r: Rig, runId: string) => r.store.run(runId)?.state;
 
-test("시작: 정상 실행은 접수 → 시작 → 종료 확인(남은 0) → 결과 보고 순서로 영수증을 낸다", async () => {
+test("시작: 정상 실행은 접수 → 시작 → 결과 보고 → 종료 확인(남은 0) 순서로 영수증을 낸다", async () => {
   const r = await make();
   const { runId } = await start(r);
   await r.worker.idle();
-  expect(r.transport.actions()).toEqual(["stop_sync_request", "hello", "receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
+  expect(r.transport.actions()).toEqual(["stop_sync_request", "hello", "receipt_accepted", "receipt_started", "report_result", "receipt_stopped"]);
   const stopped = r.transport.of("receipt_stopped")[0]!;
   expect(stopped.body).toMatchObject({ run_id: runId, remaining_processes: 0, exit: "completed" });
   expect(r.transport.of("report_result")[0]!.body.result).toMatchObject({ role: "diagnosis", outcome: "completed" });

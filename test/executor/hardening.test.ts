@@ -136,7 +136,7 @@ test("R08 시작 영수증만 한 번 실패해도 뒤 사건이 앞지르지 �
   await r.worker.idle();
   await r.worker.flush();
   const order = r.transport.actions().filter((a) => a.startsWith("receipt_") || a === "report_result");
-  expect(order).toEqual(["receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
+  expect(order).toEqual(["receipt_accepted", "receipt_started", "report_result", "receipt_stopped"]);
   const stopped = onDiskEvents(r.dir, runId).find((e) => e.action === "receipt_stopped")!;
   expect(onDiskRun(r.dir, runId).last_receipt_id).toBe(stopped.id);
   expect(r.store.run(runId)?.last_receipt_id).toBe(stopped.id);
@@ -145,7 +145,7 @@ test("R08 시작 영수증만 한 번 실패해도 뒤 사건이 앞지르지 �
   expect(again.store.inconsistency()).toBeNull();
   expect(again.store.run(runId)?.last_receipt_id).toBe(stopped.id);
   // 재연결의 재전송도 최초 순번 차례다.
-  expect(again.transport.actions().slice(2)).toEqual(["receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
+  expect(again.transport.actions().slice(2)).toEqual(["receipt_accepted", "receipt_started", "report_result", "receipt_stopped"]);
 });
 
 test("R08 늦게 적힌 앞 사건도 재전송 뒤 상태 조회가 마지막 영수증을 그대로 답한다", async () => {
