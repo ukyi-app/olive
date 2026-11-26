@@ -291,7 +291,9 @@ async function agentMain(name: string): Promise<void> {
   };
   // linkdrop은 정리를 기다리지 않고 끝나게 해(TERM 무시 → KILL 전) 남은 후손을 커널이 끝내는지 본다.
   const options = { enforceWaitMs: name === "agent-linkdrop" ? 50 : 5_000 };
-  const agent = await RoleAgent.prepare(runtime, productionParts({ graceMs: GRACE_MS, killMs: 3_000 }), options);
+  // 이 공간은 호스트의 /tmp를 그대로 본다(--dev-bind / /). 비어 있는 작업 공간이 띄우기의 조건이라(D-154) 빈 임시 폴더를 루트로 준다.
+  const workspace = mkdtempSync(join(tmpdir(), "olive-agent-workspace-"));
+  const agent = await RoleAgent.prepare(runtime, productionParts({ graceMs: GRACE_MS, killMs: 3_000 }, workspace), options);
   if (agent === null) return;
   const control = new FakeControl();
   control.agent = agent;

@@ -1,4 +1,5 @@
-// 역할 컨테이너의 PID 1로 도는 대리의 핵심. 제어(실행기)의 지시를 링크로 받아 역할 프로그램 하나를 띄우고, 끝내고, 남은 수를 센다.
+// 역할 컨테이너의 PID 1로 도는 대리의 핵심. 제어(실행기)의 지시를 링크로 받아 역할 프로그램 하나를 띄우고, 끝내고, 남은 수를 세고,
+// 실행 사이에 작업 공간(역할 컨테이너의 /tmp 전체, D-154)을 비운다.
 // 대리는 서명하지 않고 키를 보지 않는다. 대리가 내는 것은 서명 없는 사실이고, 영수증은 제어가 자기 키로 낸다.
 //
 // 차례: harden(non-dumpable) → PID 1인지 → 정리 코어 기록(PidSpace.record, 기준은 자기뿐) → attach(링크에 hello).
@@ -9,11 +10,12 @@
 // 그래서 정리가 멈추거나 실패해도 상한(enforceWaitMs) 뒤에는 끝난다. 끝난 뒤의 남은 수는 제어가 알 수 없다(링크 끊김 = 모름).
 //
 // 역할 프로그램에게서 받는 것은 stdout 바이트뿐이고 해석하지 않는다. 상한까지 모아 output 조각으로 넘긴다(해석은 제어의 일이다).
-// 시계·타이머·끝내기는 주입받는다. 신호와 /proc은 PidSpace.record가 만든 정리 코어로만, 띄우기는 Launcher로만 한다.
+// 시계·타이머·끝내기는 주입받는다. 신호와 /proc은 PidSpace.record가 만든 정리 코어로만, 띄우기는 Launcher로만, 파일은 RunWorkspace로만 한다.
 import { limits } from "../contract/v1/index.ts";
 import { PidSpace, type PidSpaceTiming, type ProcessCleanup } from "../executor/containment.ts";
 import { bunLauncher, LaunchFailed, type Launcher } from "../executor/launcher.ts";
 import { credentialText, type LaunchPlan } from "../executor/profile.ts";
+import { rootWorkspace, type RunWorkspace, WORKSPACE_ROOT } from "../executor/workspace.ts";
 import { makeNonDumpable } from "./dumpable.ts";
 import {
   type AgentMessage,
@@ -60,6 +62,7 @@ export interface AgentParts {
   harden(): boolean;
   record(): Promise<ProcessCleanup>;
   readonly launcher: Launcher;
+  readonly workspace: RunWorkspace;
 }
 
 export interface AgentOptions {
@@ -73,12 +76,14 @@ export interface AgentOptions {
   enforceWaitMs?: number;
 }
 
-export function productionParts(timing: PidSpaceTiming = {}): AgentParts {
+// root는 실제 프로세스 시험(bwrap 안, 호스트의 /tmp가 보임)이 임시 폴더로 바꾸는 자리다.
+export function productionParts(timing: PidSpaceTiming = {}, root: string = WORKSPACE_ROOT): AgentParts {
   return {
     selfPid: process.pid,
     harden: makeNonDumpable,
     record: () => PidSpace.record({ dedicated: true, ...timing }),
     launcher: bunLauncher,
+    workspace: rootWorkspace(root),
   };
 }
 
@@ -96,7 +101,9 @@ export class RoleAgent {
   private transport: AgentTransport | null = null;
   private run: Run | null = null;
   private closing = false;
-  // 끝내기·세기는 받은 차례대로 하나씩 답한다.
+  // 작업 공간을 지우는 중. 그동안은 띄우지 않는다(지우는 파일과 새 실행의 파일이 섞인다).
+  private clearing = false;
+  // 끝내기·세기·비우기는 받은 차례대로 하나씩 답한다.
   private queue: Promise<void> = Promise.resolve();
   private readonly options: Required<AgentOptions>;
 
@@ -104,6 +111,7 @@ export class RoleAgent {
     private readonly space: ProcessCleanup,
     private readonly runtime: AgentRuntime,
     private readonly launcher: Launcher,
+    private readonly workspace: RunWorkspace,
     options: AgentOptions,
   ) {
     this.options = {
@@ -125,7 +133,7 @@ export class RoleAgent {
     } catch {
       return exitWith(runtime, "space_unavailable");
     }
-    return new RoleAgent(space, runtime, parts.launcher, options);
+    return new RoleAgent(space, runtime, parts.launcher, parts.workspace, options);
   }
 
   // 링크가 이어졌다. hello를 보낸다. 링크는 하나뿐이다(두 번째 attach는 계약 밖이다).
@@ -197,6 +205,29 @@ export class RoleAgent {
           if (survivors === 0 && run !== null && run.ended) this.close(run);
           this.tell({ type: "counted", seq: message.seq, survivors });
         });
+      case "clean":
+        return this.serially(async () => {
+          const left = await this.sweep();
+          this.tell({ type: "cleaned", seq: message.seq, left });
+        });
+    }
+  }
+
+  // 작업 공간을 비우고 루트 바로 아래 남은 수를 센다(D-153의 둘째). 0만 확인이고, 지우지 않고 null을 답하는 때:
+  // - 열린 실행이 있다(프로그램이 끝났지만 0으로 닫히지 않은 실행 포함). 그 실행의 끝을 제어가 아직 맺지 않았다.
+  // - 남은 프로세스가 0이 아니거나 모른다(D-153의 첫째를 정리 때 다시 센다). 살아 있을 수 있는 프로세스가 쓰는 파일은 지우지 않는다.
+  // - 파일을 읽지 못했다.
+  // 세거나 지우는 사이 실행이 열렸으면 그 실행의 파일이 섞였을 수 있어 null이다(제어는 정리를 기다리는 동안 띄우지 않지만 대리는 그것을 믿지 않는다).
+  private async sweep(): Promise<number | null> {
+    if (this.run !== null) return null;
+    const survivors = await this.space.survivors().catch(() => null);
+    if (survivors !== 0 || this.run !== null) return null;
+    this.clearing = true;
+    try {
+      const left = await this.workspace.clear().catch(() => null);
+      return this.run === null ? left : null;
+    } finally {
+      this.clearing = false;
     }
   }
 
@@ -230,7 +261,13 @@ export class RoleAgent {
     // 앞 실행의 후손이 남은 공간에서는 띄우지 않는다(그 수가 이 실행의 것으로 섞인다).
     const before = await this.space.survivors().catch(() => null);
     if (before !== 0) return notSpawned("space_not_clean");
+    // 앞 실행이 남긴 파일(다른 계정의 자격 파일일 수 있다)을 이 실행이 읽지 않게, 작업 공간이 비었을 때만 띄운다(D-154).
+    const entries = await this.workspace.entries().catch(() => null);
+    if (entries !== 0) return notSpawned("space_not_clean");
+    // 프로필 cwd가 루트 아래 하위 폴더면 비운 뒤라 없다. 빈 것을 본 뒤에 만든다.
+    if (!(await this.workspace.enter(plan.cwd).then(() => true, () => false))) return notSpawned("spawn_failed");
     // 세는 사이 링크·취소·기한이 바뀌었을 수 있다. 여기서 launcher의 spawn까지 await가 없다.
+    if (this.clearing) return notSpawned("cleanup_busy");
     if (this.closing || this.run !== run || run.controller.signal.aborted) return notSpawned("aborted");
     if (this.expired(run)) return notSpawned("expired");
     let spawned = false;

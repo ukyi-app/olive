@@ -4,7 +4,7 @@ import { expect, test } from "bun:test";
 import { AGENT_EXIT, type AgentParts } from "../../src/agent/agent.ts";
 import { AgentDecoder } from "../../src/agent/link.ts";
 import { type AgentSocketHandlers, type AgentSocketPort, ROLE_AGENT_EXIT, runRoleAgent } from "../../src/main/role-agent.ts";
-import { FakeLauncher, FakeRuntime, FakeSpace, settle } from "./support.ts";
+import { FakeLauncher, FakeRuntime, FakeSpace, FakeWorkspace, settle } from "./support.ts";
 
 const PATH = "/run/olive/link/agent.sock";
 
@@ -14,6 +14,7 @@ function parts(order: string[], over: Partial<AgentParts> = {}): AgentParts {
     harden: () => (order.push("harden"), true),
     record: async () => (order.push("record"), new FakeSpace()),
     launcher: new FakeLauncher(),
+    workspace: new FakeWorkspace(),
     ...over,
   };
 }

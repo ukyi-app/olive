@@ -10,6 +10,8 @@
 //   제어는 새 대리의 hello와 옛 공간에 남은 프로세스가 연 연결을 말로 가를 수 없기 때문이다. 회복은 이 파일 밖의 일이다
 //   (처음 잠기는 순간 onDistrust로 조립에 알린다. 조립은 파드 전체 재시작을 부른다, runtime.ts).
 // - terminated는 0의 증거가 아니다. terminate()는 끝났다는 사실만 알리고 남은 수는 언제나 survivors()가 따로 묻는다.
+// - 정리(space().clean)가 true인 때는 하나다: 믿는 연결에서, 대기 단계이고 기다리는 terminate·clean이 없을 때 새로 보낸 clean의 답이
+//   보낸 때와 같은 단계에서 replyWaitMs 안에 왔고 남은 항목이 0이다(D-146·D-153). 그 밖은 false이고 요청은 답이나 연결 끝까지 쥔다.
 // - 서명하지 않는다. 대리의 답은 서명 없는 사실이고 영수증은 worker가 자기 키로 낸다.
 // - 자격 값은 start 바로 뒤의 값 틀 하나에만 싣는다. 오류·관측(state)에는 사유 이름만 둔다. 보낸 뒤 값과 틀의 바이트를 0으로 채운다.
 // 시계·타이머는 주입받는다. 소켓을 직접 열지 않는다(연결은 agent-listener.ts가 connect로 넘긴다).
@@ -123,9 +125,9 @@ interface Connection {
 //   늦음은 타이머 콜백과 받은 때의 시계(expiresAt) 둘로 본다. 콜백이 아직 돌지 않았어도 시계가 기한을 지났으면 늦은 답이다.
 // 늦은 답도 이 요청의 답으로만 쓰이고 다른 요청의 답이 되지 않는다(seq가 다르다).
 interface Pending {
-  readonly kind: "terminate" | "count";
+  readonly kind: "terminate" | "count" | "clean";
   readonly connection: Connection;
-  // count만: 보낸 때의 단계. 답이 올 때 같은 단계(같은 객체)여야 증거로 쓴다.
+  // count·clean: 보낸 때의 단계. 답이 올 때 같은 단계(같은 객체)여야 증거로 쓴다.
   readonly phase: Phase;
   // count만: 이 count보다 먼저 보낸 가장 최근의 terminate. 대리는 차례대로 답하므로 count의 답이 올 때 그 답은 이미 와 있어야 한다.
   readonly after: Pending | null;
@@ -248,13 +250,14 @@ export class RemoteAgent {
         return phase.sink?.failed(new ExitUnconfirmed());
       case "terminated":
       case "counted":
+      case "cleaned":
         return this.answer(message);
     }
   }
 
   // 답의 seq가 기다리는 요청과 종류까지 맞아야 한다. 보낸 적 없는(또는 이미 답을 받은) seq나 종류가 다른 답은 잠근다.
-  private answer(message: Extract<AgentMessage, { type: "terminated" | "counted" }>): void {
-    const kind = message.type === "terminated" ? "terminate" : "count";
+  private answer(message: Extract<AgentMessage, { type: "terminated" | "counted" | "cleaned" }>): void {
+    const kind = message.type === "terminated" ? "terminate" : message.type === "counted" ? "count" : "clean";
     const waiting = this.pending.get(message.seq);
     if (waiting === undefined || waiting.kind !== kind) return this.lock("unknown_reply");
     this.pending.delete(message.seq);
@@ -265,6 +268,8 @@ export class RemoteAgent {
       waiting.answered = true;
       return waiting.settle("done");
     }
+    // 늦었거나 그 사이 단계가 바뀐 답은 요청만 놓는다. 보낸 뒤 시작이 나갔으면 그 0은 이 정리의 확인이 아니다.
+    if (message.type === "cleaned") return waiting.settle(waiting.late || this.phase !== waiting.phase ? null : message.left);
     // 증거로 쓰지 못하는 답은 요청만 놓는다(물리적 대기의 끝). 단계(ended)와 연결은 그대로 두어, 같은 연결에서 새로 끝내고 센 답만
     // 그 실행을 닫고, 그 전에 끊기면 실행 중 끊김으로 잠근다(drop).
     if (!this.adoptable(waiting)) return waiting.settle(null);
@@ -319,7 +324,7 @@ export class RemoteAgent {
       if (waiting.connection !== connection) continue;
       this.pending.delete(seq);
       waiting.cancelDeadline();
-      waiting.settle(waiting.kind === "count" ? null : error);
+      waiting.settle(waiting.kind === "terminate" ? error : null);
     }
   }
 
@@ -363,7 +368,7 @@ export class RemoteAgent {
       if (kind === "terminate") this.lastTerminate = waiting;
       this.pending.set(seq, waiting);
       // 쓰기에 실패하면 drop()이 이 요청을 거둔다.
-      this.write(connection, encodeControl(kind === "terminate" ? { type: "terminate", seq } : { type: "count", seq }));
+      this.write(connection, encodeControl(kind === "terminate" ? { type: "terminate", seq } : kind === "count" ? { type: "count", seq } : { type: "clean", seq }));
     });
   }
 
@@ -386,9 +391,26 @@ export class RemoteAgent {
     busy: () => [...this.pending.values()].some((waiting) => waiting.kind === "terminate"),
   };
 
+  private sweeping(): boolean {
+    return [...this.pending.values()].some((waiting) => waiting.kind === "clean");
+  }
+
+  // 대리에게 작업 공간을 비우고 세게 한다. 실행 중이거나 끝을 맺지 못한 단계(starting·running·ended)면 묻지 않는다: 그 실행의 파일을
+  // 지우면 안 되고, 끝내기의 답을 기다리는 중이면 그 정리가 끝나기 전이다. 기다리는 clean이 있으면 새로 보내지 않는다(그 답이 아직 오는 중이다).
+  // 기한(replyWaitMs)에 false로 돌아간다: worker는 이 호출에 상한을 걸지 않고 정리 슬롯을 쥐므로, 여기서 끊어야 감독의 확정 재전송이 다시 부른다.
+  private async sweep(): Promise<boolean> {
+    if (this.phase.kind !== "idle" || this.cleanup.busy() || this.sweeping()) return false;
+    let cancel: () => void = () => {};
+    const lapsed = new Promise<null>((resolve) => (cancel = this.options.runtime.setTimer(this.options.replyWaitMs, () => resolve(null))));
+    const answer = await Promise.race([this.request("clean"), lapsed]);
+    cancel();
+    return answer === 0;
+  }
+
   // ---- RunSpace ----
 
-  // 폴더 준비·지우기는 inner가 한다. 준비가 끝난 실행 ID를 다음 띄우기의 링크 실행 ID로 남긴다(worker는 준비 → 자격 → 띄우기 차례로 부른다).
+  // 제어 쪽 폴더 준비·지우기는 inner가 한다. 준비가 끝난 실행 ID를 다음 띄우기의 링크 실행 ID로 남긴다(worker는 준비 → 자격 → 띄우기 차례로 부른다).
+  // 지우기는 inner가 끝난 뒤 대리의 작업 공간 정리(sweep)까지 확인돼야 true다.
   space(inner: RunSpace): RunSpace {
     return {
       prepare: async (runId, signal) => {
@@ -396,7 +418,7 @@ export class RemoteAgent {
         // 중단된 준비가 늦게 끝나면 다른 실행의 ID를 덮지 않는다.
         if (!signal.aborted) this.prepared = runId;
       },
-      clean: (runId) => inner.clean(runId),
+      clean: async (runId) => (await inner.clean(runId)) && (await this.sweep()),
     };
   }
 
@@ -408,7 +430,7 @@ export class RemoteAgent {
 
   private launch(plan: LaunchPlan, signal: AbortSignal, hooks: LaunchHooks): Promise<LaunchOutcome> {
     if (signal.aborted) return Promise.reject(new LaunchFailed("aborted"));
-    if (hooks.busy()) return Promise.reject(new LaunchFailed("cleanup_busy"));
+    if (hooks.busy() || this.sweeping()) return Promise.reject(new LaunchFailed("cleanup_busy"));
     const runId = this.prepared;
     this.prepared = null;
     const connection = this.usable();

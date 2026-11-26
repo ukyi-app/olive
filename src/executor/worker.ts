@@ -56,7 +56,7 @@ export interface Outlet {
   dropCurrent(): void;
 }
 
-// 실행마다 쓰는 폴더 등의 준비와 지우기. 실제 작업 폴더·tmp의 모양은 뒤 작업(O13)이 정한다.
+// 실행마다 쓰는 폴더 등의 준비와 지우기. 작업자 실행기에서는 역할 컨테이너의 /tmp 전체가 한 실행의 작업 공간이다(D-154, runtime.ts·remote-agent.ts).
 export interface RunSpace {
   // signal이 중단되면 준비를 거둔다. 실행기는 중단 뒤 늦게 끝난 준비의 결과를 쓰지 않는다.
   prepare(runId: string, signal: AbortSignal): Promise<void>;
@@ -716,6 +716,14 @@ export class WorkerExecutor {
       cleaned = false;
     }
     if (!cleaned) return;
+    // 정리 영수증이 약속하는 셋째(D-153): 제어 우편함이 그 실행의 값을 0으로 채웠다. 실행이 끝날 때도 부르지만 영수증 직전에 다시 부른다:
+    // 재시작한 프로세스의 우편함은 그 실행을 모르므로, 그 실행의 값 틀이 뒤늦게 오면 칸에 남는다.
+    // 던지면 그 약속을 할 수 없어 영수증 없이 cleanup_pending으로 두고 재전송이 다시 부른다.
+    try {
+      this.options.credentials.forget?.(runId);
+    } catch {
+      return;
+    }
     const fields = { run_id: runId, instruction_request_id: intent.request_id, cleaned_at: this.now() };
     const event = this.event("receipt_cleaned", runId, fields, intent.instruction_digest, intent.receipt_id);
     await this.transition(runId, { state: "finalized" }, [event]);

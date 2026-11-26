@@ -5,6 +5,7 @@ import { type AgentMessage, AgentDecoder, type ControlMessage, encodeControl } f
 import type { ProcessCleanup } from "../../src/executor/containment.ts";
 import type { Launcher, LaunchHooks, LaunchOutcome } from "../../src/executor/launcher.ts";
 import type { LaunchPlan } from "../../src/executor/profile.ts";
+import type { RunWorkspace } from "../../src/executor/workspace.ts";
 import { encodeCredentialFrame } from "../../src/transport/framing.ts";
 
 export const T0 = 1_800_000_000_000;
@@ -105,6 +106,31 @@ export class FakeSpace implements ProcessCleanup {
   }
   busy(): boolean {
     return false;
+  }
+}
+
+// 작업 공간. entries·clear가 차례대로 돌려줄 값(비면 0). Error를 넣으면 그 호출이 던진다.
+export class FakeWorkspace implements RunWorkspace {
+  entryCounts: (number | Error)[] = [];
+  clearCounts: (number | Error)[] = [];
+  entered: string[] = [];
+  clears = 0;
+  // clear가 돌아오기 전에 시험이 끼어드는 자리.
+  clearGate: Promise<void> | undefined;
+  async entries(): Promise<number> {
+    const next = this.entryCounts.shift() ?? 0;
+    if (next instanceof Error) throw next;
+    return next;
+  }
+  async clear(): Promise<number> {
+    this.clears++;
+    await this.clearGate;
+    const next = this.clearCounts.shift() ?? 0;
+    if (next instanceof Error) throw next;
+    return next;
+  }
+  async enter(cwd: string): Promise<void> {
+    this.entered.push(cwd);
   }
 }
 

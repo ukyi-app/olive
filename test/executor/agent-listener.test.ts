@@ -7,7 +7,7 @@ import { RoleAgent } from "../../src/agent/agent.ts";
 import { ControlDecoder, encodeAgent } from "../../src/agent/link.ts";
 import { AgentListenerRefused, listenForAgent, type UnixHandlers, type UnixListen, type UnixListening, type UnixPeer } from "../../src/executor/agent-listener.ts";
 import { RemoteAgent } from "../../src/executor/remote-agent.ts";
-import { FakeLauncher, FakeRuntime, FakeSpace } from "../agent/support.ts";
+import { FakeLauncher, FakeRuntime, FakeSpace, FakeWorkspace } from "../agent/support.ts";
 import { realTimers } from "./fake-agent.ts";
 import { pause, rig, scratch, start, until } from "./support.ts";
 
@@ -43,7 +43,7 @@ async function realAgent(exitWaitMs: number, hooks: { onCount?: () => void } = {
   runtime.t = r.clock.now();
   const space = new FakeSpace();
   const launcher = new FakeLauncher();
-  const agent = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher }))!;
+  const agent = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher, workspace: new FakeWorkspace() }))!;
   const { socket } = await dial(path, (chunk) => agent.receive(chunk), () => agent.linkClosed());
   agent.attach({
     write: (bytes) => {
@@ -134,7 +134,7 @@ test("소켓: 실제 대리가 경로 소켓으로 붙어 hello → 시작 → �
   runtime.t = r.clock.now();
   const space = new FakeSpace();
   const launcher = new FakeLauncher();
-  const agent = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher }))!;
+  const agent = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher, workspace: new FakeWorkspace() }))!;
   const { socket } = await dial(path, (chunk) => agent.receive(chunk), () => agent.linkClosed());
   agent.attach({
     write: (bytes) => {

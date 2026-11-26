@@ -220,3 +220,21 @@ test("자격: 디코딩한 값과 거절·오류의 진단에 값의 글이 실�
   const mixed = new ControlDecoder();
   expect(codeOf(() => mixed.push(concat(startBytes(), json({ v: 1, type: "nope" }))))).toBe("link_unknown_message");
 });
+
+test("링크(정리): clean·cleaned의 꼴과 seq. cleaned의 left는 0 이상의 정수나 null이고, terminated·counted와 seq를 함께 쓴다", () => {
+  expect(new ControlDecoder().push(encodeControl({ type: "clean", seq: 1 }))).toEqual([{ type: "clean", seq: 1 }]);
+  expect(() => encodeControl({ type: "clean", seq: 0 })).toThrow("link_bad_message");
+  expect(() => new ControlDecoder().push(json({ v: 1, type: "clean", seq: 1, run_id: RUN }))).toThrow("link_bad_message");
+  for (const left of [0, 3, null]) {
+    const decoder = new AgentDecoder();
+    expect(decoder.push(encodeAgent({ type: "hello" }))).toEqual([{ type: "hello" }]);
+    expect(decoder.push(encodeAgent({ type: "cleaned", seq: 1, left }))).toEqual([{ type: "cleaned", seq: 1, left }]);
+  }
+  for (const left of [-1, 1.5, "0", undefined]) {
+    expect(() => encodeAgent({ type: "cleaned", seq: 1, left } as unknown as AgentMessage), String(left)).toThrow("link_bad_message");
+  }
+  const decoder = new AgentDecoder();
+  decoder.push(encodeAgent({ type: "hello" }));
+  decoder.push(encodeAgent({ type: "counted", seq: 2, survivors: 0 }));
+  expect(() => decoder.push(encodeAgent({ type: "cleaned", seq: 2, left: 0 }))).toThrow("link_out_of_order");
+});
