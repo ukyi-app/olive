@@ -22,8 +22,8 @@ test("entrypoints: supervisor는 환경이 없으면 첫 이름을 한 줄 찍�
   expect(result.stderr.toString()).toBe(`olive supervisor ${pkg.version}: 환경 OLIVE_SUPERVISOR_PORT이(가) 없다\n`);
 });
 
-// 시험 현관 대역(D-109). 운영 값(시험 작업 꺼짐)에서 켜거나 on·off 밖의 값이면 아무 파일도 읽기 전에 91이다. 대역이 없거나 시험 값(둘 다 on)이면
-// 환경을 지나 재료 읽기에서 92로 끝나고(경로가 없다), 그 전에 고른 현관을 기록에 한 줄 남긴다. 환경 값마다의 경우는 test/supervisor/frontdoor/test-double.test.ts가 본다.
+// 시험 현관 대역(D-109·D-125). 운영 값(시험 작업 꺼짐, 또는 클러스터 이름이 vm이 아님)에서 켜거나 on·off 밖의 값이면 아무 파일도 읽기 전에 91이다.
+// 대역이 없거나 시험 값(둘 다 on이고 이름이 vm)이면 환경을 지나 재료 읽기에서 92로 끝나고(경로가 없다), 그 전에 고른 현관을 기록에 한 줄 남긴다. 환경 값마다의 경우는 test/supervisor/frontdoor/test-double.test.ts가 본다.
 test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거나 값이 틀리면 91로, 대역 없음·시험 값이면 환경을 지나 92로 끝난다", () => {
   const env = {
     OLIVE_SUPERVISOR_PORT: "8443",
@@ -41,7 +41,13 @@ test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거
   const spawn = (extra: Record<string, string>) =>
     Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
   const refused = `olive supervisor ${pkg.version}: 환경 OLIVE_TEST_FRONTDOOR이(가) 틀렸다\n`;
-  const refusedEnv: Record<string, string>[] = [{ OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "off", OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "yes" }];
+  const refusedEnv: Record<string, string>[] = [
+    { OLIVE_TEST_FRONTDOOR: "on" },
+    { OLIVE_TEST_JOBS: "off", OLIVE_TEST_FRONTDOOR: "on" },
+    { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "yes" },
+    // 시험 작업이 켜져도 클러스터 이름(여기서는 home)이 vm이 아니면 거절한다.
+    { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" },
+  ];
   for (const extra of refusedEnv) {
     const result = spawn(extra);
     expect([JSON.stringify(extra), result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([JSON.stringify(extra), 91, "", refused]);
@@ -49,7 +55,7 @@ test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거
   for (const [extra, mode] of [
     [{}, "absent"],
     [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "off" }, "absent"],
-    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, "test_double"],
+    [{ OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, "test_double"],
   ] as const) {
     const result = spawn(extra);
     const lines = result.stderr.toString().split("\n");

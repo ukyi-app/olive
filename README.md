@@ -407,7 +407,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | `OLIVE_ACCOUNT_REVISION` | 고정 계정 자격의 판(D-111, v1 revision 꼴). 배정이 고른 계정의 자격 참조(`credential`의 `revision`)에 싣는다. 계정 Secret을 바꾸는 사람 PR이 이 값을 함께 올린다 | 차트(homelab이 렌더할 이름. 값 자리는 `supervisor.account.revision`, D-111) | 모름: 자격 참조를 만들지 않아(파일을 열지 않는다) 새 실행 0. 별칭(`OLIVE_ACCOUNT_NAME`)과 판이 함께 있어야 자격 참조가 생긴다. 꼴이 틀리면 91 |
 | `OLIVE_PROFILE_REVISIONS` | 역할별 기대 프로필 revision의 JSON 객체 `{ "<v1 역할>": "<revision>" }`. 실행기 인사의 `profile_revision`과 견준다. 칸이 없는 역할은 배정하지 않고, 칸의 값이 모두 같을 때만 쓴다(아래 "이 진입점에 없는 것"의 배정 정책) | 차트(homelab 역할 프로필 조각이 렌더할 이름) | 기대값 없음: 모든 연결이 보류. JSON 객체가 아니거나 모르는 역할·꼴이 틀린 revision·거듭된 역할 칸이면 91 |
 | `OLIVE_TEST_JOBS` | 시험 작업 넣기(D-98·D-101). `on`이면 관리 통로의 `test-job`을 받는다. 없거나 빈 값·`off`면 꺼짐이고 그 명령은 늘 `disabled`로 거절된다(장부 쓰기 포트를 만들지 않는다) | 차트(시험 값에서만. 운영 값에서 켜면 CI가 거절한다: 아래 "감독 관리 통로") | 꺼짐. `on`·`off` 밖의 값은 91 |
-| `OLIVE_TEST_FRONTDOOR` | 시험 현관 대역(D-109). `on`이면 현관 포트 대신 대역을 쓴다(아래 "시험 현관 대역"). 없거나 빈 값·`off`면 대역 없음이고 현관 포트는 늘 모름이다. **`on`은 `OLIVE_TEST_JOBS=on`일 때만 받는다** | 차트(시험 값에서만. 운영 값에서 켜면 CI가 거절한다) | 대역 없음. `on`·`off` 밖의 값, 그리고 `OLIVE_TEST_JOBS`가 `on`이 아닌데 `on`이면 91 |
+| `OLIVE_TEST_FRONTDOOR` | 시험 현관 대역(D-109). `on`이면 현관 포트 대신 대역을 쓴다(아래 "시험 현관 대역"). 없거나 빈 값·`off`면 대역 없음이고 현관 포트는 늘 모름이다. **`on`은 `OLIVE_TEST_JOBS=on`이고 `OLIVE_ENVIRONMENT`가 시험 클러스터 이름 `vm`과 글자까지 같을 때만 받는다(D-125)** | 차트(시험 값에서만. 운영 값에서 켠 것을 거절하는 CI는 뒤 homelab PR의 일) | 대역 없음. `on`·`off` 밖의 값, 그리고 `on`인데 `OLIVE_TEST_JOBS`가 `on`이 아니거나 `OLIVE_ENVIRONMENT`가 `vm`이 아니면(대소문자·앞뒤 공백 다름 포함) 91 |
 
 서명 키는 경로만 환경에서 읽고 PEM 값은 감독에만 붙인 Secret 파일에서 읽는다(아래 "공개 저장소").
 
@@ -415,7 +415,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 현관(O08)이 없는 시험 클러스터에서 감독이 복원 5단계를 마치고 접수를 열게 하는 현관 포트다(D-109). 코드는 `src/supervisor/frontdoor/test-double.ts`, 고르는 곳은 진입점(`frontDoorFor`), 장부에 입력을 넣는 곳은 조립(`boot.ts`의 `admitTestInput`)이다.
 
-- **켜기:** 감독 환경 `OLIVE_TEST_FRONTDOOR=on`이고 `OLIVE_TEST_JOBS=on`일 때만이다. 감독은 어느 클러스터에서 도는지 모르고, 아는 "시험 값"의 표시는 `OLIVE_TEST_JOBS=on` 하나뿐이다(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다: 아래 "감독 관리 통로"). 그래서 `OLIVE_TEST_JOBS`가 `on`이 아닌 값에서 대역을 켜면 운영 값으로 보고 아무 파일도 읽기 전에 **91**이다. 둘 다 시험 값 전용이고, 대역은 시험 작업 넣기(`test-job`)가 쓸 소유자 입력을 만드는 짝이다. 고른 현관은 기동 기록 첫 줄 `front_door mode=absent|test_double`에 남는다.
+- **켜기:** 감독 환경 `OLIVE_TEST_FRONTDOOR=on`이고 `OLIVE_TEST_JOBS=on`이며 `OLIVE_ENVIRONMENT`가 시험 클러스터 이름 **`vm`**(`test-double.ts`의 `TEST_FRONT_DOOR_ENVIRONMENT`, homelab VM 값의 클러스터 이름과 같다)과 글자까지 같을 때만이다(D-125). 감독이 아는 "시험 값"의 표시는 이 둘이다. 하나라도 아니면 운영 값으로 보고 아무 파일도 읽기 전에 **91**이다(`VM`·` vm`처럼 대소문자나 앞뒤 공백이 다른 이름도 고쳐 읽지 않고 91). 운영 값에서 켠 것을 차트 쪽에서 거절하는 CI는 뒤 homelab PR의 일이고 아직 없다(아래 "감독 관리 통로"). 둘 다 시험 값 전용이고, 대역은 시험 작업 넣기(`test-job`)가 쓸 소유자 입력을 만드는 짝이다. 고른 현관은 기동 기록 첫 줄 `front_door mode=absent|test_double`에 남는다.
 - **대역이 만드는 것(D-76의 시험 값 한정 예외):** 권위 정지 기록 `{ generation: 0, stopped: false }`, 이웃 행 둘(`front-door` 계약 `olive-control/v2`, `observation-relay` 계약 `olive-control/v1`, 둘 다 정책 맞음), 시험 소유자 입력 하나(요청 ID `00000000-0000-4000-8000-000000000109`, 출처 `test-front-door`, 원문 참조 `test-front-door/<같은 ID>`, 만료는 처음 넣은 시각 + 168시간). 게시 결과는 만들지 않는다(늘 모름).
 - **장부의 정지가 이긴다:** 정지 기록은 세대 0이라, 장부에 같은 세대의 정지나 더 높은 세대가 있으면 장부의 기록이 남는다(`Ledger.mergeStop`). 대역은 정지를 풀거나 세대를 올리지 못하고, 정지를 내는 길도 없다.
 - **입력을 넣는 차례:** 5단계의 허가를 받아들인 뒤, 주기의 박자 밖(답 처리 뒤)에서 입력을 만들고(장부 시계) 데이터 사본 → `enqueueInput` 얻기 → 문(접수 문, 그 뒤 끝 차례가 아님을 맨 끝에) → 호출 하나다. 장부가 받으면(`created`·`existing`) 그 프로세스에서는 다시 넣지 않고, 거절이면 다음 주기에 다시 본다. 같은 요청 ID라 감독이 다시 떠도 줄은 하나다. 기록 `front_door_test_input outcome=…`에 남는다.
@@ -486,7 +486,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 - **차트 짝(homelab):** `/tmp` emptyDir는 감독 컨테이너에만 붙이고(다른 컨테이너가 같은 볼륨을 붙이면 그 컨테이너가 소켓에 닿는다), 감독 컨테이너는 uid 하나로 돈다. `/tmp`를 읽기 전용으로 바꾸지 않는다(듣지 못하면 상태가 늘 1이다). 소켓 파일의 권한은 bind 때 umask로 정해지고 `0600`은 그 뒤라, 컨테이너의 umask는 그룹·기타의 쓰기를 막는 값(기본 022)으로 둔다.
 - **homelab CLI:** 지금 CLI는 0이 아닌 코드를 모두 "감독 관리 진입점이 실패했다(exit N)"로 낸다. 3을 "복원 전이라 상태 모름"으로, 1을 "감독에 닿지 못함·읽지 못함"으로 보이는 일은 CLI 쪽 작업이다. stdout은 0일 때만 읽는다.
-- **차트 짝(homelab), 시험 작업:** `OLIVE_TEST_JOBS`는 시험 클러스터의 값에서만 `on`으로 둔다. **운영 값에서 `on`이면 CI가 거절한다**(차트 쪽 확인은 그 PR의 일이다. 이 저장소의 기본은 꺼짐이고, `on`·`off` 밖의 값은 감독이 91로 뜨지 않는다). 소유자 입력은 현관(O08)이나 시험 현관 대역이 장부에 접수한 것만 쓴다: 이 명령이 입력을 만들지 않으므로 현관도 대역도 없는 클러스터에서는 한 바퀴를 볼 수 없다. `OLIVE_TEST_FRONTDOOR`도 같은 규칙이다: 시험 값에서만 `on`, 운영 값에서 `on`이면 CI가 거절한다(차트 쪽 확인은 그 PR의 일).
+- **차트 짝(homelab), 시험 작업:** `OLIVE_TEST_JOBS`는 시험 클러스터의 값에서만 `on`으로 둔다. **운영 값에서 `on`이면 CI가 거절한다**(차트 쪽 확인은 그 PR의 일이다. 이 저장소의 기본은 꺼짐이고, `on`·`off` 밖의 값은 감독이 91로 뜨지 않는다). 소유자 입력은 현관(O08)이나 시험 현관 대역이 장부에 접수한 것만 쓴다: 이 명령이 입력을 만들지 않으므로 현관도 대역도 없는 클러스터에서는 한 바퀴를 볼 수 없다. `OLIVE_TEST_FRONTDOOR`도 같은 규칙이다: 시험 값에서만 `on`, 운영 값에서 `on`이면 CI가 거절한다. 감독은 그 `on`을 `OLIVE_ENVIRONMENT`가 `vm`일 때만 받으므로(D-125), 차트 쪽은 VM 값의 `registry.environment`를 `vm`으로 두고, CI가 대역 켜짐과 그 이름을 함께 대조한다(둘 다 뒤 homelab PR의 일).
 - **homelab CLI, 시험 작업:** `homelab olive`의 시험 작업 명령은 `bun src/main/admin.ts test-job …`을 같은 exec로 부르고 0일 때만 stdout의 `olive-test-job/v1` 한 줄을 읽는다. `write_unknown`·`timeout`이면 같은 키로 다시 부르기 전에 `status`의 `queued`를 본다(위 "같은 키로 다시 부르기").
 
 ### 이 진입점에 없는 것
