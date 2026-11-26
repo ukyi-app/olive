@@ -136,6 +136,7 @@ export const REFUSALS = [
   // abandonResult: 그 실행에 받아 두고 판정에 아직 반영하지 않은 결과 보고가 있다. 결과가 오지 않는 실행이 아니다(결과 검사 박자가 판정한다).
   "report_pending",
   // abandonResult: 사유 requested의 취소 지시는 없고 사유 없이 적힌 취소 지시가 있어, 버린 뒤의 확정 outcome(D-114)을 정할 수 없다.
+  // recordStopInstruction: 결과를 버린 실행에 사유 requested의 취소 지시가 없는데 사유 없는 취소를 적으면 같은 까닭으로 확정을 정할 수 없다.
   "outcome_unknown",
   // closeRunByOperator의 store_reset: failed_stopped인데 실패 시각(판 8의 칸)이 없다. 판 8 전에 실패한 줄이라 장부 초기화로 넘긴다(D-162).
   "failed_at_unknown",
@@ -2528,6 +2529,7 @@ export class Ledger {
   // 종료·취소 지시. 정지 중에도, 접수가 닫혀도, 장부가 실패한 뒤에도 시도한다. 아직 지시를 내지 않은 대기 실행은 not_started로 닫는다.
   // 지시의 정지 세대는 장부의 지금 값과 같아야 한다. 장부를 쓸 수 없어 이 기록이 실패해도 호출자는 최선 노력의 종료를 보낼 수 있지만,
   // 그것은 "지금 세대로 발급하도록 기록한 지시"가 아니다.
+  // 결과를 버린 실행에 사유 requested의 취소 지시가 없으면 사유 없는 취소는 outcome_unknown으로 거절한다(#recordStop, D-148).
   recordStopInstruction(input: StopInstructionInput): { ok: true; run: Run } | Refused {
     const v = exact(input, ["runId", "requestId", "action", "stopGeneration", "now", "reason"], "recordStopInstruction");
     const runId = str(v.runId, UUID, "runId");
@@ -2554,6 +2556,10 @@ export class Ledger {
     }
     if (stopGeneration === null) throw new Refuse("stop_unknown");
     this.#requireStopGeneration(stopGeneration);
+    // D-148: 결과를 버린 실행의 확정 outcome은 취소 지시의 사유로만 갈린다(abandonResult). requested가 없는데 사유 없는 취소를 더하면
+    // failedStop의 requestedCancel이 null이 되어 수명 박자가 이미 낼 수 있던 확정을 보류하고 자리를 쥔다. 이관 0009의
+    // instructions_abandoned_outcome_known이 원 SQL에도 같은 조건을 본다.
+    if (action === "task_cancel" && reason === null && this.#resultAbandoned(row.run_id) && !this.#requestedCancel(row.run_id)) throw new Refuse("outcome_unknown");
     if (["preparing", "running", "unknown_running"].includes(row.state)) this.#setState(row, "stopping", now);
     this.#insertInstruction({ requestId, runId: row.run_id, action, stopGeneration, issuedAt: now }, { reason });
     return this.#runRow(row.run_id) as RunRow;
@@ -3061,7 +3067,8 @@ export class Ledger {
   // 포기한 실행에 뒤늦게 온 결과 보고는 본문 없이 받은 기록만 남기고 ack로 마친다(recordAbandonedReport, 저장 자리가 있으면 #resultDisposition).
   // 버리지 않는 실행 둘(근거·실행 줄·보고를 그대로 둔다): 받아 두고 판정에 반영하지 않은 결과 보고가 있는 실행(D-168: 감독이 본문을 보관하고
   // ack했다. 결과 검사 박자가 ready_result로 판정한다), 버린 뒤 D-114 확정 outcome을 정할 수 없는 실행(사유 없는 취소 지시만 있음. 버리면
-  // 확정도 정리도 없이 자리를 쥔다). 뒤의 것은 결과를 기다리거나 저장소 비움 닫기(store_reset)로 닫는다.
+  // 확정도 정리도 없이 자리를 쥔다). 뒤의 것은 결과를 기다리거나 저장소 비움 닫기(store_reset)로 닫는다. 버린 뒤에 같은 이력을 만드는
+  // 사유 없는 취소는 recordStopInstruction이 같은 이름(outcome_unknown)으로 거절한다.
   // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 작업자(run_not_worker) → 끝 상태 아님(run_ended) →
   // checking(not_checking: 이미 판정됐거나 종료 확인 전) → 판 9 전의 장부(transition_denied) → 종료 영수증 ID가 실행 줄과 같음
   // (reference_mismatch) → 정지 기록 있음(stop_unknown) → 미반영 결과 보고 없음(report_pending) → 확정 outcome을 정할 수 있음
@@ -3126,6 +3133,11 @@ export class Ledger {
 
   #resultAbandoned(runId: string): boolean {
     return this.#releases && this.#db.query("SELECT 1 AS x FROM result_abandons WHERE run_id = ?").get(runId) !== null;
+  }
+
+  // 사유 requested의 취소 지시가 있는가. 판 4 전의 장부는 사유 칸이 없어 늘 false다.
+  #requestedCancel(runId: string): boolean {
+    return this.#rebuildColumns && this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'task_cancel' AND reason = 'requested'").get(runId) !== null;
   }
 
   // 부탁 줄을 값으로 바꾼다. 이은 실행이 not_started면 관리자 닫기의 근거가 있는지 읽어 단계를 가른다(toToolRequest).
@@ -3410,7 +3422,7 @@ export class Ledger {
   // 이미 받은 id인가. 같은 본문이면 "duplicate", 다른 본문이면 receipt_conflicts에 남기고 거절, 처음이면 null이다.
   // 새 id에만 원 지시 대조와 효과를 적용하도록 그 앞에서 부른다(반영할 수 없는 새 id는 적지 않고 거절한다. 실행기는 ack가 올 때까지 다시 보낸다).
   // 받은 ID는 deliveries와 결과를 버린 실행의 받은 기록(판 9의 abandoned_result_reports) 두 표에 걸쳐 하나다: 어느 쪽에 적혔든 같은 ID의
-  // 재전송은 같은 본문이면 duplicate, 다르면 충돌이다. 두 표에 같은 ID가 함께 들어가지 않는다(그 표의 트리거, recordAbandonedReport).
+  // 재전송은 같은 본문이면 duplicate, 다르면 충돌이다. 두 표에 같은 ID가 함께 들어가지 않는다(두 표의 BEFORE INSERT 트리거, recordAbandonedReport).
   #redelivery(id: string, digest: string, now: number): "duplicate" | Refused | null {
     const before = (this.#db.query("SELECT body_digest FROM deliveries WHERE id = ?").get(id) ??
       (this.#releases ? this.#db.query("SELECT body_digest FROM abandoned_result_reports WHERE report_id = ?").get(id) : null)) as { body_digest: string } | null;

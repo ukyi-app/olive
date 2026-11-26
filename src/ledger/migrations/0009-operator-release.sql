@@ -92,6 +92,19 @@ BEGIN
   SELECT RAISE(ABORT, 'result_abandon_unproven');
 END;
 
+-- 버린 뒤의 취소 지시(D-148). 버린 실행의 확정 outcome은 취소 지시의 사유로만 갈리므로, 사유 requested의 취소 지시가 없는 실행에
+-- 사유 없는 취소 지시를 더하면 outcome이 failed에서 "모름"이 되어(failedStop의 requestedCancel이 null) 수명 박자가 이미 낼 수 있던
+-- 확정을 보류하고 자리를 쥔다. 버린 뒤의 상태(failed_stopped·cleanup_pending·finalized·not_started)와 무관하게 막는다. 사유가 있는 취소와
+-- requested가 이미 있는 실행은 outcome이 정해진 채라 받는다. 같은 요청 ID로 requested 줄을 갈아 끼우는 INSERT OR REPLACE는 판 1의
+-- instructions_no_replace가 먼저 막는다.
+CREATE TRIGGER instructions_abandoned_outcome_known BEFORE INSERT ON instructions
+WHEN NEW.action = 'task_cancel' AND NEW.reason IS NULL
+  AND EXISTS (SELECT 1 FROM result_abandons a WHERE a.run_id = NEW.run_id)
+  AND NOT EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = NEW.run_id AND i.action = 'task_cancel' AND i.reason = 'requested')
+BEGIN
+  SELECT RAISE(ABORT, 'result_abandon_outcome_unknown');
+END;
+
 -- 결과를 버린 실행에 온 결과 보고의 받은 기록(D-169). 보고마다 한 줄이고 본문과 저장 자리는 없다: 버린 결과라 보관하지 않고, 보관소에
 -- 장애가 이어져도(사유 unstorable) 실행기가 ack를 받아 다시 보내기를 멈춘다. 결과 보고의 deliveries 줄은 저장 자리와 결과 digest를
 -- 요구해(이관 0001) 거기 적지 못한다.
@@ -130,6 +143,15 @@ END;
 CREATE TRIGGER abandoned_result_reports_permanent BEFORE DELETE ON abandoned_result_reports
 BEGIN
   SELECT RAISE(ABORT, 'abandoned_report_unproven');
+END;
+
+-- 반대쪽 순서: 이 표에 이미 있는 보고 ID는 deliveries에 들어가지 않는다(세 INSERT 방식 모두, 문구는 판 1의 deliveries_no_replace와 같다).
+-- 이 트리거가 없으면 원 SQL이 같은 ID를 deliveries에 넣을 수 있고, #redelivery가 deliveries를 먼저 읽어 처음 받은 digest를 충돌로,
+-- 뒤에 넣은 digest를 duplicate로 가른다. 공개 연산은 #redelivery가 두 표를 먼저 보아 이 트리거에 닿지 않는다.
+CREATE TRIGGER deliveries_not_abandoned_report BEFORE INSERT ON deliveries
+WHEN EXISTS (SELECT 1 FROM abandoned_result_reports x WHERE x.report_id = NEW.id)
+BEGIN
+  SELECT RAISE(ABORT, 'delivery_fixed');
 END;
 
 -- ---- (나) 저장소 비움 근거의 관리자 닫기 ----

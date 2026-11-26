@@ -202,6 +202,8 @@ test("이관: 판 8 장부를 판 9로 올리면 기존 줄은 그대로이고, 
       "abandoned_result_reports_proven",
       "abandoned_result_reports_fixed",
       "abandoned_result_reports_permanent",
+      "instructions_abandoned_outcome_known",
+      "deliveries_not_abandoned_report",
     ].sort(),
   );
   expect(transitions()).toEqual(
@@ -492,11 +494,13 @@ test("결과 포기 뒤 지금 수명 박자가 D-114대로 확정을 내고(sto
   ] as const) {
     const ledger = ready(open(tempPath()));
     const c = checkingRun(ledger, requested);
-    const sent: Envelope[] = [];
-    // 포기 전의 checking은 확정을 내지 않는다(결과 판정 전).
-    expect((await lifeOutcome(ledger, c.runId, NOW + 4_000, sent)).outcome, String(requested)).not.toBe("finalize_sent");
-    expect(sent).toEqual([]);
+    // 포기 전의 checking은 확정을 내지 않는다(결과 판정 전). 수명 박자가 그 실행기에 상태 조회를 낼 수는 있어 조회 밖의 송신이 없음을 본다.
+    const before: Envelope[] = [];
+    expect((await lifeOutcome(ledger, c.runId, NOW + 4_000, before)).outcome, String(requested)).not.toBe("finalize_sent");
+    expect(before.map((e) => e.header.action).filter((action) => action !== "status_query"), String(requested)).toEqual([]);
+    expect(ledger.instructionTimes(c.runId)).toMatchObject({ known: true, value: { lastFinalizeAt: null } });
     must(abandon(ledger, c));
+    const sent: Envelope[] = [];
     const life = await lifeOutcome(ledger, c.runId, NOW + 10_000, sent);
     expect(life, String(requested)).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 10_000, executorId: WORKER_EXECUTOR });
     expect(sent.map((e) => e.body), String(requested)).toEqual([{ run_id: c.runId, outcome, result_digest: null, stored_at: ABANDONED_AT }]);
@@ -506,6 +510,91 @@ test("결과 포기 뒤 지금 수명 박자가 D-114대로 확정을 내고(sto
     expect(state(ledger, c.runId)).toMatchObject({ state: "finalized" });
     expect(slotFree(ledger), String(requested)).toBe(true);
   }
+});
+
+// D-148: 버린 실행의 확정 outcome은 취소 지시의 사유로만 갈린다. 버린 뒤에 사유 없는 취소가 더해지면 이미 낼 수 있던 확정이 보류된다.
+const reasonlessCancel = (runId: string, at: number) => ({ runId, requestId: id(), action: "task_cancel" as const, stopGeneration: 0, now: at });
+
+test("포기 뒤의 사유 없는 취소(D-148): 사유 requested가 없는 포기 실행에는 outcome_unknown으로 거절하고, 수명 박자는 그대로 failed로 확정해 정리 영수증으로 자리를 푼다", async () => {
+  const ledger = ready(open(tempPath()));
+  const c = checkingRun(ledger);
+  must(abandon(ledger, c));
+  expect(ledger.recordStopInstruction(reasonlessCancel(c.runId, ABANDONED_AT + 1))).toEqual({ ok: false, reason: "outcome_unknown" });
+  expect(ledger.health()).toEqual({ writable: true });
+  expect(ledger.instructionTimes(c.runId)).toMatchObject({ known: true, value: { lastStopAt: null } });
+  // 사유가 있는 취소는 outcome을 바꾸지 않아 그대로 적힌다.
+  must(ledger.recordStopInstruction({ ...reasonlessCancel(c.runId, ABANDONED_AT + 2), reason: "deadline" }));
+  expect(ledger.failedStop(c.runId)).toEqual({ known: true, value: { runId: c.runId, stoppedAt: ABANDONED_AT, requestedCancel: false, exit: "completed" } });
+  const sent: Envelope[] = [];
+  const life = await lifeOutcome(ledger, c.runId, NOW + 10_000, sent);
+  expect(life).toMatchObject({ outcome: "finalize_sent", issuedAt: NOW + 10_000, executorId: WORKER_EXECUTOR });
+  expect(sent.map((e) => e.body)).toEqual([{ run_id: c.runId, outcome: "failed", result_digest: null, stored_at: ABANDONED_AT }]);
+  // 확정을 낸 뒤(cleanup_pending 전후 상태와 무관하게) 포기 근거가 있는 한 같다.
+  expect(ledger.recordStopInstruction(reasonlessCancel(c.runId, NOW + 10_000))).toEqual({ ok: false, reason: "outcome_unknown" });
+  expect(must(ledger.applyReceipt(cleaned(c, (life as { requestId: string }).requestId, NOW + 10_001), c.from)).delivery).toBe("new");
+  expect(state(ledger, c.runId)).toMatchObject({ state: "finalized" });
+  expect(slotFree(ledger)).toBe(true);
+});
+
+test("포기 뒤의 사유 없는 취소(D-148): 사유 requested의 취소가 이미 있는 포기 실행은 더 적어도 cancelled로 확정한다. 포기하지 않은 checking은 전처럼 적는다", async () => {
+  const ledger = ready(open(tempPath()));
+  const c = checkingRun(ledger, true);
+  must(abandon(ledger, c));
+  must(ledger.recordStopInstruction(reasonlessCancel(c.runId, ABANDONED_AT + 1)));
+  expect(ledger.failedStop(c.runId)).toEqual({ known: true, value: { runId: c.runId, stoppedAt: ABANDONED_AT, requestedCancel: true, exit: "completed" } });
+  const sent: Envelope[] = [];
+  expect(await lifeOutcome(ledger, c.runId, NOW + 10_000, sent)).toMatchObject({ outcome: "finalize_sent" });
+  expect(sent.map((e) => e.body)).toEqual([{ run_id: c.runId, outcome: "cancelled", result_digest: null, stored_at: ABANDONED_AT }]);
+
+  const kept = ready(open(tempPath()));
+  const k = checkingRun(kept);
+  must(kept.recordStopInstruction(reasonlessCancel(k.runId, NOW + 2)));
+  expect(kept.instructionTimes(k.runId)).toMatchObject({ known: true, value: { lastStopAt: NOW + 2 } });
+});
+
+test("포기 전의 사유 없는 취소(D-148): 포기는 outcome_unknown이고 수명 박자는 확정을 내지 않는다. 저장소 비움 닫기로 자리가 풀린다", async () => {
+  const ledger = ready(open(tempPath()));
+  const c = reasonlessCancelChecking(ledger);
+  expect(abandon(ledger, c)).toEqual({ ok: false, reason: "outcome_unknown" });
+  const sent: Envelope[] = [];
+  expect((await lifeOutcome(ledger, c.runId, NOW + 10_000, sent)).outcome).not.toBe("finalize_sent");
+  expect(sent.filter((e) => e.header.action === "result_finalize")).toEqual([]);
+  expect(state(ledger, c.runId).state).toBe("checking");
+  expect(slotFree(ledger)).toBe(false);
+  must(storeReset(ledger, c.runId));
+  expect(slotFree(ledger)).toBe(true);
+});
+
+test("포기 뒤의 사유 없는 취소(D-148): 원 SQL도 사유 requested가 없는 포기 실행의 사유 없는 task_cancel은 세 INSERT 방식 모두 막는다. 사유 있는 취소, requested가 있는 실행, 포기하지 않은 실행은 받는다", () => {
+  const into = (mode: string) => `${mode} INTO instructions (request_id, run_id, action, stop_generation, issued_at, reason) VALUES (?, ?, 'task_cancel', 0, ?, ?)`;
+  const path = tempPath();
+  const ledger = ready(open(path));
+  const c = checkingRun(ledger);
+  must(abandon(ledger, c));
+  ledger.close();
+  for (const mode of INSERT_MODES) {
+    expect(() => rawWrite(path, into(mode), id(), c.runId, NOW + 7_000, null), mode).toThrow("result_abandon_outcome_unknown");
+  }
+  expect(rows(path, "SELECT count(*) AS n FROM instructions WHERE run_id = ? AND action = 'task_cancel'", c.runId)).toEqual([{ n: 0 }]);
+  rawWrite(path, into("INSERT"), id(), c.runId, NOW + 7_000, "deadline");
+  const reopened = ready(open(path));
+  expect(reopened.failedStop(c.runId)).toMatchObject({ known: true, value: { requestedCancel: false } });
+  reopened.close();
+
+  const requestedPath = tempPath();
+  const requested = ready(open(requestedPath));
+  const r = checkingRun(requested, true);
+  must(abandon(requested, r));
+  requested.close();
+  rawWrite(requestedPath, into("INSERT"), id(), r.runId, NOW + 7_000, null);
+  expect(rows(requestedPath, "SELECT count(*) AS n FROM instructions WHERE run_id = ? AND action = 'task_cancel' AND reason IS NULL", r.runId)).toEqual([{ n: 1 }]);
+
+  const keptPath = tempPath();
+  const kept = ready(open(keptPath));
+  const k = checkingRun(kept);
+  kept.close();
+  rawWrite(keptPath, into("INSERT"), id(), k.runId, NOW + 7_000, null);
+  expect(rows(keptPath, "SELECT count(*) AS n FROM instructions WHERE run_id = ? AND action = 'task_cancel' AND reason IS NULL", k.runId)).toEqual([{ n: 1 }]);
 });
 
 test("포기한 실행에 늦게 온 결과 보고는 받은 기록만 남기고 ack로 마친다(실행 줄은 그대로, 재전송은 duplicate). 결과 없음 판정 실행은 그대로 거절한다", () => {
@@ -631,6 +720,41 @@ test("버린 실행의 받은 기록(D-169): 원 SQL도 포기 근거·낸 쪽·
   expect(() => rawWrite(path, "UPDATE abandoned_result_reports SET body_digest = ? WHERE report_id = ?", digest("other"), good[0] as string)).toThrow("abandoned_report_unproven");
   expect(() => rawWrite(path, "DELETE FROM abandoned_result_reports WHERE report_id = ?", good[0] as string)).toThrow("abandoned_report_unproven");
   expect(rows(path, "SELECT body_digest FROM abandoned_result_reports")).toEqual([{ body_digest: digest("late") }]);
+});
+
+test("버린 실행의 받은 기록(D-169): 받은 ID는 두 표에 걸쳐 하나다. 원 SQL이 어느 표에 먼저 적힌 ID를 다른 표에 넣든(세 INSERT 방식 모두) 막고, 다시 연 장부는 처음 받은 digest를 duplicate, 다른 digest를 충돌로 가른다", () => {
+  for (const first of ["abandoned_result_reports", "deliveries"] as const) {
+    for (const mode of INSERT_MODES) {
+      const label = `${first} 먼저, ${mode}`;
+      const path = tempPath();
+      const ledger = ready(open(path));
+      const c = checkingRun(ledger);
+      must(abandon(ledger, c, { reason: "unstorable" }));
+      const reportId = id();
+      const original = digest(`report:original:${first}`);
+      const other = digest("report:other");
+      if (first === "abandoned_result_reports") must(ledger.recordAbandonedReport({ reportId, runId: c.runId, bodyDigest: original, now: NOW + 6_000 }, c.from));
+      else must(ledger.recordReport({ ...resultReport(c, NOW + 6_000), reportId, bodyDigest: original }, c.from));
+      ledger.close();
+      if (first === "abandoned_result_reports") {
+        const sql = `${mode} INTO deliveries (id, action, run_id, body_digest, stored_ref, result_digest, received_at, applied_at) VALUES (?, 'report_result', ?, ?, ?, ?, ?, ?)`;
+        expect(() => rawWrite(path, sql, reportId, c.runId, other, `results/${id()}`, digest("other result"), NOW + 7_000, NOW + 7_000), label).toThrow("delivery_fixed");
+      } else {
+        const sql = `${mode} INTO abandoned_result_reports (report_id, run_id, sender, run_generation, body_digest, received_at) VALUES (?, ?, ?, ?, ?, ?)`;
+        expect(() => rawWrite(path, sql, reportId, c.runId, WORKER_EXECUTOR, 1, other, NOW + 7_000), label).toThrow("abandoned_report_unproven");
+      }
+      expect(rows(path, "SELECT count(*) AS n FROM abandoned_result_reports a JOIN deliveries d ON d.id = a.report_id"), label).toEqual([{ n: 0 }]);
+      expect(
+        rows(path, "SELECT (SELECT count(*) FROM deliveries WHERE id = ?1) + (SELECT count(*) FROM abandoned_result_reports WHERE report_id = ?1) AS n", reportId),
+        label,
+      ).toEqual([{ n: 1 }]);
+      const reopened = ready(open(path));
+      expect(reopened.recordAbandonedReport({ reportId, runId: c.runId, bodyDigest: original, now: NOW + 8_000 }, c.from), label).toEqual({ ok: true, delivery: "duplicate", ack: reportId });
+      expect(reopened.recordAbandonedReport({ reportId, runId: c.runId, bodyDigest: other, now: NOW + 8_000 }, c.from), label).toEqual({ ok: false, reason: "receipt_conflict" });
+      expect(reopened.conflicts(), label).toEqual({ known: true, value: [{ id: reportId, firstDigest: original, otherDigest: other }] });
+      reopened.close();
+    }
+  }
 });
 
 // ---- 저장소 비움 닫기(D-158) ----
