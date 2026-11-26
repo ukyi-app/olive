@@ -24,6 +24,7 @@
 import type * as tls from "node:tls";
 import type { NonceStore } from "../../contract/v1/index.ts";
 import { createFrameDecoder, encodeFrame, type FrameDecoder, type FrameRejectReason } from "../../transport/framing.ts";
+import { enableKeepAlive } from "../../transport/keepalive.ts";
 import { type MaterialRejectReason, type RawTlsMaterial, TlsMaterialError } from "../../transport/tls-policy.ts";
 import {
   type Checked,
@@ -166,6 +167,8 @@ export type LinkCloseCause = (typeof LINK_CLOSE_CAUSES)[number];
 export type ServerNote =
   | { readonly kind: "opened"; readonly connection: number }
   | { readonly kind: "rejected_tls"; readonly reason: ServerRejectReason }
+  // TLS 판정을 통과한 연결에 keepalive를 켜거나 그 값을 넣고 되읽지 못해 판단에 열지 않고 닫았다.
+  | { readonly kind: "keepalive_failed" }
   | { readonly kind: "closed"; readonly connection: number; readonly cause: LinkCloseCause; readonly frame?: FrameRejectReason }
   // 판단이 낸 답을 기한이 지나 싣지 않았다.
   | { readonly kind: "reply_not_sent"; readonly connection: number; readonly deadline: number; readonly at: number }
@@ -322,6 +325,13 @@ class Server implements ConnectionServer {
 
   admit(connection: CertifiedExecutorConnection): void {
     const socket = connection.socket;
+    // keepalive가 없으면 조용히 사라진 실행기의 연결이 닫히지 않아 연결 상실 박자가 옮기지 못한다. 켜지 못한 연결은 판단에 열지 않는다.
+    // 아래 stopping·시계·destroyed 확인이 이 호출 뒤에 온다. 이 뒤 이 소켓에 setKeepAlive를 다시 부르지 않는다(넣은 간격·횟수가 되돌아간다).
+    if (!enableKeepAlive(socket)) {
+      socket.destroy();
+      this.note({ kind: "keepalive_failed" });
+      return;
+    }
     const at = this.stopping ? null : this.now();
     // 판단에 열기 전이라 알릴 것이 없다.
     if (at === null) {

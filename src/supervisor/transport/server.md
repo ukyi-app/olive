@@ -92,7 +92,7 @@ closeConnection(connection: number): { kind: "closed" } | { kind: "not_open" } |
 | `WriteFrameResult` | `written`(틀 전부를 한 번의 `write`로 넘겼다. 상대가 받았다는 뜻이 아니다), `not_written`(넘긴 바이트 0: `reason`이 `NOT_WRITTEN_REASONS` 가운데 하나, `refused`면 `refusal`에 `lastCheck`나 `finalCheck`의 이름), `unknown`(`write`가 던졌다. 연결을 닫았고, 돌아오기 전에 `settled`를 이미 한 번 불렀다) |
 | `NOT_WRITTEN_REASONS` | `not_recognized`(`lastCheck`가 쓴다고 답한 뒤의 재확인에서 인정을 잃은 때도 여기다. 이때 `lastCheck`는 불렸고 `finalCheck`는 불리지 않았다), `closed`, `backlog`(그 연결을 `send_backlog`로 닫았다), `refused`(`lastCheck` 또는 `finalCheck`의 이름), `check_failed`(둘 가운데 하나가 던졌거나 꼴 아닌 값), `reentered`. `backlog` 밖에는 연결을 닫지 않는다 |
 | `Delivered` | 부르는 쪽에 넘기는 출력 넷(`occupancy`·`candidate`·`withdrawn`·`forward`), 연결 판단의 `Output` 그대로 |
-| `ServerNote` | 기록용: `opened`, `rejected_tls`(TLS 판정 사유), `closed`(`cause`, 틀 거절이면 `frame`), `reply_not_sent`(`deadline`, `at`), `reply_written`(`at`은 넘긴 시각, `done`은 완료를 안 시각), `late_dropped` |
+| `ServerNote` | 기록용: `opened`, `rejected_tls`(TLS 판정 사유), `keepalive_failed`(keepalive를 켜거나 그 값을 넣고 되읽지 못해 판단에 열지 않고 닫음), `closed`(`cause`, 틀 거절이면 `frame`), `reply_not_sent`(`deadline`, `at`), `reply_written`(`at`은 넘긴 시각, `done`은 완료를 안 시각), `late_dropped` |
 | `LINK_CLOSE_CAUSES` | `judgment`, `peer`, `frame`, `before_reply`, `check_failed`, `judgment_failed`, `write_failed`, `write_busy`(답을 넘기려는 때 쓰기 버퍼가 비지 않았거나 묶였다. 넘긴 바이트 0), `write_late`, `reply_late`, `deliver_failed`, `clock_failed`, `send_backlog`(`writeFrame`이 넘기려는 때 묶였거나 대기량이 상한을 넘었다. 그 틀은 넘기지 않았다), `send_failed`(`writeFrame`으로 넘긴 틀의 로컬 쓰기가 오류로 끝났거나 `write`가 던졌다), `shutdown`, `requested`(부르는 쪽이 `closeConnection`으로 닫았다) |
 
 서버가 받는 포트(`ConnectionServerOptions`):
@@ -155,9 +155,27 @@ closeConnection(connection: number): { kind: "closed" } | { kind: "not_open" } |
 11. **`settled`는 꼭 넘긴다.** 값을 보내는 쪽이 버퍼를 0으로 채우는 자리를 빠뜨리면 타입 검사에서 드러나게 선택 칸으로 두지 않았다.
 12. **같은 주체의 인정된 연결이 둘 이상이면 아무것도 인정하지 않는다.** 판단은 같은 주체의 더 나중 맞춤에서 앞 연결을 닫으므로 정상에서는 생기지 않는다. 어느 쪽인지 모르는 상태에서 고르지 않는다.
 
+## 반쯤 열린 연결 (TCP keepalive)
+
+상대가 FIN·RST 없이 사라지면(전원, 망 단절, 노드 퇴출) 소켓은 끝을 알리지 않는다. 이 서버는 받은 연결을 판단에 열기 전에 `src/transport/keepalive.ts`의 `enableKeepAlive`로 TCP keepalive를 켜고 탐침 간격·횟수와 `TCP_USER_TIMEOUT`을 넣어, 운영체제가 그런 연결을 끊게 한다. 계약 v1 메시지는 바꾸지 않는다.
+
+- **값은 한 자리다.** 첫 탐침 지연 30초(`KEEPALIVE_INITIAL_DELAY_MS`), 탐침 간격 10초(`KEEPALIVE_INTERVAL_MS`), 답 없는 탐침 4회(`KEEPALIVE_PROBES`), `TCP_USER_TIMEOUT` 70초(`KEEPALIVE_USER_TIMEOUT_MS` = 첫 탐침 지연 + 간격 × 횟수)를 실행기 소켓(`src/executor/socket.md`)과 함께 쓴다. **T1 실측 뒤 조정한다.**
+- **넣는 차례.** 런타임의 `setKeepAlive(true, 30000)`은 `SO_KEEPALIVE`·`TCP_KEEPIDLE`과 함께 간격 1초·10회를 넣고(Bun 1.4.4, 이 API로 바꾸지 못하고 노드 sysctl보다 앞선다) `TCP_USER_TIMEOUT`은 넣지 않는다. 그래서 그 **뒤에** `src/transport/keepalive-ffi.ts`가 libc `setsockopt`로 `TCP_KEEPINTVL`·`TCP_KEEPCNT`·`TCP_USER_TIMEOUT`을 덮어쓴다. fd는 소켓의 `_handle.fd`(문서 밖 런타임 내부 값)다. 첫 넣기 전에 그 fd가 이 연결의 것인지 따로 확인한다: libc `getsockname`·`getpeername`으로 읽은 fd의 로컬·상대 주소·포트를 런타임 소켓의 `localAddress`·`localPort`·`remoteAddress`·`remotePort`와 댄다(IPv4는 `::ffff:` 매핑 IPv6과 같은 주소로 본다). **전제: 이 망 이름공간에 VRF(독립 라우팅 도메인)가 없다.** 그러면 맺어진 TCP 연결은 이 넷으로 하나이고 같은 연결의 반대쪽 소켓은 넷이 뒤집혀 다르다. 감독·실행기는 파드 망에서 돌고 파드 망은 한 이름공간에 VRF를 여럿 두지 않는다. 이 전제는 코드로 확인하지 않는다(`/proc`를 훑지 않는다). 깨지면, 곧 다른 VRF에 같은 넷의 소켓이 있으면 커널은 묶인 장치까지 따져 둘을 가르지만 이 대조에는 같아 보여, 그 다른 소켓에 값을 쓰고 연결을 열 수 있다. 하나라도 다르거나, 어느 쪽 주소든 꼴로 읽지 못하면 모호한 것으로 보고 넣지 않고 닫는다. 다른 fd를 찾아 계속하지 않는다. **링크 로컬 IPv6(0이 아닌 scope id)은 올바른 fd여도 `keepalive_failed`로 닫힌다.** Linux의 scope id는 인터페이스 번호인데 런타임 주소 글에는 오지 않아(Bun 1.4.4) 대 볼 짝이 없고, 버리고 주소·포트만 대면 다른 인터페이스의 같은 주소와 가르지 못한다. 감독·실행기는 파드 망의 클러스터 주소로 붙고 링크 로컬 주소를 쓰지 않으므로 받아들인 한계다(`test/transport/keepalive.test.ts`가 닫는 쪽을 고정한다). 그 뒤 `SO_KEEPALIVE`·`TCP_KEEPIDLE`을 되읽어 런타임이 켰는지 보고, 넣은 뒤 다섯 값을 모두 되읽는다. 런타임 값 둘만으로는 같은 옵션을 켠 다른 연결의 fd와 가르지 못한다.
+- **이 뒤 같은 소켓에 `setKeepAlive`를 다시 부르지 않는다.** 다른 지연으로 부르면 런타임이 간격 1초·10회를 다시 넣는다. `src/`에서 `setKeepAlive`·`keepAlive` 생성 옵션·`_handle`을 쓰는 곳은 `keepalive.ts` 하나이고 `enableKeepAlive`는 이 서버와 실행기 소켓에서 한 번씩 부른다(`test/transport/keepalive.test.ts`의 정적 확인).
+- **켜지 못하면 판단에 열지 않는다.** `setKeepAlive`의 읽기나 호출이 던지거나, fd를 얻지 못하거나, fd의 양 끝 주소가 이 연결과 맞지 않거나, 넣기가 실패하거나, 되읽은 값이 하나라도 다르면 그 단계에서 멈추고 소켓을 닫고 `keepalive_failed`를 기록한다. 그 연결은 `opened`도 `closed`도 없고 판단은 모른다. 끊김을 알 길이 없는 연결을 인정하지 않는 쪽이다. 실행기는 TLS가 붙은 뒤 끊긴 것으로 보고 다시 붙는다. 이 호출은 `stopping`·시계·`destroyed`의 확인보다 앞에 있다.
+- **이미 끊긴 소켓은 기존 길로 닫는다.** `destroyed`인 소켓에는 아무것도 넣지 않고 지나가, 뒤의 `destroyed` 확인이 `opened` 뒤 `closed`(`peer`)로 닫는다. 런타임은 파기한 소켓의 `_handle`을 바로 비우므로 fd 실패로 세면 사유가 바뀐다.
+- **런타임 판이 바뀌어 `_handle.fd`가 사라지면 모든 연결이 `keepalive_failed`로 닫힌다.** keepalive 없이 조용히 여는 대신 기록으로 드러나는 쪽이고, 아래 시험이 판 올림 때 잡는다.
+- **끊긴 뒤는 기존 닫힘 길이다.** 운영체제가 소켓을 오류(`ETIMEDOUT`)로 끝내면 `tls-server.ts`가 파기해 `close`가 온다. 그 뒤는 보장 3 그대로다: `closed`(사유 `peer`) 한 번, 인사를 마친 연결이면 `withdrawn`, 연결 표의 `occupancy`에서 빠지므로 연결 상실 박자(`dispatch/link-loss.md`)가 없음을 세기 시작한다.
+- **조용한 연결은 약 70초에 끊긴다.** 마지막 수신 뒤 첫 탐침 지연 30초 + 간격 10초 × 4회다. `TCP_USER_TIMEOUT`이 0이 아니면 커널은 탐침 수 대신 "마지막 수신 뒤 경과 ≥ `TCP_USER_TIMEOUT`이고 답 없는 탐침 ≥ 1"로 끊으므로 같은 때다. 그래서 `TCP_USER_TIMEOUT`을 첫 탐침 지연 + 간격 이하로 두지 않는다(첫 탐침 뒤 곧 끊겨 허용 끊김이 사라진다).
+- **탐침 넷이 모두 답을 못 받으면 살아 있는 연결도 끊긴다.** 망이 끊긴 채(노드 망 흔들림, CNI·터널 재연결) 탐침 넷이 모두 답을 못 받으면 상대가 살아 있어도 운영체제가 연결을 끊는다. 약 40초는 첫 무응답 탐침(마지막 수신 뒤 30초)부터 만료 검사(70초)까지이고, 견디는 단절의 고정 길이가 아니다. 견디는 길이는 단절이 탐침 시점과 어떻게 겹치는지와 그 사이 새 수신에 달렸다. 마지막 수신이 0초이고 다른 트래픽이 없으면 탐침은 30·40·50·60초에 나가고, 커널은 70초 만료 검사에서 다음 탐침 전에 끊을 수 있다. 그래서 29.5~60.5초의 31초 단절은 탐침 넷을 모두 잃어 망이 돌아와도 새 수신이 없으면 70초에 끊기고, 1~46초의 45초 단절은 50초 탐침에 답해 산다(커널 분기로 계산한 값, 패킷 단절 실측 안 함). 그 뒤는 위 끊긴 뒤의 길과 같다: 감독은 `closed`(`peer`)·`withdrawn`을 내고 그 실행기를 `occupancy`에서 빼므로 연결 상실 박자(`dispatch/link-loss.md`)가 없음을 세기 시작하고, 실행기는 `closed`(`socket_error`) 뒤 간격을 두고 다시 붙는다. 망이 돌아와 판정 시간(`judgeMs`) 안에 다시 인정되면 옮기는 실행은 없다. 그 안에 다시 인정되지 못하면 그 실행기의 진행 중 실행은 살아 있어도 `unknown_running`으로 옮겨진다.
+- **보내고 ACK를 못 받은 바이트가 있으면 약 70초에 끊긴다.** 그때는 keepalive가 돌지 않고 재전송이 끊는데, `TCP_USER_TIMEOUT`이 그 상한이다(없으면 Linux `tcp_retries2` 기본 약 15분).
+- **처리가 멈춰 읽지 않는 상대의 연결도 약 70초 뒤 끊길 수 있다.** 상대 프로세스가 소켓을 읽지 않아 그 수신 창이 0이 되고 이쪽에 보낼 바이트가 걸려 있으면, 상대 커널이 0 창 탐침에 답해도 `TCP_USER_TIMEOUT` 뒤 연결을 끊는다(커널 소스 읽기, 실측 안 함). 보낼 것이 없거나 창이 차지 않으면 이 규칙은 돌지 않는다.
+- **상대 커널이 답하면 산 것이다.** 실행기 프로세스가 멈췄어도 그 노드의 커널이 탐침에 답하고 위 0 창 조건이 아니면 끊지 않는다. 그것을 알려면 계약의 살아 있음 확인 메시지가 필요하다(결정 필요, 이 모듈에 없음).
+- **시험은 libc로 되읽고 커널 타이머를 본다.** 실제 TLS 루프백의 서버 쪽 소켓에서 libc `getsockopt`로 다섯 값을 단언하고, `/proc/net/tcp`에서 그 연결의 타이머가 keepalive(2)이고 남은 시간이 첫 탐침 지연 이하인지 본다(Linux 전용, `test/transport/tcp-timers.ts`). fd 얻기·되읽기의 실패는 그 소켓의 `_handle.fd`와 `setKeepAlive`를 바꿔 넣는다. 같은 초기 옵션을 켠 다른 TLS 연결의 fd를 넣은 실행기 쪽 시험은 그 fd의 값이 그대로이고 link가 열리지 않음을 본다(`test/executor/socket.test.ts`). 실제 만료까지의 시간은 재지 않는다. 끊김은 서버 쪽 소켓을 `ETIMEDOUT` 오류로 파기해 흉내 낸다.
+
 ## 이 모듈에 없는 것
 
-- 반쯤 열린 조용한 연결(상대가 FIN·RST 없이 사라짐)을 알아채 닫는 유휴 시간. 계약 v1에 살아 있음 확인 메시지가 없어 받은 바이트로만 재면 일 없는 실행기를 끊는다. 정책 인자 자리도 두지 않았다(뒤 조각).
+- 계약 메시지나 받은 바이트로 재는 유휴 시간. 계약 v1에 살아 있음 확인 메시지가 없어 받은 바이트로만 재면 일 없는 실행기를 끊는다. 반쯤 열린 연결은 위 TCP keepalive가 운영체제 기한 뒤 닫는다.
 - 재접속 빈도·주체별 요청 빈도·동시 처리의 제한. 연결 판단의 `maxConnections`·`reconnect`를 `settings`로 넘길 수 있을 뿐이고 기본은 둘 다 `null`(제한 없음)이다. 숫자는 설계와 계약에 없다.
 - 복원기와의 묶음, 복원 전의 맞춤 거절, 인증서 교체 뒤 재인증, 세션 실행기의 연결.
 
@@ -178,7 +196,7 @@ closeConnection(connection: number): { kind: "closed" } | { kind: "not_open" } |
 - **`written`은 접수가 아니다.** 상대가 받았는지는 실행기의 영수증으로 안다. `written`·`flushed`를 접수로 기록하지 않는다. `failed`·`closed`여도 상대가 틀 전체를 받았을 수 있다(`unknown`의 `failed`도 같다).
 - **맞춤이 끝나기 전의 연결에 다른 것을 쓰지 않는다.** `writeFrame`은 인정된 연결에만 쓰므로 이 규칙을 지킨다. 서버가 받은 연결의 소켓에 쓰거나 묶었고(`cork`), 맞춤의 답을 넘기려는 때에도 그 바이트가 쓰기 버퍼에 남아 있거나 묶여 있으면 답이 넘겨지지 않고 그 연결이 `write_busy`로 닫힌다. 앞서 쓴 것이 그때 이미 다 나갔고 묶이지 않았으면 맞춤은 정상으로 끝난다.
 - **재접속·빈도·동시 처리의 제한을 정한다(계약 v1 구현 인수 조건 2).** 숫자를 정하면 `settings`로 넘기고, 주체별 요청 빈도·동시 검증 수·연결마다 대기열의 상한은 새로 둔다.
-- **반쯤 열린 연결의 감지를 정한다.** TCP keepalive나 계약의 확인 메시지와 유휴 시간을 정한 뒤 `closed`로 이어지게 한다.
+- **keepalive 값을 T1 실측 뒤 조정한다.** 네 값은 `src/transport/keepalive.ts` 한 자리에 있다. `TCP_USER_TIMEOUT`은 첫 탐침 지연 + 간격 × 횟수로 두고 첫 탐침 지연 + 간격 이하로 줄이지 않는다. 런타임 판을 올리면 `_handle.fd`와 `setKeepAlive`가 넣는 값이 그대로인지 위 시험으로 본다(달라지면 모든 연결이 `keepalive_failed`로 닫힌다). 프로세스가 멈춘 실행기까지 알아채야 하면 계약의 살아 있음 확인 메시지를 정한다(위 "반쯤 열린 연결").
 - **외부 nonce 저장소의 완료·취소를 조립에서 다룬다.** 서버를 닫는 시점에 이미 저장소를 기다리는 검증은 남을 수 있다(`close()`는 진행 중인 검증을 취소하거나 기다리지 않는다. 늦게 끝난 결과는 `late_dropped`로 버린다).
 - **`deliver`는 던지지 않는다.** 던지면 그 연결이 닫힌다. `forward`는 `handleForward`로, `occupancy`(`full`)는 `passHelloAnswer`로 잇는다. 후보 표시는 실행 권한을 주지 않는다.
 - **서버를 새로 시작하면 연결 번호가 1부터다.** 연결 번호로 묶은 기다리는 조회·밀린 사본은 서버 객체와 함께 버린다.
