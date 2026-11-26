@@ -38,7 +38,7 @@ import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import { resendTick } from "../dispatch/resend.ts";
-import { type ResultCheckPolicy, type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
+import { type ResultCheckPolicy, type ResultCheckTickResult, type ResultReach, resultCheckTick } from "../dispatch/result-check.ts";
 import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
@@ -476,6 +476,9 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
 
   // 받아들인 복원 단계(0~5). 순서기는 5, 답 줄과 D-90 박자는 2 이상일 때만 연다.
   let stage = 0;
+  // 5단계를 받아들인 시각(장부 시계, 결과 검사의 기한 시작 D-123). 받아들이기 전이거나 그때 시각을 읽지 못했으면 null이고, 그러면 이
+  // 프로세스의 결과 검사는 결과 없음 판정을 하지 않는다. 받아들인 순간에 읽으므로 장부가 허가를 낸 시각보다 이르지 않다.
+  let restoredAt: number | null = null;
   const observationsSettled = () => stage >= 2;
 
   // 효과의 문. 끝 차례가 정한 코드, 진행 중인 박자의 절대 기한, 받아들인 5단계의 허가를 한 판단으로 본다.
@@ -583,11 +586,24 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     if (value === null) throw new Error("not_wired");
     return value;
   };
+  // 결과 검사의 기한 시작과 연결 조건(D-123). 실행기 연결은 서버가 지금 인정한 그 주체의 연결 하나(recognized: 이번 복원기로 맞춘 뒤
+  // 인사까지 끝났고 서버가 닫지 않은 연결)이고, 그 시각은 연결 표가 적은 인사를 받은 시각(greeting.at, 서버가 장부 시계로 읽는다)이다.
+  // 끊겼다 다시 붙으면 새 연결의 인사 시각이 된다. 박자가 부를 때마다 읽고 캐시하지 않는다. 던지면 결과 검사가 모름으로 읽는다.
+  const reach: ResultReach = {
+    restoredAt: () => restoredAt,
+    greetedAt: (executorId) => {
+      const live = need(server);
+      const connection = live.recognized(executorId);
+      if (connection === null) return null;
+      const at = live.table().get(connection)?.greeting?.at;
+      return typeof at === "number" ? at : null;
+    },
+  };
   const beats: CycleBeats = {
     linkLoss: (clocks, policy, input) =>
       make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
     // 판정은 접수 문을 본다: 정지 중·허가 폐기·복원 전에는 확정도 열리지 않으므로 판정만 앞당기지 않는다(result-check.md "접수").
-    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen }, now, settings.resultCheck),
+    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, reach }, now, settings.resultCheck),
     life: (clock, input) =>
       make.ticks.life(
         { ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen },
@@ -840,7 +856,12 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
         stage = index + 1;
         lastRestoreFailure = "";
         const step5 = stage === 5 ? (waited.value as { intakeMayOpen: boolean; closedBecause: readonly string[] }) : null;
-        if (step5 !== null) granted = step5.intakeMayOpen === true;
+        if (step5 !== null) {
+          granted = step5.intakeMayOpen === true;
+          // peek은 공유 하한을 올리지 않아 순서기의 시계 판정을 바꾸지 않는다. 원천을 읽지 못하면 unavailable이다(던지지 않는다).
+          const seen = shared.peek();
+          restoredAt = seen.state === "ok" ? seen.at : null;
+        }
         if (stopping) return;
         if (step5 !== null) log("restore_step", { step: 5, intakeMayOpen: granted, closedBecause: step5.closedBecause.join(",") });
         else log("restore_step", { step: stage });

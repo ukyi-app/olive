@@ -1,6 +1,7 @@
 // 결과 검사의 한 박자. checking에 머문 작업자 실행마다 반영 전 결과 보고를 모으고, 판정 자리(resultVerdict)가 통과로 낸 결과만
-// 장부의 markResult로 ready_result에 옮긴다. 반영 전 결과 보고가 없는 채 checking이 된 지 기한(policy.reportWaitMs)이 지난 실행은
-// markResult(null)로 failed_stopped에 옮긴다(D-113). 확정(result_finalize)은 이 박자가 아니라 수명 박자가 낸다.
+// 장부의 markResult로 ready_result에 옮긴다. 반영 전 결과 보고가 없는 채 기한(policy.reportWaitMs)이 지난 실행은
+// markResult(null)로 failed_stopped에 옮긴다(D-113). 기한은 종료 영수증 시각·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이
+// 인정된 시각 가운데 가장 늦은 때부터 센다(D-123). 확정(result_finalize)은 이 박자가 아니라 수명 박자가 낸다.
 // 장부·접수·박자 유효 문은 포트로, 판정 시각(now)은 순서기가 부르기 직전에 다시 읽은 장부 시계로, 기한은 정책 인자로 받는다.
 // 소켓·타이머·시계·난수를 직접 부르지 않는다. 쥐는 것은 이 모듈의 박자가 진행 중이라는 표시 하나다(돌아오면 지운다).
 //
@@ -8,7 +9,10 @@
 // 1. 모름은 판정하지 않는다. 실행 목록이나 반영 전 보고 목록을 읽지 못하거나 한 줄이라도 칸을 읽지 못하면 장부를 부르지 않는다.
 //    보고 한 줄을 건너뛰고 판정하면 그 실행의 다른 digest를 보지 못한 채 판정해, 장부가 그 보고를 충돌로 닫는다.
 // 2. 판정은 그 실행의 반영 전 결과 보고가 정확히 한 digest일 때만이다. 다른 digest가 함께 있으면 판정하지 않고 digest_conflict로 남긴다.
-//    결과 없음 판정은 반영 전 결과 보고가 하나도 없고, 실행 줄의 updated_at(checking이 된 시각)부터 now까지 기한 이상일 때만이다.
+//    결과 없음 판정은 반영 전 결과 보고가 하나도 없고, 기한 시작(waitFrom)부터 now까지 기한 이상일 때만이다. 기한 시작은
+//    실행 줄의 updated_at(checking이 된 시각)·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이 인정된 시각 가운데 가장 늦은 때다.
+//    그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기(RENEW_INTERVAL_MS)가 지나지 않았거나, 셋 중 하나라도 모르면 기다린다:
+//    실행기는 연결이 맞춰져 있을 때만 결과 보고를 보내고(src/executor/worker.ts의 transmit), 받음 확인이 없는 보고를 그 주기로 다시 보낸다.
 // 3. markResult에는 늘 그 보고의 reportId를 넘긴다. 장부가 그 보고가 이 실행의 반영 전 보고이고 digest가 같은지 대조해(아니면
 //    reference_mismatch) 판정이 이 박자가 본 보고를 정확히 가리킨다. 확정을 여는 데에는 필요 없다: 빠져도 장부는 판정하면서
 //    그 실행의 반영 전 결과 보고를 모두 반영한다.
@@ -16,6 +20,7 @@
 // 5. 장부 호출은 장부 포트 수신자·메서드·인자 얻기 → 문(접수 → 박자 유효 문) → 호출 하나다(send-gate.ts의 callAfterGate).
 //    문 뒤에는 외부 코드가 없고, 읽기부터 호출까지 await가 없다.
 // 6. 장부가 던지거나 답이 정의 밖이면 그 자리에서 박자를 멈춘다(판정이 적혔는지 모른다). 거절은 그 실행의 결과이고 박자는 이어 간다.
+import { limits } from "../../contract/v1/index.ts";
 import { LEDGER_RUN_STATES, type Ledger, REFUSALS as LEDGER_REFUSALS, type LedgerRunState, type Refusal as LedgerRefusal, type Restorer } from "../../ledger/index.ts";
 import { callAfterGate, holdBeatValid } from "./send-gate.ts";
 
@@ -26,6 +31,19 @@ export interface ResultCheckPorts {
   readonly intake: Pick<Restorer, "intakeOpen">;
   // 이 박자가 아직 유효한가. 장부 호출 바로 앞에서 본다. 빠지면 늘 유효다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
   readonly beatValid?: () => boolean;
+  // 결과 없음 판정의 기한 시작과 연결 조건(D-123)에 드는 사실. 결과 없음 판정으로 가기 직전에만 읽고 통과 판정은 보지 않는다.
+  // 빠지면 결과 없음 판정을 하지 않는다(이 부품 단독의 쓰임). 조립은 반드시 넘긴다.
+  readonly reach?: ResultReach;
+}
+
+// 결과 보고가 장부에 닿을 수 있게 된 때를 가늠하는 사실 둘(D-123). 시각은 모두 장부와 같은 시계다. 모르면 null이고, null이면 결과 없음
+// 판정을 하지 않는다. 던져도 null과 같다.
+export interface ResultReach {
+  // 이 프로세스가 복원 5단계의 허가를 받아들인 시각. 받아들이기 전이거나 그때 시각을 읽지 못했으면 null.
+  restoredAt(): number | null;
+  // 그 실행기의 연결이 지금 인정돼 있으면(이번 복원기로 맞춘 뒤 인사까지 끝났고 서버가 아직 닫지 않은 연결 하나) 그 인사를 받은 시각.
+  // 연결이 없거나 둘 이상이거나 모르면 null.
+  greetedAt(executorId: string): number | null;
 }
 
 // 판정 자리가 보는 반영 전 결과 보고 하나. 장부의 pendingReports가 낸 차례(받은 시각, id) 그대로 넘긴다.
@@ -83,7 +101,8 @@ export type ResultCheckHalt =
 export type ResultCheckOutcome =
   // 장부가 판정을 적었다고 답했다. state는 답의 실행 줄 상태다.
   | { readonly runId: string; readonly outcome: "judged"; readonly reportId: string; readonly resultDigest: string; readonly state: LedgerRunState }
-  // 반영 전 결과 보고가 없고 기한 전이다(또는 정책 인자가 없거나 checking이 된 시각을 읽지 못했다). 장부를 부르지 않았다.
+  // 반영 전 결과 보고가 없고 기한 전이다(또는 정책 인자·기한 시작의 사실이 없거나 모르거나, 그 실행기의 연결이 없거나 인정 뒤 재전송
+  // 한 주기 전이다). 장부를 부르지 않았다.
   | { readonly runId: string; readonly outcome: "waiting" }
   // 반영 전 결과 보고 없이 기한이 지나 장부가 결과 없음 판정을 적었다고 답했다(failed_stopped). checkingSince는 판정에 쓴 실행 줄의
   // updated_at이다. 조립이 감독 기록에 경보 한 줄을 남긴다.
@@ -148,11 +167,12 @@ function beatValid(ports: ResultCheckPorts): boolean {
 
 // checking인 작업자 실행을 실행 목록의 차례대로. 모든 줄의 실행 ID·종류·상태를 칸마다 한 번 읽는다. 한 줄이라도 읽지 못하거나
 // 꼴이 틀리거나 같은 실행 ID가 둘이면 목록 전체가 모름이다(그 줄이 checking 실행일 수 있다).
-// checking 줄은 updated_at도 한 번 읽는다. checking으로 오는 길은 completed 종료 영수증 하나라 그 시각이 영수증을 받은 시각이다.
-// 그 칸만 꼴이 틀리면 since가 null이고 그 실행은 결과 없음으로 판정하지 않는다(통과 판정은 이 칸을 쓰지 않는다).
+// checking 줄은 updated_at과 지정 실행기도 한 번씩 읽는다. checking으로 오는 길은 completed 종료 영수증 하나라 그 시각이 영수증을 받은
+// 시각이다. 두 칸은 결과 없음 판정에만 쓴다: 꼴이 틀리면 그 칸이 null이고 그 실행은 결과 없음으로 판정하지 않는다.
 interface CheckingRun {
   readonly runId: string;
   readonly since: number | null;
+  readonly executorId: string | null;
 }
 function readChecking(ports: ResultCheckPorts): CheckingRun[] | null {
   try {
@@ -173,7 +193,8 @@ function readChecking(ports: ResultCheckPorts): CheckingRun[] | null {
       seen.add(runId);
       if (kind !== "worker" || state !== "checking") continue;
       const since: unknown = row.updatedAt;
-      checking.push({ runId, since: isTime(since) ? since : null });
+      const executorId: unknown = row.executorId;
+      checking.push({ runId, since: isTime(since) ? since : null, executorId: typeof executorId === "string" && executorId.length > 0 ? executorId : null });
     }
     return checking;
   } catch {
@@ -216,6 +237,29 @@ function readPending(ports: ResultCheckPorts): Map<string, PendingResult[]> | nu
 
 type Judged = { readonly outcome: ResultCheckOutcome | null; readonly halt: ResultCheckHalt | null };
 
+// 결과 없음 판정의 기한 시작(D-123): 종료 영수증 시각(since)·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이 인정된 시각 가운데
+// 가장 늦은 때. 그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기가 지나지 않았거나(정각부터 지난 것으로 본다), 하나라도 모르면
+// null(기다림)이다. 감독이 멈춰 있던 동안이나 실행기 연결이 끊긴 동안은 실행기가 결과 보고를 장부에 닿게 할 수 없으므로 기한에 넣지
+// 않는다. 포트의 칸과 호출마다 한 번만 읽고, 던짐은 모름이다.
+function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now: number): number | null {
+  const executorId = run.executorId;
+  if (executorId === null) return null;
+  try {
+    const reach = ports.reach;
+    if (reach === undefined) return null;
+    const restoredAt: unknown = reach.restoredAt();
+    if (!isTime(restoredAt)) return null;
+    const greetedAt: unknown = reach.greetedAt(executorId);
+    if (!isTime(greetedAt)) return null;
+    // 실행기는 받음 확인이 없는 보고를 마지막 송신에서 이 간격이 지나면 다시 보낸다(src/executor/worker.ts의 tick). 인정 뒤 이 간격 안에는
+    // 다시 보낸 보고가 아직 장부에 닿지 않았을 수 있다.
+    if (now - greetedAt < limits.RENEW_INTERVAL_MS) return null;
+    return Math.max(since, restoredAt, greetedAt);
+  } catch {
+    return null;
+  }
+}
+
 // 기한. 정책 인자가 없으면 null(결과 없음 판정 없음), 칸을 읽지 못하거나 꼴이 틀리면 undefined다.
 function waitOf(policy: ResultCheckPolicy | undefined): number | null | undefined {
   if (policy === undefined) return null;
@@ -238,11 +282,13 @@ function tickOnce(ports: ResultCheckPorts, now: number, policy: ResultCheckPolic
   if (pending === null) return { kind: "not_run", reason: "read_unknown", read: "reports" };
 
   const runs: ResultCheckOutcome[] = [];
-  for (const { runId, since } of checking) {
+  for (const run of checking) {
+    const { runId, since } = run;
     const verdict = resultVerdict(pending.get(runId) ?? []);
     if (verdict.kind === "wait") {
-      // 기한 정각부터 판정한다. 시계가 그 시각보다 뒤로 갔으면(now < since) 경과가 음수라 기다린다.
-      if (wait === null || since === null || now - since < wait) {
+      // 기한 정각부터 판정한다. 시계가 기한 시작보다 뒤로 갔으면(now < from) 경과가 음수라 기다린다.
+      const from = wait === null || since === null ? null : waitFrom(ports, run, since, now);
+      if (wait === null || since === null || from === null || now - from < wait) {
         runs.push({ runId, outcome: "waiting" });
         continue;
       }
