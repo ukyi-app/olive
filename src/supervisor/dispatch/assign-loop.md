@@ -46,6 +46,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 | `assign_refused` + `reason` | 장부가 거절했다(`input_cancelled`·`input_expired` 포함). 이번 호출이 새 실행을 잇지 않았다는 뜻이다. 부탁이 대기로 남는지는 장부가 정한다(그 사이 취소되어 장부가 이미 닫은 부탁이면 `transition_denied`이고 대기 목록에 없다) |
 | `assign_failed` + `failure` | `random_unavailable`(장부를 부르지 않음), `threw`, `malformed_answer` |
 | `withheld` + `reason`, `executorId` | 이 호출이 그 부탁을 잇지 않았다. 그 부탁의 지금 장부 상태는 보장하지 않는다(겹친 박자의 다른 호출이 이미 이었을 수 있다). 재시도나 지표에 지금 단계가 필요하면 장부를 다시 읽는다. `listed`: 빼고 고른 답이 `no_executor`였고 빼지 않았다면 고르기가 고를 실행기가 맡기지 않을 실행기다(`executorId`가 그 실행기), 또는 고르기가 고른 실행기 하나가 고른 뒤의 대조에서 집합에 있었다(`executorId`가 그 실행기). 뒤의 경우는 맞는 후보가 모두 막혔다는 뜻이 아니다: 같은 박자에서 다른 후보를 다시 고르지 않고, 다음 박자가 다시 고른다. `withheld_unknown`: 고르기 직전에 다시 읽은 집합이 모름이다(`executorId: null`). 아래 "맡기지 않을 실행기" |
+| `candidates_unknown` | 고르기 직전에 다시 읽은 후보 연결이 모름이다(던짐, `known`이 불리언 `true`가 아님, 꼴이 틀림). 그 고르기 뒤의 효과를 부르지 않았다: 자격 없이 고르기 직전이면 자격 포트·파일 읽기 0, 자격으로 다시 고르기 직전이면 난수·잇기 0. 아래 "사실·자격·후보 연결" |
 
 | 실행마다 (`StartOutcome`) | 뜻 |
 |---|---|
@@ -64,7 +65,7 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 2. **쓰기 전의 읽기.** 접수(`intakeOpen()`이 `true`가 아니면 `intake_closed`), 정지 세대(0 이상의 안전 정수가 아니면 `stop_generation_unknown`), 대기 부탁 목록, 후보 연결, 맡기지 않을 실행기(항목이 모두 작업자 실행기 주체 이름이 아니면 `withheld`, 아래 "맡기지 않을 실행기"), 시작 판단의 읽기 넷(`queueView`, `listRuns`, `slotHolds`, `listInputs`)을 이 차례로 읽는다. 하나라도 `known`이 불리언 `true`가 아니거나 던지거나 꼴이 틀리면(배열이 아님, 객체가 아닌 항목) 그 이름으로 `read_unknown`이다. `listRuns`의 대기 실행에 대한 `queueView`의 시작 불가 사유(`startBar`)는 명시적 `null`이거나 장부가 정한 이름(`StartBar`)이어야 하고, 줄이 없거나(두 읽기가 어긋남) 칸이 빠졌거나 다른 값이면 `queue_view`다. 이 검사는 행마다 본 범위에서다: 같은 실행의 `queueView` 행이 여럿이면 마지막 행만 보므로, 앞 행의 틀린 사유는 뒤의 정상 행에 가려져 시작이 불릴 수 있다(실제 장부는 한 실행에 한 행을 낸다). 읽기의 답은 받았으나 그 행을 해석하다 던지면(행의 칸 getter, 배열의 빈 원소) 구별된 결과 없이 박자가 예외로 끝난다(아래 "박자가 멈출 때").
 3. 그 읽기로 `planNext`의 입력을 만들어 부른다. 출처를 나누지 못한 입력(`originOf`가 `undefined`)은 넣지 않아 그 실행이 `input_unknown`으로 보류된다. `planNext`가 정책 검사에서 던지면 `policy_rejected`다.
 4. **시작.** `planNext`의 후보마다: 세션이면 `not_worker`. 작업자면 접수를 다시 보고(닫혔으면 `halted`), 맡기지 않을 실행기를 다시 읽어 그 실행의 지정 실행기와 대조하고(걸리면 `withheld`, 그 실행은 건너뛴다), 난수 포트로 요청 ID를 만들어 `startRun`. 성공 답을 받은 뒤에만 `startDraft`(장부의 실행 줄, 그 요청 ID, 박자의 정지 세대, 장부의 `issuedAt`) → `sealDraft` → 송신 표식 → `sink.send`. 표식과 송신은 공유 함수 `sendInstruction`(`send-gate.md`) 하나로 하고, 표식은 `startRun`을 부른 그 장부 객체로 봉투의 실행·요청 ID를 봉한 시각(아래 "시각")에 적는다. 표식이 `ok`가 아니면 싣지 않는다(`start_unmarked`). 거절·예외이면 지시를 만들지 않는다. 성공 답은 초안에 필요한 칸(실행 줄과 `issuedAt`)만 검증하고, 이 모듈이 쓰지 않는 칸(성공 답의 별도 `credential` 등)은 보지 않는다.
-5. **잇기.** 대기 부탁마다 목록의 순서로: 사실 포트, 자격 포트, 접수와 맡기지 않을 실행기의 다시 읽기, 그 실행기를 뺀 후보로 `pickAssignment`. `assign`이면 고른 실행기를 같은 집합과 한 번 더 대조하고, 걸리지 않으면 난수 포트로 실행 ID를 만들어 `assignToolRequest`. 어느 답이든 그 부탁만의 결과이고 다음 부탁을 본다.
+5. **잇기.** 대기 부탁마다 목록의 순서로: 사실 포트, 접수·맡기지 않을 실행기·후보 연결의 다시 읽기, 그 실행기를 뺀 후보로 자격 없이(`credential: null`) `pickAssignment`. 그 답이 `credential_unknown`(자격 앞의 검사를 통과한 후보와 고정 계정이 있다)일 때만 자격 포트를 부르고, 접수·맡기지 않을 실행기·후보 연결을 다시 읽어 그 자격으로 처음부터 다시 고른다. 다른 답이면 자격 포트를 부르지 않고 그 답이 그 부탁의 결과다. `assign`이면 고른 실행기를 같은 집합과 한 번 더 대조하고, 걸리지 않으면 난수 포트로 실행 ID를 만들어 `assignToolRequest`. 어느 답이든 그 부탁만의 결과이고 다음 부탁을 본다.
 
 2의 읽기에서 1~5의 어느 쓰기도 부르지 않는다. 읽기 하나라도 닫힘·모름·틀림이면 그 박자에는 잇기도 시작도 없다.
 
@@ -116,8 +117,9 @@ HaltedAt = { step: "start", runId: string } | { step: "assign", ref: string }
 ## 사실·자격·후보 연결
 
 - **사실(`facts`):** 배정 전 거절의 사실을 그 부탁과 대조해 채우는 쪽은 포트다. 모르는 칸은 비운다. 포트가 던지면 빈 사실로 넘겨 고르기가 `evidence_missing`으로 보류한다. 이 모듈은 사실을 지어내지 않는다.
-- **자격(`credentials`):** 고르기와 같은 `selectAccount(부탁의 역할, accounts)`로 계정을 정해 그 계정의 참조를 묻는다. 계정이 없으면 묻지 않는다(고르기가 `no_account`). `known: false`이거나 던지면 `null`로 넘겨 고르기가 `credential_unknown`으로 보류한다. 꼴과 계정 대조는 고르기가 한다.
+- **자격(`credentials`):** 고르기와 같은 `selectAccount(부탁의 역할, accounts)`로 계정을 정해 그 계정의 참조를 묻는다. **자격 없이 고른 답이 `credential_unknown`일 때만 묻는다:** 부탁·사실·역할·대상·허용 표·등록행·기대 revision을 통과한 후보와 고정 계정이 있어야 한다. 실제 포트(`accounts/credential-ref.ts`)는 계정의 자격 파일을 읽으므로, 맞는 실행기가 없거나(`no_executor`) 계정이 없거나(`no_account`) 사실이 빠진(`evidence_missing`) 부탁에서는 파일을 열지 않는다. 맡기지 않을 실행기만 맞는 부탁은 묻는다(빼지 않은 고르기가 자격까지 닿는다): `listed`와 다른 보류를 전처럼 가르기 위해서다. `known: false`이거나 던지면 `null`로 넘겨 고르기가 `credential_unknown`으로 보류한다. 꼴과 계정 대조는 고르기가 한다.
 - **후보 연결(`connections`):** `Connections.candidates(복원기)`는 정지 세대를 모르면 빈 목록을 낸다. "후보 없음"과 "모름"을 가르려면 감싸는 조립 코드가 세대를 모를 때 `known: false`를 낸다.
+- **후보 연결은 고를 때마다 다시 읽는다.** 박자 처음의 읽기는 쓰기 전의 문으로만 쓰고(모름이면 `read_unknown`·`candidates`), 잇기의 두 고르기(사실 조회 뒤 자격 없이, 자격 조회 뒤 그 자격으로)는 각각 그 직전에 후보 포트를 다시 부른다. 연결 표는 부를 때마다 지금 열린 연결로 새 목록을 만들고, 장부는 넘긴 실행기 이름과 기대 revision으로 실행을 만든다. 박자 처음의 목록으로 고르면, 조회를 기다리는 사이 같은 실행기가 끊고 다른 프로필로 다시 인사했을 때 지금 연결과 맞지 않는 실행이 적힌다. 다시 읽은 목록으로 고르면 그 연결은 지금의 인사로 판정된다(기대 프로필과 다르면 `no_executor`). 다시 읽기가 모름이면 그 부탁만 `candidates_unknown`이고 다음 부탁을 본다(이미 쓴 것이 있을 수 있어 박자 전체를 `not_run`으로 바꿀 수 없다). 다시 읽기는 접수·맡기지 않을 실행기 다음이라 접수가 닫혔으면 먼저 멈춘다. 다시 읽은 목록으로 고른 뒤 장부 쓰기까지는 `await`가 없다(난수, 장부 포트 얻기, 박자 유효 문만 있다).
 
 ## 내보내지 못했을 때
 

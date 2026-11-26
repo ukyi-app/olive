@@ -5,6 +5,7 @@
 // 지키는 것:
 // 1. 닫혔거나 모르면 쓰지 않는다. 접수, 정지 세대, 대기 부탁 목록, 후보 연결, 맡기지 않을 실행기, 시작 판단의 읽기 넷을 쓰기 전에 모두 읽고,
 //    하나라도 닫힘·모름·틀림이면 그 박자에는 잇기도 시작도 부르지 않는다. 쓰기 직전마다 접수를 다시 본다(포트가 비동기라 박자 중에 닫힐 수 있다).
+//    잇기의 고르기는 그때마다 후보 연결을 다시 읽는다: 사실·자격을 기다리는 사이 같은 실행기의 연결이 다른 인사로 바뀔 수 있다.
 // 2. 잇기는 pickAssignment가 assign을 낸 부탁만, 난수 포트에서 만든 새 실행 ID로 한다. 한 부탁의 보류·거절·실패는 그 부탁만 건너뛴다.
 // 3. 시작은 planNext의 작업자 후보만 startRun에 넘기고, 장부의 성공 답(issuedAt)을 받은 뒤에만 초안 → 봉하기 → 송신 표식 → 내보내기를 한다.
 //    표식과 내보내기는 send-gate.ts의 sendInstruction 하나로만 하고, 표식이 ok가 아니면 싣지 않는다(D-90 자동 닫기의 전제).
@@ -107,6 +108,8 @@ export type RequestOutcome =
   // 이 호출이 그 부탁을 잇지 않았다는 뜻이고 그 부탁의 지금 장부 상태는 보장하지 않는다(겹친 박자의 다른 호출이 이미 이었을 수 있다).
   // 기존의 no_executor(지금의 연결·정책 조합에 맞는 후보 없음)와 다르다.
   | { readonly ref: string; readonly outcome: "withheld"; readonly reason: Exclude<WithheldReason, "executor_unknown">; readonly executorId: string | null }
+  // 고르기 직전에 다시 읽은 후보 연결이 모름이다(던짐, known이 true가 아님, 꼴이 틀림). 그 고르기 뒤의 효과(자격 조회·잇기)를 부르지 않았다.
+  | { readonly ref: string; readonly outcome: "candidates_unknown" }
   | { readonly ref: string; readonly outcome: "assigned"; readonly runId: string; readonly executorId: string }
   // 이미 이어진 부탁. 넘긴 실행 ID는 쓰이지 않았고 장부가 돌려준 실행이 그 부탁의 실행이다.
   | { readonly ref: string; readonly outcome: "already_assigned"; readonly runId: string; readonly executorId: string }
@@ -290,7 +293,8 @@ function beatValid(ports: AssignLoopPorts): boolean {
 }
 
 // rows는 listRuns의 행(실행 ID → 행)이다. 시작 직전에 지정 실행기를 읽는 데만 쓴다(대기 실행의 지정 실행기는 배정 뒤 바뀌지 않는다).
-type Snapshot = { stopGeneration: number; waiting: readonly WaitingToolRequest[]; candidates: readonly Candidate[]; view: SchedulerView; rows: ReadonlyMap<string, Run> };
+// 후보 연결은 여기에 두지 않는다: 잇기의 고르기가 그때마다 다시 읽는다(decide).
+type Snapshot = { stopGeneration: number; waiting: readonly WaitingToolRequest[]; view: SchedulerView; rows: ReadonlyMap<string, Run> };
 
 // 쓰기 전의 읽기 전부. 하나라도 닫힘·모름이면 그 이유를 낸다.
 function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number): Snapshot | Extract<TickResult, { kind: "not_run" }> {
@@ -305,8 +309,7 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
   const { ledger } = ports;
   const waiting = readList<WaitingToolRequest>(() => ledger.listWaitingToolRequests());
   if (waiting === null) return { kind: "not_run", reason: "read_unknown", read: "waiting_requests" };
-  const candidates = readList<Candidate>(() => ports.connections.candidates());
-  if (candidates === null) return { kind: "not_run", reason: "read_unknown", read: "candidates" };
+  if (readList<Candidate>(() => ports.connections.candidates()) === null) return { kind: "not_run", reason: "read_unknown", read: "candidates" };
   // 빠뜨린 입력을 빈 집합으로 치지 않는다: 빈 집합은 "없음"이고 빠뜨린 것은 모름이다.
   if (readWithheld(ports) === null) return { kind: "not_run", reason: "read_unknown", read: "withheld" };
 
@@ -366,7 +369,7 @@ function readAll(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number):
     }
     if (origin !== undefined) known.push({ requestId: input.requestId, origin, receivedAt: input.receivedAt, expiresAt: input.expiresAt, cancelled: input.cancelled });
   }
-  return { stopGeneration: stopGeneration as number, waiting, candidates, view: { runs: view, inputs: known, slotHolds: holds, now }, rows };
+  return { stopGeneration: stopGeneration as number, waiting, view: { runs: view, inputs: known, slotHolds: holds, now }, rows };
 }
 
 export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignLoopPolicy, now: number): Promise<TickResult> {
@@ -406,7 +409,7 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
     }
     for (const request of snapshot.waiting) {
       at = { step: "assign", ref: request.ref };
-      const outcome = await assignOne(ports, policy, snapshot.candidates, request, now);
+      const outcome = await assignOne(ports, policy, request, now);
       if (outcome === "intake_closed" || outcome === "beat_closed") return halt(outcome);
       requests.push(outcome);
     }
@@ -416,10 +419,47 @@ export async function assignAndStartTick(ports: AssignLoopPorts, policy: AssignL
   return { kind: "ran", starts, requests, halted: null, haltedAt: null };
 }
 
+// 자격만 빠져 보류된 답. 자격 없이(null) 고른 답이 이것이면 자격 앞의 검사를 모두 통과한 후보와 고정 계정이 있다.
+const awaitsCredential = (outcome: RequestOutcome): boolean => outcome.outcome === "skipped" && outcome.pick.kind === "held" && outcome.pick.reason === "credential_unknown";
+
+// 지금의 접수, 맡기지 않을 실행기, 후보 연결을 다시 읽고 고른다. 비동기 포트(사실·자격)를 기다린 뒤마다 부른다: 그 사이 닫혔거나 바뀌었을 수 있다.
+// 고른 답(assign)이면 그 답을, 아니면 그 부탁의 결과를 낸다.
+function decide(
+  ports: AssignLoopPorts,
+  ref: string,
+  given: Omit<PickInput, "connections" | "intakeOpen">,
+): Extract<PickResult, { kind: "assign" }> | RequestOutcome | "intake_closed" {
+  const open = intakeOpen(ports.intake);
+  if (open !== true) return "intake_closed";
+  // 접수가 닫혔으면 이보다 먼저 멈춘다.
+  const withheld = readWithheld(ports);
+  if (withheld === null) return { ref, outcome: "withheld", reason: "withheld_unknown", executorId: null };
+  // 박자 처음의 후보 목록으로 고르지 않는다. 연결 표는 부를 때마다 지금 열린 연결로 새 목록을 만들고, 장부는 넘긴 실행기 이름과
+  // 기대 revision을 그대로 적는다. 그래서 조회를 기다리는 사이 같은 실행기가 다른 프로필로 다시 인사하면 옛 목록의 고르기가 지금 연결과
+  // 맞지 않는 실행을 적는다. 모르면 빈 목록으로 치지 않고 이 고르기 뒤의 효과(자격 파일 읽기, 잇기)를 닫는다.
+  const connections = readList<Candidate>(() => ports.connections.candidates());
+  if (connections === null) return { ref, outcome: "candidates_unknown" };
+  const input = { ...given, intakeOpen: open };
+  const kept = withoutWithheld(connections, withheld);
+  let picked = pickAssignment({ ...input, connections: kept });
+  // 거르지 않았으면(같은 참조) 길이를 다시 읽지 않는다: 읽기마다 답이 다른 목록이면 그 읽기가 박자를 멈춘다.
+  if (picked.kind === "held" && picked.reason === "no_executor" && kept !== connections && kept.length < connections.length) {
+    // 뺀 실행기가 맞았는지만 가린다(이 답으로는 잇지 않는다). 맞았다면 no_executor와 구별해 내고,
+    // 아니면 빼지 않은 고르기의 답(맞는 실행기 없음, 자격 모름 등)을 그대로 싣는다.
+    const unfiltered = pickAssignment({ ...input, connections });
+    if (unfiltered.kind === "assign") return { ref, outcome: "withheld", reason: "listed", executorId: unfiltered.input.executorId };
+    picked = unfiltered;
+  }
+  if (picked.kind === "intake_closed") return "intake_closed";
+  if (picked.kind !== "assign") return { ref, outcome: "skipped", pick: picked };
+  // 고른 실행기를 같은 집합과 한 번 더 대조한다. 후보의 주체를 거를 때 읽지 못해 남긴 후보를 고르기가 고를 수 있다.
+  if (withheld.has(picked.input.executorId)) return { ref, outcome: "withheld", reason: "listed", executorId: picked.input.executorId };
+  return picked;
+}
+
 async function assignOne(
   ports: AssignLoopPorts,
   policy: AssignLoopPolicy,
-  connections: readonly Candidate[],
   request: WaitingToolRequest,
   now: number,
 ): Promise<RequestOutcome | "intake_closed" | "beat_closed"> {
@@ -430,7 +470,20 @@ async function assignOne(
   } catch {
     facts = {};
   }
-  // 고르기가 대조할 자격 참조. 계정은 고르기와 같은 selectAccount로 정하고, 고르기가 다시 골라 대조한다(다르면 credential_mismatch).
+  const given: Omit<PickInput, "connections" | "intakeOpen" | "credential"> = {
+    request: { ref, role: request.role, inputDigest: request.inputDigest, input: request.input },
+    assignment: policy.assignment,
+    accounts: policy.accounts,
+    plans: policy.plans,
+    facts,
+    now,
+  };
+  // 자격은 자격 앞의 검사(부탁·사실·역할·대상·허용 표·등록행·기대 revision·계정)를 통과한 후보가 있을 때만 묻는다. 실제 포트는
+  // 계정의 자격 파일을 읽으므로 맞는 실행기가 없는 부탁마다 파일을 열지 않게 한다. 그래서 자격 없이(null) 먼저 고르고, 그 답이
+  // credential_unknown일 때만 묻는다. 맡기지 않을 실행기를 빼서 후보가 없어도 빼지 않은 고르기가 자격까지 닿으면 묻는다: 그래야 listed를 가린다.
+  const first = decide(ports, ref, { ...given, credential: null });
+  if (first === "intake_closed" || ("outcome" in first && !awaitsCredential(first))) return first;
+  // 계정은 고르기와 같은 selectAccount로 정하고, 고르기가 다시 골라 대조한다(다르면 credential_mismatch).
   // 모르면 null이고 고르기가 credential_unknown으로 보류한다.
   let credential: CredentialRef | null = null;
   const account = selectAccount(request.role, policy.accounts);
@@ -443,35 +496,9 @@ async function assignOne(
       credential = null;
     }
   }
-  const given: Omit<PickInput, "connections"> = {
-    request: { ref, role: request.role, inputDigest: request.inputDigest, input: request.input },
-    assignment: policy.assignment,
-    accounts: policy.accounts,
-    credential,
-    plans: policy.plans,
-    facts,
-    // 비동기 포트를 기다린 뒤라 지금의 접수를 다시 읽어 넘긴다.
-    intakeOpen: intakeOpen(ports.intake),
-    now,
-  };
-  if (given.intakeOpen !== true) return "intake_closed";
-  // 같은 까닭으로 맡기지 않을 실행기도 고르기 직전에 다시 읽는다. 접수가 닫혔으면 이보다 먼저 멈춘다.
-  const withheld = readWithheld(ports);
-  if (withheld === null) return { ref, outcome: "withheld", reason: "withheld_unknown", executorId: null };
-  const kept = withoutWithheld(connections, withheld);
-  let picked = pickAssignment({ ...given, connections: kept });
-  // 거르지 않았으면(같은 참조) 길이를 다시 읽지 않는다: 읽기마다 답이 다른 목록이면 그 읽기가 박자를 멈춘다.
-  if (picked.kind === "held" && picked.reason === "no_executor" && kept !== connections && kept.length < connections.length) {
-    // 뺀 실행기가 맞았는지만 가린다(이 답으로는 잇지 않는다). 맞았다면 no_executor와 구별해 내고,
-    // 아니면 빼지 않은 고르기의 답(맞는 실행기 없음, 자격 모름 등)을 그대로 싣는다.
-    const unfiltered = pickAssignment({ ...given, connections });
-    if (unfiltered.kind === "assign") return { ref, outcome: "withheld", reason: "listed", executorId: unfiltered.input.executorId };
-    picked = unfiltered;
-  }
-  if (picked.kind === "intake_closed") return "intake_closed";
-  if (picked.kind !== "assign") return { ref, outcome: "skipped", pick: picked };
-  // 고른 실행기를 같은 집합과 한 번 더 대조한다. 후보의 주체를 거를 때 읽지 못해 남긴 후보를 고르기가 고를 수 있다.
-  if (withheld.has(picked.input.executorId)) return { ref, outcome: "withheld", reason: "listed", executorId: picked.input.executorId };
+  // 조회를 기다리는 사이 접수가 닫히거나 맡기지 않을 실행기·후보 연결이 바뀌었을 수 있다. decide가 셋을 다시 읽고 처음부터 다시 고른다.
+  const picked = decide(ports, ref, { ...given, credential });
+  if (picked === "intake_closed" || "outcome" in picked) return picked;
 
   const runId = freshUuid(ports.random);
   if (runId === null) return { ref, outcome: "assign_failed", failure: "random_unavailable" };
