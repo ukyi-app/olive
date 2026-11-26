@@ -5,6 +5,7 @@ import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
+import * as net from "node:net";
 import { join } from "node:path";
 import { encodeAgent } from "../../src/agent/link.ts";
 import { EXECUTOR_EXIT, type ExecutorDeps, type ExecutorSettings, type StartResult, type StartStep, startExecutor } from "../../src/executor/runtime.ts";
@@ -437,10 +438,43 @@ interface Seen {
   body: Record<string, unknown>;
 }
 
+// 실행기 소켓은 붙은 소켓의 커널 소켓에 keepalive 값을 넣고 되읽은 뒤에만 link에 연다(src/transport/keepalive.ts).
+// 대역에는 커널 소켓이 없어 루프백 TCP 연결 하나를 만들어 그 setKeepAlive와 _handle, 양 끝 주소·포트를 빌려 준다. 대역을 닫으면 함께 닫는다.
+// 시험 프로세스가 이 연결 때문에 끝나지 않고 남지 않도록 unref한다.
+async function kernelSocket(): Promise<{ readonly socket: net.Socket; close(): void }> {
+  const accepted: net.Socket[] = [];
+  const listener = net.createServer((socket) => {
+    socket.unref();
+    accepted.push(socket);
+  });
+  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  listener.unref();
+  const port = (listener.address() as net.AddressInfo).port;
+  const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const client = net.connect({ port, host: "127.0.0.1" }, () => resolve(client));
+    client.once("error", reject);
+  });
+  socket.unref();
+  listener.close();
+  return {
+    socket,
+    close: () => {
+      socket.destroy();
+      for (const peer of accepted) peer.destroy();
+    },
+  };
+}
+
 // 감독 쪽 틀 인코딩까지 실제로 지나는 대역. 실행기가 보낸 봉투를 풀어 모은다.
 function wired(marker: string) {
   const h = harness({ marker });
-  const wire = Object.assign(new EventEmitter(), { destroyed: false, write: (_bytes: Uint8Array) => true, destroy: () => {} });
+  const kernels: { readonly socket: net.Socket; close(): void }[] = [];
+  const wire = Object.assign(new EventEmitter(), { destroyed: false, write: (_bytes: Uint8Array) => true, destroy: () => {}, setKeepAlive: (_enable: boolean, _delay: number): unknown => undefined });
+  Object.defineProperty(wire, "_handle", { get: () => (kernels.at(-1)?.socket as unknown as { _handle?: unknown } | undefined)?._handle ?? null });
+  wire.setKeepAlive = (enable, delay) => kernels.at(-1)?.socket.setKeepAlive(enable, delay);
+  for (const key of ["localAddress", "localPort", "remoteAddress", "remotePort"] as const) {
+    Object.defineProperty(wire, key, { get: () => kernels.at(-1)?.socket[key] });
+  }
   const got: Seen[] = [];
   const decoder = createFrameDecoder();
   const closed = new Promise<void>((resolve) => wire.once("close", resolve));
@@ -452,10 +486,14 @@ function wired(marker: string) {
   wire.destroy = () => {
     if (wire.destroyed) return;
     wire.destroyed = true;
+    for (const kernel of kernels) kernel.close();
     wire.emit("close");
   };
   h.deps.createTlsClient = (() => ({
-    connect: async () => ({ socket: wire, closed, supervisor: {}, peerNotAfter: T0 + 600_000 }),
+    connect: async () => {
+      kernels.push(await kernelSocket());
+      return { socket: wire, closed, supervisor: {}, peerNotAfter: T0 + 600_000 };
+    },
     close: () => wire.destroy(),
   })) as unknown as ExecutorDeps["createTlsClient"];
   const send = (value: unknown) => {
