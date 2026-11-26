@@ -678,3 +678,78 @@ describe("인정이 끝난 연결의 인사: 관측만 적기(recordAnswerSighti
     expect(runState(ledger, live.runId)).toBe("running");
   });
 });
+
+describe("D-128: 닫힌 실행을 running으로 실은 인사(full)의 경보", () => {
+  // 시작 지시만 낸 작업자 실행을 D-90으로 닫는다(시작 발행 NOW + 30000의 빈 전체 답).
+  function closedRun(ledger: Ledger) {
+    const live = startedWorker(ledger);
+    must(ledger.closeUnreceivedRun({ runId: live.runId, runs: [], answeredAt: NOW + 30_000, receivedAt: NOW + 30_005, now: NOW + 30_010 }, { sender: WORKER_EXECUTOR }));
+    return live;
+  }
+  const AFTER_SIGNED = NOW + 40_000;
+  const AFTER_RECEIVED = NOW + 40_100;
+
+  test("반영 결과(applied)에 장부의 경보를 싣고, 열린 실행만 실은 인사에는 경보 칸이 없다", async () => {
+    const ledger = ready(open(tempPath()));
+    const closed = closedRun(ledger);
+    const live = runningWorker(ledger);
+    const w = new World(ledger);
+    const { conn, output } = await w.greet(K0, WORKER_EXECUTOR, [status(closed.runId, "running"), status(live.runId, "running")], AFTER_SIGNED, AFTER_RECEIVED);
+    expect(passHelloAnswer({ output, table: w.table, now: AFTER_RECEIVED + 1 }, { ledger, intake: w.stop, links: w.links() })).toEqual({
+      kind: "applied",
+      executorId: WORKER_EXECUTOR,
+      connection: conn,
+      answeredAt: AFTER_SIGNED,
+      moved: [],
+      deferred: [],
+      outsideLedger: [],
+      alarms: [{ alarm: "closed_run_running", runId: closed.runId }],
+    });
+    expect(runState(ledger, closed.runId)).toBe("not_started");
+    const quiet = new World(ledger);
+    const again = await quiet.greet(K0, WORKER_EXECUTOR, [status(live.runId, "running")], AFTER_SIGNED + 1, AFTER_RECEIVED + 1);
+    const outcome = passHelloAnswer({ output: again.output, table: quiet.table, now: AFTER_RECEIVED + 2 }, { ledger, intake: quiet.stop, links: quiet.links() });
+    expect([outcome.kind, "alarms" in outcome]).toEqual(["applied", false]);
+  });
+
+  test("훑기: 경보 칸이 던지거나 약속 밖의 꼴이어도 반영(applied)이고 다시 넘길 값·맡기지 않음이 없으며 경보는 unreadable 하나다", async () => {
+    const injections: [string, (answer: Record<string, unknown>) => unknown][] = [
+      [
+        "칸이 던짐",
+        (answer) =>
+          Object.defineProperty({ ...answer }, "alarms", {
+            enumerable: true,
+            get() {
+              throw new Error("경보 칸을 읽다 던짐");
+            },
+          }),
+      ],
+      ["배열 아님", (answer) => ({ ...answer, alarms: 3 })],
+      ["모르는 이름", (answer) => ({ ...answer, alarms: [{ runId: id(), runGeneration: 1, alarm: "closed_run_maybe" }] })],
+    ];
+    for (const [name, inject] of injections) {
+      const ledger = ready(open(tempPath()));
+      const closed = closedRun(ledger);
+      const w = new World(ledger);
+      const { conn, output } = await w.greet(K0, WORKER_EXECUTOR, [status(closed.runId, "running")], AFTER_SIGNED, AFTER_RECEIVED);
+      const port: HelloAnswerLedger = {
+        applyExecutorAnswer: (input, from) => inject({ ...ledger.applyExecutorAnswer(input, from) }) as ReturnType<Ledger["applyExecutorAnswer"]>,
+        recordAnswerSightings: (input, from) => ledger.recordAnswerSightings(input, from),
+      };
+      expect({ name, outcome: passHelloAnswer({ output, table: w.table, now: AFTER_RECEIVED + 1 }, { ledger: port, intake: w.stop, links: w.links() }) }).toEqual({
+        name,
+        outcome: {
+          kind: "applied",
+          executorId: WORKER_EXECUTOR,
+          connection: conn,
+          answeredAt: AFTER_SIGNED,
+          moved: [],
+          deferred: [],
+          outsideLedger: [],
+          alarms: [{ alarm: "unreadable", runId: null }],
+        },
+      });
+      expect(runState(ledger, closed.runId)).toBe("not_started");
+    }
+  });
+});

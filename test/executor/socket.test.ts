@@ -11,9 +11,12 @@ import type { StoreIo } from "../../src/executor/store.ts";
 import { createExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "../../src/executor/socket.ts";
 import { startTlsServer, type TlsServer } from "../../src/supervisor/transport/tls-server.ts";
 import { createFrameDecoder, encodeCredentialFrame, encodeFrame, FRAME_MAX_BODY_BYTES, FRAME_PREFIX_BYTES, type MixedFrameDecoder } from "../../src/transport/framing.ts";
+import { KEEPALIVE_INITIAL_DELAY_MS, KEEPALIVE_OPTIONS } from "../../src/transport/keepalive.ts";
+import { libcSocketOptions, type SocketOptionName } from "../../src/transport/keepalive-ffi.ts";
 import { createTlsClient, type TlsClient } from "../../src/transport/tls-client.ts";
 import type { RawTlsMaterial } from "../../src/transport/tls-policy.ts";
 import { type Issued, makePki, SUPERVISOR_DNS, SUPERVISOR_URI } from "../transport/certs.ts";
+import { tcpTimer } from "../transport/tcp-timers.ts";
 import { barrier, credentialValue, fromSupervisor, gate, type Rig, rig, scriptedIo, sha256, syncReply, taskStartBody } from "./support.ts";
 
 const HOST = "127.0.0.1";
@@ -883,4 +886,179 @@ test("정책: 간격의 숫자가 범위 밖이면 소켓을 만들지 않고 �
     expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy: POLICY, receive, timer: new FakeTimer(), random: () => 0 }), JSON.stringify(receive)).toEqual({ ok: false, reason: "policy_rejected" });
   }
   expect(createExecutorSocket({ client, link: r.link, inbox: inboxFor(r), policy: POLICY, receive: RECEIVE, timer: new FakeTimer(), random: () => 0 }).ok).toBe(true);
+});
+
+// 감독 흉내(tls-server.ts)는 keepalive를 켜지 않는다. 켜는 것은 실행기 소켓의 connected뿐이다.
+function capturing(sockets: tls.TLSSocket[], before?: (socket: tls.TLSSocket) => void) {
+  return (client: TlsClient): Pick<TlsClient, "connect"> => ({
+    connect: async (signal) => {
+      const verified = await client.connect(signal);
+      sockets.push(verified.socket);
+      before?.(verified.socket);
+      return verified;
+    },
+  });
+}
+
+test("keepalive: 붙은 소켓에 커널 keepalive 타이머가 걸리고 첫 탐침까지 KEEPALIVE_INITIAL_DELAY_MS 이하다. 감독 쪽 소켓에는 없다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw) });
+  s.socket.start();
+  await until(() => s.opened.length === 1 && s.peers.length === 1);
+  const own = raw[0]!;
+  await until(() => tcpTimer(own.localPort!, own.remotePort!).kind === 2);
+  const timer = tcpTimer(own.localPort!, own.remotePort!);
+  expect(timer.remainingMs).toBeLessThanOrEqual(KEEPALIVE_INITIAL_DELAY_MS);
+  expect(timer.remainingMs).toBeGreaterThan(KEEPALIVE_INITIAL_DELAY_MS - 10_000);
+  const peer = s.peers[0]!.socket;
+  // 상대 쪽은 keepalive가 아니다(보낼 것이 남았으면 재전송 타이머 1, 없으면 0).
+  expect(tcpTimer(peer.localPort!, peer.remotePort!).kind).not.toBe(2);
+});
+
+test("keepalive: 켜지 못하면(호출이 던짐, 메서드 읽기가 던짐) link에 열지 않고 닫은 뒤 실패로 세어 간격을 두고 다시 붙는다", async () => {
+  const faults: ((socket: tls.TLSSocket) => void)[] = [
+    (socket) => {
+      socket.setKeepAlive = () => {
+        throw new Error("시험: setsockopt 실패");
+      };
+    },
+    (socket) =>
+      Object.defineProperty(socket, "setKeepAlive", {
+        configurable: true,
+        get() {
+          throw new Error("시험: 메서드 읽기 실패");
+        },
+      }),
+  ];
+  for (const fault of faults) {
+    const raw: tls.TLSSocket[] = [];
+    const s = await setup({ wrap: capturing(raw, fault) });
+    s.socket.start();
+    await until(() => s.timer.waits.length === 1);
+    expect(s.opened).toHaveLength(0);
+    expect(s.events.filter((e) => e.kind !== "connecting")).toEqual([
+      { kind: "connect_failed", attempt: 1, reason: "keepalive_failed" },
+      { kind: "retry_scheduled", delayMs: 100 },
+    ]);
+    expect(raw[0]!.destroyed).toBe(true);
+    await until(() => s.client.openConnections() === 0);
+    // 감독이 받기 전에 끊겨 감독 쪽 연결이 생기지 않을 수도 있다. 생겼어도 받은 틀은 없다(맞춤 요청을 싣지 않았다).
+    expect(s.peers.flatMap((p) => p.got)).toEqual([]);
+  }
+});
+
+test("keepalive: 커널이 조용한 감독을 끊으면(keepalive 만료의 ETIMEDOUT 흉내) 그 연결을 닫고 간격을 두고 다시 붙는다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw) });
+  s.socket.start();
+  await syncPeer(s, 0);
+  // keepalive 탐침이 모두 답을 못 받으면 운영체제가 소켓을 ETIMEDOUT으로 끝낸다. 런타임은 그것을 error 뒤 close로 알린다.
+  raw[0]!.destroy(Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }));
+  await until(() => s.timer.waits.length === 1);
+  expect(closedReasons(s)).toEqual(["socket_error"]);
+  expect(s.opened[0]!.connection.state).toBe("closed");
+  expect(s.timer.waits.map((w) => w.ms)).toEqual([100]);
+  s.timer.waits[0]!.fire();
+  await syncPeer(s, 1);
+  expect(s.opened).toHaveLength(2);
+});
+
+const fdOf = (socket: tls.TLSSocket) => (socket as unknown as { _handle: { fd: number } })._handle.fd;
+const optionsOf = (socket: tls.TLSSocket) =>
+  Object.fromEntries((Object.keys(KEEPALIVE_OPTIONS) as SocketOptionName[]).map((name) => [name, libcSocketOptions.get(fdOf(socket), name)]));
+
+test("keepalive: 붙은 소켓을 libc로 되읽으면 켬·첫 탐침 30초·간격 10초·4회·TCP_USER_TIMEOUT 70초다. 감독 쪽 소켓은 켜지 않았다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw) });
+  s.socket.start();
+  await until(() => s.opened.length === 1 && s.peers.length === 1);
+  expect(optionsOf(raw[0]!)).toEqual({ SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 10, TCP_KEEPCNT: 4, TCP_USER_TIMEOUT: 70_000 });
+  expect(optionsOf(s.peers[0]!.socket)).toMatchObject({ SO_KEEPALIVE: 0, TCP_USER_TIMEOUT: 0 });
+});
+
+test("keepalive: fd를 얻지 못하거나(fd 읽기가 던짐, 음수) 런타임 값의 되읽기가 다르면(setKeepAlive가 넣지 않음, 다른 지연) link에 열지 않고 닫은 뒤 실패로 세어 다시 붙는다", async () => {
+  const handleOf = (socket: tls.TLSSocket) => (socket as unknown as { _handle: object })._handle;
+  const faults: ((socket: tls.TLSSocket) => void)[] = [
+    (socket) =>
+      Object.defineProperty(handleOf(socket), "fd", {
+        configurable: true,
+        get() {
+          throw new Error("시험: fd 읽기 실패");
+        },
+      }),
+    (socket) => Object.defineProperty(handleOf(socket), "fd", { configurable: true, value: -1 }),
+    (socket) => {
+      socket.setKeepAlive = () => socket;
+    },
+    (socket) => {
+      const original = socket.setKeepAlive.bind(socket);
+      socket.setKeepAlive = ((enable?: boolean) => original(enable, 20_000)) as typeof socket.setKeepAlive;
+    },
+  ];
+  for (const fault of faults) {
+    const raw: tls.TLSSocket[] = [];
+    const s = await setup({ wrap: capturing(raw, fault) });
+    s.socket.start();
+    await until(() => s.timer.waits.length === 1);
+    expect(s.opened).toHaveLength(0);
+    expect(s.events.filter((e) => e.kind !== "connecting")).toEqual([
+      { kind: "connect_failed", attempt: 1, reason: "keepalive_failed" },
+      { kind: "retry_scheduled", delayMs: 100 },
+    ]);
+    expect(raw[0]!.destroyed).toBe(true);
+    await until(() => s.client.openConnections() === 0);
+    expect(s.peers.flatMap((p) => p.got)).toEqual([]);
+  }
+});
+
+test("keepalive: 돌려받기 전에 이미 끊긴 소켓은 keepalive가 아니라 기존 사유(tls_error)로 닫고 다시 붙는다", async () => {
+  const raw: tls.TLSSocket[] = [];
+  const s = await setup({ wrap: capturing(raw, (socket) => socket.destroy()) });
+  s.socket.start();
+  await until(() => s.timer.waits.length === 1);
+  expect(s.opened).toHaveLength(0);
+  expect(s.events.filter((e) => e.kind !== "connecting")).toEqual([
+    { kind: "connect_failed", attempt: 1, reason: "tls_error" },
+    { kind: "retry_scheduled", delayMs: 100 },
+  ]);
+});
+
+// 리뷰 재현: 같은 초기 옵션(런타임 setKeepAlive만 지남)의 TLS 소켓 둘에서 새 소켓의 fd 읽기만 앞 연결의 번호로 바꾼다.
+// 런타임 값 둘의 되읽기는 같아 가르지 못한다. 양 끝 주소 대조가 첫 넣기 전에 닫아야 한다.
+test("keepalive: 같은 초기 옵션을 켠 다른 TLS 연결의 fd를 받으면 그 fd에 쓰지 않고(값 그대로) link에 열지 않고 닫는다", async () => {
+  const firstRaw: tls.TLSSocket[] = [];
+  const first = await setup({ wrap: capturing(firstRaw) });
+  first.socket.start();
+  await until(() => first.opened.length === 1);
+  const otherFd = fdOf(firstRaw[0]!);
+  // 앞 연결을 런타임 setKeepAlive만 지난 값으로 되돌려, 새 소켓이 setKeepAlive 뒤 갖는 초기 옵션과 같게 둔다.
+  for (const [name, value] of [["TCP_KEEPINTVL", 1], ["TCP_KEEPCNT", 10], ["TCP_USER_TIMEOUT", 0]] as const) {
+    expect(libcSocketOptions.set(otherFd, name, value)).toBe(true);
+  }
+  const initial = { SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 1, TCP_KEEPCNT: 10, TCP_USER_TIMEOUT: 0 };
+  expect(optionsOf(firstRaw[0]!)).toEqual(initial);
+  const raw: tls.TLSSocket[] = [];
+  let realFd = -1;
+  const next = await setup({
+    wrap: capturing(raw, (socket) => {
+      realFd = fdOf(socket);
+      Object.defineProperty((socket as unknown as { _handle: object })._handle, "fd", { configurable: true, value: otherFd });
+    }),
+  });
+  next.socket.start();
+  await until(() => next.opened.length > 0 || next.timer.waits.length === 1);
+  expect(realFd).not.toBe(otherFd);
+  expect(next.opened).toHaveLength(0);
+  expect(optionsOf(firstRaw[0]!)).toEqual(initial);
+  expect(next.events.filter((e) => e.kind !== "connecting")).toEqual([
+    { kind: "connect_failed", attempt: 1, reason: "keepalive_failed" },
+    { kind: "retry_scheduled", delayMs: 100 },
+  ]);
+  expect(raw[0]!.destroyed).toBe(true);
+  // 다른 fd에는 쓰기 0: 세 값 가운데 하나라도 넣었으면 10·4·70000으로 바뀐다. 앞 연결은 열린 채다.
+  expect(optionsOf(firstRaw[0]!)).toEqual(initial);
+  expect(first.opened).toHaveLength(1);
+  expect(firstRaw[0]!.destroyed).toBe(false);
+  await until(() => next.client.openConnections() === 0);
+  expect(next.peers.flatMap((p) => p.got)).toEqual([]);
 });

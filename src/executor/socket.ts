@@ -35,6 +35,7 @@ import {
   type MixedFrameDecoder,
   type MixedFrameRejectReason,
 } from "../transport/framing.ts";
+import { enableKeepAlive } from "../transport/keepalive.ts";
 import { type ConnectFailure, type TlsClient, TlsConnectError, type VerifiedSupervisorConnection } from "../transport/tls-client.ts";
 import type { CredentialInbox } from "./credential-inbox.ts";
 import type { Connection, ExecutorLink, Transport } from "./link.ts";
@@ -95,7 +96,8 @@ export type CloseReason =
 export type SocketEvent =
   | { readonly kind: "connecting"; readonly attempt: number }
   | { readonly kind: "connected"; readonly attempt: number }
-  | { readonly kind: "connect_failed"; readonly attempt: number; readonly reason: ConnectFailure["kind"] | "threw" }
+  // keepalive_failed: 붙은 소켓에 keepalive를 켜거나 그 값을 넣고 되읽지 못해 link에 열지 않고 닫았다.
+  | { readonly kind: "connect_failed"; readonly attempt: number; readonly reason: ConnectFailure["kind"] | "threw" | "keepalive_failed" }
   // 그 연결이 맞춤을 끝냈다. 다음 다시 붙기는 처음 간격부터다.
   | { readonly kind: "synced"; readonly attempt: number }
   | { readonly kind: "closed"; readonly attempt: number; readonly reason: CloseReason }
@@ -267,6 +269,14 @@ class Socket implements ExecutorSocket {
       return;
     }
     this.pending = null;
+    // keepalive가 없으면 조용히 사라진 감독의 연결이 닫히지 않아 다시 붙지 않는다. 켜지 못한 소켓은 link에 열지 않는다.
+    // 아래 destroyed 확인이 이 호출 뒤에 온다. 이 뒤 이 소켓에 setKeepAlive를 다시 부르지 않는다(넣은 간격·횟수가 되돌아간다).
+    if (!enableKeepAlive(verified.socket)) {
+      verified.socket.destroy();
+      this.emit({ kind: "connect_failed", attempt, reason: "keepalive_failed" });
+      this.schedule();
+      return;
+    }
     // 돌려받기 전에 이미 끊긴 소켓이면 Wire가 close 사건을 놓쳤을 수 있다. link에 열지 않고 실패로 센다.
     if (verified.socket.destroyed) {
       verified.socket.destroy();

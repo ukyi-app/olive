@@ -8,6 +8,7 @@
 //    세션 인수 영수증은 앞 세션 또는 대기 중인 세션 실행의 지정 실행기도 낼 수 있다(인수의 ack는 증거 저장의 확인일 뿐이다).
 // 2. 장부가 ok를 돌려준 것에만, 장부가 돌려준 id로 ack 초안을 만든다. 거절·예외·꼴이 틀린 답이면 ack가 없어 실행기가 다시 보낸다.
 //    장부가 duplicate를 돌려주면(이미 반영함) 정지 세대를 알고 초안 생성에 성공할 때 ack를 다시 만든다: 앞의 ack가 유실됐을 수 있다.
+//    장부가 답에 실은 닫힌 실행의 경보(영수증의 alarm, 답의 alarms)는 결과에 옮기기만 한다. 경보 칸이 이상해도 ack·반영 결과는 그대로다.
 // 3. status_report는 감독이 낸 조회의 답이고 그 조회를 받은 실행기가 그 조회를 실은 연결로 보냈을 때만 받는다. 대조된 답은
 //    장부를 부를 때마다 그 직전에 그 답이 온 연결이 지금도 낸 쪽의 인정된 연결인지 보고, 맞을 때만 applyExecutorAnswer에
 //    partial로 넘긴다. sender·runs·answeredAt은 검증된 봉투의 값이다.
@@ -20,6 +21,7 @@
 //    소유자가 없는 실행, 장부 읽기가 약속 밖의 값을 준 경우. 그 밖에 장부가 끝내 받지 않는 보고(판정이 끝난 실행의 맞지 않는 결과 등)는
 //    본문부터 보관된다.
 import {
+  type AnswerAlarm,
   type AnswerSightingsInput,
   type DeferredLoss,
   type Delivery,
@@ -29,6 +31,7 @@ import {
   type Ledger,
   type LedgerRunState,
   type LostRun,
+  type ReceiptAlarm,
   type ReceiptInput,
   type Refusal as LedgerRefusal,
   type ReportInput,
@@ -92,16 +95,24 @@ export interface SightingAnswer {
   readonly answeredAt: number | null;
 }
 
+// 장부 답에 실린 닫힌 실행의 경보(D-127 영수증의 closed_run_started, D-128 답의 closed_run_running). 기록할 값일 뿐이고 ack·반영 결과를
+// 가르지 않는다(조립이 감독 로그 한 줄로 낸다). unreadable: 경보 칸이 있지만 약속한 꼴이 아니거나 읽다 던졌다. 경보가 있었을 수 있어
+// 버리지 않고 이 값으로 낸다(경보가 빠지는 쪽보다 남는 쪽). 실행 ID를 모르면 null이다.
+export type LedgerAlarm =
+  | { readonly alarm: ReceiptAlarm | AnswerAlarm; readonly runId: string }
+  | { readonly alarm: "unreadable"; readonly runId: string | null };
+
 // 답 하나를 장부에 넘긴 결과. 장부의 답을 지우거나 합치지 않는다.
 export type AnswerSettlement =
   // 장부가 반영했다. moved: 임대를 거두고 unknown_running으로 옮긴 실행, deferred: not_known을 받고도 옮기지 않은 실행(같은 ID를
-  // 다시 조회한다), outsideLedger: 장부 밖 실행(닫는 지시에만 쓰는 세대와 함께).
+  // 다시 조회한다), outsideLedger: 장부 밖 실행(닫는 지시에만 쓰는 세대와 함께). alarms: 장부가 실은 경보. 없으면 칸이 없다.
   | {
       readonly settled: "applied";
       readonly answer: ExecutorAnswerCopy;
       readonly moved: readonly LostRun[];
       readonly deferred: readonly DeferredLoss[];
       readonly outsideLedger: readonly { readonly runId: string; readonly runGeneration: number }[];
+      readonly alarms?: readonly LedgerAlarm[];
     }
   // 장부가 아무것도 적지 못했다. 반영된 것이 아니다.
   | {
@@ -249,10 +260,11 @@ export type ResultRefusal = (typeof RESULT_REFUSALS)[number];
 export type AckUnavailable = DraftRefusalReason | "stop_generation_unknown" | "draft_threw";
 
 export type ReceiptOutcome =
-  // 장부가 받았다(new: 이번에 반영, duplicate: 이미 반영). ack는 봉해서 낸 쪽에 싣는다.
-  | { readonly outcome: "ack"; readonly action: string; readonly id: string; readonly delivery: Delivery; readonly ack: Draft<"ack"> }
+  // 장부가 받았다(new: 이번에 반영, duplicate: 이미 반영). ack는 봉해서 낸 쪽에 싣는다. alarm은 장부가 그 영수증의 답에 실은 경보이고
+  // 없으면 칸이 없다(아래 둘 다).
+  | { readonly outcome: "ack"; readonly action: string; readonly id: string; readonly delivery: Delivery; readonly ack: Draft<"ack">; readonly alarm?: LedgerAlarm }
   // 장부가 받았지만 ack 초안을 만들지 못했다.
-  | { readonly outcome: "applied_without_ack"; readonly action: string; readonly id: string; readonly delivery: Delivery; readonly reason: AckUnavailable }
+  | { readonly outcome: "applied_without_ack"; readonly action: string; readonly id: string; readonly delivery: Delivery; readonly reason: AckUnavailable; readonly alarm?: LedgerAlarm }
   // 장부가 거절했다. ack가 없다.
   | { readonly outcome: "ledger_refused"; readonly action: string; readonly id: string; readonly reason: LedgerRefusal }
   // 장부가 던졌거나 답이 꼴에 맞지 않는다. 받았는지 모르므로 ack가 없다(다시 오면 장부가 다시 가른다).
@@ -511,11 +523,12 @@ function handleResult(action: string, header: Record<string, unknown>, read: Rea
   return settle(action, reportId, () => results.ledger.recordReport(report, from), header.sender as string, input.stopGeneration, ports.random);
 }
 
-type LedgerAnswer = { ok: true; delivery: Delivery; ack: string } | { ok: false; reason: LedgerRefusal };
+type LedgerAnswer = { ok: true; delivery: Delivery; ack: string; alarm: LedgerAlarm | null } | { ok: false; reason: LedgerRefusal };
 
 // 장부의 답이 약속한 꼴인가. ok면 delivery가 둘 중 하나이고 ack id가 넘긴 id와 같아야 한다(다른 id의 ack는 다른 영수증의 재전송을 멈춘다).
 // 칸마다 한 번만 읽어 지역 값으로만 판단한다. 칸을 읽다 던지면 꼴이 틀린 답이고 그 예외의 문구는 버린다(본문이 실려 있을 수 있다).
-function readAnswer(answer: unknown, id: string): LedgerAnswer | null {
+// 경보 칸은 영수증의 답(alarmRunId가 그 실행)에서만 읽고, 그 칸 때문에 꼴이 틀린 답이 되지 않는다(receiptAlarm).
+function readAnswer(answer: unknown, id: string, alarmRunId: string | null): LedgerAnswer | null {
   try {
     if (!isRecord(answer)) return null;
     const ok = answer.ok;
@@ -523,7 +536,7 @@ function readAnswer(answer: unknown, id: string): LedgerAnswer | null {
       const delivery = answer.delivery;
       const ack = answer.ack;
       if ((delivery !== "new" && delivery !== "duplicate") || ack !== id) return null;
-      return { ok: true, delivery, ack };
+      return { ok: true, delivery, ack, alarm: alarmRunId === null ? null : receiptAlarm(answer, alarmRunId) };
     }
     if (ok !== false) return null;
     const reason = answer.reason;
@@ -533,26 +546,65 @@ function readAnswer(answer: unknown, id: string): LedgerAnswer | null {
   }
 }
 
+// applyReceipt 답의 경보 칸. 한 번만 읽고, 던지거나 약속 밖의 값이면 unreadable이다(ack는 그대로 만든다: 경보 때문에 ack를 막으면
+// 실행기가 같은 영수증을 끝없이 다시 보낸다).
+function receiptAlarm(answer: Record<string, unknown>, runId: string): LedgerAlarm | null {
+  let value: unknown;
+  try {
+    value = answer.alarm;
+  } catch {
+    return { alarm: "unreadable", runId };
+  }
+  if (value === undefined) return null;
+  return value === ("closed_run_started" satisfies ReceiptAlarm) ? { alarm: value, runId } : { alarm: "unreadable", runId };
+}
+
+// applyExecutorAnswer 답(ok)의 경보 칸을 결과에 옮길 꼴로 읽는다. 칸이 없거나 빈 배열이면 칸이 없다. 칸과 항목의 칸은 한 번씩만 읽고,
+// 던지거나 항목 하나라도 약속한 꼴(closed_run_running, 비지 않은 runId, 1 이상의 세대)이 아니면 unreadable 하나로 낸다(어느 실행인지
+// 모른다). 반영 결과는 가르지 않는다: 경보 때문에 반영을 실패로 세면 같은 답을 다시 넘기고 그 실행기의 뒤 답을 막는다.
+export function readAnswerAlarms(answer: Record<string, unknown>): { readonly alarms?: readonly LedgerAlarm[] } {
+  const unreadable = { alarms: [{ alarm: "unreadable", runId: null }] as const };
+  try {
+    const value = answer.alarms;
+    if (value === undefined) return {};
+    if (!Array.isArray(value)) return unreadable;
+    const alarms: LedgerAlarm[] = [];
+    for (const item of value as unknown[]) {
+      if (!isRecord(item)) return unreadable;
+      const alarm = item.alarm;
+      const runId = item.runId;
+      const runGeneration = item.runGeneration;
+      if (alarm !== ("closed_run_running" satisfies AnswerAlarm) || !isText(runId) || !Number.isSafeInteger(runGeneration) || (runGeneration as number) < 1) return unreadable;
+      alarms.push({ alarm, runId });
+    }
+    return alarms.length === 0 ? {} : { alarms };
+  } catch {
+    return unreadable;
+  }
+}
+
 // 장부 반영 → ack 초안. 장부가 ok를 돌려준 뒤에만 ackDraft를 부른다(그 전에 초안이 만들어지는 길이 없다).
-function settle(action: string, id: string, call: () => unknown, recipient: string, stopGeneration: number | null, random: Random): ReceiptOutcome {
+// alarmRunId는 영수증일 때 그 실행 ID이고(답의 경보 칸을 읽는다), 보고면 null이다(recordReport의 답에는 경보 칸이 없다).
+function settle(action: string, id: string, call: () => unknown, recipient: string, stopGeneration: number | null, random: Random, alarmRunId: string | null = null): ReceiptOutcome {
   let raw: unknown;
   try {
     raw = call();
   } catch {
     return { outcome: "ledger_failed", action, id, failure: "threw" };
   }
-  const answer = readAnswer(raw, id);
+  const answer = readAnswer(raw, id, alarmRunId);
   if (answer === null) return { outcome: "ledger_failed", action, id, failure: "malformed_answer" };
   if (!answer.ok) return { outcome: "ledger_refused", action, id, reason: answer.reason };
-  if (stopGeneration === null) return { outcome: "applied_without_ack", action, id, delivery: answer.delivery, reason: "stop_generation_unknown" };
+  const alarm = answer.alarm === null ? {} : { alarm: answer.alarm };
+  if (stopGeneration === null) return { outcome: "applied_without_ack", action, id, delivery: answer.delivery, reason: "stop_generation_unknown", ...alarm };
   let drafted: ReturnType<typeof ackDraft>;
   try {
     drafted = ackDraft({ recipient, stopGeneration, ids: [answer.ack] }, random);
   } catch {
-    return { outcome: "applied_without_ack", action, id, delivery: answer.delivery, reason: "draft_threw" };
+    return { outcome: "applied_without_ack", action, id, delivery: answer.delivery, reason: "draft_threw", ...alarm };
   }
-  if (!drafted.ok) return { outcome: "applied_without_ack", action, id, delivery: answer.delivery, reason: drafted.reason };
-  return { outcome: "ack", action, id, delivery: answer.delivery, ack: drafted.draft };
+  if (!drafted.ok) return { outcome: "applied_without_ack", action, id, delivery: answer.delivery, reason: drafted.reason, ...alarm };
+  return { outcome: "ack", action, id, delivery: answer.delivery, ack: drafted.draft, ...alarm };
 }
 
 function copyRuns(runs: readonly RunStatus[]): RunStatus[] {
@@ -700,6 +752,7 @@ function readExecutorAnswer(answer: unknown, copy: ExecutorAnswerCopy): AnswerSe
         moved: moved.map((m) => ({ runId: m.runId, runGeneration: m.runGeneration, before: m.before, after: m.after })),
         deferred: deferred.map((d) => ({ runId: d.runId, runGeneration: d.runGeneration, state: d.state, why: d.why })),
         outsideLedger: outsideLedger.map((o) => ({ runId: o.runId, runGeneration: o.runGeneration })),
+        ...readAnswerAlarms(answer),
       };
     }
     if (answer.ok !== false || !(LEDGER_REFUSALS as readonly unknown[]).includes(answer.reason)) return null;
@@ -818,7 +871,8 @@ export function handleForward(input: ForwardInput, ports: ReceiptPorts): Receipt
     const ledger = ports.ledger;
     if (handling === "ledger_receipt") {
       const receipt = receiptInput(action, read, header.body_digest, input.now);
-      return settle(action, receipt.receiptId, () => ledger.applyReceipt(receipt, from), header.sender, input.stopGeneration, ports.random);
+      const runId = receipt.action === "receipt_session_takeover" ? receipt.previousRunId : receipt.runId;
+      return settle(action, receipt.receiptId, () => ledger.applyReceipt(receipt, from), header.sender, input.stopGeneration, ports.random, runId);
     }
     const report = reportInput(action as "report_session_broken" | "report_hook_event", read, header.body_digest, input.now);
     return settle(action, report.reportId, () => ledger.recordReport(report, from), header.sender, input.stopGeneration, ports.random);
