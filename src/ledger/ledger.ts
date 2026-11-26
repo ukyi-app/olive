@@ -153,6 +153,22 @@ function safe(value: unknown, where: string): number {
   return value as number;
 }
 
+// 실행 줄에 적힌 종료 영수증 exit(판 8). 목록 밖의 값이면 그 값으로 확정을 정하지 않고 corrupt로 닫는다.
+function storedExit(value: unknown): StopExit {
+  if (!(STOP_EXITS as readonly unknown[]).includes(value)) throw new LedgerUnavailableError("corrupt", "runs.stop_exit: 계약의 exit가 아니다");
+  return value as StopExit;
+}
+
+// failed_stopped가 된 장부 시각과 종료 영수증 exit(FailedStop의 두 칸 주석). 실패 상태가 된 시각 칸(판 8 runs.failed_stopped_at)이
+// 있으면 그 값이고, 그때 exit 칸이 비었으면 completed다(트리거가 그 칸을 exit와 함께 적는 첫 종료 확인이나 checking에서 옮기는 쓰기에만
+// 허락한다). 시각 칸이 빈 줄은 시각을 모른다(null). updated_at이 종료 확인 영수증 시각과 같아도 근거가 아니다: 감독이 다시 뜨면
+// 공유 시계의 하한이 0부터라 늦은 판정 뒤의 예산 기록이 영수증 시각을 다시 적을 수 있고, 그 장부는 판정이 같은 시각인 장부와 같다.
+function stopFacts(row: RunRow): Pick<FailedStop, "stoppedAt" | "exit"> {
+  const exit = row.stop_exit === undefined || row.stop_exit === null ? null : storedExit(row.stop_exit);
+  if (row.failed_stopped_at !== undefined && row.failed_stopped_at !== null) return { stoppedAt: safe(row.failed_stopped_at, "runs.failed_stopped_at"), exit: exit ?? "completed" };
+  return { stoppedAt: null, exit };
+}
+
 // ---- 장부의 값 ----
 
 export interface StopRecord {
@@ -223,6 +239,9 @@ interface RunRow {
   stop_receipt_id: string | null;
   cleaned_receipt_id: string | null;
   result_digest: string | null;
+  // 판 8(0008-stop-exit)의 칸 둘. 판 목록을 그 앞에서 끊어 연 장부에는 칸이 없어 undefined다.
+  stop_exit?: string | null;
+  failed_stopped_at?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -546,6 +565,27 @@ export interface SettledResult {
   resultDigest: string;
   storedRef: string;
   storedAt: number;
+}
+
+// failed_stopped 작업자 실행의 확정 본문(outcome·stored_at)을 정하는 데 쓰는 장부 사실. failedStop만 낸다.
+export interface FailedStop {
+  runId: string;
+  // 실행 줄이 failed_stopped가 된 장부 시각: 그 상태로 옮긴 쓰기(종료 확인 영수증 또는 markResult의 결과 없음 판정)가 넘긴 시각이다.
+  // 판 8부터는 그 쓰기가 runs.failed_stopped_at에 함께 적고 그 뒤로 바뀌지 않는다. runs.updated_at으로 읽지 않는다: recordBudget 같은
+  // 뒤 쓰기가 상태와 무관하게 그 칸을 바꾼다.
+  // 그 칸이 빈 줄(판 8 전에 failed_stopped가 된 줄, 원 SQL로 그 칸 없이 옮긴 줄)은 늘 null(모름)이다. updated_at이 종료 확인 영수증을
+  // 받은 시각과 같아도 그 시각이라고 보지 않는다: 감독이 다시 뜨면 공유 시계가 앞선 시각을 다시 낼 수 있어, 늦은 결과 없음 판정 뒤의
+  // 예산 기록이 영수증 시각을 다시 적은 줄과 그 시각에 곧바로 옮긴 줄을 장부가 가를 근거가 없다.
+  stoppedAt: number | null;
+  // 그 실행에 사유 requested의 취소 지시(task_cancel)가 적혔으면 true, 취소 지시가 없거나 다른 사유뿐이면 false. requested는 없고
+  // 사유 없이 적힌 취소 지시가 있으면 null(모름: requested였을 수 있다. 판 4 전의 줄이거나 사유를 넘기지 않은 기록).
+  requestedCancel: boolean | null;
+  // 종료 확인 영수증의 exit. 판 8(0008-stop-exit)부터는 그 영수증을 반영한 쓰기가 실행 줄에 함께 적은 값(runs.stop_exit)이다.
+  // 그 칸이 NULL인데 failed_stopped_at이 있는 줄(판 8 전에 completed로 checking이 됐고 판 8 뒤에 결과 없음으로 판정된 줄)은 "completed"다:
+  // 트리거가 failed_stopped_at을 exit 없이 적는 쓰기를 checking에서 옮길 때만 허락한다.
+  // 두 칸이 다 빈 줄은 null(모름)이다. 시각으로 completed를 추론하지 않는다: updated_at이 영수증보다 늦은 것은 결과 없음 판정과 예산
+  // 기록 같은 다른 쓰기가 같은 모양이라, cancelled로 곧바로 끝난 실행을 failed로 확정할 수 있다.
+  exit: StopExit | null;
 }
 
 // 받아 적은 세션 증거. 이 PR은 적고 읽기까지만 하고, 세션 시작의 근거로 소비하지 않는다(ledger.md "세션 증거").
@@ -1552,6 +1592,11 @@ export class Ledger {
   // 판 7(0007-operator-closure)의 관리자 닫기 근거 표. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 관리자가 닫은 실행이
   // 없는 것으로 읽는다(그런 장부에서는 관리자 닫기를 거절한다). 기본 판 목록으로 연 장부에는 늘 있다.
   readonly #operatorClosures: boolean;
+  // 판 8(0008-stop-exit)의 종료 영수증 exit 칸. 판 목록을 그 앞에서 끊어 연 장부(시험용 길)에는 없어서, 종료 확인만 적고 exit는
+  // 판 8 전에 받은 줄처럼 모름으로 읽는다. 기본 판 목록으로 연 장부에는 늘 있다.
+  readonly #stopExitColumn: boolean;
+  // 판 8의 실패 상태가 된 시각 칸. 위와 같이 판 목록을 끊어 연 장부에는 없어서 적지 않고, 그 줄은 판 8 전의 줄처럼 읽는다.
+  readonly #failedAtColumn: boolean;
   // 이 장부 객체의 열기 ID. 송신 표식이 "이 열기가 실었다"를 적는 값이다. 열 때마다(객체마다) 새로 만들어 다시 열면 달라진다.
   // 장부의 식별(ledger_id)·사본 ID와 같이 장부가 스스로 만드는 식별이라 crypto.randomUUID()로 만든다(업무 참조처럼 부르는 쪽이
   // 넘기게 하면 다시 연 객체가 앞 열기의 값을 쓸 수 있다). 파일에는 표식·닫기 근거 줄에만 남는다.
@@ -1567,6 +1612,8 @@ export class Ledger {
     this.#rebuildColumns = db.query("SELECT 1 AS x FROM pragma_table_info('instructions') WHERE name = 'budget_left'").get() !== null;
     this.#closures = sqlOf(db, "unreceived_closures") !== null;
     this.#operatorClosures = sqlOf(db, "operator_closures") !== null;
+    this.#stopExitColumn = db.query("SELECT 1 AS x FROM pragma_table_info('runs') WHERE name = 'stop_exit'").get() !== null;
+    this.#failedAtColumn = db.query("SELECT 1 AS x FROM pragma_table_info('runs') WHERE name = 'failed_stopped_at'").get() !== null;
     this.#openId = crypto.randomUUID();
   }
 
@@ -1659,11 +1706,13 @@ export class Ledger {
     return record;
   }
 
-  #setState(row: RunRow, to: LedgerRunState, now: number, extra: Partial<Pick<RunRow, "stop_receipt_id" | "cleaned_receipt_id" | "result_digest">> = {}): void {
+  #setState(row: RunRow, to: LedgerRunState, now: number, extra: Partial<Pick<RunRow, "stop_receipt_id" | "stop_exit" | "cleaned_receipt_id" | "result_digest">> = {}): void {
     if (!mayTransition(row.kind, row.state, to)) throw new Refuse("transition_denied");
     const sets = ["state = $state", "updated_at = $now"];
     const params: Record<string, string | number | null> = { state: to, now, run_id: row.run_id };
-    for (const [key, value] of Object.entries(extra)) {
+    // failed_stopped가 된 시각은 그 전이와 같은 UPDATE에서만 적힌다(판 8의 트리거). 실패 확정의 stored_at이 이 값이다(failedStop).
+    const columns: Record<string, string | number | null | undefined> = to === "failed_stopped" && this.#failedAtColumn ? { ...extra, failed_stopped_at: now } : extra;
+    for (const [key, value] of Object.entries(columns)) {
       sets.push(`${key} = $${key}`);
       params[key] = value ?? null;
     }
@@ -3220,7 +3269,9 @@ export class Ledger {
         if (row.kind !== "worker") throw new Refuse("invariant_violation");
         // 이미 종료 확인이 있으면 상태를 다시 옮기지 않는다(다른 id의 늦은 영수증).
         if (row.stop_receipt_id !== null) return;
-        this.#setState(row, r.exit === "completed" ? "checking" : "failed_stopped", r.now, { stop_receipt_id: r.receiptId });
+        // exit는 종료 확인과 같은 UPDATE에서만 적힌다(판 8의 트리거). 실패 확정의 outcome이 이 값을 읽는다(failedStop).
+        const evidence = this.#stopExitColumn ? { stop_receipt_id: r.receiptId, stop_exit: r.exit } : { stop_receipt_id: r.receiptId };
+        this.#setState(row, r.exit === "completed" ? "checking" : "failed_stopped", r.now, evidence);
         return;
       }
       case "receipt_cleaned":
@@ -3351,6 +3402,21 @@ export class Ledger {
         .get(runId, row.result_digest) as { stored_ref: string; received_at: number } | null;
       if (report === null) return null;
       return { runId, resultDigest: row.result_digest, storedRef: report.stored_ref, storedAt: safe(report.received_at, "deliveries.received_at") };
+    });
+  }
+
+  // failed_stopped 작업자 실행의 확정 본문을 정할 사실(FailedStop). 실행 줄, 그 종료 확인 영수증, 취소 지시를 한 읽기에서 본다.
+  // 없는 실행이거나 지금 failed_stopped가 아니면 null이다. 있는 칸만 읽고 장부를 바꾸지 않는다.
+  failedStop(runId: string): Read<FailedStop | null> {
+    return this.#read(() => {
+      const row = this.#runRow(runId);
+      if (row === null || row.kind !== "worker" || row.state !== "failed_stopped" || row.stop_receipt_id === null) return null;
+      const reasons = (
+        this.#db.query(`SELECT ${this.#rebuildColumns ? "reason" : "NULL AS reason"} FROM instructions WHERE run_id = ? AND action = 'task_cancel'`).all(runId) as { reason: string | null }[]
+      ).map((cancel) => cancel.reason);
+      const requestedCancel = reasons.includes("requested") ? true : reasons.includes(null) ? null : false;
+      const { stoppedAt, exit } = stopFacts(row);
+      return { runId, stoppedAt, requestedCancel, exit };
     });
   }
 

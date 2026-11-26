@@ -435,7 +435,7 @@ test("이관: 판 1~6의 장부가 판 7로 올라가고 기존 줄은 그대로
     const columns = tables.map((table) => (rows(path, `PRAGMA table_info(${table})`) as { name: string }[]).map((column) => column.name).join(", "));
     const kept = () => tables.map((table, index) => rows(path, `SELECT ${columns[index]} FROM ${table}`));
     const old = kept();
-    const upgraded = openLedger(path, { clock, mode: "reopen" });
+    const upgraded = openLedger(path, { clock, mode: "reopen", migrations: loadMigrations().slice(0, VERSION) });
     expect(upgraded, `판 ${version}`).toMatchObject({ ok: true, migrated: { from: version, to: VERSION } });
     if (upgraded.ok) upgraded.ledger.close();
     const now = kept();
@@ -449,7 +449,7 @@ test("이관: 판 1~6의 장부가 판 7로 올라가고 기존 줄은 그대로
   open(path, { migrations: loadMigrations().slice(0, VERSION - 1) }).close();
   const objects = () => new Map((rows(path, "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL") as { name: string; sql: string }[]).map((o) => [o.name, o.sql]));
   const six = objects();
-  open(path).close();
+  open(path, { migrations: loadMigrations().slice(0, VERSION) }).close();
   const seven = objects();
   expect([...six].filter(([name, sql]) => seven.get(name) !== sql).map(([name]) => name)).toEqual(["runs_not_started_needs_closure"]);
   // 정의(sql)가 있는 새 객체 전부. WITHOUT ROWID 표의 기본 키는 따로 인덱스가 없어 여기 없다.
