@@ -299,13 +299,25 @@ export interface DeferredLoss {
   why: "start_may_arrive" | "answer_time_unknown";
 }
 
+// applyExecutorAnswer의 답에 싣는 경보(D-128). closed_run_running: 닫기 근거(D-90 또는 관리자)가 있는 not_started 실행을 지정 실행기가
+// 같은 세대의 running으로 답했다(닫은 실행이 아직 돈다). 경보만이다: 상태·임대·점유는 바꾸지 않고, 그 답의 양성 관측은 다른 실행처럼 첫 줄만 적는다.
+export type AnswerAlarm = "closed_run_running";
+
+export interface ExecutorAnswerAlarm {
+  runId: string;
+  runGeneration: number;
+  alarm: AnswerAlarm;
+}
+
 // moved: 믿던 임대를 거두고 unknown_running으로 옮긴 실행(접수 순번 순서). deferred: not_known을 받고도 옮기지 않은 실행(접수 순번 순서).
-// outsideLedger: 장부 밖 실행, 닫는 지시에만 쓰는 세대와 함께.
+// outsideLedger: 장부 밖 실행, 닫는 지시에만 쓰는 세대와 함께. alarms: 경보가 난 실행(접수 순번 순서). 경보가 없으면 칸이 없다
+// (applyReceipt의 alarm과 같이, 경보가 없는 답의 꼴은 그대로다).
 export interface ExecutorAnswerResult {
   ok: true;
   moved: LostRun[];
   deferred: DeferredLoss[];
   outsideLedger: { runId: string; runGeneration: number }[];
+  alarms?: ExecutorAnswerAlarm[];
 }
 
 // applyExecutorAnswer가 아무것도 적지 못했다(상태 이동도 양성 관측도 없다). unsavedSightings는 이 답의 not_known 밖 항목 전부다
@@ -2576,6 +2588,8 @@ export class Ledger {
   // - 다만 not_known은 시작 봉투가 아직 닿을 수 있는 동안 만들어졌으면 거두지 않는다(#notKnownTooEarly). 그 답은 "아직 시작을
   //   받지 못했다"일 뿐이라, 거두면 곧 시작을 받아 정상으로 도는 작업이 갱신을 잃고 실패한다.
   // - "돈다"는 답은 상태도 임대도 바꾸지 않는다. 답에는 실행기의 임대 끝이 없어 갱신의 근거가 아니다.
+  // - 닫힌 실행(#closedAfterStart)의 같은 세대 running 답은 답에 경보(closed_run_running)만 싣는다(D-128). 그 실행은 not_started라
+  //   임대를 거두는 갈래에 들지 않고, 점유도 적지 않는다(자리를 다시 막는 것은 늦은 시작 영수증뿐이다).
   // - 장부 밖 실행은 실행 줄로 올리지 않고 닫을 대상으로만 돌려준다(계약의 runsOutsideLedger).
   // 쓰기 모드는 markLostFor와 같은 continue다: 임대를 거두는 것도 관측을 남기는 것도 자리를 더 오래 쥐는 쪽의 기록이다.
   applyExecutorAnswer(input: ExecutorAnswerInput, from: { sender: string }): ExecutorAnswerResult | ExecutorAnswerUnsaved {
@@ -2589,12 +2603,14 @@ export class Ledger {
       const outsideLedger = runsOutsideLedger(runs, (runId) => this.#runRow(runId)?.run_generation).map((run) => ({ runId: run.run_id, runGeneration: run.run_generation }));
       const moved: { row: RunRow; next: LedgerRunState }[] = [];
       const deferred: { row: RunRow; why: DeferredLoss["why"] }[] = [];
+      const alarmed: { row: RunRow }[] = [];
       for (const status of runs) {
         const row = this.#runRow(status.run_id);
         if (row === null || row.executor_id !== sender) continue;
         if (status.state !== "not_known") {
           if (status.run_generation !== row.run_generation) continue;
           this.#sight(sender, status, coverage, answeredAt, now);
+          if (status.state === "running" && this.#closedAfterStart(row)) alarmed.push({ row });
         }
         if (!LEASE_TRUSTED.includes(row.state) || RENEWABLE_REPORTED.includes(status.state)) continue;
         const early = status.state === "not_known" ? this.#notKnownTooEarly(row.run_id, answeredAt) : null;
@@ -2602,11 +2618,16 @@ export class Ledger {
         else moved.push(...this.#moveLost(now, sender, row.run_id));
       }
       const byQueue = (a: { row: RunRow }, b: { row: RunRow }) => a.row.queue_seq - b.row.queue_seq;
+      const alarms: { alarms?: ExecutorAnswerAlarm[] } =
+        alarmed.length === 0
+          ? {}
+          : { alarms: alarmed.sort(byQueue).map(({ row }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), alarm: "closed_run_running" as const })) };
       return {
         ok: true as const,
         moved: moved.sort(byQueue).map(({ row, next }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), before: row.state, after: next })),
         deferred: deferred.sort(byQueue).map(({ row, why }) => ({ runId: row.run_id, runGeneration: safe(row.run_generation, "run_generation"), state: row.state, why })),
         outsideLedger,
+        ...alarms,
       };
     });
     if (written.ok) return written;

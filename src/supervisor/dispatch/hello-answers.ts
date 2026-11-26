@@ -22,7 +22,7 @@ import {
   type Restorer,
 } from "../../ledger/index.ts";
 import type { Connections } from "../transport/connections.ts";
-import { type AnswerLinks, recordSighting, type SightingOutcome } from "./receipts.ts";
+import { type AnswerLinks, type LedgerAlarm, readAnswerAlarms, recordSighting, type SightingOutcome } from "./receipts.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는다. 자리를 푸는 연산이 이 포트에 없다.
 export type HelloAnswerLedger = Pick<Ledger, "applyExecutorAnswer" | "recordAnswerSightings">;
@@ -70,6 +70,7 @@ export type NotCurrentWhy = (typeof NOT_CURRENT_WHY)[number];
 
 export type HelloAnswerOutcome =
   // 장부가 반영했다. moved·deferred·outsideLedger는 장부의 답 그대로다. outsideLedger의 세대는 닫는 지시에만 쓴다.
+  // alarms는 장부가 실은 닫힌 실행의 경보(receipts.ts의 readAnswerAlarms)이고 없으면 칸이 없다.
   | {
       readonly kind: "applied";
       readonly executorId: string;
@@ -78,6 +79,7 @@ export type HelloAnswerOutcome =
       readonly moved: readonly LostRun[];
       readonly deferred: readonly DeferredLoss[];
       readonly outsideLedger: readonly { readonly runId: string; readonly runGeneration: number }[];
+      readonly alarms?: readonly LedgerAlarm[];
     }
   // 장부가 아무것도 적지 못했다(ok: false). reason·unsavedSightings는 장부의 답 그대로다.
   | {
@@ -165,7 +167,8 @@ function apply(ledger: HelloAnswerLedger, answer: HelloRetry, now: number): Hell
       const deferred = items(r.deferred, deferredLoss);
       const outsideLedger = items(r.outsideLedger, runRef);
       if (moved === null || deferred === null || outsideLedger === null) return malformed;
-      return { kind: "applied", executorId, connection, answeredAt: answer.answeredAt, moved, deferred, outsideLedger };
+      // 경보 칸은 따로 읽는다: 그 칸이 이상해도 반영(applied)은 그대로다(readAnswerAlarms).
+      return { kind: "applied", executorId, connection, answeredAt: answer.answeredAt, moved, deferred, outsideLedger, ...readAnswerAlarms(r) };
     }
     if (ok !== false) return malformed;
     const reason = r.reason;

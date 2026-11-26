@@ -37,6 +37,7 @@ import type { CancelDelivery } from "../dispatch/cancel.ts";
 import { lifeTick } from "../dispatch/life-loop.ts";
 import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
+import type { AnswerSettlement, LedgerAlarm } from "../dispatch/receipts.ts";
 import { resendTick } from "../dispatch/resend.ts";
 import { type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
 import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
@@ -46,7 +47,7 @@ import type { ToolConfig, ToolPolicyPort, ToolPorts } from "../scheduler/tools.t
 import type { ConnectionSettings } from "../transport/connections.ts";
 import { RegistryState, type RegistrySettings } from "../transport/registry.ts";
 import type { ConnectionServer, ConnectionServerOptions, Delivered, StartResult } from "../transport/server.ts";
-import { type AnswerLines, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
+import { type AnswerLines, type AnswerNote, createAnswerEvidenceBook, createAnswerLines } from "./answers.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
@@ -305,6 +306,32 @@ function unreceivedFields(value: Step<UnreceivedTickResult>): LogFields {
     run.outcome === "skipped" || run.outcome === "refused" || run.outcome === "ledger_failed" ? `${run.outcome}:${run.reason}` : run.outcome === "rehello" ? `rehello:${run.result}` : run.outcome,
   );
   return { unreceived: "ran", unreceivedOutcomes: tally(names), unreceivedHalted: result.halted };
+}
+
+// 장부 경보 한 줄의 칸과 반복을 가르는 열쇠. 열쇠가 null이면 거르지 않는다.
+type LedgerAlert = { readonly key: string | null; readonly fields: LogFields };
+
+// 장부가 답에 실은 닫힌 실행의 경보(D-127·D-128)를 기록 한 줄씩의 칸으로 옮긴다. 꼴은 result_check_alert와 같은 reason·runId이고,
+// 영수증은 delivery(new·duplicate), 실행기의 답은 coverage(상태 보고와 그 밀린 사본은 partial, 인사는 full)를 더한다.
+// 열쇠는 영수증이면 (실행 ID, 영수증 ID), 답이면 (실행 ID, 경보 이름)이다. 영수증 ID는 열쇠에만 쓰고 줄에 싣지 않는다(boot.md S44).
+// unreadable은 열쇠가 없다: 답의 경보는 실행 ID가 null이라 열쇠를 만들면 서로 다른 읽기 실패가 한 열쇠로 뭉쳐 뒤 줄을 삼킨다.
+function ledgerAlerts(note: AnswerNote): LedgerAlert[] {
+  const alert = (alarm: LedgerAlarm, part: string, extra: LogFields): LedgerAlert => ({
+    key: alarm.alarm === "unreadable" ? null : JSON.stringify([alarm.runId, part]),
+    fields: { reason: alarm.alarm, runId: alarm.runId, ...extra },
+  });
+  const answer = (alarm: LedgerAlarm, coverage: string): LedgerAlert => alert(alarm, `answer:${alarm.alarm}`, { coverage });
+  const applied = (settled: readonly AnswerSettlement[]): LedgerAlert[] =>
+    settled.flatMap((item) => (item.settled === "applied" ? (item.alarms ?? []).map((alarm) => answer(alarm, item.answer.coverage)) : []));
+  if (note.kind === "receipt") {
+    const outcome = note.outcome;
+    if ((outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") && outcome.alarm !== undefined) return [alert(outcome.alarm, `receipt:${outcome.id}`, { delivery: outcome.delivery })];
+    return [];
+  }
+  if (note.kind === "status") return note.outcome.outcome === "status_matched" ? applied(note.outcome.settled) : [];
+  if (note.kind === "backlog") return note.outcome.outcome === "backlog_settled" ? applied(note.outcome.settled) : [];
+  if (note.kind === "hello") return note.outcome.kind === "applied" ? (note.outcome.alarms ?? []).map((alarm) => answer(alarm, "full")) : [];
+  return [];
 }
 
 // 결과 검사 박자의 결과. 실행마다 판정·대기·충돌·거절·장부 고장을 세고, 멈춘 이유를 따로 싣는다.
@@ -569,6 +596,19 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     }
   };
 
+  // 장부 경보(ledger_alert)도 같은 경보마다 이 프로세스에서 한 줄만 남긴다: 실행기는 ack를 받을 때까지 같은 시작 영수증을 다시 보내고
+  // (정지 세대를 모르면 계속), 인사·조회의 답은 연결·조회마다 다시 온다. 기억은 메모리뿐이라 감독이 다시 뜨면 다시 한 줄을 남긴다.
+  const alerted = new Set<string>();
+  const alertLedger = (note: AnswerNote): void => {
+    for (const { key, fields } of ledgerAlerts(note)) {
+      if (key !== null) {
+        if (alerted.has(key)) continue;
+        alerted.add(key);
+      }
+      log("ledger_alert", fields);
+    }
+  };
+
   // 5. 순서기를 서버보다 먼저 만든다: 정책이 범위 밖이면 소켓을 열기 전에 끝낸다. 박자 여섯은 아래에서 만드는 객체에 부를 때 위임한다.
   let wire: WireSink | null = null;
   let lines: AnswerLines | null = null;
@@ -733,6 +773,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       observe: (note) => {
         if (note.kind === "fault") log("answer_fault", { where: note.where });
         else if (note.kind === "hello") log("hello", { outcome: note.outcome.kind });
+        // 답 줄은 장부 반영·ack 초안·줄의 상태를 정한 뒤에 기록하고 기록의 예외를 삼킨다(answers.ts의 note). 그래서 경보 줄은 ack·장부·줄을 바꾸지 않는다.
+        alertLedger(note);
       },
       credentials: issuance.credentials,
     });

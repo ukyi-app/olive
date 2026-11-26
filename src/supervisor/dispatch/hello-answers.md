@@ -26,7 +26,7 @@
 
 | `kind` | 뜻 | 장부 호출 | `withhold` | `retry` |
 |---|---|---|---|---|
-| `applied` | 장부가 반영했다. `answeredAt`(서명 시각), `moved`·`deferred`·`outsideLedger`(장부의 답 그대로) | 했다 | 없음 | 없음 |
+| `applied` | 장부가 반영했다. `answeredAt`(서명 시각), `moved`·`deferred`·`outsideLedger`(장부의 답 그대로), 닫힌 실행을 `running`으로 실었으면 `alarms`(D-128, `receipts.md` "장부의 경보". 경보 칸을 읽지 못해도 `applied`이고 `unreadable`로 싣는다) | 했다 | 없음 | 없음 |
 | `ledger_unsaved` | 장부가 아무것도 적지 못했다. `reason`·`unsavedSightings` 그대로 | 했다 | 실행기 | 있음 |
 | `ledger_failed` | `threw`(장부가 던짐, `message: null`), `malformed_answer`(답이나 그 항목의 꼴이 틀림, 답을 읽다가 던짐, `message: null`), `input_rejected`(장부의 `LedgerInputError`: 같은 값은 다시 넘겨도 같다. `message`는 장부의 문구) | 했다 | 실행기 | `input_rejected`만 `null` |
 | `held` | 접수가 열려 있지 않다(복원 중, 정지 중 등) | 안 했다 | 실행기 | 없음(같은 `output`을 다시 넘긴다) |

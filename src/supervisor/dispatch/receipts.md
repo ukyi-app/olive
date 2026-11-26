@@ -46,8 +46,10 @@
 | `SentQuery` | `PendingQuery`와 `connection`(그 조회를 실제로 실은 연결). `pendingQueries`의 항목이다 |
 | `AnswerLinks` | `current(connection, executorId): boolean`. 그 연결이 지금도 그 실행기의 인정된 연결인가. 동기. 장부 호출마다 그 직전에 불린다 |
 | `ExecutorAnswerCopy` | `sender`, `connection`(그 답이 온 연결), `coverage: "partial"`, `runs`, `answeredAt`. `connection` 밖은 `applyExecutorAnswer`에 넘기는 값 그대로 |
-| `AnswerSettlement` | 답 하나를 넘긴 결과: `applied`(`moved`, `deferred`, `outsideLedger`), `unsaved`(`reason`, `unsavedSightings`), `ledger_failed`(`threw`·`malformed_answer`), `not_current`(`link`: `not_current`·`unknown`. 넘기기 직전에 본 그 답의 연결이 인정된 연결이 아니거나 모름, `applyExecutorAnswer`를 부르지 않음. `sighting`: 관측만 적기의 결과), `held`(앞의 밀린 답 때문에 넘기지 않음). 모두 `answer`(그 사본)를 싣는다 |
+| `AnswerSettlement` | 답 하나를 넘긴 결과: `applied`(`moved`, `deferred`, `outsideLedger`, 경보가 있으면 `alarms`: 아래 "장부의 경보"), `unsaved`(`reason`, `unsavedSightings`), `ledger_failed`(`threw`·`malformed_answer`), `not_current`(`link`: `not_current`·`unknown`. 넘기기 직전에 본 그 답의 연결이 인정된 연결이 아니거나 모름, `applyExecutorAnswer`를 부르지 않음. `sighting`: 관측만 적기의 결과), `held`(앞의 밀린 답 때문에 넘기지 않음). 모두 `answer`(그 사본)를 싣는다 |
 | `recordSighting(answer, ledger, links, now)` | `SightingAnswer`(`sender`, `connection`, `coverage`, `runs`, `answeredAt`) → `SightingOutcome`. 인정이 끝난 연결의 답에서 양성 관측만 적는다. 인사 처리기도 같은 함수를 쓴다 |
+| `LedgerAlarm` | 장부 답에 실린 닫힌 실행의 경보 하나: `{ alarm: "closed_run_started" \| "closed_run_running", runId }` 또는 `{ alarm: "unreadable", runId }`(경보 칸을 읽지 못함. 답의 경보면 `runId: null`) |
+| `readAnswerAlarms(answer)` | `applyExecutorAnswer`의 성공 답 → `{ alarms? }`. 인사 처리기도 같은 함수로 읽는다 |
 | `SightingOutcome` | `saved`, `unsaved`(장부의 `reason`·`unsavedSightings` 그대로), `ledger_failed`(`threw`·`malformed_answer`), `skipped`(`why`: `SIGHTING_SKIPS`) |
 | `ReceiptPorts` | `ledger: ReceiptLedger`, `random: Random`(`ports.ts`), `results?: ResultPorts`(결과 보고에만 쓴다. 없으면 결과 보고는 `result_unknown`·`ports`) |
 | `ReceiptLedger` | `Pick<Ledger, "applyReceipt" \| "recordReport" \| "applyExecutorAnswer" \| "recordAnswerSightings">`. 실제 장부가 그대로 맞는다 |
@@ -59,8 +61,8 @@
 
 | `outcome` | 뜻 | ack 초안 |
 |---|---|---|
-| `ack` | 장부가 받았다(`delivery`: `new` 이번에 반영, `duplicate` 이미 반영) | 있음(`ack`) |
-| `applied_without_ack` | 장부는 받았지만 ack 초안을 만들지 못했다(`stop_generation_unknown`, `ackDraft`의 거절 사유, `draft_threw`). 실행기가 다시 보내면 장부가 `duplicate`로 받고, 그때 정지 세대를 알고 초안 생성에 성공하면 ack한다 | 없음 |
+| `ack` | 장부가 받았다(`delivery`: `new` 이번에 반영, `duplicate` 이미 반영). 장부가 그 영수증의 답에 경보를 실었으면 `alarm`(아래 "장부의 경보") | 있음(`ack`) |
+| `applied_without_ack` | 장부는 받았지만 ack 초안을 만들지 못했다(`stop_generation_unknown`, `ackDraft`의 거절 사유, `draft_threw`). 실행기가 다시 보내면 장부가 `duplicate`로 받고, 그때 정지 세대를 알고 초안 생성에 성공하면 ack한다. 경보는 `ack`과 같이 `alarm` | 없음 |
 | `ledger_refused` | 장부의 거절 사유 그대로 | 없음 |
 | `ledger_failed` | 장부가 던졌다(`threw`) 또는 답이 꼴에 맞지 않는다(`malformed_answer`, 답의 칸을 읽다 던진 것 포함) | 없음 |
 | `status_matched` | 기다리는 조회의 답이고 지금 인정된 연결에서 왔다. `queryRequestId`, `executor`, `connection`, `settled`(밀린 답 → 이번 답, 받은 순서. 마지막이 이번 답. 넘기는 동안 연결의 인정이 끝난 답은 `not_current`), `backlog`(다음에 그 실행기의 어떤 답보다 먼저 넘길 답) | 없음 |
@@ -68,6 +70,12 @@
 | `status_unmatched` | `unknown_query`, `other_executor`, `runs_mismatch`, `other_connection`(그 조회를 실은 연결이 아닌 연결에서 옴. 항목의 연결 번호가 없거나 꼴이 틀려도 이것). 장부를 부르지 않았다 | 없음 |
 | `result_refused` | 결과 보고를 장부에 넘기지 않았다. 확정된 이유(`reason`): 장부의 읽기로 본 `unknown_run`·`sender_mismatch`·`run_generation_mismatch`·`not_receivable`·`no_owner`, 보관소의 판단이 거절한 `conflict`·`too_large`·`digest_mismatch`·`invalid_input` | 없음 |
 | `result_unknown` | 결과 보고를 장부에 넘기지 않았다. 모름(`at`): `ports`(결과 포트가 없음), `ledger_read`(장부를 읽지 못함·꼴이 틀린 답·장부가 아는 목록과 꼴 밖의 값), `store`(보관이 `unknown`이거나 던짐) | 없음 |
+
+**장부의 경보(D-127·D-128).** 장부는 닫힌 실행(D-90·관리자 닫기)의 늦은 시작 영수증에 `alarm: "closed_run_started"`를, 같은 세대의 `running` 답에 `alarms`(`closed_run_running`)를 싣는다(`src/ledger/ledger.md` "경보를 밖으로 낸다"). 처리기는 그것을 결과에 옮기기만 한다: 영수증은 `ack`·`applied_without_ack`의 `alarm`(`runId`는 그 영수증의 실행), 답은 `applied`의 `alarms`다. 경보가 없으면 칸이 없다. 조립이 이 칸을 감독 로그 `ledger_alert` 한 줄씩으로 낸다(같은 경보는 프로세스에서 한 줄, `src/supervisor/runtime/boot.md` S43).
+
+- **경보 칸은 ack·반영을 가르지 않는다.** 경보 칸은 다른 칸과 따로 한 번만 읽고, 던지거나 약속 밖의 값(모르는 이름, 배열이 아님, 항목의 실행 ID·세대가 꼴 밖)이면 `unreadable`로 싣는다(답의 경보는 어느 실행인지 몰라 `runId: null` 하나). ack 초안·`delivery`, `applied`·밀린 사본·다시 물을 실행은 경보 칸이 없을 때와 같다: 경보 때문에 ack를 막으면 실행기가 같은 영수증을 끝없이 다시 보내고, 반영을 실패로 세면 같은 답을 다시 넘기며 그 실행기의 뒤 답을 막는다. 경보가 빠지는 쪽보다 남는 쪽이라 버리지 않는다.
+- **보고(`recordReport`)의 답에서는 경보 칸을 읽지 않는다.** 장부가 보고에 경보를 싣지 않는다.
+- **인정이 끝난 연결의 답(`recordSighting`)에는 경보가 없다.** `recordAnswerSightings`는 관측만 적고 경보를 싣지 않는다(장부의 계약). 그 실행은 지금 연결의 다음 답(조회·인사)에서 경보가 난다.
 | `rejected` | 위 표의 거절과 꼴 거절 | 없음 |
 
 ## 결과 보고
