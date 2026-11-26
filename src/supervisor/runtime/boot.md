@@ -51,6 +51,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | 5단계 허가를 소비자에 보이기 | `kickRestore`의 수락(`granted`) | 단계 결과를 기한 안에 받아들임. 받기 전은 닫힘(붙잡지 않음), 기한 넘김은 `intake_unaccepted` | 없음 | 해당 없음 | 단계를 부르기 전(`kickRestore`의 `stepLimit`) |
 | 현관 결과의 장부 반영(1단계 정지 병합, 2단계 이웃, 4단계 게시) | 복원기 안. 조립은 현관 포트를 `inStep`으로 감싼다 | 답을 받은 순간 `pastLimit(stepLimit)`, 정각 이후면 거부(모름) | 없음(거부한 답은 복원기가 장부에 쓰지 않거나 `unknown`으로 적는다) | 해당 없음 | 단계를 부르기 전(`kickRestore`의 `stepLimit`) |
 | 답 처리(`pump`) | 주기 `loop`의 `haltReason` → `answerLines.pump()` | `haltReason`. 박자 시간 기록(`beat_time`, 시계·기록 포트)은 그 앞 | 없음 | 해당 없음 | 박자 결과를 받은 뒤 |
+| 시험 현관 대역의 소유자 입력(D-109) | 주기 `loop`의 `pump` 뒤 `admitTestInput`: 변수 판정(받음 표시·`stopping`·`stage >= 5`·`granted`) → 대역의 `testInput`(장부 시계 `shared.now()`) → 데이터 사본 → `ledger.enqueueInput` 얻기 → 문 → 호출 | 접수 문(`intake.intakeOpen`, (2)에 복원기 접수) 뒤 `stopping`(끝 차례를 맨 끝에 읽는다) | 없음 | 없음(입력은 사본, 쓰기 함수는 문 전에 얻는다) | 박자 밖(`beatLimit`이 비어 있다). 대역이 없으면(운영) 아무것도 읽지 않는다 |
 
 ## 조건과 코드 자리
 
@@ -76,7 +77,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | S16 | `candidate`마다 `noteCandidate` | 답 줄이 한다(`answers.ts`의 `candidate`). 조립은 답 줄의 `cycle`에 그 순서기를 넘긴다 | "같은 객체" |
 | S17 | `takeRequery()`를 다시 묻게 | 꺼내 수를 기록만(`answerLines.takeRequery()`). 답 줄은 실행 ID만 내고 사유를 내지 않는다. 다시 묻기는 수명 박자의 간격 | 남는 한계 |
 | S19 | D-90 박자에 같은 답 줄의 `evidence`·`withheld`, 증거 장부는 프로세스에 하나 | `beats.unreceived`(박자 함수 본문에서 `need(lines)`로 위임), `make.lines`의 `evidenceBook: createAnswerEvidenceBook()` | `boot-evidence.test.ts`(시한 뒤 빈 full이면 닫기 1회, 오염·대기·번호 변경·연결 바뀜은 0회), `boot-effects.test.ts` "D-90 박자의 증거·맡기지 않을 실행기는 같은 답 줄의", "읽기만 한다" |
-| S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음 | `deps.openLedger`의 `mode: "reopen"` | "장부 not_initialized", 정적 `"create"` 0 |
+| S20 | `reopen`, `not_initialized`를 첫 설치로 넘기지 않음. 첫 설치는 감독 밖의 일회성 진입점 `src/main/ledger-init.ts`가 한다(D-110) | `deps.openLedger`의 `mode: "reopen"` | "장부 not_initialized", 정적 `"create"` 0, `test/ledger-init.test.ts` "정적: src/에서 \"create\" 글자를 쓰는 곳은"(`src/ledger/` 밖에서 그 진입점 하나) |
 | S21 | 필수 이웃에 현관·관측 중계·실행기 | `requiredPeers`(`settings.otherPeers`와 등록표의 활성 실행기) | "필수 이웃(S21)" |
 | S22 | 1단계 전 서버가 보는 세대 `null` | 복원기를 감싸지 않고 넘김(`published`) | 루프백 1단계 전 맞춤 답 0 |
 | S23 | `restoreDone`은 5단계 뒤만 | 순서기의 `restoreDone: () => stage >= 5 && effectsOpen()` | "관측 신호는 2단계를, 복원 끝은 5단계를" |
@@ -84,7 +85,7 @@ SUPERVISOR_EXIT = { config: 91, material: 92, registry: 93, ledger: 94, server: 
 | S25 | 게시 교체는 `deliver`·`pump` 밖 | 게시 교체가 없다(정한 것 4) | 정적 "다시 넣는 자리 없음" |
 | S26 | `PeersPort` 행은 인증 연결과 검증한 인사가 맞은 것만 | `peers.ts`, 복원기 포트의 `peers: createPeers(…)` | 루프백(정책 일치 실행기 행으로 5단계가 열림) |
 | S27 | `OccupancyPort`는 지금 서버 표 | 복원기 포트의 `occupancy` | 루프백 |
-| S28 | 현관이 없으면 모름(던짐), 지어낸 `null` 없음 | 진입점의 `absent`, 복원기 포트의 `stopAuthority`·`publications`·`peers`(`inStep`이 감싼다) | "현관이 답하지 않으면 1단계를 같은 복원기로" |
+| S28 | 현관이 없으면 모름(던짐), 지어낸 `null` 없음 | 진입점의 `absent`(시험 값의 시험 현관 대역은 D-109의 예외: README "시험 현관 대역"), 복원기 포트의 `stopAuthority`·`publications`·`peers`(`inStep`이 감싼다) | "현관이 답하지 않으면 1단계를 같은 복원기로" |
 | S29 | 새 업무는 `intakeOpen()`일 때만, 허가가 버려지면 새 복원기 | 박자의 접수 문 `intake`. 버려지면 96(`judge`, 주기 `loop`의 `haltReason`) | "낸 접수 허가가 버려지면", `boot-effects-loopback.test.ts` F4 |
 | S33·S34 | 재개방 때 위임·새 객체 | **해당 없음.** 재개방을 두지 않는다(아래) | 정적 "한 자리와 재개방 없음" |
 | S35 | `maxPendingWriteBytes` 주입 | 서버의 `maxPendingWriteBytes: settings.maxPendingWriteBytes`, 진입점 `MAX_MESSAGE_BYTES × 4` | `entry.test.ts`(산출값), `boot.test.ts` "같은 객체"(서버로 넘긴 값) |
