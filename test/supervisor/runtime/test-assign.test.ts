@@ -102,7 +102,7 @@ describe("진입점 설정", () => {
   });
 
   test("시험 값(OLIVE_TEST_JOBS=on)이면 시험 숫자의 실행 계획·요청 한도와 시험 사실 공급자(testAssign 참)다. 현관 대역과 무관하다", () => {
-    for (const extra of [{ OLIVE_TEST_JOBS: "on" }, { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }] as Record<string, string>[]) {
+    for (const extra of [{ OLIVE_TEST_JOBS: "on" }, { OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }] as Record<string, string>[]) {
       const s = settingsOf(extra);
       expect([JSON.stringify(extra), s.assign.plans, s.assign.queue, s.testAssign]).toEqual([JSON.stringify(extra), testAssignPolicy().plans, { alertMaxWaitMs: 60_000, requestBudget: { admin: 1_000, alert: 1_000 } }, true]);
     }

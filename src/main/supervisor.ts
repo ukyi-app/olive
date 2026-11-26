@@ -13,7 +13,7 @@ import { answerLine, createAdminHandlers } from "../supervisor/admin/commands.ts
 import { type AdminFs, type AdminListening, AdminListenRefused, listenAdmin } from "../supervisor/admin/listener.ts";
 import { ADMIN_SOCKET_MODE, ADMIN_SOCKET_PATH } from "../supervisor/admin/protocol.ts";
 import { bootSupervisor, type FrontDoorPorts, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
-import { testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
+import { TEST_FRONT_DOOR_ENVIRONMENT, testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
 import { accountFromEnv, accountRevisionFromEnv, assignmentFrom, type ProfileUse, profileRevisionsFromEnv } from "../supervisor/runtime/assign-policy.ts";
 import { testAssignPolicy } from "../supervisor/runtime/test-assign.ts";
 import { RENEW_MARGIN_MS } from "../supervisor/scheduler/lifecycle.ts";
@@ -46,8 +46,9 @@ export const SUPERVISOR_ENV = [
 // 보류로 조용히 남으면 켜는 사람이 원인을 찾지 못한다.
 // OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
 // 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로"). "on"이면 시험 배정 값(runtime/test-assign.ts)도 쓴다.
-// OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"일 때만 받는다.
-// 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다) 그것 없이 켜면 운영 값으로 보고 91이다.
+// OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"이고 OLIVE_ENVIRONMENT가
+// 시험 클러스터 이름(test-double.ts의 TEST_FRONT_DOOR_ENVIRONMENT, "vm")과 글자까지 같을 때만 받는다(D-125). 감독이 아는 "시험 값"의 표시는 이 둘이고,
+// 하나라도 아니면 운영 값으로 보고 91이다. 운영 값에서 켠 것을 거절하는 차트 CI(대역 켜짐과 그 이름을 함께 대조)는 뒤 homelab PR의 일이고 아직 없다.
 export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_ACCOUNT_NAME", "OLIVE_ACCOUNT_REVISION", "OLIVE_PROFILE_REVISIONS", "OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 장부 파일 이름은 장부 초기화 진입점과 함께 쓴다(ledger-path.ts).
@@ -130,7 +131,8 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (testJobs !== "" && testJobs !== "on" && testJobs !== "off") return invalid("OLIVE_TEST_JOBS");
   const testFrontDoor = env.OLIVE_TEST_FRONTDOOR ?? "";
   if (testFrontDoor !== "" && testFrontDoor !== "on" && testFrontDoor !== "off") return invalid("OLIVE_TEST_FRONTDOOR");
-  if (testFrontDoor === "on" && testJobs !== "on") return invalid("OLIVE_TEST_FRONTDOOR");
+  // 이름은 글자까지 비교한다. "VM"·" vm"처럼 꼴부터 틀린 이름은 이 줄에 오기 전에 위 꼴 검사가 OLIVE_ENVIRONMENT로 거절한다(필수 이름이 먼저다).
+  if (testFrontDoor === "on" && (testJobs !== "on" || registry.environment !== TEST_FRONT_DOOR_ENVIRONMENT)) return invalid("OLIVE_TEST_FRONTDOOR");
   const frontDoor: FrontDoorChoice = testFrontDoor === "on" ? "test_double" : "absent";
   // 시험 배정 값(O-D)은 시험 작업 넣기와 같은 시험 값에서만 쓴다. 운영 값에서는 null이고 실행 계획 없음·요청 한도 0·사실 모름이다.
   const testAssign = testJobs === "on" ? testAssignPolicy() : null;

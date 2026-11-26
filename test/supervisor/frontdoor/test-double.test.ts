@@ -11,6 +11,7 @@ import { type AskOutcome, exitFor } from "../../../src/supervisor/admin/client.t
 import { answerLine, createAdminHandlers } from "../../../src/supervisor/admin/commands.ts";
 import { ADMIN_LIMITS, parseReply, type TestJobRequest } from "../../../src/supervisor/admin/protocol.ts";
 import {
+  TEST_FRONT_DOOR_ENVIRONMENT,
   TEST_FRONT_DOOR_OWNER,
   TEST_FRONT_DOOR_PEERS,
   TEST_FRONT_DOOR_SOURCE,
@@ -59,7 +60,7 @@ describe("대역 포트", () => {
       { peer: "front-door", contract: CONTRACT_V2, policy: "match" },
       { peer: "observation-relay", contract: CONTRACT_V1, policy: "match" },
     ]);
-    const parsed = settingsFromEnv({ ...FULL, OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" });
+    const parsed = settingsFromEnv({ ...FULL, OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" });
     if (!parsed.ok) throw new Error(parsed.name);
     expect(rows.map((row) => row.peer)).toEqual([...parsed.settings.otherPeers]);
     expect<readonly string[]>([...TEST_FRONT_DOOR_PEERS]).toEqual([...parsed.settings.otherPeers]);
@@ -97,7 +98,7 @@ describe("진입점 설정", () => {
       "absent",
       "absent",
     ]);
-    expect(choice({ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" })).toBe("test_double");
+    expect(choice({ OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" })).toBe("test_double");
     const invalid = { ok: false, name: "OLIVE_TEST_FRONTDOOR", problem: "invalid" } as const;
     for (const jobs of [undefined, "", "off"]) {
       const env: Record<string, string> = jobs === undefined ? { OLIVE_TEST_FRONTDOOR: "on" } : { OLIVE_TEST_JOBS: jobs, OLIVE_TEST_FRONTDOOR: "on" };
@@ -112,14 +113,71 @@ describe("진입점 설정", () => {
     expect(settingsFromEnv({ ...FULL, OLIVE_TEST_JOBS: "x", OLIVE_TEST_FRONTDOOR: "on" })).toEqual({ ok: false, name: "OLIVE_TEST_JOBS", problem: "invalid" });
   });
 
+  // D-125: 대역 on × 클러스터 이름 × OLIVE_TEST_JOBS. 이름은 글자까지 같아야 한다. 필수 이름이 선택 이름보다 먼저라, 빈 이름은 OLIVE_ENVIRONMENT의
+  // 없음, 대소문자·앞뒤 공백이 다른 이름은 그 꼴 검사의 invalid로 먼저 걸린다(어느 쪽이든 91이고 대역은 없다). 꼴은 맞지만 vm이 아닌 이름
+  // (운영 이름, vm을 앞뒤에 품은 이름)은 OLIVE_TEST_FRONTDOOR로 거절한다. settingsFromEnv는 파일을 읽지 않으므로 실패는 아무 파일도 읽기 전의
+  // 91이다(진입점의 91은 test/entrypoints.test.ts).
+  test("OLIVE_TEST_FRONTDOOR=on은 OLIVE_ENVIRONMENT가 시험 클러스터 이름 vm과 글자까지 같고 OLIVE_TEST_JOBS=on일 때만 대역이다. 그 밖은 91이다", () => {
+    expect(TEST_FRONT_DOOR_ENVIRONMENT).toBe("vm");
+    const R = { ok: false, name: "OLIVE_TEST_FRONTDOOR", problem: "invalid" } as const;
+    const M = { ok: false, name: "OLIVE_ENVIRONMENT", problem: "missing" } as const;
+    const L = { ok: false, name: "OLIVE_ENVIRONMENT", problem: "invalid" } as const;
+    const T = "test_double";
+    // 열 차례: OLIVE_TEST_JOBS = on, off, 없음.
+    const table: [environment: string, expected: [unknown, unknown, unknown]][] = [
+      ["vm", [T, R, R]],
+      ["prod", [R, R, R]],
+      ["home", [R, R, R]],
+      ["vm-1", [R, R, R]],
+      ["prod-vm", [R, R, R]],
+      ["v", [R, R, R]],
+      ["", [M, M, M]],
+      ["VM", [L, L, L]],
+      [" vm", [L, L, L]],
+      ["vm ", [L, L, L]],
+    ];
+    const seen = table.map(([environment]) => [
+      environment,
+      (["on", "off", undefined] as const).map((jobs) => {
+        const env: Record<string, string> = { ...FULL, OLIVE_ENVIRONMENT: environment, OLIVE_TEST_FRONTDOOR: "on" };
+        if (jobs !== undefined) env.OLIVE_TEST_JOBS = jobs;
+        const parsed = settingsFromEnv(env);
+        return parsed.ok ? parsed.frontDoor : parsed;
+      }),
+    ]);
+    expect<unknown>(seen).toEqual(table);
+    // 시험 작업 값의 틀림은 이름 판정보다 먼저다.
+    expect(settingsFromEnv({ ...FULL, OLIVE_ENVIRONMENT: "prod", OLIVE_TEST_JOBS: "x", OLIVE_TEST_FRONTDOOR: "on" })).toEqual({ ok: false, name: "OLIVE_TEST_JOBS", problem: "invalid" });
+  });
+
+  test("대역이 꺼진 값(없음·빈 값·off)은 클러스터 이름과 OLIVE_TEST_JOBS에 상관없이 대역 없음이고 시험 작업 켜짐은 OLIVE_TEST_JOBS만 따른다. 꼴이 틀린 이름은 전처럼 OLIVE_ENVIRONMENT로 invalid다", () => {
+    for (const band of [undefined, "", "off"]) {
+      for (const environment of ["vm", "prod", "home", "VM", " vm", "vm "]) {
+        for (const jobs of ["on", "off", undefined]) {
+          const env: Record<string, string> = { ...FULL, OLIVE_ENVIRONMENT: environment };
+          if (band !== undefined) env.OLIVE_TEST_FRONTDOOR = band;
+          if (jobs !== undefined) env.OLIVE_TEST_JOBS = jobs;
+          const parsed = settingsFromEnv(env);
+          const label = `band=${band} env=${JSON.stringify(environment)} jobs=${jobs}`;
+          if (["VM", " vm", "vm "].includes(environment)) {
+            expect(parsed, label).toEqual({ ok: false, name: "OLIVE_ENVIRONMENT", problem: "invalid" });
+            continue;
+          }
+          if (!parsed.ok) throw new Error(`${label}: ${parsed.name}`);
+          expect([label, parsed.frontDoor, parsed.settings.testJobs]).toEqual([label, "absent", jobs === "on"]);
+        }
+      }
+    }
+  });
+
   test("배정의 출처: 대역이면 대역 출처만 admin, 대역이 없으면 늘 모름이다", () => {
     const originOf = (env: Record<string, string>) => {
       const parsed = settingsFromEnv({ ...FULL, ...env });
       if (!parsed.ok) throw new Error(parsed.name);
       return parsed.settings.assign.originOf;
     };
-    expect(originOf({ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" })(TEST_FRONT_DOOR_SOURCE)).toBe("admin");
-    expect(originOf({ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" })("admin-dm")).toBeUndefined();
+    expect(originOf({ OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" })(TEST_FRONT_DOOR_SOURCE)).toBe("admin");
+    expect(originOf({ OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" })("admin-dm")).toBeUndefined();
     expect(originOf({ OLIVE_TEST_JOBS: "on" })(TEST_FRONT_DOOR_SOURCE)).toBeUndefined();
     expect(originOf({})(TEST_FRONT_DOOR_SOURCE)).toBeUndefined();
   });
