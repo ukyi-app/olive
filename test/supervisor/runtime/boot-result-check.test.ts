@@ -8,6 +8,7 @@ import { limits, parsePrincipal } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
 import { KEEPALIVE_DETECT_MS, RESULT_CHECK } from "../../../src/main/supervisor.ts";
 import type { BootResult, SupervisorSettings } from "../../../src/supervisor/runtime/boot.ts";
+import { KEEPALIVE_USER_TIMEOUT_MS } from "../../../src/transport/keepalive.ts";
 import { digest, from, id, must, worker } from "../../ledger/helpers.ts";
 import { EXECUTOR, FRONT_ROWS, WALL, type World, world } from "./boot-world.ts";
 
@@ -303,10 +304,12 @@ describe("결과 검사 박자 + 조립", () => {
 
 describe("결과 기한과 keepalive의 관계(D-113 시험 숫자)", () => {
   test("운영 기한은 keepalive가 반쯤 열린 연결을 닫는 한계에 재전송 한 주기를 더한 것보다 길다", () => {
-    // 감독은 닫힘을 통보받지 못한 연결을 인정된 연결로 본다. 그 연결은 keepalive가 닫는다. KEEPALIVE_DETECT_MS는 olive #77
-    // (src/transport/keepalive.ts)의 KEEPALIVE_USER_TIMEOUT_MS(= KEEPALIVE_INITIAL_DELAY_MS 30000 + KEEPALIVE_INTERVAL_MS 10000 ×
-    // KEEPALIVE_PROBES 4)와 같아야 한다: 한쪽을 바꾸면 이 시험이 실패한다. #77이 이 저장소에 들어오면 그 상수를 가져다 대조한다.
-    expect(KEEPALIVE_DETECT_MS).toBe(30_000 + 10_000 * 4);
+    // 감독은 닫힘을 통보받지 못한 연결을 인정된 연결로 본다. 그 연결은 keepalive가 닫는다. 한계는 src/transport/keepalive.ts의
+    // KEEPALIVE_USER_TIMEOUT_MS(= KEEPALIVE_INITIAL_DELAY_MS 30000 + KEEPALIVE_INTERVAL_MS 10000 × KEEPALIVE_PROBES 4)이고,
+    // 진입점의 KEEPALIVE_DETECT_MS가 그 값이어야 한다. 70초 고정은 keepalive 값을 바꿀 때 이 기한을 다시 보게 하는 자리다.
+    expect(KEEPALIVE_DETECT_MS).toBe(KEEPALIVE_USER_TIMEOUT_MS);
+    expect(KEEPALIVE_USER_TIMEOUT_MS).toBe(30_000 + 10_000 * 4);
+    expect(RESULT_CHECK.reportWaitMs).toBeGreaterThan(KEEPALIVE_USER_TIMEOUT_MS + limits.RENEW_INTERVAL_MS);
     expect(RESULT_CHECK.reportWaitMs).toBeGreaterThan(KEEPALIVE_DETECT_MS + limits.RENEW_INTERVAL_MS);
   });
 });

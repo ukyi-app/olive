@@ -19,6 +19,7 @@ import { createFileResultBackend } from "../supervisor/scheduler/result-store-fi
 import { RegistryState, type RegistryTarget } from "../supervisor/transport/registry.ts";
 import { startConnectionServer } from "../supervisor/transport/server.ts";
 import { CREDENTIAL_MAX_BYTES } from "../transport/framing.ts";
+import { KEEPALIVE_USER_TIMEOUT_MS } from "../transport/keepalive.ts";
 import { LEDGER_FILE } from "./ledger-path.ts";
 
 // 읽는 환경. 차례는 README "감독 진입점"의 표와 같다: 차트가 이미 주는 이름이 앞, 차트 짝(N5c)이 더할 이름이 뒤다.
@@ -63,10 +64,10 @@ const TIMING: SupervisorSettings["timing"] = {
 };
 // 갱신을 낼 수 있는 구간을 7,000ms로 둔다(lifecycle.ts의 LifecyclePolicy 설명).
 const LIFE: SupervisorSettings["life"] = { renewEveryMs: limits.RUN_LEASE_MAX_MS - RENEW_MARGIN_MS - 7_000, answerTimeoutMs: 20_000 };
-// 감독 서버와 실행기 소켓의 TCP keepalive가 조용한 반쯤 열린 연결을 닫기까지의 한계(ms): 첫 탐침 30초 + 간격 10초 × 4, 보낸 바이트가
-// 확인되지 않을 때의 TCP_USER_TIMEOUT도 같은 70초다. keepalive 변경(olive #77, src/transport/keepalive.ts의
-// KEEPALIVE_USER_TIMEOUT_MS)과 같아야 한다. 그 상수가 이 저장소에 생기면 그것을 가져다 쓴다.
-export const KEEPALIVE_DETECT_MS = 30_000 + 10_000 * 4;
+// 감독 서버와 실행기 소켓의 TCP keepalive가 반쯤 열린 연결을 닫기까지의 한계(ms). TCP_USER_TIMEOUT이 0이 아니면 커널은 그 값으로 끊고,
+// keepalive.ts는 그 값을 첫 탐침 지연 + 간격 × 횟수(30초 + 10초 × 4 = 70초)와 같게 둔다: 조용한 연결과 보낸 바이트가 확인되지 않는
+// 연결이 모두 이 안에 닫힌다. keepalive 값을 바꾸면 이 한계도 따라 바뀌고, 결과 기한과의 관계는 시험이 다시 본다.
+export const KEEPALIVE_DETECT_MS = KEEPALIVE_USER_TIMEOUT_MS;
 // 결과 보고 없는 checking 실행을 결과 없음으로 판정하기까지의 기다림(D-113). T1 실측 전의 시험 숫자다. 감독은 닫힘을 통보받지 못한
 // 연결(상대가 사라졌는데 FIN이 오지 않음)을 인정된 연결로 본다. 그 연결은 keepalive가 KEEPALIVE_DETECT_MS 안에 닫고, 실행기는 다시
 // 붙은 뒤 ack가 없는 보고를 RENEW_INTERVAL_MS(10초)마다 다시 보낸다(worker.ts의 tick). 그래서 기한은 둘을 더한 80초보다 길어야
