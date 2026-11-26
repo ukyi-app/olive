@@ -1,5 +1,6 @@
 // 시험 현관 대역(D-109). 현관(O08)이 없는 시험 클러스터에서 감독이 복원 5단계를 마치고 접수를 열게 하는 현관 포트다.
-// 진입점(src/main/supervisor.ts)이 시험 값(OLIVE_TEST_FRONTDOOR=on, 그리고 OLIVE_TEST_JOBS=on)에서만 고르고, 운영 값에서는 만들지 않는다.
+// 진입점(src/main/supervisor.ts)이 시험 값(OLIVE_TEST_FRONTDOOR=on, 그리고 OLIVE_TEST_JOBS=on이고 OLIVE_ENVIRONMENT가 TEST_FRONT_DOOR_ENVIRONMENT와
+// 글자까지 같을 때, D-125)에서만 고르고, 운영 값에서는 만들지 않는다. 차트 CI가 같은 두 조건을 따로 대조하는 것은 homelab의 일이다.
 //
 // 대역이 스스로 만드는 것(D-76 "기록 없음을 지어내지 않는다"의 시험 값 한정 예외):
 // - 권위 정지 기록: 정지 아님, 세대 0. 장부에 같은 세대의 정지나 더 높은 세대가 있으면 장부가 이긴다(Ledger.mergeStop). 그래서 대역은
@@ -19,6 +20,10 @@ import type { InputRecord, PeerContractAnswer } from "../../ledger/index.ts";
 import type { FrontDoorPorts } from "../runtime/boot.ts";
 import type { Origin } from "../scheduler/queue.ts";
 
+// 대역을 받는 유일한 클러스터 이름(D-125). homelab VM 값의 클러스터 이름(cluster.name)과 같은 값이고, 감독은 OLIVE_ENVIRONMENT를 이 값과
+// 글자까지 비교한다(앞뒤 공백·대소문자를 고치지 않는다: 고쳐 읽으면 운영 값의 오타가 시험 클러스터로 읽힐 수 있다).
+// 함정: 운영 클러스터를 이 이름으로 짓거나 VM의 이름을 바꾸면 이 값과 homelab 값을 함께 바꾼다.
+export const TEST_FRONT_DOOR_ENVIRONMENT = "vm";
 // 시험 소유자 입력의 출처 이름. 실제 현관이 쓰는 출처 이름과 겹치지 않는 값이라 장부에서 대역의 입력을 가를 수 있다.
 export const TEST_FRONT_DOOR_SOURCE = "test-front-door";
 // 시험 소유자 입력의 요청 ID. 시험 작업 넣기(test-job)의 owner 칸에 이 값을 넣는다(README "시험 현관 대역").

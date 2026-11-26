@@ -22,8 +22,8 @@ test("entrypoints: supervisor는 환경이 없으면 첫 이름을 한 줄 찍�
   expect(result.stderr.toString()).toBe(`olive supervisor ${pkg.version}: 환경 OLIVE_SUPERVISOR_PORT이(가) 없다\n`);
 });
 
-// 시험 현관 대역(D-109). 운영 값(시험 작업 꺼짐)에서 켜거나 on·off 밖의 값이면 아무 파일도 읽기 전에 91이다. 대역이 없거나 시험 값(둘 다 on)이면
-// 환경을 지나 재료 읽기에서 92로 끝나고(경로가 없다), 그 전에 고른 현관을 기록에 한 줄 남긴다. 환경 값마다의 경우는 test/supervisor/frontdoor/test-double.test.ts가 본다.
+// 시험 현관 대역(D-109·D-125). 운영 값(시험 작업 꺼짐, 또는 클러스터 이름이 vm이 아님)에서 켜거나 on·off 밖의 값이면 아무 파일도 읽기 전에 91이다.
+// 대역이 없거나 시험 값(둘 다 on이고 이름이 vm)이면 환경을 지나 재료 읽기에서 92로 끝나고(경로가 없다), 그 전에 고른 현관을 기록에 한 줄 남긴다. 환경 값마다의 경우는 test/supervisor/frontdoor/test-double.test.ts가 본다.
 test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거나 값이 틀리면 91로, 대역 없음·시험 값이면 환경을 지나 92로 끝난다", () => {
   const env = {
     OLIVE_SUPERVISOR_PORT: "8443",
@@ -41,7 +41,13 @@ test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거
   const spawn = (extra: Record<string, string>) =>
     Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
   const refused = `olive supervisor ${pkg.version}: 환경 OLIVE_TEST_FRONTDOOR이(가) 틀렸다\n`;
-  const refusedEnv: Record<string, string>[] = [{ OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "off", OLIVE_TEST_FRONTDOOR: "on" }, { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "yes" }];
+  const refusedEnv: Record<string, string>[] = [
+    { OLIVE_TEST_FRONTDOOR: "on" },
+    { OLIVE_TEST_JOBS: "off", OLIVE_TEST_FRONTDOOR: "on" },
+    { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "yes" },
+    // 시험 작업이 켜져도 클러스터 이름(여기서는 home)이 vm이 아니면 거절한다.
+    { OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" },
+  ];
   for (const extra of refusedEnv) {
     const result = spawn(extra);
     expect([JSON.stringify(extra), result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([JSON.stringify(extra), 91, "", refused]);
@@ -49,7 +55,7 @@ test("entrypoints: supervisor는 시험 현관 대역을 운영 값에서 켜거
   for (const [extra, mode] of [
     [{}, "absent"],
     [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "off" }, "absent"],
-    [{ OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, "test_double"],
+    [{ OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, "test_double"],
   ] as const) {
     const result = spawn(extra);
     const lines = result.stderr.toString().split("\n");
@@ -93,6 +99,39 @@ test("entrypoints: supervisor는 배정 판 값의 꼴이 틀리면 91로, 없�
     const result = spawn(extra);
     const lines = result.stderr.toString().split("\n");
     expect([summary, result.exitCode, lines[1]]).toEqual([summary, 92, `olive supervisor: assign_inputs ${summary}`]);
+  }
+});
+
+// 시험 배정 값(O-D). 운영 값(OLIVE_TEST_JOBS 없음·빈 값·off)은 실행 계획 0·요청 한도 0·사실 모름(mode=off) 그대로이고, 시험 값(on)에서만 시험 숫자다.
+// 환경을 지나 재료 읽기에서 92로 끝나기 전에 기록 test_assign 한 줄을 남긴다. 값과 조립의 사실 공급자는 test/supervisor/runtime/test-assign.test.ts가 본다.
+test("entrypoints: supervisor는 운영 값에서 시험 배정 값을 쓰지 않고(mode=off·계획 0·한도 0), 시험 값에서만 시험 숫자를 쓴다", () => {
+  const env = {
+    OLIVE_SUPERVISOR_PORT: "8443",
+    OLIVE_LEDGER_DIR: "/olive-absent/ledger",
+    OLIVE_SIGNING_KEY_DIR: "/olive-absent/signing",
+    OLIVE_ACCOUNTS_DIR: "/olive-absent/accounts",
+    OLIVE_TLS_DIR: "/olive-absent/tls",
+    OLIVE_TRUST_DIR: "/olive-absent/trust",
+    OLIVE_REGISTRY_FILE: "/olive-absent/registry.json",
+    OLIVE_ENVIRONMENT: "home",
+    OLIVE_TARGETS: JSON.stringify([{ target: "diagnosis", namespace: "olive-diagnosis", roles: ["diagnosis"] }]),
+    OLIVE_POLICY_REVISION: "policy-1",
+    OLIVE_RESULT_DIR: "/olive-absent/results",
+  };
+  const spawn = (extra: Record<string, string>) =>
+    Bun.spawnSync([process.execPath, "src/main/supervisor.ts"], { cwd: root, env: { PATH: process.env.PATH ?? "", ...env, ...extra }, timeout: 10_000 });
+  const off = "olive supervisor: test_assign mode=off plans=0 requestBudget=admin:0,alert:0";
+  const on = "olive supervisor: test_assign mode=on plans=1 requestBudget=admin:1000,alert:1000";
+  for (const [extra, line] of [
+    [{}, off],
+    [{ OLIVE_TEST_JOBS: "" }, off],
+    [{ OLIVE_TEST_JOBS: "off" }, off],
+    [{ OLIVE_TEST_JOBS: "on" }, on],
+    [{ OLIVE_ENVIRONMENT: "vm", OLIVE_TEST_JOBS: "on", OLIVE_TEST_FRONTDOOR: "on" }, on],
+  ] as const) {
+    const result = spawn(extra);
+    const lines = result.stderr.toString().split("\n");
+    expect([JSON.stringify(extra), result.exitCode, lines[2]]).toEqual([JSON.stringify(extra), 92, line]);
   }
 });
 

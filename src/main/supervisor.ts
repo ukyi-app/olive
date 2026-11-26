@@ -13,8 +13,9 @@ import { answerLine, createAdminHandlers } from "../supervisor/admin/commands.ts
 import { type AdminFs, type AdminListening, AdminListenRefused, listenAdmin } from "../supervisor/admin/listener.ts";
 import { ADMIN_SOCKET_MODE, ADMIN_SOCKET_PATH } from "../supervisor/admin/protocol.ts";
 import { bootSupervisor, type FrontDoorPorts, type LogFields, type RunningSupervisor, SUPERVISOR_EXIT, type SupervisorDeps, type SupervisorSettings } from "../supervisor/runtime/boot.ts";
-import { testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
+import { TEST_FRONT_DOOR_ENVIRONMENT, testFrontDoorPorts, testOriginOf } from "../supervisor/frontdoor/test-double.ts";
 import { accountFromEnv, accountRevisionFromEnv, assignmentFrom, type ProfileUse, profileRevisionsFromEnv } from "../supervisor/runtime/assign-policy.ts";
+import { testAssignPolicy } from "../supervisor/runtime/test-assign.ts";
 import { RENEW_MARGIN_MS } from "../supervisor/scheduler/lifecycle.ts";
 import { createFileResultBackend } from "../supervisor/scheduler/result-store-file.ts";
 import { RegistryState, type RegistryTarget } from "../supervisor/transport/registry.ts";
@@ -45,9 +46,10 @@ export const SUPERVISOR_ENV = [
 // 세 값은 없거나 빈 값이면 모름이고 배정은 채우기 전처럼 보류된다. 꼴이 틀리면 다른 이름처럼 91이다: 오타가 "값 없음"과 같은
 // 보류로 조용히 남으면 켜는 사람이 원인을 찾지 못한다.
 // OLIVE_TEST_JOBS: 시험 작업 넣기(D-98·D-101). "on"이면 켜고, 없거나 빈 값이나 "off"면 꺼짐이다. 그 밖의 값은 91: 오타가 조용히 켜짐·꺼짐으로
-// 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로").
-// OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"일 때만 받는다.
-// 감독이 아는 "시험 값"의 표시는 OLIVE_TEST_JOBS=on 하나뿐이라(운영 값에서 그 값을 거절할 차트 CI는 뒤 homelab PR의 일이고 아직 없다) 그것 없이 켜면 운영 값으로 보고 91이다.
+// 읽히지 않게. 운영 값에서 켜면 차트의 CI가 거절한다(차트 짝의 일, README "감독 관리 통로"). "on"이면 시험 배정 값(runtime/test-assign.ts)도 쓴다.
+// OLIVE_TEST_FRONTDOOR: 시험 현관 대역(D-109). 값의 규칙은 OLIVE_TEST_JOBS와 같고, 더해 "on"은 OLIVE_TEST_JOBS도 "on"이고 OLIVE_ENVIRONMENT가
+// 시험 클러스터 이름(test-double.ts의 TEST_FRONT_DOOR_ENVIRONMENT, "vm")과 글자까지 같을 때만 받는다(D-125). 감독이 아는 "시험 값"의 표시는 이 둘이고,
+// 하나라도 아니면 운영 값으로 보고 91이다. 운영 값에서 켠 것을 거절하는 차트 CI(대역 켜짐과 그 이름을 함께 대조)는 뒤 homelab PR의 일이고 아직 없다.
 export const SUPERVISOR_OPTIONAL_ENV = ["OLIVE_ACCOUNT_NAME", "OLIVE_ACCOUNT_REVISION", "OLIVE_PROFILE_REVISIONS", "OLIVE_TEST_JOBS", "OLIVE_TEST_FRONTDOOR"] as const;
 
 // 파일 이름. 폴더는 환경이 주고 이름은 코드가 정한다. 장부 파일 이름은 장부 초기화 진입점과 함께 쓴다(ledger-path.ts).
@@ -141,8 +143,11 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
   if (testJobs !== "" && testJobs !== "on" && testJobs !== "off") return invalid("OLIVE_TEST_JOBS");
   const testFrontDoor = env.OLIVE_TEST_FRONTDOOR ?? "";
   if (testFrontDoor !== "" && testFrontDoor !== "on" && testFrontDoor !== "off") return invalid("OLIVE_TEST_FRONTDOOR");
-  if (testFrontDoor === "on" && testJobs !== "on") return invalid("OLIVE_TEST_FRONTDOOR");
+  // 이름은 글자까지 비교한다. "VM"·" vm"처럼 꼴부터 틀린 이름은 이 줄에 오기 전에 위 꼴 검사가 OLIVE_ENVIRONMENT로 거절한다(필수 이름이 먼저다).
+  if (testFrontDoor === "on" && (testJobs !== "on" || registry.environment !== TEST_FRONT_DOOR_ENVIRONMENT)) return invalid("OLIVE_TEST_FRONTDOOR");
   const frontDoor: FrontDoorChoice = testFrontDoor === "on" ? "test_double" : "absent";
+  // 시험 배정 값(O-D)은 시험 작업 넣기와 같은 시험 값에서만 쓴다. 운영 값에서는 null이고 실행 계획 없음·요청 한도 0·사실 모름이다.
+  const testAssign = testJobs === "on" ? testAssignPolicy() : null;
   const assignment = assignmentFrom(targets, profileRevisions.value, policyRevision);
   const revision = accountRevision.value;
   const tlsDir = value("OLIVE_TLS_DIR");
@@ -177,13 +182,14 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       // 배정 정책. 허용 표와 기대 revision은 대상 표·역할별 기대 프로필 revision에서(runtime/assign-policy.ts의 assignmentFrom), 등록행은
       // 조립이 적용한 등록표에서 채운다(여기서는 비운다). 계정은 별칭 env 하나에서 고정 계정 하나다(D-126). 별칭이 없으면 비어 있고
       // 고르기가 no_account로 보류하며 자격 참조를 묻지 않는다. 별칭만 있고 판이 없으면 자격 참조는 파일을 열기 전에 모름이다.
-      // 실행 계획·요청 한도·배정 전 사실은 시험 배정 값 조각 전까지 비어 있다. 요청 한도 0은 planNext가 거절해 박자가 policy_rejected로 끝난다.
+      // 실행 계획·요청 한도는 시험 값에서만 시험 숫자(runtime/test-assign.ts)이고, 배정 전 사실은 같은 시험 값에서만 조립이 시험 공급자로 채운다(testAssign).
+      // 운영 값에서는 셋 다 비어 있다: 요청 한도 0은 planNext가 거절해 박자가 policy_rejected로 끝난다.
       // 접수 출처는 시험 현관 대역일 때만 그 대역의 출처 하나를 관리자 요청으로 본다(D-109). 그 밖은 늘 모름이라 입력의 일을 보류한다.
       assign: {
         assignment: assignment.context,
         accounts: account.value === null ? [] : [account.value],
-        plans: [],
-        queue: { alertMaxWaitMs: 60_000, requestBudget: { admin: 0, alert: 0 } },
+        plans: testAssign === null ? [] : testAssign.plans,
+        queue: { alertMaxWaitMs: 60_000, requestBudget: testAssign === null ? { admin: 0, alert: 0 } : testAssign.requestBudget },
         originOf: frontDoor === "test_double" ? testOriginOf : () => undefined,
       },
       life: LIFE,
@@ -194,6 +200,7 @@ export function settingsFromEnv(env: Readonly<Record<string, string | undefined>
       maxPendingWriteBytes: limits.MAX_MESSAGE_BYTES * 4,
       timing: TIMING,
       testJobs: testJobs === "on",
+      testAssign: testAssign !== null,
     },
     frontDoor,
     assignInputs: { accountRevision: revision !== null, profileRevisions: assignment.profile },
@@ -292,6 +299,9 @@ async function main(): Promise<never> {
   productionDeps.log("front_door", { mode: parsed.frontDoor });
   // 배정에 채운 배포 값의 요약. 값 없이 켜져 배정이 늘 보류되는 것을 기록만 보고도 알게.
   productionDeps.log("assign_inputs", { accountRevision: parsed.assignInputs.accountRevision, profileRevisions: parsed.assignInputs.profileRevisions, accounts: parsed.settings.assign.accounts.length });
+  // 시험 배정 값의 요약. 운영 값이면 mode=off·실행 계획 0·요청 한도 0이고 배정 전 사실은 모두 모름이다(README "시험 배정 값").
+  const { plans, queue } = parsed.settings.assign;
+  productionDeps.log("test_assign", { mode: parsed.settings.testAssign === true ? "on" : "off", plans: plans.length, requestBudget: `admin:${queue.requestBudget.admin},alert:${queue.requestBudget.alert}` });
   const started = await bootSupervisor(parsed.settings, { ...productionDeps, frontDoor: frontDoorFor(parsed.frontDoor) }, stop.signal);
   if (!started.ok) {
     console.error(`olive supervisor ${pkg.version}: 기동 단계 ${started.step}에서 멈췄다(${started.reason})`);
