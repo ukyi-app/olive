@@ -252,6 +252,19 @@ export class Connections {
     return this.#greetedNow(source).map(fullAnswer);
   }
 
+  // 주체별로, 부르는 순간의 복원기(source)로 맞춘 뒤 hello를 받은 열린 연결의 수. 감독이 복원 2단계 앞에서 필수 실행기를 기다리는
+  // 동안 주기마다 읽는다(runtime/boot.ts). 메모리만 본다: source.stopGeneration()을 부르지 않고(감독의 복원기는 그 값을 장부에서 읽어,
+  // 그 읽기의 실패가 장부 고장이 된다) 실행 목록도 복사하지 않는다. 그래서 세대를 모르게 된 뒤의 연결도 센다. 배정 후보·점유의
+  // 판단에 쓰지 않는다: 그 판단은 occupancy·candidates(#greetedNow)다.
+  greetedCounts(source: StopGenerationSource): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const conn of this.#inner.byId.values()) {
+      if (conn.phase !== "greeted" || conn.sync?.source !== source || conn.greeting === null) continue;
+      counts.set(conn.sync.principal, (counts.get(conn.sync.principal) ?? 0) + 1);
+    }
+    return counts;
+  }
+
   // 부르는 순간의 복원기(source)로 답한 맞춤 뒤에 hello를 받았고, 그 복원기가 지금 세대를 알며, 아직 열린 연결.
   // 복원기를 바꾸거나 세대를 모르게 된 뒤 tick이 옛 연결을 닫기 전에도 옛 복원의 인사를 내지 않도록 조회 때마다 본다.
   // 인사 뒤 새 정지로 세대가 오른 것은 막지 않는다(그 연결로 비상 종료를 보내야 한다).
