@@ -69,7 +69,7 @@ test("판 7 장부를 열어 판 8로 올리면 실행·영수증·지시 줄은
   const instructionsBefore = rows(path, "SELECT * FROM instructions ORDER BY request_id");
   expect(rows(path, "SELECT name FROM pragma_table_info('runs') WHERE name = 'stop_exit'")).toEqual([]);
 
-  const upgraded = open(path);
+  const upgraded = open(path, { migrations: loadMigrations().slice(0, VERSION) });
   upgraded.close();
   expect(rows(path, "SELECT version, name FROM ledger_migrations WHERE version >= ? ORDER BY version", VERSION - 1)).toEqual([
     { version: VERSION - 1, name: "0007-operator-closure.sql" },
@@ -110,7 +110,7 @@ test("판 8 이관이 커밋 전에 끊기면 판 7 장부 그대로이고(판 7
   expect(seven).toMatchObject({ ok: true, migrated: { from: VERSION - 1, to: VERSION - 1 } });
   if (seven.ok) seven.ledger.close();
 
-  const resumed = openLedger(path, { clock, mode: "reopen" });
+  const resumed = openLedger(path, { clock, mode: "reopen", migrations: loadMigrations().slice(0, VERSION) });
   expect(resumed).toMatchObject({ ok: true, migrated: { from: VERSION - 1, to: VERSION } });
   if (resumed.ok) resumed.ledger.close();
   expect(versions()).toEqual([...versionsBefore, { version: VERSION }]);
@@ -308,7 +308,7 @@ test("판 7 장부를 8로 올리면 정의가 바뀌는 것은 runs 하나, 새
   open(path, { migrations: BEFORE() }).close();
   const objects = () => new Map((rows(path, "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL") as { name: string; sql: string }[]).map((o) => [o.name, o.sql]));
   const seven = objects();
-  open(path).close();
+  open(path, { migrations: loadMigrations().slice(0, VERSION) }).close();
   const eight = objects();
   expect([...seven].filter(([name, sql]) => eight.get(name) !== sql).map(([name]) => name)).toEqual(["runs"]);
   expect([...eight.keys()].filter((name) => !seven.has(name))).toEqual(["runs_stop_exit_fixed", "runs_failed_stopped_at_fixed"]);

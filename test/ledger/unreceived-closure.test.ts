@@ -691,8 +691,8 @@ test("이관: 판 1~5의 장부가 판 6으로 올라가고 기존 줄은 그대
     if (upgraded.ok) upgraded.ledger.close();
     const now = kept();
     expect(now.slice(0, -1), `판 ${version}`).toEqual(old.slice(0, -1));
-    // 판 6의 전이 두 줄과 판 7의 전이 한 줄.
-    expect((now.at(-1) as unknown[]).length, `판 ${version}`).toBe((old.at(-1) as unknown[]).length + 3);
+    // 판 6의 전이 두 줄, 판 7의 전이 한 줄, 판 9의 전이 세 줄.
+    expect((now.at(-1) as unknown[]).length, `판 ${version}`).toBe((old.at(-1) as unknown[]).length + 6);
     expect(rows(path, "SELECT (SELECT count(*) FROM start_dispatches) + (SELECT count(*) FROM unreceived_closures) + (SELECT count(*) FROM snapshot_run_bounds) AS n")).toEqual([{ n: 0 }]);
     // 적용 때 있던 시작 지시는 모두 판 이전의 시작으로 남는다.
     expect(rows(path, "SELECT run_id, request_id FROM starts_before_closure"), `판 ${version}`).toEqual([{ run_id: live.runId, request_id: live.requestId }]);

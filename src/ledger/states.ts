@@ -1,4 +1,4 @@
-// 감독 장부의 실행 상태와 허용된 전이(supervisor.md §3). 같은 표가 마이그레이션 0001·0006·0007의 run_transitions에 있고,
+// 감독 장부의 실행 상태와 허용된 전이(supervisor.md §3). 같은 표가 마이그레이션 0001·0006·0007·0009의 run_transitions에 있고,
 // 시험이 둘을 대조한다. 여기서 바꾸면 그 표도 바꿔야 한다(병합된 판은 고치지 않고 다음 번호의 마이그레이션으로 더한다).
 
 export const LEDGER_RUN_STATES = [
@@ -23,10 +23,11 @@ export const SLOT_FREE: readonly LedgerRunState[] = ["queued", "finalized", "not
 export const TERMINAL: readonly LedgerRunState[] = ["finalized", "not_started"];
 
 // not_started로 가는 길은 queued에서, 또는 닫기 근거가 있을 때만이다. 지시를 낸 뒤에는 실행기가 띄우지 않았다는 증명이 계약에 없으므로
-// 보통은 슬롯을 놓지 않는다(끊기면 unknown_running). 예외가 작업자의 preparing·unknown_running·stopping → not_started 세 줄이다.
-// preparing·unknown_running은 D-90(실행기가 받은 적 없는 실행, closeUnreceivedRun), unknown_running·stopping은 D-91(관리자가 확인한
-// 뒤 실패로 닫음, closeRunByOperator)이 쓴다. 장부의 트리거(판 7이 다시 만든 runs_not_started_needs_closure)가 queued 밖에서
-// not_started로 가는 갱신을 두 근거 표(unreceived_closures·operator_closures) 가운데 하나에 같은 앞 상태의 줄이 있을 때만 허락한다.
+// 보통은 슬롯을 놓지 않는다(끊기면 unknown_running). 예외가 작업자의 닫기 줄이다. preparing·unknown_running은 D-90(실행기가 받은 적
+// 없는 실행, closeUnreceivedRun), unknown_running·stopping은 D-91(관리자가 파드를 바꾼 뒤 실패로 닫음), checking·ready_result·
+// failed_stopped는 D-158(관리자가 실행기 저장소를 비운 뒤 실패로 닫음, 판 9)이 쓴다. 뒤 둘은 closeRunByOperator다. 장부의 트리거(판 7이
+// 다시 만든 runs_not_started_needs_closure)가 queued 밖에서 not_started로 가는 갱신을 두 근거 표(unreceived_closures·operator_closures)
+// 가운데 하나에 같은 앞 상태의 줄이 있을 때만 허락한다.
 // 장부의 checking은 종료 확인 영수증이 이미 적힌 뒤의 감독 쪽 결과 검사다. 끊김·재시작이 그 증명을 지우지 않으므로
 // checking에서 unknown_running으로 가는 길은 없다(계약의 stateAfterLoss는 종료 증명이 없는 실행기 상태에만 쓴다).
 export const TRANSITIONS: Readonly<Record<RunKind, Readonly<Partial<Record<LedgerRunState, readonly LedgerRunState[]>>>>> = {
@@ -35,10 +36,11 @@ export const TRANSITIONS: Readonly<Record<RunKind, Readonly<Partial<Record<Ledge
     preparing: ["running", "stopping", "unknown_running", "checking", "failed_stopped", "not_started"],
     running: ["stopping", "unknown_running", "checking", "failed_stopped"],
     stopping: ["unknown_running", "checking", "failed_stopped", "not_started"],
+    checking: ["ready_result", "failed_stopped", "not_started"],
+    ready_result: ["finalized", "cleanup_pending", "not_started"],
+    failed_stopped: ["finalized", "cleanup_pending", "not_started"],
+    // 열쇠는 LEDGER_RUN_STATES의 차례로 둔다(시험이 not_started로 가는 앞 상태의 목록을 그 차례로 대조한다).
     unknown_running: ["stopping", "checking", "failed_stopped", "not_started"],
-    checking: ["ready_result", "failed_stopped"],
-    ready_result: ["finalized", "cleanup_pending"],
-    failed_stopped: ["finalized", "cleanup_pending"],
     cleanup_pending: ["finalized"],
   },
   // 세션은 결과가 없고, 종료 확인은 다음 세대의 인수 영수증이다(D-50).
