@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { limits, parsePrincipal } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
 import { KEEPALIVE_DETECT_MS, RESULT_CHECK } from "../../../src/main/supervisor.ts";
+import type { ResultReach } from "../../../src/supervisor/dispatch/result-check.ts";
 import type { BootResult, SupervisorSettings } from "../../../src/supervisor/runtime/boot.ts";
 import { KEEPALIVE_USER_TIMEOUT_MS } from "../../../src/transport/keepalive.ts";
 import { digest, from, id, must, worker } from "../../ledger/helpers.ts";
@@ -138,6 +139,13 @@ async function restarted() {
   if (ledger === null || !w.events.some((e) => e.event === "restore_step" && e.fields.step === 5 && e.fields.intakeMayOpen === true)) throw new Error("5단계를 받아들이지 않았다");
   const run = checking(ledger);
   return { w, running: result.running, ledger, run, beat: () => w.time.advance(w.settings.timing.beatEveryMs) };
+}
+
+// 조립이 결과 검사 박자에 넘긴 사실 포트. 시험 세계는 박자 포트를 beatValid만 있는 꼴로 쥐므로 그 칸으로 읽는다. 첫 박자 뒤에만 있다.
+function reachOf(w: World): ResultReach {
+  const reach = (w.captured.beatPorts?.resultCheck as { reach?: ResultReach } | undefined)?.reach;
+  if (reach === undefined) throw new Error("결과 검사 박자가 아직 돌지 않았다");
+  return reach;
 }
 
 function stateOf(ledger: Ledger, runId: string): string {
@@ -575,6 +583,123 @@ describe("감독이 받고 보관하지 못한 결과 보고의 기억", () => {
     const b = await ripe();
     try {
       noteReceipt(b.w, { outcome: "ledger_failed", action: "report_result", id: id(), failure: "threw" });
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect([outcomes(b.w).slice(-3), b.marks, stateOf(b.ledger, b.run.runId)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], [], "checking"]);
+    } finally {
+      await b.running.stop();
+    }
+  });
+});
+
+describe("양성 관측의 기억", () => {
+  // 검증을 지난 결과 보고 forward. 머리의 body_digest를 빼 처리기가 보관소·장부에 닿기 전에 거절하게 한다(보관하지 못한 보고의 기억과
+  // 섞이지 않는다). 조립은 처리기를 부르기 전에 도착을 적는다.
+  function reportArrives(w: World, runId: string, reportId: string) {
+    const header = { sender: EXECUTOR, action: "report_result", run_generation: 0, issued_at: w.wall };
+    w.fake.options!.deliver({ kind: "forward", connection: 7, verified: { ok: true, action: "report_result", header, body: { report_id: reportId, run_id: runId, result: {} } } } as never);
+  }
+  // 상태 보고의 점유 행(partial). 실제 서버는 상태 보고마다 이것과 forward를 함께 넘긴다. 답 줄은 partial을 줄에 세우지 않는다.
+  function partialOccupancy(w: World, runId: string, state: string) {
+    w.fake.options!.deliver({ kind: "occupancy", connection: 7, answer: { executorId: EXECUTOR, coverage: "partial", runs: [{ run_id: runId, state, run_generation: generationOf(w, runId), last_receipt_id: null }] } } as never);
+  }
+
+  test("결과 보고 도착·ready_result 답(상태 보고 forward·점유)은 그 실행만 막고, 같은 실행의 보고를 장부가 받으면 실행째 지우며, 보관 전 확정 거절은 그 보고 몫만 지운다", async () => {
+    const b = await ripe();
+    try {
+      const runId = b.run.runId;
+      const reach = reachOf(b.w);
+      const steps: [string, boolean | null][] = [];
+      const step = (name: string) => steps.push([name, reach.positiveObserved(runId)]);
+      const [r1, r2, r3, r4] = [id(), id(), id(), id()];
+      step("처음");
+      reportArrives(b.w, runId, r1);
+      step("r1 도착(처리기 거절)");
+      noteReceipt(b.w, { outcome: "result_refused", id: r1, runId, reason: "no_owner" });
+      step("r1 확정 거절");
+      // 등록하지 않은 요청 ID의 답: 대조되지 않는다(unknown_query).
+      replyTo(b.w, id(), [{ run_id: runId, state: "ready_result", run_generation: generationOf(b.w, runId) }]);
+      step("대조되지 않은 상태 보고의 ready_result");
+      reportArrives(b.w, runId, r2);
+      noteReceipt(b.w, { outcome: "result_refused", id: r2, runId, reason: "no_owner" });
+      step("r2 도착 뒤 확정 거절");
+      reportArrives(b.w, id(), r3);
+      noteReceipt(b.w, { outcome: "ack", action: "report_result", id: r3, delivery: "new", ack: {} });
+      step("다른 실행 r3 ack");
+      noteReceipt(b.w, { outcome: "ack", action: "receipt_stopped", id: r2, delivery: "new", ack: {} });
+      step("다른 동작의 같은 ID ack");
+      noteReceipt(b.w, { outcome: "applied_without_ack", action: "report_result", id: r2, delivery: "duplicate", reason: "stop_generation_unknown" });
+      step("r2 장부가 받음");
+      partialOccupancy(b.w, runId, "failed_stopped");
+      step("점유의 failed_stopped");
+      partialOccupancy(b.w, runId, "ready_result");
+      step("점유의 ready_result");
+      await b.beat();
+      reportArrives(b.w, runId, r4);
+      noteReceipt(b.w, { outcome: "ack", action: "report_result", id: r4, delivery: "new", ack: {} });
+      step("r4 ack");
+      await b.beat();
+      expect(steps).toEqual([
+        ["처음", false],
+        ["r1 도착(처리기 거절)", true],
+        ["r1 확정 거절", false],
+        ["대조되지 않은 상태 보고의 ready_result", true],
+        ["r2 도착 뒤 확정 거절", true],
+        ["다른 실행 r3 ack", true],
+        ["다른 동작의 같은 ID ack", true],
+        ["r2 장부가 받음", false],
+        ["점유의 failed_stopped", false],
+        ["점유의 ready_result", true],
+        ["r4 ack", false],
+      ]);
+      expect(outcomes(b.w).slice(-2)).toEqual(["waiting=1", "no_result=1"]);
+      expect([b.marks, stateOf(b.ledger, runId)]).toEqual([[{ runId, resultDigest: null, now: b.w.wall }], "failed_stopped"]);
+    } finally {
+      await b.running.stop();
+    }
+  });
+
+  test("그 실행을 물은 조회의 답이 대조됐지만 그 조회를 실은 시각을 몰라 근거로 적지 못하면 양성 관측이라 앞의 부정 답으로 판정하지 않는다", async () => {
+    const b = await ripe();
+    try {
+      const runId = b.run.runId;
+      const reach = reachOf(b.w);
+      const prior = b.w.deps.monoNow;
+      const requestId = id();
+      Object.assign(b.w.deps, {
+        monoNow: () => {
+          throw new Error("조회 시각");
+        },
+      });
+      try {
+        b.w.captured.sink!.ports.queries.add({ requestId, recipient: EXECUTOR, runIds: [runId], connection: 7 });
+      } finally {
+        Object.assign(b.w.deps, { monoNow: prior });
+      }
+      replyTo(b.w, requestId, [{ run_id: runId, state: "failed_stopped", run_generation: generationOf(b.w, runId) }]);
+      expect([reach.answeredState(EXECUTOR, runId), reach.positiveObserved(runId)]).toEqual(["failed_stopped", true]);
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect([outcomes(b.w).slice(-3), b.marks, stateOf(b.ledger, runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], [], "checking", []]);
+    } finally {
+      await b.running.stop();
+    }
+  });
+
+  test("양성 관측을 적다 던지면 그 뒤로는 어느 실행에 양성 관측이 있는지 몰라 판정하지 않는다", async () => {
+    const b = await ripe();
+    try {
+      const reach = reachOf(b.w);
+      b.w.fake.options!.deliver({
+        kind: "occupancy",
+        connection: 7,
+        answer: {
+          executorId: EXECUTOR,
+          coverage: "partial",
+          get runs() {
+            throw new Error("점유 행");
+          },
+        },
+      } as never);
+      expect(reach.positiveObserved(b.run.runId)).toBe(null);
       for (let i = 0; i < 3; i += 1) await b.beat();
       expect([outcomes(b.w).slice(-3), b.marks, stateOf(b.ledger, b.run.runId)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], [], "checking"]);
     } finally {

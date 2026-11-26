@@ -3,8 +3,9 @@
 //
 // 이 파일이 지키는 것:
 // - 항목은 그 조회를 실제로 실은 연결의 번호와 함께 등록된 값만 있다(더하는 쪽은 내보내기 포트 하나다). 등록 차례를 지킨다.
-// - 실은 횟수만큼 항목이 있다. 같은 초안을 다시 봉해 같은 연결에 다시 실으면 같은 요청 ID의 항목이 둘이고, 실행기는 실을 때마다
-//   그때의 상태로 답하므로 두 답이 서로 다른 관측일 수 있다. 그래서 항목은 하나씩만 끝낸다(settle은 항목 하나).
+// - 더한 횟수만큼 항목이 있다. 같은 초안을 다시 봉해 같은 연결에 다시 더하면 같은 요청 ID의 항목이 둘이고, 실행기는 실을 때마다
+//   그때의 상태로 답하므로 두 답이 서로 다른 관측일 수 있다. 그래서 항목은 하나씩만 끝낸다(settle은 항목 하나). 대체할 앞 항목은
+//   조립이 아래 supersededBy로 골라 끝낸다(받는 이·연결·실행 ID마다 하나).
 // - remove는 더할 때 받은 그 객체로 찾고, 없는 항목에도 던지지 않는다(내보내기 포트가 쓰지 못한 조회를 거둔다).
 // - 연결이 철회되면(withdrawn) 그 연결의 항목을 끝낸다. 처리 중인 답과 철회 전에 받아 줄에 선 답이 쓸 항목만 그 답을 처리할 때까지
 //   남긴다. 답을 처리한 항목과 답이 쓰지 않고 지나간 항목은 답 줄이 끝낸다(같은 연결로 dropConnection을 다시 부른다).
@@ -61,18 +62,17 @@ export function createQueryBook(): QueryRegistry {
   };
 }
 
-// 새 조회 query가 대체하는 등록 항목: 같은 받는 이·같은 연결·같은 실행 ID 집합(차례 무관)이고 요청 ID가 다른 것. 등록부는 대체를
-// 모른다(답 줄은 같은 실행의 조회가 여럿 기다리는 것도 처리한다). 상한을 두는 것은 조립이다: 수명 박자는 답 없는 실행을 answerTimeoutMs마다
-// 새 요청 ID로 다시 묻으므로, 조립이 더할 때마다 이 항목을 끝내지 않으면 답하지 않는 연결에 항목이 끝없이 쌓인다. 끝낸 항목의 늦은 답은
-// 대조할 항목이 없어(unknown_query) 장부에도 결과 검사의 근거에도 닿지 않는다. 같은 요청 ID를 다시 실은 항목은 대체하지 않는다(실은 횟수만큼).
+// 새 조회 query를 등록부에 더하기 직전에 고르는, 그 조회가 대체해 끝낼 등록 항목: 같은 받는 이·같은 연결에서 query와 실행 ID가 하나라도
+// 같은 항목. 요청 ID는 보지 않는다(같은 요청 ID를 다시 싣는 것도 대체다). 조립이 더하기 전에 고르고 더한 뒤 끝내면, 이 포트로 실은 모든
+// 조회에 대해 받는 이·연결·실행 ID마다 등록 항목은 하나 이하다(여러 실행을 묻는 조회, 실행 집합의 중첩, 같은 요청 ID의 재송신 포함).
+// 지금 운영 호출자는 수명 박자 한 곳이고 늘 한 실행만 묻는다. 여러 실행을 묻는 조회가 앞 항목을 대체하면 그 항목이 물은 다른 실행에도
+// 등록 항목이 없어진다(그 답은 대조되지 않고 다시 묻는 것은 수명 박자의 간격이다).
+// 등록부는 대체를 모른다(답 줄은 같은 실행의 조회가 여럿 기다리는 것도 처리한다). 상한을 두는 것은 조립이다: 수명 박자는 답 없는 실행을
+// answerTimeoutMs마다 새 요청 ID로 다시 묻으므로, 조립이 더할 때마다 이 항목을 끝내지 않으면 답하지 않는 연결에 항목이 끝없이 쌓인다.
+// 끝낸 항목의 늦은 답은 대조할 항목이 없어(unknown_query) 장부에도 결과 없음 판정의 부정 근거에도 닿지 않는다. 그 답이 ready_result를
+// 실었으면 조립이 대조 전에 양성 관측으로 따로 적는다(boot.ts의 notePositive). 그래서 실행기가 매번 answerTimeoutMs보다 늦게 답하면
+// 부정 근거가 생기지 않아 결과 없음으로 판정하지 않는다(자리를 쥔다, result-check.md "늦은 답").
 export function supersededBy(pending: readonly SentQuery[], query: SentQuery): SentQuery[] {
   const asked = new Set(query.runIds);
-  return pending.filter(
-    (held) =>
-      held.requestId !== query.requestId &&
-      held.recipient === query.recipient &&
-      held.connection === query.connection &&
-      new Set(held.runIds).size === asked.size &&
-      held.runIds.every((runId) => asked.has(runId)),
-  );
+  return pending.filter((held) => held.recipient === query.recipient && held.connection === query.connection && held.runIds.some((runId) => asked.has(runId)));
 }

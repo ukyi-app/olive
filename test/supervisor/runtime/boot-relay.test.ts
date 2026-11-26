@@ -13,6 +13,7 @@ import type * as tls from "node:tls";
 import { type Envelope, limits, type NonceStore, rawPublicKey, type Result, resultDigest, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
 import { RESULT_CHECK } from "../../../src/main/supervisor.ts";
+import type { ResultReach } from "../../../src/supervisor/dispatch/result-check.ts";
 import type { ReceiptOutcome } from "../../../src/supervisor/dispatch/receipts.ts";
 import type { AnswerNote } from "../../../src/supervisor/runtime/answers.ts";
 import type { BootResult } from "../../../src/supervisor/runtime/boot.ts";
@@ -39,6 +40,13 @@ const RENEW = limits.RENEW_INTERVAL_MS;
 const WAIT = RESULT_CHECK.reportWaitMs;
 
 const cleanup: (() => unknown)[] = [];
+
+// 조립이 결과 검사 박자에 넘긴 사실 포트. 시험 세계는 박자 포트를 beatValid만 있는 꼴로 쥐므로 그 칸으로 읽는다. 첫 박자 뒤에만 있다.
+function reachOf(w: World): ResultReach {
+  const reach = (w.captured.beatPorts?.resultCheck as { reach?: ResultReach } | undefined)?.reach;
+  if (reach === undefined) throw new Error("결과 검사 박자가 아직 돌지 않았다");
+  return reach;
+}
 afterEach(async () => {
   for (const fn of cleanup.splice(0).reverse()) await fn();
 });
@@ -450,7 +458,7 @@ describe("결과 없음 판정 전 보관하지 못한 결과와 그 실행의 �
     expect([s.state(), s.marks.map((input) => (input as { resultDigest: unknown }).resultDigest)]).toEqual(["ready_result", [resultDigest(RESULT)]]);
   });
 
-  test("실행기가 기한 시작 + 한 주기 뒤 실은 조회에 ready_result로 답하면 결과 없음 판정 0이고, 그 뒤 결과가 없다고 답하면 판정한다(대조군)", async () => {
+  test("실행기가 기한 시작 + 한 주기 뒤 실은 조회에 ready_result로 답하면 결과 없음 판정 0이고, 그 뒤 결과가 없다고 답해도 양성 관측이 남아 판정 0이며, 결과 보고를 ack한 뒤 그 digest로 판정한다", async () => {
     const s = await supervised();
     const peer = await s.connect();
     const wall = s.w.wall;
@@ -466,16 +474,22 @@ describe("결과 없음 판정 전 보관하지 못한 결과와 그 실행의 �
     await s.beat();
     await s.beat();
     expect([s.nulls(), s.state(), s.alerts()]).toEqual([0, "checking", []]);
-    // 마지막 조회에서 20초가 지나 수명 박자가 새 조회를 싣고, 실행기가 결과가 없다고 답한다.
+    // 마지막 조회에서 20초가 지나 수명 박자가 새 조회를 싣고, 실행기가 결과가 없다고 답한다. 그 답은 대조돼 결과 없음의 근거 조건은
+    // 모두 찼지만, 앞의 ready_result 답(양성 관측)은 같은 실행의 보고를 장부가 받아야만 지워진다.
     await s.delivered(peer);
     const latest = queriesOf(peer).at(-1)!;
     await s.reply(peer, latest, "failed_stopped");
     await s.beat();
-    expect([s.state(), s.marks, s.alerts()]).toEqual([
-      "failed_stopped",
-      [{ runId: s.run.runId, resultDigest: null, now: s.w.wall }],
-      [{ reason: "no_result", runId: s.run.runId, checkingSince: s.run.since }],
-    ]);
+    await s.beat();
+    const reach = reachOf(s.w);
+    expect([reach.answeredState(R1, s.run.runId), reach.positiveObserved(s.run.runId)]).toEqual(["failed_stopped", true]);
+    expect([s.nulls(), s.state(), s.alerts(), peer.frames.filter((envelope) => envelope.header.action === "result_finalize")]).toEqual([0, "checking", [], []]);
+    const reportId = id();
+    expect(await s.sendResult(peer, reportId)).toEqual(expect.objectContaining({ outcome: "ack", id: reportId }));
+    await until(() => acked(peer, reportId));
+    expect(reach.positiveObserved(s.run.runId)).toBe(false);
+    await s.beat();
+    expect([s.state(), s.marks.map((input) => (input as { resultDigest: unknown }).resultDigest), s.alerts()]).toEqual(["ready_result", [resultDigest(RESULT)], []]);
   });
 
   test("같은 실행기의 다른 실행(B)을 물은 조회의 올바른 답은 대상 실행(A)의 결과 없음 판정 근거가 아니다", async () => {
@@ -534,5 +548,221 @@ describe("결과 없음 판정 전 보관하지 못한 결과와 그 실행의 �
     ]);
     await s.beat();
     expect([s.marks, s.state()]).toEqual([[], "checking"]);
+  });
+});
+
+// 결과가 있을 수 있다는 관측(양성 관측)이 하나라도 남으면 결과 없음 판정을 하지 않는다: 검증을 지난 결과 보고의 도착(처리 결과와 무관),
+// 어느 조회·연결의 ready_result 답, 대조됐지만 근거로 적지 못한 최신 답. 같은 실행의 보고를 장부가 받으면(ack) 지운다. 늦게 오는 답과
+// 송신 포트의 미결 조회 상한도 실제 소켓으로 본다.
+describe("양성 관측과 늦은 답", () => {
+  const digestsOf = (s: Awaited<ReturnType<typeof supervised>>) => s.marks.map((input) => (input as { resultDigest: unknown }).resultDigest);
+  const finalized = (peer: Peer) => peer.frames.filter((envelope) => envelope.header.action === "result_finalize");
+
+  for (const failure of ["clock", "handler"] as const) {
+    test(`검증을 지난 첫 결과 보고의 처리가 한 번 실패하면(${failure === "clock" ? "답 줄의 시계 한 번 던짐" : "결과 포트 접근자 한 번 던짐"}) 보관하지 못한 보고의 기억이 없어도 결과 없음 판정 0이고, 복구 뒤 같은 보고를 ack하고 그 digest로 판정한다`, async () => {
+      const s = await supervised();
+      const peer = await s.connect();
+      const wall = s.w.wall;
+      const mono = s.w.time.monoNow();
+      const at = (ms: number) => {
+        s.w.wall = wall + ms;
+        s.w.time.set(mono + ms);
+      };
+      const ports = s.w.captured.lines!.ports;
+      await s.beat();
+      // 기한 시작 + 한 주기 뒤 실은 조회에 실행기가 checking으로 답했다: 결과 없음의 다른 조건은 기한 뒤 모두 찬다.
+      at(80_000);
+      await s.beat();
+      await s.delivered(peer);
+      await s.reply(peer, queriesOf(peer).at(-1)!, "checking");
+      await until(() => s.matched() === 1);
+      at(89_900);
+      const reportId = id();
+      const start = s.answers.length;
+      const clock = ports.clock;
+      const results = ports.results!;
+      const backend = Object.getOwnPropertyDescriptor(results, "backend")!;
+      try {
+        if (failure === "clock") {
+          Object.assign(ports, {
+            clock: {
+              now: () => {
+                throw new Error("시계 한 번");
+              },
+            },
+          });
+        } else {
+          Object.defineProperty(results, "backend", {
+            configurable: true,
+            get: () => {
+              throw new Error("포트 한 번");
+            },
+          });
+        }
+        const body = { report_id: reportId, run_id: s.run.runId, result: RESULT };
+        peer.send(sealEnvelope({ sender: R1, recipient: "supervisor", action: "report_result", request_id: id(), stop_generation: peer.generation, run_generation: s.run.from.runGeneration, issued_at: s.w.wall, nonce: hex32(), body } as never, K1.privateKey));
+        await until(() => s.answers.slice(start).some((note) => note.kind === "receipt" || note.kind === "fault"));
+      } finally {
+        Object.assign(ports, { clock });
+        Object.defineProperty(results, "backend", backend);
+      }
+      const incoming = s.answers.slice(start).find((note) => note.kind === "receipt" || note.kind === "fault");
+      expect(incoming).toMatchObject(failure === "clock" ? { kind: "receipt", outcome: { outcome: "rejected", reason: "input_malformed", field: "now" } } : { kind: "fault", where: "deliver" });
+      expect([reachOf(s.w).unstoredResult(s.run.runId), reachOf(s.w).positiveObserved(s.run.runId)]).toEqual([false, true]);
+      for (const elapsed of [91_000, 10 * WAIT]) {
+        at(elapsed);
+        await s.beat();
+        expect([elapsed, s.nulls(), s.state(), s.alerts(), finalized(peer)]).toEqual([elapsed, 0, "checking", [], []]);
+      }
+      expect(await s.sendResult(peer, reportId)).toEqual(expect.objectContaining({ outcome: "ack", action: "report_result", id: reportId }));
+      await until(() => acked(peer, reportId));
+      expect([reachOf(s.w).unstoredResult(s.run.runId), reachOf(s.w).positiveObserved(s.run.runId)]).toEqual([false, false]);
+      await s.beat();
+      expect([s.state(), digestsOf(s), s.alerts()]).toEqual(["ready_result", [resultDigest(RESULT)], []]);
+    });
+  }
+
+  test("대체된 조회에 늦게 온 ready_result 답은 대조되지 않아도 양성 관측이다: 앞서 대조된 부정 답이 남아도 결과 없음 판정 0이고, 결과 보고를 ack한 뒤 그 digest로 판정한다", async () => {
+    const s = await supervised();
+    const peer = await s.connect();
+    const wall = s.w.wall;
+    const mono = s.w.time.monoNow();
+    const advance = async (ms: number) => {
+      s.w.wall = wall + ms;
+      s.w.time.set(mono + ms);
+      await s.beat();
+      await s.delivered(peer);
+      return queriesOf(peer).at(-1)!;
+    };
+    await s.beat();
+    const negative = await advance(21_000);
+    await s.reply(peer, negative, "checking");
+    await until(() => s.matched() === 1);
+    const positive = await advance(68_000);
+    const newest = await advance(89_000);
+    expect(newest.header.request_id).not.toBe(positive.header.request_id);
+    const before = s.answers.length;
+    await s.reply(peer, positive, "ready_result");
+    expect(s.answers.slice(before).filter((note) => note.kind === "status").map((note) => (note.kind === "status" && note.outcome.outcome === "status_unmatched" ? note.outcome.reason : "?"))).toEqual(["unknown_query"]);
+    // 부정 근거는 앞의 대조된 답 그대로다. 양성 관측이 판정을 막는다.
+    expect([reachOf(s.w).answeredState(R1, s.run.runId), reachOf(s.w).positiveObserved(s.run.runId)]).toEqual(["checking", true]);
+    await advance(91_000);
+    await advance(10 * WAIT);
+    expect([s.nulls(), s.state(), s.alerts(), finalized(peer)]).toEqual([0, "checking", [], []]);
+    const reportId = id();
+    expect(await s.sendResult(peer, reportId)).toEqual(expect.objectContaining({ outcome: "ack", id: reportId }));
+    await until(() => acked(peer, reportId));
+    await s.beat();
+    expect([s.state(), digestsOf(s), s.alerts()]).toEqual(["ready_result", [resultDigest(RESULT)], []]);
+  });
+
+  for (const state of ["ready_result", "failed_stopped"] as const) {
+    test(`대조된 최신 답을 그 조회의 실은 시각을 몰라(단조 시계 한 번 던짐) 근거로 적지 못하면 그 답이 ${state}여도 앞의 부정 답으로 판정하지 않고(양성 관측), 결과 보고를 ack한 뒤 그 digest로 판정한다`, async () => {
+      const s = await supervised();
+      const peer = await s.connect();
+      const wall = s.w.wall;
+      const mono = s.w.time.monoNow();
+      const at = (ms: number) => {
+        s.w.wall = wall + ms;
+        s.w.time.set(mono + ms);
+      };
+      await s.beat();
+      at(21_000);
+      await s.beat();
+      await s.delivered(peer);
+      await s.reply(peer, queriesOf(peer).at(-1)!, "checking");
+      await until(() => s.matched() === 1);
+      at(89_000);
+      // 조립이 조회를 등록하며 실은 시각을 적는 그 단조 시계 읽기 하나만 던진다.
+      const prior = s.w.deps.monoNow;
+      let failures = 0;
+      Object.assign(s.w.deps, {
+        monoNow: () => {
+          const stack = new Error().stack ?? "";
+          if (failures === 0 && stack.includes("monoRead") && stack.includes("add")) {
+            failures += 1;
+            throw new Error("조회 시각 한 번");
+          }
+          return prior();
+        },
+      });
+      try {
+        await s.beat();
+      } finally {
+        Object.assign(s.w.deps, { monoNow: prior });
+      }
+      expect(failures).toBe(1);
+      await s.delivered(peer);
+      await s.reply(peer, queriesOf(peer).at(-1)!, state);
+      await until(() => s.matched() === 2);
+      expect([reachOf(s.w).answeredState(R1, s.run.runId), reachOf(s.w).positiveObserved(s.run.runId)]).toEqual(["checking", true]);
+      for (const elapsed of [91_000, 10 * WAIT]) {
+        at(elapsed);
+        await s.beat();
+        expect([elapsed, s.nulls(), s.state(), s.alerts(), finalized(peer)]).toEqual([elapsed, 0, "checking", [], []]);
+      }
+      const reportId = id();
+      expect(await s.sendResult(peer, reportId)).toEqual(expect.objectContaining({ outcome: "ack", id: reportId }));
+      await until(() => acked(peer, reportId));
+      await s.beat();
+      expect([s.state(), digestsOf(s)]).toEqual(["ready_result", [resultDigest(RESULT)]]);
+    });
+  }
+
+  test("실행기가 매번 직전 조회에 20.1초 늦게 결과가 없다고 답하면 늦은 답은 대조되지 않아 60번 뒤에도 결과 없음 판정 0으로 자리를 쥐고(미결 조회는 하나), 마지막 조회에 제때 답하면 다음 박자에 판정한다", async () => {
+    const s = await supervised();
+    const peer = await s.connect();
+    const wall = s.w.wall;
+    const mono = s.w.time.monoNow();
+    await s.beat();
+    await s.delivered(peer);
+    let prev = queriesOf(peer).at(-1)!;
+    const statuses = () => s.answers.filter((note) => note.kind === "status").map((note) => (note.kind === "status" ? note.outcome : null));
+    let maxPending = 0;
+    for (let i = 1; i <= 60; i += 1) {
+      s.w.wall = wall + i * 20_100;
+      s.w.time.set(mono + i * 20_100);
+      await s.beat();
+      await s.delivered(peer);
+      const current = queriesOf(peer).at(-1)!;
+      expect(current.header.request_id).not.toBe(prev.header.request_id);
+      const before = statuses().length;
+      await s.reply(peer, prev);
+      await until(() => statuses().length === before + 1);
+      maxPending = Math.max(maxPending, s.w.captured.queries!.pending().length);
+      prev = current;
+    }
+    const late = statuses().map((outcome) => (outcome?.outcome === "status_unmatched" ? outcome.reason : outcome?.outcome));
+    expect([maxPending, late.length, late.filter((reason) => reason === "unknown_query").length]).toEqual([1, 60, 60]);
+    expect([s.matched(), s.nulls(), s.state(), s.server.recognized(R1), reachOf(s.w).positiveObserved(s.run.runId)]).toEqual([0, 0, "checking", peer.id, false]);
+    await s.reply(peer, prev);
+    await s.beat();
+    expect([s.matched(), s.nulls(), s.state(), s.alerts()]).toEqual([1, 1, "failed_stopped", [{ reason: "no_result", runId: s.run.runId, checkingSince: s.run.since }]]);
+  });
+
+  test("감독의 실제 송신 포트로 같은 요청 ID를 두 번, 실행이 겹치는 여러 실행 조회를 두 번 실어도 네 틀 모두 실리고 그 실행의 미결 조회는 늘 하나다", async () => {
+    const s = await supervised();
+    const peer = await s.connect();
+    const active = s.run.runId;
+    const count = () => s.w.captured.queries!.pending().filter((query) => query.connection === peer.id && query.runIds.includes(active)).length;
+    const fixed = id();
+    const cases = [
+      { request: fixed, runs: [active] },
+      { request: fixed, runs: [active] },
+      { request: id(), runs: [active, id()] },
+      { request: id(), runs: [id(), active] },
+    ];
+    const observed: number[] = [];
+    for (const each of cases) {
+      const query = sealEnvelope(
+        { sender: "supervisor", recipient: R1, action: "status_query", request_id: each.request, stop_generation: peer.generation, run_generation: 0, issued_at: s.w.wall, nonce: hex32(), body: { run_ids: each.runs } },
+        SUP.privateKey,
+      );
+      expect(await s.w.captured.sink!.value.sink.send(query)).toBe("sent");
+      observed.push(count());
+    }
+    await until(() => queriesOf(peer).length === 4);
+    expect(observed).toEqual([1, 1, 1, 1]);
+    expect(s.w.captured.queries!.pending().filter((query) => query.runIds.includes(active)).map((query) => query.requestId)).toEqual([cases[3]!.request]);
   });
 });

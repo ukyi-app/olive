@@ -555,6 +555,71 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const unstoredResults = new Map<string, string>();
   // 기억을 적다 던졌다. 그 뒤로는 어느 실행에 보관하지 못한 보고가 있는지 모른다(unstoredResult가 null).
   let unstoredLost = false;
+  // 실행 ID → 그 실행의 양성 관측(ResultReach.positiveObserved). reports는 서명·송신자 검증을 지나 도착한 그 실행의 결과 보고 ID(나),
+  // seen은 그 실행을 ready_result로 말한 답(가)이나 대조됐지만 근거로 적지 못한 그 실행의 상태 답(다)이 있었다는 표시다. 같은 실행의
+  // 결과 보고를 장부가 받으면(ack·applied_without_ack) 그 실행의 칸을 지우고, 보고 하나가 보관 전에 확정 거절되면 그 보고 몫만 지운다.
+  // 그 밖의 것(뒤의 부정 답, 연결 철회, 처리기 실패)은 지우지 않는다: 지워지지 않으면 결과 검사는 그 실행을 결과 없음으로 판정하지 않는다.
+  // 메모리뿐이라 감독이 다시 뜨면 비고, 실행기는 ack 없는 보고를 다시 보내고 그 실행을 ready_result로 답한다.
+  const positives = new Map<string, { readonly reports: Set<string>; seen: boolean }>();
+  // 보고 ID → 실행 ID. 장부의 ack 결과에는 실행 ID가 없어 도착 때 적은 이 표로 그 실행을 찾는다.
+  const positiveReports = new Map<string, string>();
+  // 양성 관측을 적다 던졌거나 어느 실행의 것인지 모르는 양성 관측이 있었다. 그 뒤로는 모름이다(positiveObserved가 null).
+  let positiveLost = false;
+  const positiveOf = (runId: string) => {
+    let entry = positives.get(runId);
+    if (entry === undefined) {
+      entry = { reports: new Set<string>(), seen: false };
+      positives.set(runId, entry);
+    }
+    return entry;
+  };
+  // (가)·(다). 실행 ID를 모르면 어느 실행의 것인지 모르므로 모름으로 둔다.
+  const markSeen = (runIds: Iterable<unknown> | null): void => {
+    try {
+      if (runIds === null) {
+        positiveLost = true;
+        return;
+      }
+      for (const runId of runIds) {
+        if (typeof runId !== "string" || runId.length === 0) positiveLost = true;
+        else positiveOf(runId).seen = true;
+      }
+    } catch {
+      positiveLost = true;
+    }
+  };
+  // 서버의 출력을 답 줄에 넘기기 전에 본다. 답 줄이 시계를 읽거나 처리기를 부르기 전이라 처리 중 무엇이 던져도 관측은 남는다. 서버는
+  // 서명과 송신자(그 연결의 주체)를 검증한 봉투만 forward로 넘기고, 점유(occupancy)는 인정된 연결의 검증한 인사·상태 보고에서만 만든다.
+  // - 결과 보고(forward report_result): 그 실행·보고 ID(나). 칸의 꼴이 틀린 보고는 처리기도 받지 못해 결과가 되지 못하므로 적지 않는다.
+  // - 상태 보고(forward status_report)와 점유(full·partial): ready_result로 말한 실행(가). 조회와 대조하기 전이라 대체된 조회의 늦은 답,
+  //   다른 연결의 답, 인사도 적힌다. 실제 서버는 상태 보고 하나를 점유(partial)와 forward로 함께 넘긴다(같은 실행을 두 번 적어도 같다).
+  // 던지면 그 뒤로 모름이다. 이 함수도 던지지 않는다(던지면 서버가 그 연결을 닫는다).
+  const notePositive = (output: Delivered): void => {
+    try {
+      if (output.kind === "forward") {
+        const verified: unknown = output.verified;
+        if (typeof verified !== "object" || verified === null) return;
+        const { action, body } = verified as { action?: unknown; body?: unknown };
+        if (typeof body !== "object" || body === null) return;
+        if (action === "report_result") {
+          const { run_id: runId, report_id: reportId } = body as { run_id?: unknown; report_id?: unknown };
+          if (typeof runId !== "string" || runId.length === 0 || typeof reportId !== "string" || reportId.length === 0) return;
+          positiveOf(runId).reports.add(reportId);
+          positiveReports.set(reportId, runId);
+        } else if (action === "status_report") {
+          const runs: unknown = (body as { runs?: unknown }).runs;
+          if (!Array.isArray(runs)) return;
+          markSeen(runs.filter((run: unknown) => typeof run === "object" && run !== null && (run as { state?: unknown }).state === "ready_result").map((run: { run_id?: unknown }) => run.run_id));
+        }
+      } else if (output.kind === "occupancy") {
+        const runs: unknown = output.answer.runs;
+        if (!Array.isArray(runs)) return;
+        markSeen(runs.filter((run: unknown) => typeof run === "object" && run !== null && (run as { state?: unknown }).state === "ready_result").map((run: { run_id?: unknown }) => run.run_id));
+      }
+    } catch {
+      positiveLost = true;
+    }
+  };
   // 서버의 출력을 답 줄에 넘기기 전에 본다. 후보는 판단이 연결을 greeted로 옮긴 같은 동기 구간에서 온다. 던지면 서버가 그 연결을
   // 닫으므로 여기서는 던지지 않는다.
   const noteLink = (output: Delivered) => {
@@ -716,6 +781,11 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       for (const held of unstoredResults.values()) if (held === runId) return true;
       return false;
     },
+    positiveObserved: (runId) => {
+      if (positiveLost) return null;
+      const entry = positives.get(runId);
+      return entry !== undefined && (entry.seen || entry.reports.size > 0);
+    },
     sinceSeenMs: (runId) => {
       const at = monoRead();
       if (at === null) return null;
@@ -738,20 +808,24 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     }
   };
   // 상태 조회의 답이 대조됐으면(status_matched) 그 조회가 물은 실행마다 그 조회를 실은 때와 그 답의 상태를 그 연결의 답한 조회로 적는다.
-  // 실은 때를 모르는 조회, 다른 연결로 실은 조회, 물은 실행 집합과 답의 실행 집합이 다른 답은 적지 않는다(결과 검사는 적힌 것이 없으면
-  // 결과 없음 판정을 하지 않는다). 답의 상태는 처리기가 이번 답으로 낸 마지막 사본(settled의 끝)에서 읽는다.
+  // 실은 때를 모르는 조회, 다른 연결로 실은 조회, 물은 실행 집합과 답의 실행 집합이 다른 답은 근거로 적지 않는다(결과 검사는 적힌 것이
+  // 없으면 결과 없음 판정을 하지 않는다). 답의 상태는 처리기가 이번 답으로 낸 마지막 사본(settled의 끝)에서 읽는다.
+  // 인정된 연결에서 대조된 답을 근거로 적지 못하면 그 답이 물은 실행의 최신 상태를 모르는 것이다: 앞서 적힌 부정 답이 남아 있어도 그것이
+  // 최신이 아니므로 양성 관측(다)으로 적는다. 철회된 연결의 답은 적지 않는다(그 연결의 근거는 철회 때 지웠고, 결과 검사는 지금 연결의 답을 요구한다).
   const noteAnswered = (note: AnswerNote): void => {
+    if (note.kind !== "status" || note.outcome.outcome !== "status_matched") return;
+    let asked: Iterable<unknown> | null = null;
     try {
-      if (note.kind !== "status" || note.outcome.outcome !== "status_matched") return;
       const connection = note.outcome.connection;
       const stamp = queryStamps.get(note.outcome.queryRequestId);
-      if (stamp === undefined || stamp.connection !== connection || note.connection !== connection || stamp.at === null || stamp.mono === null) return;
-      if (!greetedLinks.has(connection)) return;
       const copy = note.outcome.settled.at(-1)?.answer;
-      if (copy === undefined || copy.connection !== connection || copy.sender !== note.outcome.executor) return;
-      const asked = new Set(stamp.runIds);
+      asked = stamp !== undefined ? stamp.runIds : copy !== undefined ? copy.runs.map((run) => run.run_id) : null;
+      if (!greetedLinks.has(connection)) return;
+      if (stamp === undefined || stamp.connection !== connection || note.connection !== connection || stamp.at === null || stamp.mono === null) return markSeen(asked);
+      if (copy === undefined || copy.connection !== connection || copy.sender !== note.outcome.executor) return markSeen(asked);
+      const askedSet = new Set(stamp.runIds);
       const states = new Map(copy.runs.map((run) => [run.run_id, run.state] as const));
-      if (states.size !== asked.size || [...states.keys()].some((runId) => !asked.has(runId))) return;
+      if (states.size !== askedSet.size || [...states.keys()].some((runId) => !askedSet.has(runId))) return markSeen(asked);
       const byRun = answeredLinks.get(connection) ?? new Map<string, { readonly at: number; readonly mono: number; readonly state: string }>();
       for (const [runId, state] of states) {
         const prior = byRun.get(runId);
@@ -759,12 +833,14 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       }
       answeredLinks.set(connection, byRun);
     } catch {
-      // 적지 못한 답은 결과 없음 판정의 근거가 되지 않는다.
+      // 적지 못한 답은 결과 없음 판정의 근거가 되지 않고, 그 실행의 최신 상태를 모르게 된 것이다.
+      markSeen(asked);
     }
   };
   // 결과 보고를 처리한 결과로 보관하지 못한 보고의 기억을 고친다. 모름(보관 unknown·장부 던짐·장부 거절)은 적고, 장부가 받은 것(ack·
   // applied_without_ack)과 보관 전의 확정 거절(result_refused)은 지운다. 장부 거절도 적는 까닭: ledger_unwritable처럼 장부에 닿지 않은
   // 거절이 있다. 적다 던지면 그 뒤로 모름이다.
+  // 양성 관측은 지우기만 한다: 장부가 받은 보고의 실행은 칸째, 확정 거절된 보고는 그 보고 몫만. 지우다 던지면 남는다(판정하지 않는 쪽).
   const noteStored = (note: AnswerNote): void => {
     try {
       if (note.kind !== "receipt") return;
@@ -773,8 +849,23 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       else if ((outcome.outcome === "ledger_failed" || outcome.outcome === "ledger_refused") && outcome.action === "report_result") {
         if (outcome.runId === undefined) unstoredLost = true;
         else unstoredResults.set(outcome.id, outcome.runId);
-      } else if ((outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") && outcome.action === "report_result") unstoredResults.delete(outcome.id);
-      else if (outcome.outcome === "result_refused") unstoredResults.delete(outcome.id);
+      } else if ((outcome.outcome === "ack" || outcome.outcome === "applied_without_ack") && outcome.action === "report_result") {
+        const runId = positiveReports.get(outcome.id) ?? unstoredResults.get(outcome.id);
+        unstoredResults.delete(outcome.id);
+        if (runId !== undefined) {
+          for (const reportId of positives.get(runId)?.reports ?? []) positiveReports.delete(reportId);
+          positives.delete(runId);
+        }
+        positiveReports.delete(outcome.id);
+      } else if (outcome.outcome === "result_refused") {
+        unstoredResults.delete(outcome.id);
+        // 보고 ID → 실행 ID 표는 남긴다: 같은 보고 ID의 ack가 뒤에 오면 그 실행을 찾아 지운다.
+        const entry = positives.get(outcome.runId);
+        if (entry !== undefined && positiveReports.get(outcome.id) === outcome.runId) {
+          entry.reports.delete(outcome.id);
+          if (entry.reports.size === 0 && !entry.seen) positives.delete(outcome.runId);
+        }
+      }
     } catch {
       unstoredLost = true;
     }
@@ -882,6 +973,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       settings: settings.connection,
       deliver: (output) => {
         noteLink(output);
+        notePositive(output);
         deliver(output);
       },
       observe: (note) => log("server", note.kind === "closed" ? { kind: note.kind, cause: note.cause } : note.kind === "rejected_tls" ? { kind: note.kind, reason: note.reason } : { kind: note.kind }),
@@ -930,6 +1022,17 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       };
       Object.assign(queries, {
         add: (query: Parameters<typeof add>[0]) => {
+          // 같은 받는 이·연결에서 실행이 겹치는 앞 조회(같은 요청 ID를 다시 싣는 것 포함)는 이 조회가 대체한다(query-book.ts의 supersededBy):
+          // 미결 조회는 받는 이·연결·실행마다 하나뿐이고, 대체된 조회의 늦은 답은 대조되지 않아 결과 없음 판정의 부정 근거가 되지 않는다
+          // (ready_result 답은 notePositive가 대조 전에 양성 관측으로 적는다). 더하기 전에 고른다: 더한 뒤에 고르면 같은 요청 ID의 새 항목도
+          // 골라진다. 내보내기 포트는 쓰기 전에 더하므로 끝내 싣지 못한(거둔) 새 조회도 앞 조회를 끝낸 뒤다: 그 연결에서 answerTimeoutMs 넘게
+          // 답이 없던 조회의 답을 버리는 쪽이다. 고르거나 끝내다 던지면 남긴다.
+          let held: readonly Parameters<typeof add>[0][] = [];
+          try {
+            held = supersededBy(queries.pending(), query);
+          } catch {
+            held = [];
+          }
           add.call(queries, query);
           try {
             if (!queryStamps.has(query.requestId)) {
@@ -937,13 +1040,10 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
               queryStamps.set(query.requestId, { connection: query.connection, runIds: [...query.runIds], at: seen.state === "ok" ? seen.at : null, mono: monoRead() });
             }
           } catch {
-            // 시각을 적지 못한 조회의 답은 결과 없음 판정의 근거가 되지 않는다.
+            // 시각을 적지 못한 조회의 답은 결과 없음 판정의 근거가 되지 않는다(대조되면 그 실행의 양성 관측(다)이다).
           }
-          // 같은 실행·연결의 앞 조회는 이 조회가 대체한다(query-book.ts의 supersededBy): 미결 조회는 그 실행·연결에 하나뿐이고, 대체된
-          // 조회의 늦은 답은 대조되지 않아 결과 없음 판정의 근거가 되지 않는다. 내보내기 포트는 쓰기 전에 더하므로 끝내 싣지 못한(거둔) 새
-          // 조회도 앞 조회를 끝낸 뒤다: 그 연결에서 answerTimeoutMs 넘게 답이 없던 조회의 답을 버리는 쪽이다. 끝내다 던지면 남긴다.
           try {
-            for (const held of supersededBy(queries.pending(), query)) settle.call(queries, held);
+            for (const entry of held) settle.call(queries, entry);
           } catch {
             // 남은 앞 조회는 답이 오거나 연결이 철회되면 끝난다.
           }
