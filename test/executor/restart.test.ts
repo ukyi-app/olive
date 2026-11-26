@@ -439,7 +439,7 @@ interface Seen {
 }
 
 // 실행기 소켓은 붙은 소켓의 커널 소켓에 keepalive 값을 넣고 되읽은 뒤에만 link에 연다(src/transport/keepalive.ts).
-// 대역에는 커널 소켓이 없어 루프백 TCP 연결 하나를 만들어 그 setKeepAlive와 _handle을 빌려 준다. 대역을 닫으면 함께 닫는다.
+// 대역에는 커널 소켓이 없어 루프백 TCP 연결 하나를 만들어 그 setKeepAlive와 _handle, 양 끝 주소·포트를 빌려 준다. 대역을 닫으면 함께 닫는다.
 // 시험 프로세스가 이 연결 때문에 끝나지 않고 남지 않도록 unref한다.
 async function kernelSocket(): Promise<{ readonly socket: net.Socket; close(): void }> {
   const accepted: net.Socket[] = [];
@@ -472,6 +472,9 @@ function wired(marker: string) {
   const wire = Object.assign(new EventEmitter(), { destroyed: false, write: (_bytes: Uint8Array) => true, destroy: () => {}, setKeepAlive: (_enable: boolean, _delay: number): unknown => undefined });
   Object.defineProperty(wire, "_handle", { get: () => (kernels.at(-1)?.socket as unknown as { _handle?: unknown } | undefined)?._handle ?? null });
   wire.setKeepAlive = (enable, delay) => kernels.at(-1)?.socket.setKeepAlive(enable, delay);
+  for (const key of ["localAddress", "localPort", "remoteAddress", "remotePort"] as const) {
+    Object.defineProperty(wire, key, { get: () => kernels.at(-1)?.socket[key] });
+  }
   const got: Seen[] = [];
   const decoder = createFrameDecoder();
   const closed = new Promise<void>((resolve) => wire.once("close", resolve));

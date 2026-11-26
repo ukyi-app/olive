@@ -125,13 +125,13 @@ ExecutorSocket = {
 
 ## 반쯤 열린 연결 (TCP keepalive)
 
-감독이 FIN·RST 없이 사라지면 소켓은 끝을 알리지 않는다. 이 소켓은 붙은 소켓을 `link.open`에 넘기기 전에 `src/transport/keepalive.ts`의 `enableKeepAlive`로 TCP keepalive를 켜고 탐침 간격·횟수와 `TCP_USER_TIMEOUT`을 넣어, 운영체제가 그런 연결을 끊게 한다. 계약 v1 메시지는 바꾸지 않는다. 값(첫 탐침 지연 30초, 간격 10초 × 4회, `TCP_USER_TIMEOUT` 70초)과 넣는 차례(런타임 `setKeepAlive` 뒤 libc `setsockopt`, 넣기 전·뒤 되읽기)는 감독 서버와 같은 한 자리이고 **T1 실측 뒤 조정한다**(`src/supervisor/transport/server.md` "반쯤 열린 연결").
+감독이 FIN·RST 없이 사라지면 소켓은 끝을 알리지 않는다. 이 소켓은 붙은 소켓을 `link.open`에 넘기기 전에 `src/transport/keepalive.ts`의 `enableKeepAlive`로 TCP keepalive를 켜고 탐침 간격·횟수와 `TCP_USER_TIMEOUT`을 넣어, 운영체제가 그런 연결을 끊게 한다. 계약 v1 메시지는 바꾸지 않는다. 값(첫 탐침 지연 30초, 간격 10초 × 4회, `TCP_USER_TIMEOUT` 70초)과 넣는 차례(런타임 `setKeepAlive` 뒤 fd의 양 끝 주소·포트를 런타임 소켓의 것과 대조, libc `setsockopt`, 넣기 전·뒤 되읽기)는 감독 서버와 같은 한 자리이고 **T1 실측 뒤 조정한다**(`src/supervisor/transport/server.md` "반쯤 열린 연결").
 
-- **켜지 못하면 열지 않는다.** `setKeepAlive`의 읽기나 호출이 던지거나, fd(`_handle.fd`)를 얻지 못하거나, 넣기가 실패하거나, 되읽은 값이 하나라도 다르면 소켓을 닫고 `connect_failed`(`keepalive_failed`)를 알리고 실패로 세어 간격을 두고 다시 붙는다. 이 확인은 멈춤·다른 붙기로 넘어감의 확인 뒤, `destroyed` 확인 앞이다.
+- **켜지 못하면 열지 않는다.** `setKeepAlive`의 읽기나 호출이 던지거나, fd(`_handle.fd`)를 얻지 못하거나, 그 fd의 양 끝 주소·포트가 이 연결과 맞지 않거나(다른 연결의 fd에는 아무것도 넣지 않는다), 넣기가 실패하거나, 되읽은 값이 하나라도 다르면 소켓을 닫고 `connect_failed`(`keepalive_failed`)를 알리고 실패로 세어 간격을 두고 다시 붙는다. 이 확인은 멈춤·다른 붙기로 넘어감의 확인 뒤, `destroyed` 확인 앞이다.
 - **이미 끊긴 소켓은 기존 사유로 닫는다.** `destroyed`인 소켓에는 아무것도 넣지 않고 지나가, 뒤의 `destroyed` 확인이 `connect_failed`(`tls_error`)로 닫는다.
 - **이 뒤 같은 소켓에 `setKeepAlive`를 다시 부르지 않는다.** 다른 지연으로 부르면 런타임이 간격 1초·10회를 다시 넣는다.
 - **끊긴 뒤는 기존 닫힘 길이다.** 운영체제가 소켓을 오류(`ETIMEDOUT`)로 끝내면 `closed`(`socket_error`)이고 `Connection.close()` 뒤 간격을 두고 다시 붙는다.
-- **끊기까지의 시간과 한계는 감독 쪽과 같다**(`src/supervisor/transport/server.md` "반쯤 열린 연결"): 조용해진 뒤 약 70초에 끊는다. 30초 넘게 조용한 연결에서 망이 약 40초 넘게 끊기면 살아 있는 감독과의 연결도 끊긴다(이 소켓은 `closed`(`socket_error`) 뒤 간격을 두고 다시 붙고, 감독은 `withdrawn` 뒤 연결 상실 박자가 없음을 세기 시작한다). 보내고 ACK를 못 받은 바이트가 있으면 `TCP_USER_TIMEOUT`이 약 70초에 끊는다. 감독이 읽지 않아 창이 0인 채 보낼 바이트가 걸려 있어도 약 70초 뒤 끊는다. 감독 프로세스가 멈췄어도 그 노드의 커널이 탐침에 답하고 그 0 창 조건이 아니면 끊지 않는다.
+- **끊기까지의 시간과 한계는 감독 쪽과 같다**(`src/supervisor/transport/server.md` "반쯤 열린 연결"): 조용해진 뒤 약 70초에 끊는다. 망이 끊긴 채 탐침 넷이 모두 답을 못 받으면 살아 있는 감독과의 연결도 끊긴다. 약 40초는 첫 무응답 탐침부터 만료 검사까지이고, 견디는 단절 길이는 탐침 시점과 새 수신에 달렸다(마지막 수신 0초에 29.5~60.5초의 31초 단절은 끊기고 1~46초의 45초 단절은 산다). 끊기면 이 소켓은 `closed`(`socket_error`) 뒤 간격을 두고 다시 붙고, 감독은 `withdrawn` 뒤 연결 상실 박자가 없음을 세기 시작한다. 보내고 ACK를 못 받은 바이트가 있으면 `TCP_USER_TIMEOUT`이 약 70초에 끊는다. 감독이 읽지 않아 창이 0인 채 보낼 바이트가 걸려 있어도 약 70초 뒤 끊는다. 감독 프로세스가 멈췄어도 그 노드의 커널이 탐침에 답하고 그 0 창 조건이 아니면 끊지 않는다.
 
 ## 남는 한계
 

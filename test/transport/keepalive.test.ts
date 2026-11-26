@@ -2,7 +2,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { closeSync, openSync } from "node:fs";
 import * as net from "node:net";
-import { libcSocketOptions, type SocketOptionName, type SocketOptionPort } from "../../src/transport/keepalive-ffi.ts";
+import { libcSocketOptions, type SocketAddress, type SocketOptionName, type SocketOptionPort, type SocketSide } from "../../src/transport/keepalive-ffi.ts";
 import {
   enableKeepAlive,
   KEEPALIVE_INITIAL_DELAY_MS,
@@ -21,7 +21,7 @@ afterEach(async () => {
 
 const NAMES = Object.keys(KEEPALIVE_OPTIONS) as SocketOptionName[];
 
-test("값: 조용한 연결은 약 70초, 허용 끊김은 약 40초이고 TCP_USER_TIMEOUT은 첫 탐침 지연 + 간격 × 횟수다", () => {
+test("값: 조용한 연결은 약 70초(첫 무응답 탐침부터 만료 검사까지 약 40초)이고 TCP_USER_TIMEOUT은 첫 탐침 지연 + 간격 × 횟수다", () => {
   expect(KEEPALIVE_OPTIONS).toEqual({ SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 10, TCP_KEEPCNT: 4, TCP_USER_TIMEOUT: 70_000 });
   expect(KEEPALIVE_USER_TIMEOUT_MS).toBe(KEEPALIVE_INITIAL_DELAY_MS + KEEPALIVE_INTERVAL_MS * KEEPALIVE_PROBES);
   // 첫 탐침 지연 + 간격 이하이면 첫 탐침 뒤 곧 끊긴다(keepalive.ts 머리말의 함정).
@@ -34,7 +34,17 @@ test("값: 조용한 연결은 약 70초, 허용 끊김은 약 40초이고 TCP_U
 type Call = readonly [string, ...unknown[]];
 
 // 커널 소켓 하나를 흉내 내는 가짜 소켓과 포트. 차례를 calls에 남긴다.
-function fake(over: { socket?: Partial<Record<string, unknown>>; get?: (name: SocketOptionName, real: number) => unknown; set?: (name: SocketOptionName) => unknown } = {}) {
+// 커널 쪽 fd 7의 양 끝은 127.0.0.1:40000 → 127.0.0.1:8443이고, 런타임 주소 글도 같은 연결을 가리킨다.
+const LOCAL = { address: "00000000000000000000ffff7f000001", port: 40_000 };
+const PEER = { address: "00000000000000000000ffff7f000001", port: 8_443 };
+function fake(
+  over: {
+    socket?: Partial<Record<string, unknown>>;
+    get?: (name: SocketOptionName, real: number) => unknown;
+    set?: (name: SocketOptionName) => unknown;
+    address?: (side: SocketSide, real: SocketAddress) => unknown;
+  } = {},
+) {
   const calls: Call[] = [];
   const kernel: Record<SocketOptionName, number> = { SO_KEEPALIVE: 0, TCP_KEEPIDLE: 7200, TCP_KEEPINTVL: 75, TCP_KEEPCNT: 9, TCP_USER_TIMEOUT: 0 };
   const socket = {
@@ -47,6 +57,10 @@ function fake(over: { socket?: Partial<Record<string, unknown>>; get?: (name: So
       kernel.TCP_KEEPCNT = 10;
     },
     _handle: { fd: 7 },
+    localAddress: "127.0.0.1",
+    localPort: 40_000,
+    remoteAddress: "127.0.0.1",
+    remotePort: 8_443,
     ...over.socket,
   };
   const options: SocketOptionPort = {
@@ -60,17 +74,24 @@ function fake(over: { socket?: Partial<Record<string, unknown>>; get?: (name: So
       if (result === true) kernel[name] = value;
       return result as boolean;
     },
+    address(fd, side) {
+      calls.push(["address", fd, side]);
+      const real = side === "local" ? LOCAL : PEER;
+      return (over.address ? over.address(side, real) : real) as SocketAddress | null;
+    },
   };
   return { socket: socket as unknown as KeepAliveSocket, options, calls, kernel };
 }
 
 const sets = (calls: readonly Call[]) => calls.filter((c) => c[0] === "set");
 
-test("차례: setKeepAlive 뒤 fd 하나에 런타임 값 둘을 되읽고, 셋을 넣고, 다섯을 되읽는다", () => {
+test("차례: setKeepAlive 뒤 fd 하나의 양 끝 주소를 대고, 런타임 값 둘을 되읽고, 셋을 넣고, 다섯을 되읽는다", () => {
   const f = fake();
   expect(enableKeepAlive(f.socket, f.options)).toBe(true);
   expect(f.calls).toEqual([
     ["setKeepAlive", true, 30_000],
+    ["address", 7, "local"],
+    ["address", 7, "peer"],
     ["get", 7, "SO_KEEPALIVE"],
     ["get", 7, "TCP_KEEPIDLE"],
     ["set", 7, "TCP_KEEPINTVL", 10],
@@ -136,6 +157,73 @@ test("넣기 전 되읽기: 런타임 값이 다르거나(켜지지 않음, 다�
   expect(sets(thrown.calls)).toEqual([]);
 });
 
+test("fd의 양 끝 대조: 커널이 준 주소·포트가 하나라도 다르거나 읽지 못하면 되읽기·넣기 없이 false다", () => {
+  const other = { address: "00000000000000000000ffff7f000002", port: 40_000 };
+  const cases: [string, (side: SocketSide, real: SocketAddress) => unknown][] = [
+    ["로컬 주소", (side, real) => (side === "local" ? other : real)],
+    ["로컬 포트", (side, real) => (side === "local" ? { ...real, port: 40_001 } : real)],
+    ["상대 주소", (side, real) => (side === "peer" ? { ...real, address: other.address } : real)],
+    ["상대 포트", (side, real) => (side === "peer" ? { ...real, port: 8_444 } : real)],
+    // 같은 연결의 반대쪽 소켓: 넷이 뒤집혀 있다.
+    ["반대쪽", (side) => (side === "local" ? PEER : LOCAL)],
+    ["로컬 null", (side, real) => (side === "local" ? null : real)],
+    ["상대 null", (side, real) => (side === "peer" ? null : real)],
+    ["꼴 아님", () => "00000000000000000000ffff7f000001"],
+    ["던짐", () => { throw new Error("시험: getsockname 던짐"); }],
+  ];
+  for (const [label, address] of cases) {
+    const f = fake({ address });
+    expect(enableKeepAlive(f.socket, f.options), label).toBe(false);
+    expect(f.calls.filter((c) => c[0] === "get" || c[0] === "set"), label).toEqual([]);
+  }
+});
+
+test("fd의 양 끝 대조: 런타임 주소 글·포트를 꼴로 읽지 못하면(없음, 영역이 붙은 IPv6, 틀린 IPv4·IPv6, 포트 밖) 모호한 것으로 보고 false다", () => {
+  const bad: Partial<Record<string, unknown>>[] = [
+    { localAddress: undefined },
+    { remoteAddress: undefined },
+    { localPort: undefined },
+    { remotePort: undefined },
+    { localAddress: "fe80::1%eth0" },
+    { localAddress: "127.0.0.1.1" },
+    { localAddress: "256.0.0.1" },
+    { localAddress: "127.0.0.01" },
+    { localAddress: "::ffff:1.2.3" },
+    { localAddress: "1::2::3" },
+    { localAddress: "1:2:3:4:5:6:7:8:9" },
+    { localAddress: "1:2:3:4:5:6:7:8::" },
+    { localAddress: "1.2.3.4::" },
+    { localAddress: "12345::1" },
+    { localAddress: "" },
+    { localPort: 0 },
+    { localPort: 65_536 },
+    { remotePort: 8_443.5 },
+    { remotePort: "8443" },
+  ];
+  for (const socket of bad) {
+    const f = fake({ socket });
+    expect(enableKeepAlive(f.socket, f.options), JSON.stringify(socket)).toBe(false);
+    expect(f.calls.filter((c) => c[0] === "get" || c[0] === "set"), JSON.stringify(socket)).toEqual([]);
+  }
+});
+
+test("fd의 양 끝 대조: IPv4와 그 매핑 IPv6, 줄인·편 IPv6, 대소문자는 같은 주소다", () => {
+  for (const localAddress of ["127.0.0.1", "::ffff:127.0.0.1", "::FFFF:7f00:1", "0:0:0:0:0:ffff:127.0.0.1", "0000:0000:0000:0000:0000:ffff:7f00:0001"]) {
+    const f = fake({ socket: { localAddress } });
+    expect(enableKeepAlive(f.socket, f.options), localAddress).toBe(true);
+  }
+  const v6: [string, string][] = [
+    ["::1", "00000000000000000000000000000001"],
+    ["2001:db8::1", "20010db8000000000000000000000001"],
+    ["fd7a:115c:a1e0::1:2", "fd7a115ca1e000000000000000010002"],
+    ["1:2:3:4:5:6:7::", "00010002000300040005000600070000"],
+  ];
+  for (const [text, hex] of v6) {
+    const f = fake({ socket: { remoteAddress: text }, address: (side, real) => (side === "peer" ? { ...real, address: hex } : real) });
+    expect(enableKeepAlive(f.socket, f.options), text).toBe(true);
+  }
+});
+
 test("넣기: 하나라도 실패(false·꼴 아닌 값·던짐)하면 그 뒤를 넣지 않고 되읽지 않고 false다", () => {
   for (const [i, target] of (["TCP_KEEPINTVL", "TCP_KEEPCNT", "TCP_USER_TIMEOUT"] as const).entries()) {
     for (const bad of [false, undefined, 0, "throw"]) {
@@ -166,16 +254,19 @@ test("넣은 뒤 되읽기: 다섯 값 가운데 하나라도 다르면(다른 �
 });
 
 // 실제 커널 소켓: 루프백 TCP 한 쌍(TLS 쪽은 server.test.ts·socket.test.ts가 본다).
-async function pair(): Promise<{ client: net.Socket; server: net.Socket }> {
+async function pair(listen = "127.0.0.1", connect = listen): Promise<{ client: net.Socket; server: net.Socket }> {
   let accepted: net.Socket | null = null;
   const listener = net.createServer((socket) => {
     accepted = socket;
   });
-  await new Promise<void>((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    listener.once("error", reject);
+    listener.listen(0, listen, resolve);
+  });
   cleanup.push(() => new Promise<void>((resolve) => listener.close(() => resolve())));
   const port = (listener.address() as net.AddressInfo).port;
   const client = await new Promise<net.Socket>((resolve, reject) => {
-    const socket = net.connect({ port, host: "127.0.0.1" }, () => resolve(socket));
+    const socket = net.connect({ port, host: connect }, () => resolve(socket));
     socket.once("error", reject);
   });
   for (let i = 0; i < 200 && accepted === null; i++) await Bun.sleep(5);
@@ -204,6 +295,78 @@ test("실제 소켓: libc로 다섯 값을 넣고 되읽는다. 켜지 않은 �
   client.write("x");
   await got;
   expect(read(client)).toEqual({ ...KEEPALIVE_OPTIONS });
+});
+
+// 런타임 setKeepAlive(true, 30000)만 지난 소켓의 값. 다른 연결의 fd에 쓰면 간격·횟수·TCP_USER_TIMEOUT이 바뀐다.
+const RUNTIME_ONLY = { SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 1, TCP_KEEPCNT: 10, TCP_USER_TIMEOUT: 0 };
+const swapFd = (socket: net.Socket, fd: number) =>
+  Object.defineProperty((socket as unknown as { _handle: object })._handle, "fd", { configurable: true, value: fd });
+
+test("실제 소켓: 같은 런타임 값을 켠 다른 연결(다른 연결, 같은 연결의 반대쪽)의 fd를 받으면 그 fd에 쓰지 않고 false다", async () => {
+  const a = await pair();
+  const b = await pair();
+  a.client.setKeepAlive(true, KEEPALIVE_INITIAL_DELAY_MS);
+  a.server.setKeepAlive(true, KEEPALIVE_INITIAL_DELAY_MS);
+  expect(read(a.client)).toEqual(RUNTIME_ONLY);
+  expect(read(a.server)).toEqual(RUNTIME_ONLY);
+  const own = fdOf(b.client);
+  swapFd(b.client, fdOf(a.client));
+  expect(enableKeepAlive(b.client)).toBe(false);
+  expect(read(a.client)).toEqual(RUNTIME_ONLY);
+  swapFd(a.client, fdOf(a.server));
+  expect(enableKeepAlive(a.client)).toBe(false);
+  expect(read(a.server)).toEqual(RUNTIME_ONLY);
+  // 제 fd로 되돌리면 넣는다.
+  swapFd(b.client, own);
+  expect(enableKeepAlive(b.client)).toBe(true);
+  expect(read(b.client)).toEqual({ ...KEEPALIVE_OPTIONS });
+});
+
+test("실제 소켓: libc 포트의 address는 getsockname·getpeername을 런타임 주소·포트와 같은 꼴로 돌려주고, 소켓이 아닌 fd는 null이다", async () => {
+  const { client, server } = await pair();
+  const loopback = "00000000000000000000ffff7f000001";
+  expect(libcSocketOptions.address(fdOf(client), "local")).toEqual({ address: loopback, port: client.localPort! });
+  expect(libcSocketOptions.address(fdOf(client), "peer")).toEqual({ address: loopback, port: client.remotePort! });
+  expect(libcSocketOptions.address(fdOf(server), "local")).toEqual({ address: loopback, port: client.remotePort! });
+  expect(libcSocketOptions.address(fdOf(server), "peer")).toEqual({ address: loopback, port: client.localPort! });
+  const plain = openSync(import.meta.path, "r");
+  cleanup.push(() => closeSync(plain));
+  expect(libcSocketOptions.address(plain, "local")).toBeNull();
+  expect(libcSocketOptions.address(-1, "peer")).toBeNull();
+  expect(libcSocketOptions.address(fdOf(client), "nope" as SocketSide)).toBeNull();
+});
+
+// IPv6을 끈 커널(/proc/net/tcp6 없음)에서는 ::1을 듣지 못한다. 그때는 그 실패가 주소 계열 오류인지만 보고 IPv6 쪽 단언을 하지 않는다
+// (IPv6 주소 글의 읽기는 위 가짜 포트 시험이 본다). 건너뛰기 표시는 test/repo.test.ts가 막는다.
+async function ipv6Unavailable(): Promise<string | null> {
+  const listener = net.createServer();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listener.once("error", reject);
+      listener.listen(0, "::1", resolve);
+    });
+    return null;
+  } catch (error) {
+    return String((error as NodeJS.ErrnoException).code);
+  } finally {
+    listener.close();
+  }
+}
+
+test("실제 소켓: IPv6 루프백과 이중 스택에 IPv4로 붙은 연결(받은 쪽 주소는 ::ffff: 매핑)도 양 끝을 대고 넣는다", async () => {
+  const unavailable = await ipv6Unavailable();
+  if (unavailable !== null) {
+    expect(["EADDRNOTAVAIL", "EAFNOSUPPORT"]).toContain(unavailable);
+    return;
+  }
+  const six = await pair("::1");
+  const mapped = await pair("::", "127.0.0.1");
+  for (const socket of [six.client, six.server, mapped.client, mapped.server]) {
+    expect(enableKeepAlive(socket), `${socket.localAddress} → ${socket.remoteAddress}`).toBe(true);
+    expect(read(socket)).toEqual({ ...KEEPALIVE_OPTIONS });
+  }
+  expect(libcSocketOptions.address(fdOf(six.client), "peer")).toEqual({ address: "00000000000000000000000000000001", port: six.client.remotePort! });
+  expect(libcSocketOptions.address(fdOf(mapped.server), "local")?.address).toBe("00000000000000000000ffff7f000001");
 });
 
 test("실제 소켓: libc 포트는 실패를 던지지 않고 null·false로 돌려준다(소켓이 아닌 fd, 음수·int32 밖, 커널이 거절하는 값, 모르는 이름)", async () => {

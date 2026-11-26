@@ -1022,3 +1022,43 @@ test("keepalive: 돌려받기 전에 이미 끊긴 소켓은 keepalive가 아니
     { kind: "retry_scheduled", delayMs: 100 },
   ]);
 });
+
+// 리뷰 재현: 같은 초기 옵션(런타임 setKeepAlive만 지남)의 TLS 소켓 둘에서 새 소켓의 fd 읽기만 앞 연결의 번호로 바꾼다.
+// 런타임 값 둘의 되읽기는 같아 가르지 못한다. 양 끝 주소 대조가 첫 넣기 전에 닫아야 한다.
+test("keepalive: 같은 초기 옵션을 켠 다른 TLS 연결의 fd를 받으면 그 fd에 쓰지 않고(값 그대로) link에 열지 않고 닫는다", async () => {
+  const firstRaw: tls.TLSSocket[] = [];
+  const first = await setup({ wrap: capturing(firstRaw) });
+  first.socket.start();
+  await until(() => first.opened.length === 1);
+  const otherFd = fdOf(firstRaw[0]!);
+  // 앞 연결을 런타임 setKeepAlive만 지난 값으로 되돌려, 새 소켓이 setKeepAlive 뒤 갖는 초기 옵션과 같게 둔다.
+  for (const [name, value] of [["TCP_KEEPINTVL", 1], ["TCP_KEEPCNT", 10], ["TCP_USER_TIMEOUT", 0]] as const) {
+    expect(libcSocketOptions.set(otherFd, name, value)).toBe(true);
+  }
+  const initial = { SO_KEEPALIVE: 1, TCP_KEEPIDLE: 30, TCP_KEEPINTVL: 1, TCP_KEEPCNT: 10, TCP_USER_TIMEOUT: 0 };
+  expect(optionsOf(firstRaw[0]!)).toEqual(initial);
+  const raw: tls.TLSSocket[] = [];
+  let realFd = -1;
+  const next = await setup({
+    wrap: capturing(raw, (socket) => {
+      realFd = fdOf(socket);
+      Object.defineProperty((socket as unknown as { _handle: object })._handle, "fd", { configurable: true, value: otherFd });
+    }),
+  });
+  next.socket.start();
+  await until(() => next.opened.length > 0 || next.timer.waits.length === 1);
+  expect(realFd).not.toBe(otherFd);
+  expect(next.opened).toHaveLength(0);
+  expect(optionsOf(firstRaw[0]!)).toEqual(initial);
+  expect(next.events.filter((e) => e.kind !== "connecting")).toEqual([
+    { kind: "connect_failed", attempt: 1, reason: "keepalive_failed" },
+    { kind: "retry_scheduled", delayMs: 100 },
+  ]);
+  expect(raw[0]!.destroyed).toBe(true);
+  // 다른 fd에는 쓰기 0: 세 값 가운데 하나라도 넣었으면 10·4·70000으로 바뀐다. 앞 연결은 열린 채다.
+  expect(optionsOf(firstRaw[0]!)).toEqual(initial);
+  expect(first.opened).toHaveLength(1);
+  expect(firstRaw[0]!.destroyed).toBe(false);
+  await until(() => next.client.openConnections() === 0);
+  expect(next.peers.flatMap((p) => p.got)).toEqual([]);
+});
