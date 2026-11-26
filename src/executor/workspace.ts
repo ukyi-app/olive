@@ -7,8 +7,10 @@
 // - 같은 uid가 권한을 뺀 폴더는 모드를 되돌린 뒤 연다. 되돌리지 못한 항목은 남고, 남은 수로 센다.
 // - 지우는 동안 쓰는 프로세스가 없어야 한다. 부르는 쪽(대리)이 남은 프로세스 0을 본 뒤에만 부른다.
 // - 경로로 지운다. 경로가 PATH_MAX를 넘는 깊은 트리는 그 자리가 남아 0이 나오지 않는다(영수증이 나가지 않는 쪽).
+// - 이름은 바이트로 읽고 바이트로 이어 붙인다. Linux 파일명은 바이트열이라 UTF-8이 아닌 이름(다른 인코딩의 아카이브)을
+//   문자열로 읽으면 바뀐 이름으로 지우려다 실패하고 원래 항목이 계속 남는다(재시도해도 같아 슬롯이 풀리지 않는다).
 import { chmod, lstat, mkdir, readdir, rmdir, unlink } from "node:fs/promises";
-import { join, posix } from "node:path";
+import { posix } from "node:path";
 
 // 역할 컨테이너에서 쓸 수 있는 볼륨은 이 자리의 role-tmp 하나다. 차트와 CI 경계 표가 이 경로를 고정한다.
 export const WORKSPACE_ROOT = "/tmp";
@@ -30,10 +32,11 @@ export function insideWorkspace(path: string, root: string = WORKSPACE_ROOT): bo
 
 export function rootWorkspace(root: string = WORKSPACE_ROOT): RunWorkspace {
   return {
-    entries: async () => (await readdir(root)).length,
+    entries: async () => (await names(Buffer.from(root))).length,
     clear: async () => {
-      for (const name of await readdir(root)) await removeTree(join(root, name)).catch(() => {});
-      return (await readdir(root)).length;
+      const top = Buffer.from(root);
+      for (const name of await names(top)) await removeTree(child(top, name)).catch(() => {});
+      return (await names(top)).length;
     },
     enter: async (cwd) => {
       if (cwd === root || !insideWorkspace(cwd, root)) return;
@@ -42,10 +45,15 @@ export function rootWorkspace(root: string = WORKSPACE_ROOT): RunWorkspace {
   };
 }
 
-async function removeTree(path: string): Promise<void> {
+const names = (dir: Buffer) => readdir(dir, { encoding: "buffer" });
+
+const SLASH = Buffer.from("/");
+const child = (dir: Buffer, name: Buffer) => Buffer.concat([dir, SLASH, name]);
+
+async function removeTree(path: Buffer): Promise<void> {
   const info = await lstat(path);
   if (!info.isDirectory()) return unlink(path);
   if ((info.mode & 0o700) !== 0o700) await chmod(path, 0o700);
-  for (const name of await readdir(path)) await removeTree(join(path, name)).catch(() => {});
+  for (const name of await names(path)) await removeTree(child(path, name)).catch(() => {});
   await rmdir(path);
 }

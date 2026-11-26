@@ -56,6 +56,23 @@ test("작업 공간: 깊은 트리(200단)도 지운다", async () => {
   expect(readdirSync(root)).toEqual([]);
 });
 
+test("작업 공간: UTF-8이 아닌 이름(루트 바로 아래, 하위 폴더 안, 폴더 이름 자신)도 원래 바이트로 지워 0을 센다", async () => {
+  const root = fresh("olive-workspace-");
+  const at = (...parts: Buffer[]) => Buffer.concat([Buffer.from(root), ...parts.flatMap((part) => [Buffer.from("/"), part])]);
+  // Latin-1의 "café"와 Shift_JIS의 "テスト". 둘 다 UTF-8로 읽으면 다른 문자열이 된다.
+  const latin1 = Buffer.from([0x63, 0x61, 0x66, 0xe9]);
+  const sjis = Buffer.from([0x83, 0x65, 0x83, 0x58, 0x83, 0x67]);
+  writeFileSync(at(latin1), "x");
+  mkdirSync(at(sjis));
+  writeFileSync(at(sjis, latin1), "secret");
+  mkdirSync(at(Buffer.from("plain")));
+  writeFileSync(at(Buffer.from("plain"), sjis), "y");
+  const space = rootWorkspace(root);
+  expect(await space.entries()).toBe(3);
+  expect(await space.clear()).toBe(0);
+  expect(readdirSync(root)).toEqual([]);
+});
+
 test("작업 공간: 루트를 읽지 못하면 entries·clear가 던진다(대리는 null로 답하고 띄우지 않는다)", async () => {
   const missing = join(fresh("olive-workspace-"), "absent");
   const space = rootWorkspace(missing);

@@ -242,6 +242,12 @@ export class RoleAgent {
     };
     this.run = run;
     this.arm(run);
+    // 지우는 중에 온 start는 받은 때 거절한다. 사전 계수를 기다리는 사이 정리가 끝나도 띄우지 않게 결정을 미루지 않고,
+    // 자격 값은 꺼내지 않고 0으로 채워 버린다. 실행은 열린 채로 두어 다른 거절처럼 count의 0으로 닫힌다.
+    if (this.clearing) {
+      start.credential.discard();
+      return this.ended(run, { type: "not_spawned", run_id: run.runId, reason: "cleanup_busy" });
+    }
     const value = start.credential.take();
     let plan: LaunchPlan | null = null;
     try {
@@ -264,12 +270,14 @@ export class RoleAgent {
     // 앞 실행이 남긴 파일(다른 계정의 자격 파일일 수 있다)을 이 실행이 읽지 않게, 작업 공간이 비었을 때만 띄운다(D-154).
     const entries = await this.workspace.entries().catch(() => null);
     if (entries !== 0) return notSpawned("space_not_clean");
+    // 폴더 만들기도 효과다. 세는 사이 닫힘·취소·기한·정리가 왔으면 띄우지 않을 실행의 폴더를 빈 공간에 남기지 않는다.
+    const beforeEnter = this.stale(run);
+    if (beforeEnter !== null) return notSpawned(beforeEnter);
     // 프로필 cwd가 루트 아래 하위 폴더면 비운 뒤라 없다. 빈 것을 본 뒤에 만든다.
     if (!(await this.workspace.enter(plan.cwd).then(() => true, () => false))) return notSpawned("spawn_failed");
-    // 세는 사이 링크·취소·기한이 바뀌었을 수 있다. 여기서 launcher의 spawn까지 await가 없다.
-    if (this.clearing) return notSpawned("cleanup_busy");
-    if (this.closing || this.run !== run || run.controller.signal.aborted) return notSpawned("aborted");
-    if (this.expired(run)) return notSpawned("expired");
+    // 만드는 사이에도 바뀌었을 수 있다. 여기서 launcher의 spawn까지 await가 없다.
+    const beforeSpawn = this.stale(run);
+    if (beforeSpawn !== null) return notSpawned(beforeSpawn);
     let spawned = false;
     try {
       const outcome = await this.launcher.run(plan, run.controller.signal, {
@@ -298,6 +306,14 @@ export class RoleAgent {
       // 끝을 확인하지 못했다(ExitUnconfirmed 등). 남은 수는 제어가 묻는다.
       this.ended(run, { type: "unconfirmed", run_id: runId });
     }
+  }
+
+  // await 뒤에 효과(폴더 만들기, 띄우기)를 내기 전의 다시 보기. 띄우면 안 되는 사유, 없으면 null.
+  private stale(run: Run): NotSpawnedReason | null {
+    if (this.clearing) return "cleanup_busy";
+    if (this.closing || this.run !== run || run.controller.signal.aborted) return "aborted";
+    if (this.expired(run)) return "expired";
+    return null;
   }
 
   private ended(run: Run, message: AgentMessage): void {

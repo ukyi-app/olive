@@ -96,13 +96,16 @@ export class FakeSpace implements ProcessCleanup {
   counts: (number | null)[] = [];
   countCalls = 0;
   hangTerminate = false;
+  // 있으면 survivors가 이것이 풀린 뒤에 답한다(값은 부른 때 정한다). 계수가 다른 일보다 늦게 끝나는 순서를 만드는 자리.
+  countGate: Promise<void> | undefined;
   terminate(): Promise<void> {
     this.terminations++;
     return this.hangTerminate ? new Promise(() => {}) : Promise.resolve();
   }
   survivors(): Promise<number | null> {
     this.countCalls++;
-    return Promise.resolve(this.counts.length > 0 ? this.counts.shift()! : 0);
+    const value = this.counts.length > 0 ? this.counts.shift()! : 0;
+    return (this.countGate ?? Promise.resolve()).then(() => value);
   }
   busy(): boolean {
     return false;
@@ -117,7 +120,10 @@ export class FakeWorkspace implements RunWorkspace {
   clears = 0;
   // clear가 돌아오기 전에 시험이 끼어드는 자리.
   clearGate: Promise<void> | undefined;
+  // entries가 돌아오기 전에 시험이 끼어드는 자리.
+  entriesGate: Promise<void> | undefined;
   async entries(): Promise<number> {
+    await this.entriesGate;
     const next = this.entryCounts.shift() ?? 0;
     if (next instanceof Error) throw next;
     return next;

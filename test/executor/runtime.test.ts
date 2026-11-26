@@ -13,6 +13,7 @@ import {
   type ExecutorDeps,
   type ExecutorSettings,
   type StartResult,
+  parseProfile,
   type StartStep,
   startExecutor,
 } from "../../src/executor/runtime.ts";
@@ -502,6 +503,34 @@ test("재료 틀림(D-154): 프로필 cwd나 HOME이 작업 공간(/tmp) 밖이�
   }
   const files = contents();
   files.set(FILES.profile, JSON.stringify({ ...PROFILE, cwd: "/tmp/work", env: { HOME: "/tmp/home" } }));
+  expect(await begin(harness({ files }))).toMatchObject({ ok: true });
+});
+
+test("재료 틀림(D-154): 자격 환경 이름이 HOME이면(역할이 받는 HOME이 자격 문자열이다) cwd가 /tmp 아래여도 82, 저장소·연결 0. VM 시험 프로필 둘은 그대로 받는다", async () => {
+  for (const profile of [
+    { ...PROFILE, credentialEnv: "HOME" },
+    { ...PROFILE, cwd: "/tmp/work", credentialEnv: "HOME" },
+  ]) {
+    const files = contents();
+    files.set(FILES.profile, JSON.stringify(profile));
+    const h = harness({ files });
+    expect(await begin(h), JSON.stringify(profile)).toMatchObject({ ok: false, step: "material", code: EXECUTOR_EXIT.material, reason: "profile_outside_workspace" });
+    expect(h.calls).not.toContain("openStore");
+    expect(h.connects).toBe(0);
+  }
+  // VM 시험 프로필(진단·격리 읽기)의 꼴: cwd는 /tmp, 고정 HOME 없음, 자격 환경 이름은 HOME이 아니다.
+  const vm = (role: "diagnosis" | "isolated_reader") => ({
+    role,
+    revision: "t1-fixed-1",
+    program: "/bin/sh",
+    argv: ["-c", "printf '%s\\n' \"$FIXED_RESULT\""],
+    cwd: "/tmp",
+    env: { FIXED_RESULT: JSON.stringify({ role, outcome: "completed", summary: "고정 결과", items: [], refs: [] }) },
+    credentialEnv: "CLAUDE_CODE_OAUTH_TOKEN",
+  });
+  for (const role of ["diagnosis", "isolated_reader"] as const) expect(parseProfile(JSON.stringify(vm(role))), role).toMatchObject({ role, cwd: "/tmp" });
+  const files = contents();
+  files.set(FILES.profile, JSON.stringify(vm("diagnosis")));
   expect(await begin(harness({ files }))).toMatchObject({ ok: true });
 });
 

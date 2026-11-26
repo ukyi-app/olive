@@ -449,6 +449,19 @@ if (problem !== null) {
     expect(await fileGrowing(report.witness), "대리가 끝난 뒤에도 후손이 돈다").toBe(false);
   });
 
+  test("실제 프로세스 대리 cleanfiles: 실제 역할이 작업 공간에 쓴 파일을 끝내기·세기(0) 뒤 링크 clean이 모두 지워 left 0을 답하고, 대리와 따로 본 폴더도 비었다", () => {
+    const result = runScenario<AgentResult & { workspace: string; written: number; left: number | null; remaining: number }>("agent-cleanfiles", AS_PID_1);
+    expect(result.pid).toBe(1);
+    expect(result.exited.code).toBe(0);
+    expect(result.survivors).toBe(0);
+    // work·home 아래 12개(숨김 파일, 깊은 폴더, 루트 밖 링크, UTF-8이 아닌 이름, HOME의 자격 파일). 써야 시험이 뜻을 가진다.
+    expect(result.written).toBe(12);
+    expect(result.left).toBe(0);
+    expect(result.remaining).toBe(0);
+    // 공간 밖(이 시험 프로세스)에서도 따로 본다. 루트(마운트 지점 자리)는 남는다.
+    expect(readdirSync(result.workspace)).toEqual([]);
+  });
+
   test("실제 프로세스 대리 nondumpable: 대리가 뜬 뒤에는 같은 uid의 자식이 /proc/1/environ·/proc/1/root를 읽지 못한다(뜨기 전에는 읽었다)", () => {
     const result = runScenario<AgentResult>("agent-nondumpable", AS_PID_1);
     expect(result.pid).toBe(1);

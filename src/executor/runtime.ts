@@ -284,7 +284,8 @@ export function parseProfile(text: string): RoleProfile {
   });
   if (!linkCarries(profile)) throw new MaterialError("profile_link_unencodable");
   // 대리는 실행 사이에 작업 공간(/tmp) 전체를 비운다(D-154). 작업 폴더와 HOME이 그 밖이면 모델 CLI가 쓴 파일(자격 파일 포함)이 정리 밖에 남는다.
-  if (!insideWorkspace(profile.cwd) || (Object.hasOwn(profile.env, "HOME") && !insideWorkspace(profile.env.HOME!))) {
+  // 자격 환경 이름이 HOME이면 역할이 받는 HOME은 자격 문자열이라 기동 때 작업 공간 아래임을 보장할 수 없다.
+  if (!insideWorkspace(profile.cwd) || profile.credentialEnv === "HOME" || (Object.hasOwn(profile.env, "HOME") && !insideWorkspace(profile.env.HOME!))) {
     throw new MaterialError("profile_outside_workspace");
   }
   return profile;

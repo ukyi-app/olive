@@ -724,6 +724,9 @@ export class WorkerExecutor {
     } catch {
       return;
     }
+    // 대리의 답을 기다리는 사이 감독 연결·세대가 바뀌었을 수 있다. 영수증은 지금 연결의 권한으로만 처음 적는다.
+    // 거절이면 의도(예약 영수증 ID)와 cleanup_pending을 그대로 두고, 지금 연결의 확정 재전송이 다시 지우고 같은 ID로 낸다.
+    if (!this.authorized(header.stop_generation, epoch)) return;
     const fields = { run_id: runId, instruction_request_id: intent.request_id, cleaned_at: this.now() };
     const event = this.event("receipt_cleaned", runId, fields, intent.instruction_digest, intent.receipt_id);
     await this.transition(runId, { state: "finalized" }, [event]);

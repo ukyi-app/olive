@@ -4,7 +4,7 @@ import { expect, test } from "bun:test";
 import { type AgentMessage, ControlDecoder, encodeAgent, type ReceivedControl } from "../../src/agent/link.ts";
 import { createCredentialInbox } from "../../src/executor/credential-inbox.ts";
 import type { AgentLinkSession, RemoteAgent } from "../../src/executor/remote-agent.ts";
-import { fromSupervisor, type Rig, rig, sha256, start, until } from "./support.ts";
+import { fromSupervisor, type Rig, reconnect, rig, sha256, start, until } from "./support.ts";
 
 // 대리 자리. 끝내기·세기에는 같은 호출 안에서 답한다(남은 0). clean에는 left로 답하고, undefined면 답하지 않는다(시험이 reply로 낸다).
 class CleanAgent {
@@ -155,6 +155,33 @@ test("원격 정리 끊김: 답을 기다리는 사이 링크가 끊기면 clean
   expect(next.cleans()).toHaveLength(1);
   expect(stateOf(r, runId)).toBe("finalized");
   expect(r.transport.of("receipt_cleaned")).toHaveLength(1);
+});
+
+test("원격 정리 연결 교체: 대리의 답을 기다리는 사이 감독 연결이 바뀌면 그 0으로 첫 영수증을 기록하지 않고(의도·cleanup_pending 보존), 새 연결의 확정 재전송 뒤에만 처음 의도의 영수증 ID로 낸다", async () => {
+  const agent = new CleanAgent();
+  // 연결을 바꾸는 동안 대리 답의 기한(replyWaitMs)이 지나지 않게 넉넉히 둔다.
+  const r = await rig({ exitWaitMs: 5_000, remote: { attach: (remote) => agent.attach(remote) } });
+  const runId = await finishedRun(r, agent);
+  const finalize = finalizer(r, runId);
+  agent.left = undefined;
+  const handling = r.connection.receive(finalize());
+  await until(() => agent.cleans().length === 1);
+  const intent = r.store.run(runId)!.cleanup!;
+  await reconnect(r, 0);
+  // 확정을 보낸 연결은 끝났다. 대리는 제때 0을 답한다.
+  agent.reply(0);
+  await handling;
+  await r.worker.idle();
+  expect(stateOf(r, runId)).toBe("cleanup_pending");
+  expect(r.store.run(runId)!.cleanup).toEqual(intent);
+  expect(r.store.outboxFor(runId).filter((entry) => entry.action === "receipt_cleaned")).toHaveLength(0);
+  expect(r.transport.of("receipt_cleaned")).toHaveLength(0);
+  // 지금 연결의 재전송이 다시 지우고 확인한 뒤에야 낸다.
+  agent.left = 0;
+  await r.connection.receive(finalize());
+  expect(agent.cleans()).toHaveLength(2);
+  expect(stateOf(r, runId)).toBe("finalized");
+  expect(r.transport.of("receipt_cleaned").map((envelope) => envelope.body)).toMatchObject([{ receipt_id: intent.receipt_id, run_id: runId }]);
 });
 
 test("원격 정리: 시작 응답을 기다리는 중(실행 중 단계)에는 대리에게 묻지 않고 false다", async () => {

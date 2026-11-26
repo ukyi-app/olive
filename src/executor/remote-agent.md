@@ -96,7 +96,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 - `survivors()`가 0을 돌려주는 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle`이나 `ended` 단계에 새로 보낸 `count`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고, 그 `count`보다 먼저 보낸 가장 최근의 `terminate`도 `replyWaitMs` 안에 답했고, 그 값이 0이다. "안에"는 받은 때의 주입 단조 시계로 잰다.
 - `terminated`는 0으로 쓰이지 않는다. `terminate()`는 값을 돌려주지 않는다.
-- **정리 확인:** `space().clean`이 true인 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle` 단계이고 기다리는 `terminate`·`clean`이 없을 때 새로 보낸 `clean`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고 `left`가 0이다. false면 worker가 `cleanup_pending`으로 슬롯을 쥐고 감독의 확정 재전송이 다시 부른다.
+- **정리 확인:** `space().clean`이 true인 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle` 단계이고 기다리는 `terminate`·`clean`이 없을 때 새로 보낸 `clean`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고 `left`가 0이다. false면 worker가 `cleanup_pending`으로 슬롯을 쥐고 감독의 확정 재전송이 다시 부른다. true여도 worker는 우편함을 비운 뒤 정리 영수증을 처음 적기 직전에 지금 연결·정지 세대의 권한을 다시 본다: 답을 기다리는 사이 감독 연결이 바뀌었으면 적지 않고 `cleanup_pending`과 예약 영수증 ID를 그대로 두며, 지금 연결의 확정 재전송이 다시 묻고 같은 ID로 낸다.
 - 서명하지 않는다. 대리의 답은 서명 없는 사실이고 영수증은 worker가 자기 키로 낸다.
 - 자격 값은 값 틀 하나에만 실린다. `state()`·`AgentUnavailable`·`AgentListenerRefused`에는 사유 이름만 있다.
 - 듣는 곳은 `agent-listener.ts`의 경로 유닉스 소켓 하나다. 경로는 `/`로 시작해야 하고 NUL을 담지 못한다(abstract 이름 거절). TCP·다른 소켓 API는 실행기 코드에 없다(`test/executor/static.test.ts`).
@@ -124,7 +124,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 ## 시험
 
 - `test/executor/remote-agent.test.ts`: 시험이 대리 자리에서 링크의 말을 직접 정해 worker 전체를 지난다. 대조군(0 → `receipt_stopped`), 띄우기 보류, 대리 죽음과 새 `hello`, 늦은 답과 `terminated`만의 답, 늦은 끝내기, 늦은 최종 계수(원격 단계·연결 세대까지), 응답 시각(시계만 기한을 넘기고 타이머는 돌지 않은 계수·끝내기·시작의 답, 기한 직전 대조군), 두 번째 연결(계수 대기 중, 쉬는 동안), 0 아닌 수·모름, 순서 틀림·모르는 말 다섯, 출력 상한, 시작 응답 상한, 잘린 틀, 끝의 시각, 깊은 결과(R16)·끝난 뒤 임대(R11)·nonce 장애(F10), 확인 없는 기동, 자격 값의 자리, renew 맞춤.
-- `test/executor/remote-clean.test.ts`: 확정 → `clean` → `cleaned` 0 → `receipt_cleaned`·`finalized`, 남은 수·모름 뒤 재전송으로 처음 의도의 영수증 ID, 기한 넘김·늦은 0·기다리는 동안 다시 묻지 않음, 대기 중 끊김(잠그지 않음) 뒤 새 대리, 실행 중 단계에서 묻지 않음, 영수증 직전의 우편함 0.
+- `test/executor/remote-clean.test.ts`: 확정 → `clean` → `cleaned` 0 → `receipt_cleaned`·`finalized`, 남은 수·모름 뒤 재전송으로 처음 의도의 영수증 ID, 기한 넘김·늦은 0·기다리는 동안 다시 묻지 않음, 대기 중 끊김(잠그지 않음) 뒤 새 대리, 대기 중 감독 연결 교체(그 0으로 첫 영수증 0건, 새 연결의 재전송 뒤에만 처음 의도의 ID로 발행), 실행 중 단계에서 묻지 않음, 영수증 직전의 우편함 0.
 - `test/executor/remote-start-timer.test.ts`: 시작 기한의 타이머가 정각보다 먼저 돌아도 기한 안의 `spawned`를 시작으로 기록하고, 다시 건 기다림이 기한에 닿으면 끝내기를 보낸다.
 - `test/executor/agent-listener.test.ts`: 스크래치 경로 소켓에 실제 대리 핵심(`RoleAgent`, 가짜 launcher·정리 코어)을 붙여 `hello → start → exited → terminate → count 0`이 `receipt_stopped`의 0까지 닿는 것, 실제 대리의 끝내기 응답만·최종 계수만 늦은 경우, 실제 소켓의 두 번째 연결, 경로·권한 거절, 다 못 쓴 바이트의 이어 쓰기와 0 채우기, 이어 쓰기 예외의 정리, 공개 면.
 - `test/executor/remote-{worker,ordering,recovery,hardening,evidence}.test.ts`: 기존 실행기 시험 파일을 원격 구현과 가짜 대리(`fake-agent.ts`)로 한 번 더 돌린다. 링크로 옮길 수 없는 가짜 launcher를 전제한 넷(`support.ts`의 `DIRECT_ONLY`: 끝을 drain 전에 알리는 셋, 출력 상한을 넘기는 하나)만 등록하지 않고 그 이름을 대조한다. 그 넷이 지키던 보장 가운데 링크로 옮길 수 있는 것(깊은 결과의 종료 증거, 끝난 뒤 임대, nonce 장애 뒤의 완료)은 `remote-agent.test.ts`가 제어가 끝을 관측한 뒤를 기준으로 다시 본다. drain 중 임대 만료의 `completed`만 링크에서 성립하지 않는다("끝의 시각").
