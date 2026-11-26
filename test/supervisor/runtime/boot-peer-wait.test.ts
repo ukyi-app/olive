@@ -206,6 +206,22 @@ describe("복원 2단계 앞에서 필수 실행기를 기다린다(D-142·D-143
     expect(await running.stop()).toBe(0);
   });
 
+  // 실행기 둘이면 기다리지 않으므로, 둘 다 이미 붙어 있으면 main과 같이 곧바로 열려야 한다(실행기 수 조건이 접수를 막지 않음).
+  test("(다) 필수 실행기 둘이 1단계 전에 이미 모두 붙어 있으면 기다리지 않는다: 1단계 다음 주기에 2단계, 접수 열림", async () => {
+    const t = arrange(2);
+    t.connect(1, EXECUTOR);
+    t.connect(2, WORKER_B);
+    const running = await started(t);
+    await until(t.w, () => t.judged(5) !== undefined);
+    expect(t.judged(5)!.fields).toEqual({ step: 5, intakeMayOpen: true, closedBecause: "" });
+    expect(t.judged(2)!.at - t.judged(1)!.at).toBeLessThanOrEqual(BEAT_EVERY_MS);
+    expect([t.asked.length, t.calls.step2]).toEqual([1, 1]);
+    expect(t.asked[0]).toBe(t.judged(2)!.at);
+    expect([t.named("restore_wait").length, t.named("restore_wait_end").length]).toEqual([0, 0]);
+    expect(t.fatal()).toBeNull();
+    expect(await running.stop()).toBe(0);
+  });
+
   test("(라) 기다리는 중 멈춤: 2단계를 부르지 않고 장부 쓰기 0, 0으로 끝난다", async () => {
     // 기다리는 것은 필수 실행기 하나가 빠졌을 때뿐이라, 장부 밖 실행을 든 실행기는 멈춤 뒤에 붙인다.
     const t = arrange(1);
