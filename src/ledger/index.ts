@@ -4,11 +4,13 @@ export { classify, type Faults, LedgerUnavailableError, UNAVAILABLE_REASONS, typ
 export { type CredentialRef, LedgerInputError, type SourceRef } from "./input.ts";
 export {
   type AdmitRunInput,
+  type AnswerAlarm,
   type AnswerSightingsInput,
   type AssignToolRequestInput,
   type DeferredLoss,
   type Delivery,
   type EnvelopeFrom,
+  type ExecutorAnswerAlarm,
   type ExecutorAnswerInput,
   type ExecutorAnswerResult,
   type ExecutorAnswerUnsaved,
