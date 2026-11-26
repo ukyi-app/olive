@@ -82,9 +82,11 @@ export const libcSocketOptions: SocketOptionPort = Object.freeze({
   },
 });
 
-// sa_family는 호스트 바이트 순서(u16), 포트는 망 바이트 순서다. IPv6의 scope id가 0이 아니면(링크 로컬 영역) 주소와 포트만으로
-// 연결을 가르지 못하므로 null이다.
-function decodeSockaddr(storage: Uint8Array, length: number): SocketAddress | null {
+// sa_family는 호스트 바이트 순서(u16), 포트는 망 바이트 순서다. IPv6의 scope id가 0이 아니면(링크 로컬 영역) null이다.
+// Linux의 scope id는 인터페이스 번호라, 그것을 버리고 주소·포트만 대면 다른 인터페이스의 같은 링크 로컬 주소와 가르지 못한다.
+// 런타임 주소 글에는 영역이 오지 않아(Bun 1.4.4, 링크 로컬 연결에서 '%' 없음) 대 볼 짝도 없다. 그래서 링크 로컬 연결은
+// 올바른 fd여도 keepalive_failed로 닫힌다. 감독·실행기는 파드 망의 클러스터 주소로 붙고 링크 로컬 주소를 쓰지 않으므로 받아들인 한계다.
+export function decodeSockaddr(storage: Uint8Array, length: number): SocketAddress | null {
   const view = new DataView(storage.buffer, storage.byteOffset, storage.byteLength);
   const family = new Uint16Array(storage.buffer, storage.byteOffset, 1)[0];
   let bytes: Uint8Array;

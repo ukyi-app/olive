@@ -2,7 +2,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { closeSync, openSync } from "node:fs";
 import * as net from "node:net";
-import { libcSocketOptions, type SocketAddress, type SocketOptionName, type SocketOptionPort, type SocketSide } from "../../src/transport/keepalive-ffi.ts";
+import { decodeSockaddr, libcSocketOptions, type SocketAddress, type SocketOptionName, type SocketOptionPort, type SocketSide } from "../../src/transport/keepalive-ffi.ts";
 import {
   enableKeepAlive,
   KEEPALIVE_INITIAL_DELAY_MS,
@@ -215,12 +215,36 @@ test("fd의 양 끝 대조: IPv4와 그 매핑 IPv6, 줄인·편 IPv6, 대소문
   const v6: [string, string][] = [
     ["::1", "00000000000000000000000000000001"],
     ["2001:db8::1", "20010db8000000000000000000000001"],
-    ["fd7a:115c:a1e0::1:2", "fd7a115ca1e000000000000000010002"],
+    ["2001:db8:a1e0::1:2", "20010db8a1e000000000000000010002"],
     ["1:2:3:4:5:6:7::", "00010002000300040005000600070000"],
   ];
   for (const [text, hex] of v6) {
     const f = fake({ socket: { remoteAddress: text }, address: (side, real) => (side === "peer" ? { ...real, address: hex } : real) });
     expect(enableKeepAlive(f.socket, f.options), text).toBe(true);
+  }
+});
+
+// 링크 로컬 IPv6의 영역은 받아들인 한계다(keepalive-ffi.ts decodeSockaddr 주석): 감독·실행기는 파드 망의 클러스터 주소로 붙는다.
+// 영역을 버리고 주소·포트만 대면 다른 인터페이스의 같은 주소와 가르지 못하므로, 올바른 fd여도 닫는 쪽에 둔다.
+test("fd의 양 끝 대조: 커널 주소의 IPv6 scope id가 0이 아니면(링크 로컬 영역) 런타임 주소 글이 맞아도 되읽기·넣기 없이 false다", () => {
+  const sockaddrIn6 = (scope: number) => {
+    const storage = new Uint8Array(128);
+    const view = new DataView(storage.buffer);
+    new Uint16Array(storage.buffer, 0, 1)[0] = 10; // AF_INET6, 호스트 바이트 순서
+    view.setUint16(2, 40_000, false);
+    storage.set([0xfe, 0x80], 8);
+    storage[23] = 1;
+    view.setUint32(24, scope, true);
+    return storage;
+  };
+  expect(decodeSockaddr(sockaddrIn6(0), 28)).toEqual({ address: "fe800000000000000000000000000001", port: 40_000 });
+  const control = fake({ socket: { localAddress: "fe80::1" }, address: (side, real) => (side === "local" ? decodeSockaddr(sockaddrIn6(0), 28) : real) });
+  expect(enableKeepAlive(control.socket, control.options)).toBe(true);
+  for (const scope of [1, 2, 0xffff_ffff]) {
+    expect(decodeSockaddr(sockaddrIn6(scope), 28), String(scope)).toBeNull();
+    const f = fake({ socket: { localAddress: "fe80::1" }, address: (side, real) => (side === "local" ? decodeSockaddr(sockaddrIn6(scope), 28) : real) });
+    expect(enableKeepAlive(f.socket, f.options), String(scope)).toBe(false);
+    expect(f.calls.filter((c) => c[0] === "get" || c[0] === "set"), String(scope)).toEqual([]);
   }
 });
 

@@ -78,9 +78,13 @@ function handleFd(socket: KeepAliveSocket): number | null {
   return Number.isSafeInteger(fd) && (fd as number) >= 0 ? (fd as number) : null;
 }
 
-// fd가 이 소켓의 연결인지 커널에 묻는다. 한 망 이름공간에서 맺어진 TCP 연결은 로컬·상대 주소·포트 넷으로 하나다(같은 연결의 반대쪽
-// 소켓은 넷이 뒤집혀 다르다). 런타임 값 둘(SO_KEEPALIVE·TCP_KEEPIDLE)은 같은 옵션을 켠 다른 연결과 가르지 못해 이것이 먼저다.
-// 런타임 주소 글이나 커널 주소를 꼴로 읽지 못하면(영역이 붙은 IPv6 등) 모호한 것으로 보고 false다.
+// fd가 이 소켓의 연결인지 커널에 묻는다. 런타임 값 둘(SO_KEEPALIVE·TCP_KEEPIDLE)은 같은 옵션을 켠 다른 연결과 가르지 못해 이것이 먼저다.
+// 전제: 이 망 이름공간에 VRF(독립 라우팅 도메인)가 없어, 맺어진 TCP 연결이 로컬·상대 주소·포트 넷으로 하나다(같은 연결의 반대쪽
+// 소켓은 넷이 뒤집혀 다르다). 감독·실행기는 파드 망에서 돌고 파드 망은 한 이름공간에 VRF를 여럿 두지 않는다. 이 전제는 코드로
+// 확인하지 않는다(/proc를 훑지 않는다). 깨지면, 곧 다른 VRF에 같은 넷의 소켓이 있으면 커널은 장치까지 따져 둘을 가르지만 여기서는
+// 같아 보여 그 다른 소켓에 값을 쓰고 true를 돌려줄 수 있다.
+// 런타임 주소 글이나 커널 주소를 꼴로 읽지 못하면 모호한 것으로 보고 false다. 영역(scope id)이 붙은 링크 로컬 IPv6도 여기서 닫힌다:
+// 올바른 fd여도 keepalive_failed다(keepalive-ffi.ts의 decodeSockaddr). 파드 망의 클러스터 주소만 쓰므로 받아들인 한계다.
 function sameConnection(socket: KeepAliveSocket, fd: number, options: SocketOptionPort): boolean {
   const local = runtimeAddress(socket.localAddress, socket.localPort);
   const remote = runtimeAddress(socket.remoteAddress, socket.remotePort);

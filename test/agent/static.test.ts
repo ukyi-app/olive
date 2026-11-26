@@ -1,6 +1,6 @@
 // 대리 코드의 정적 확인: 띄우기·신호·/proc은 실행기의 한 자리(launcher.ts, containment.ts)를 거치고,
 // 소켓을 열거나 듣지 않고, 환경·시계·타이머·끝내기를 직접 부르지 않는다. bun:ffi는 src/ 전체에서 dumpable.ts와 transport/keepalive-ffi.ts 두 곳이다.
-// libc 기호는 dlopen에 넘긴 객체의 모든 키로 센다. 해석할 수 없는 꼴로 적으면 실패한다.
+// libc 기호는 파일마다 하나뿐인 dlopen 호출에 넘긴 객체의 모든 키로 센다. 해석할 수 없는 꼴로 적으면 실패한다.
 import { expect, test } from "bun:test";
 import { list, readText } from "../files.ts";
 
@@ -36,13 +36,26 @@ test("정적: 대리 코드는 받은 메시지를 로그·inspect로 내보내�
   for (const file of files) expect(banned.test(await code(file)), file).toBe(false);
 });
 
-// dlopen("libc.so.6", { … })에 넘긴 객체 글을 괄호를 세어 떼고, 맨 위 단계의 항목을 모두 "이름: { … }" 꼴로 읽는다.
-// 그 꼴이 아닌 항목(펼치기, 계산된 키, 문자열 키, 줄임 키, 값이 객체 글이 아님)이나 객체 안의 문자열·주석·나눗셈, 셋째 인자는 해석할 수 없어 null이다.
-// 줄바꿈은 따지지 않는다: 기호를 한 줄로 적든 여러 줄로 적든 같은 키다.
+// 파일 안의 dlopen 낱말을 모두 센다. bun:ffi의 이름 가져오기 목록 안의 것만 빼고, 나머지는 쓰임새를 가리지 않고 사용처다
+// (호출, 이름과 괄호 사이 공백·줄바꿈, 다른 이름에 담기, 속성 읽기, 문자열 안). 사용처가 하나가 아니면 아래 기호 검사가 그 하나를 볼 수 없다.
+function dlopenUses(source: string): number[] {
+  const imported = new Set<number>();
+  for (const statement of source.matchAll(/\bimport\s*\{[^}]*\}\s*from\s*"bun:ffi"/g)) {
+    for (const name of statement[0].matchAll(/\bdlopen\b/g)) imported.add(statement.index + name.index);
+  }
+  return [...source.matchAll(/\bdlopen\b/g)].map((match) => match.index).filter((at) => !imported.has(at));
+}
+
+// 유일한 사용처가 dlopen("libc.so.6", { … }) 호출이면 넘긴 객체 글을 괄호를 세어 떼고, 맨 위 단계의 항목을 모두 "이름: { … }" 꼴로 읽는다.
+// 사용처가 하나가 아니거나 그 꼴의 호출이 아니면, 또는 그 꼴이 아닌 항목(펼치기, 계산된 키, 문자열 키, 줄임 키, 값이 객체 글이 아님)이나
+// 객체 안의 문자열·주석·나눗셈, 셋째 인자가 있으면 해석할 수 없어 null이다.
+// 공백·줄바꿈은 따지지 않는다: 기호를 한 줄로 적든 여러 줄로 적든 같은 키다.
 function dlopenSymbols(source: string): string[] | null {
-  const call = /\bdlopen\("libc\.so\.6", \{/.exec(source);
+  const uses = dlopenUses(source);
+  if (uses.length !== 1) return null;
+  const call = /^dlopen\s*\(\s*"libc\.so\.6"\s*,\s*\{/.exec(source.slice(uses[0]!));
   if (call === null) return null;
-  const open = call.index + call[0].length - 1;
+  const open = uses[0]! + call[0].length - 1;
   let depth = 0;
   let end = -1;
   for (let i = open; i < source.length && end < 0; i++) {
@@ -83,7 +96,7 @@ test("정적: bun:ffi는 dumpable.ts(prctl 하나)와 transport/keepalive-ffi.ts
   expect(users).toEqual(["src/agent/dumpable.ts", "src/transport/keepalive-ffi.ts"]);
   const opened = async (file: string) => {
     const source = await code(file);
-    return { dlopen: [...source.matchAll(/\bdlopen\(/g)].length, libc: [...source.matchAll(/\bdlopen\("libc\.so\.6", \{/g)].length, symbols: dlopenSymbols(source) };
+    return { dlopen: dlopenUses(source).length, libc: [...source.matchAll(/\bdlopen\s*\(\s*"libc\.so\.6"\s*,\s*\{/g)].length, symbols: dlopenSymbols(source) };
   };
   expect(await opened("src/agent/dumpable.ts")).toEqual({ dlopen: 1, libc: 1, symbols: ["prctl"] });
   expect(await opened("src/transport/keepalive-ffi.ts")).toEqual({ dlopen: 1, libc: 1, symbols: ["getpeername", "getsockname", "getsockopt", "setsockopt"] });

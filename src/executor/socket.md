@@ -127,7 +127,8 @@ ExecutorSocket = {
 
 감독이 FIN·RST 없이 사라지면 소켓은 끝을 알리지 않는다. 이 소켓은 붙은 소켓을 `link.open`에 넘기기 전에 `src/transport/keepalive.ts`의 `enableKeepAlive`로 TCP keepalive를 켜고 탐침 간격·횟수와 `TCP_USER_TIMEOUT`을 넣어, 운영체제가 그런 연결을 끊게 한다. 계약 v1 메시지는 바꾸지 않는다. 값(첫 탐침 지연 30초, 간격 10초 × 4회, `TCP_USER_TIMEOUT` 70초)과 넣는 차례(런타임 `setKeepAlive` 뒤 fd의 양 끝 주소·포트를 런타임 소켓의 것과 대조, libc `setsockopt`, 넣기 전·뒤 되읽기)는 감독 서버와 같은 한 자리이고 **T1 실측 뒤 조정한다**(`src/supervisor/transport/server.md` "반쯤 열린 연결").
 
-- **켜지 못하면 열지 않는다.** `setKeepAlive`의 읽기나 호출이 던지거나, fd(`_handle.fd`)를 얻지 못하거나, 그 fd의 양 끝 주소·포트가 이 연결과 맞지 않거나(다른 연결의 fd에는 아무것도 넣지 않는다), 넣기가 실패하거나, 되읽은 값이 하나라도 다르면 소켓을 닫고 `connect_failed`(`keepalive_failed`)를 알리고 실패로 세어 간격을 두고 다시 붙는다. 이 확인은 멈춤·다른 붙기로 넘어감의 확인 뒤, `destroyed` 확인 앞이다.
+- **켜지 못하면 열지 않는다.** `setKeepAlive`의 읽기나 호출이 던지거나, fd(`_handle.fd`)를 얻지 못하거나, 그 fd의 양 끝 주소·포트가 이 연결과 맞지 않거나(VRF가 없는 이 망 이름공간이라는 전제에서 다른 연결의 fd에는 아무것도 넣지 않는다, `server.md`), 넣기가 실패하거나, 되읽은 값이 하나라도 다르면 소켓을 닫고 `connect_failed`(`keepalive_failed`)를 알리고 실패로 세어 간격을 두고 다시 붙는다. 이 확인은 멈춤·다른 붙기로 넘어감의 확인 뒤, `destroyed` 확인 앞이다.
+- **링크 로컬 IPv6(0이 아닌 scope id)로 붙은 연결은 올바른 fd여도 `keepalive_failed`로 닫히고 다시 붙기를 되풀이한다.** scope id(인터페이스 번호)는 런타임 주소 글에 오지 않아 fd 대조가 가르지 못한다. 실행기는 파드 망에서 감독의 클러스터 주소로 붙고 링크 로컬 주소를 쓰지 않으므로 받아들인 한계다(`server.md` "반쯤 열린 연결"의 넣는 차례).
 - **이미 끊긴 소켓은 기존 사유로 닫는다.** `destroyed`인 소켓에는 아무것도 넣지 않고 지나가, 뒤의 `destroyed` 확인이 `connect_failed`(`tls_error`)로 닫는다.
 - **이 뒤 같은 소켓에 `setKeepAlive`를 다시 부르지 않는다.** 다른 지연으로 부르면 런타임이 간격 1초·10회를 다시 넣는다.
 - **끊긴 뒤는 기존 닫힘 길이다.** 운영체제가 소켓을 오류(`ETIMEDOUT`)로 끝내면 `closed`(`socket_error`)이고 `Connection.close()` 뒤 간격을 두고 다시 붙는다.
