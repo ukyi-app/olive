@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, getRandomValues } from "node:crypto";
 import { type RunStatus, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
+import { RESTORE_KEY } from "../../../src/ledger/ledger.ts";
 import { checkingRunIds } from "../../../src/supervisor/dispatch/result-check.ts";
 import { type AnswerNote, createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
 import { createQueryBook, createResultWaitQueries, RESULT_WAIT_QUERIES_KEPT } from "../../../src/supervisor/runtime/query-book.ts";
@@ -55,12 +56,58 @@ describe("결과 기다림 조회의 고르기", () => {
     expect(() => createResultWaitQueries(0)).toThrow(RangeError);
   });
 
-  test("checking 목록은 장부의 읽기 하나로 낸다. 한 줄이라도 읽지 못하면 모름(null)이다", () => {
+  test("checking 목록은 장부의 관측 읽기 하나(peekCheckingRuns)로 낸다. 읽지 못하거나 실행 ID가 틀리거나 같은 ID가 둘이면 모름(null)이다", () => {
     const ledger = ready(open(tempPath()));
     const run = checking(ledger);
+    must(ledger.admitRun(worker()));
+    expect(ledger.peekCheckingRuns()).toEqual({ known: true, value: [run.runId] });
     expect(checkingRunIds(ledger)).toEqual(new Set([run.runId]));
-    expect(checkingRunIds({ listRuns: () => ({ known: false }) as never })).toBeNull();
-    expect(checkingRunIds({ listRuns: () => ({ known: true, value: [{ runId: "x" }] }) as never })).toBeNull();
+    expect(checkingRunIds({ peekCheckingRuns: () => ({ known: false, reason: "io" }) })).toBeNull();
+    expect(checkingRunIds({ peekCheckingRuns: () => ({ known: true, value: ["x"] }) })).toBeNull();
+    expect(checkingRunIds({ peekCheckingRuns: () => ({ known: true, value: [run.runId, run.runId] }) })).toBeNull();
+    expect(
+      checkingRunIds({
+        peekCheckingRuns: () => {
+          throw new Error("x");
+        },
+      }),
+    ).toBeNull();
+  });
+
+  test("감시 목록 읽기는 실패해도 장부를 고장으로 표시하지 않고 허가를 버리지 않는다. 같은 고장을 일반 읽기(listRuns)가 만나면 표시한다(대조군)", () => {
+    let armed = false;
+    const ledger = ready(
+      open(tempPath(), {
+        faults: {
+          at(point: string) {
+            if (point !== "read" || !armed) return;
+            armed = false;
+            throw Object.assign(new Error("fixture"), { code: "SQLITE_IOERR" });
+          },
+        },
+      }),
+    );
+    const run = checking(ledger);
+    const attempt = ledger.beginRestore(RESTORE_KEY);
+    ledger.pinRestore(RESTORE_KEY, attempt);
+    expect(ledger.grantIntake(RESTORE_KEY, attempt)).toBe(true);
+    const state = () => ({ health: ledger.health(), intake: ledger.intakeOpen(attempt) });
+    const before = state();
+    expect(before).toEqual({ health: { writable: true }, intake: true });
+    armed = true;
+    expect(ledger.peekCheckingRuns()).toEqual({ known: false, reason: "io" });
+    expect([armed, state()]).toEqual([false, before]);
+    armed = true;
+    expect(checkingRunIds(ledger)).toBeNull();
+    expect([armed, state()]).toEqual([false, before]);
+    expect(checkingRunIds(ledger)).toEqual(new Set([run.runId]));
+    // 대조군: 같은 고장을 일반 읽기가 만나면 장부가 고장으로 표시되고 허가가 사라진다. 그 뒤의 관측 읽기는 알려진 값을 내지 않는다.
+    armed = true;
+    expect(ledger.listRuns()).toEqual({ known: false, reason: "io" });
+    expect(state()).toEqual({ health: { writable: false, reason: "io" }, intake: false });
+    expect(ledger.peekCheckingRuns()).toEqual({ known: false, reason: "io" });
+    ledger.close();
+    expect(ledger.peekCheckingRuns()).toEqual({ known: false, reason: "closed" });
   });
 });
 

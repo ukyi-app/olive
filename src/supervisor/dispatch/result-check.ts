@@ -249,12 +249,27 @@ function readChecking(ports: { readonly ledger: Pick<Ledger, "listRuns"> }): Che
   }
 }
 
-// 결과 기다림 경보(D-151)와 결과 기다림 조회(result_wait)의 등록부 정리가 보는 checking 작업자 실행 ID. 장부의 읽기 하나(listRuns)만
-// 쓰고 접수 문·박자 유효 문을 보지 않는다: 복원 5단계가 접수를 닫은 채 끝나도 감독과 수명 박자는 돌고 checking 실행은 자리를 쥐므로,
-// 판정 박자의 결과에 묶으면 그동안 경보가 없다. 판정 박자의 1번과 같은 조건(한 줄이라도 읽지 못함·같은 ID 둘)이면 null이다.
-export function checkingRunIds(ledger: Pick<Ledger, "listRuns">): ReadonlySet<string> | null {
-  const checking = readChecking({ ledger });
-  return checking === null ? null : new Set(checking.map((run) => run.runId));
+// 결과 기다림 경보(D-151)와 결과 기다림 조회(result_wait)의 등록부 정리가 보는 checking 작업자 실행 ID. 장부의 관측 읽기 하나
+// (peekCheckingRuns)만 쓰고 접수 문·박자 유효 문을 보지 않는다: 복원 5단계가 접수를 닫은 채 끝나도 감독과 수명 박자는 돌고 checking
+// 실행은 자리를 쥐므로, 판정 박자의 결과에 묶으면 그동안 경보가 없다. 함정: 일반 읽기(listRuns)는 실패하면 장부를 고장으로 표시하고
+// 접수 허가를 버려 감독이 끝난다. 판정·쓰기에 쓰지 않는 관측이 그 길을 열면 안 된다. 읽지 못함·실행 ID가 아님·같은 ID 둘이면 null이다.
+export function checkingRunIds(ledger: Pick<Ledger, "peekCheckingRuns">): ReadonlySet<string> | null {
+  try {
+    const answer: unknown = ledger.peekCheckingRuns();
+    if (!isObject(answer) || answer.known !== true) return null;
+    const value: unknown = answer.value;
+    if (!Array.isArray(value)) return null;
+    const seen = new Set<string>();
+    const length = value.length;
+    for (let index = 0; index < length; index += 1) {
+      const runId: unknown = value[index];
+      if (!isUuid(runId) || seen.has(runId)) return null;
+      seen.add(runId);
+    }
+    return seen;
+  } catch {
+    return null;
+  }
 }
 
 // 반영 전 결과 보고를 실행마다 장부의 차례대로 모은다. 결과 밖의 보고(세션 깨짐·훅)는 동작 칸만 본다. 결과 보고는 실행 ID·저장 자리·

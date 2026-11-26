@@ -1845,6 +1845,21 @@ export class Ledger {
     }
   }
 
+  // 감독의 결과 기다림 경보·조회 정리가 박자 뒤에 보는 checking 작업자 실행 ID(대기 순번 차례). peekStatus와 같이 실패해도 장부를
+  // 고장으로 표시하지 않고 허가를 버리지 않는다: 판정·쓰기에 쓰지 않는 관측 하나의 일시 오류로 접수가 닫히고 감독이 끝나지 않게.
+  // 장부가 정말 고장이면 감독 자신의 다음 읽기·쓰기가 그것을 본다. 이미 고장으로 표시된 장부는 알려진 값을 내지 않는다.
+  peekCheckingRuns(): Read<string[]> {
+    if (this.#closed) return { known: false, reason: "closed" };
+    if (this.#broken !== null) return { known: false, reason: this.#broken };
+    try {
+      this.#faults.at("read");
+      const rows = this.#db.query("SELECT run_id FROM runs WHERE kind = 'worker' AND state = 'checking' ORDER BY queue_seq").all() as { run_id: string }[];
+      return { known: true, value: rows.map((row) => row.run_id) };
+    } catch (error) {
+      return { known: false, reason: classify(error) };
+    }
+  }
+
   // 새 복원 시도를 시작한다. 앞 시도의 허가는 여기서 끝나고, 앞 시도는 더는 지금의 시도가 아니다.
   beginRestore(key: symbol): RestoreAttempt {
     if (key !== RESTORE_KEY) throw new TypeError("복원 시도는 재시작 복원만 시작한다");

@@ -128,7 +128,124 @@ describe("결과 검사 박자 + 조립", () => {
     expect(await result.running.stop()).toBe(0);
   });
 
-  test("경보는 공유 시계를 다시 읽지 않는다: 박자 기록 중의 시계 읽기가 하루 앞선 값을 내도 다음 박자의 하한·결과 검사·배정이 그대로다", async () => {
+  test("경보의 감시 목록 읽기가 한 번 실패해도 장부 건강이 그대로라 감독이 끝나지 않고, 그 박자는 세지도 잊지도 않는다", async () => {
+    const w = world({ settings: { resultWaitAlertMs: 1_000 } });
+    const seed = open(w.ledgerPath);
+    const run = startedWorker(seed);
+    must(seed.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: run.runId, instructionRequestId: run.requestId, bodyDigest: digest("start"), now: NOW }, run.from));
+    must(seed.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: run.runId, exit: "completed", bodyDigest: digest("stop"), now: NOW + 1 }, run.from));
+    seed.close();
+    w.front.peers = async () => [{ peer: "front-door", contract: "olive-control/v2", policy: "match" }];
+    const log = w.deps.log;
+    const openLedger = w.deps.openLedger;
+    const fault = { armed: false, on: false, thrown: 0 };
+    // 접수가 닫힌 박자를 기록하는 동기 구간(경보가 감시 목록을 읽는 자리)에서만 장부의 첫 읽기 하나가 일시 오류를 낸다.
+    w.deps = {
+      ...w.deps,
+      log(event, fields) {
+        log(event, fields);
+        if (fault.armed && event === "beat" && fields?.resultCheck === "not_run:intake_closed") {
+          fault.armed = false;
+          fault.on = true;
+          queueMicrotask(() => {
+            fault.on = false;
+          });
+        }
+      },
+      openLedger(path, options) {
+        return openLedger(path, {
+          ...options,
+          faults: {
+            at(point: string) {
+              if (!fault.on || point !== "read" || fault.thrown > 0) return;
+              fault.thrown += 1;
+              throw Object.assign(new Error("fixture"), { code: "SQLITE_BUSY" });
+            },
+          },
+        });
+      },
+    };
+    const result = await w.boot();
+    if (!result.ok) throw new Error(`기동하지 못했다: ${result.step} ${result.reason}`);
+    await w.time.flush();
+    for (let i = 0; i < 40 && !w.events.some((e) => e.event === "restore_step" && e.fields.step === 5); i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
+    // 처음 본 박자 → 읽지 못한 박자(1초 뒤) → 2초 뒤 박자. 읽지 못한 박자가 센 것을 잊으면 2초 뒤 박자는 다시 처음 본 박자라 경보가 없다.
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    fault.armed = true;
+    w.wall += 1_000;
+    await w.time.advance(w.settings.timing.beatEveryMs);
+    expect([fault.armed, fault.thrown, w.events.filter((e) => e.event === "result_check_alert")]).toEqual([false, 1, []]);
+    for (let i = 0; i < 3; i += 1) {
+      w.wall += 1_000;
+      await w.time.advance(w.settings.timing.beatEveryMs);
+    }
+    expect(w.events.filter((e) => e.event === "restore_step").at(-1)?.fields).toMatchObject({ step: 5, intakeMayOpen: false, closedBecause: "peer_unconfirmed" });
+    expect({
+      fatal: w.events.filter((e) => e.event === "fatal").map((e) => e.fields.reason),
+      alive: result.running.admin.progress().alive,
+      health: w.opened?.health(),
+      alerts: w.events.filter((e) => e.event === "result_check_alert").map((e) => e.fields),
+      state: stateOf(w.opened!, run.runId),
+    }).toEqual({ fatal: [], alive: true, health: { writable: true }, alerts: [{ reason: "result_wait_overdue", runId: run.runId, waitedMs: 2_000 }], state: "checking" });
+    expect(await result.running.stop()).toBe(0);
+  });
+
+  test("박자 도중(배정을 기다리는 동안) checking이 된 실행의 머문 시간은 목록을 본 때부터 센다: 그 박자의 판정 시각으로 앞당기지 않는다", async () => {
+    const w = world({ settings: { resultWaitAlertMs: 90_000, timing: { beatEveryMs: 1_000, beatWaitMs: 5_000, restoreStepWaitMs: 30_000, startupWaitMs: 10_000, stopWaitMs: 10_000 } } });
+    const base = w.time.monoNow();
+    const wall = () => WALL + w.time.monoNow() - base;
+    const ticks = w.deps.make!.ticks!;
+    const gate: { pause: boolean; release: (() => void) | null } = { pause: false, release: null };
+    w.deps = {
+      ...w.deps,
+      wallNow: wall,
+      make: {
+        ...w.deps.make,
+        ticks: {
+          ...ticks,
+          assign: async (ports, policy, now) => {
+            if (gate.pause) {
+              gate.pause = false;
+              await new Promise<void>((resolve) => {
+                gate.release = resolve;
+              });
+            }
+            return ticks.assign(ports, policy, now);
+          },
+        },
+      },
+    };
+    const result = await w.boot();
+    if (!result.ok) throw new Error(`기동하지 못했다: ${result.step} ${result.reason}`);
+    await w.time.flush();
+    for (let i = 0; i < 20 && !w.events.some((e) => e.event === "restore_step" && e.fields.step === 5); i += 1) await w.time.advance(1_000);
+    const ledger = w.opened!;
+    const row = must(ledger.admitRun(worker({ now: wall(), deadlineAt: wall() + 600_000 }))).run;
+    const requestId = id();
+    must(ledger.startRun({ runId: row.runId, requestId, stopGeneration: 0, now: wall() }));
+    must(ledger.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: row.runId, instructionRequestId: requestId, bodyDigest: digest("accepted"), now: wall() }, from(row)));
+    // 결과 검사가 시각을 받은 뒤 배정에서 4초를 붙든다. 그 사이에 종료 영수증이 와 checking이 된다.
+    gate.pause = true;
+    await w.time.advance(1_000);
+    expect(gate.release).not.toBeNull();
+    await w.time.advance(4_000);
+    const entered = wall();
+    must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: row.runId, exit: "completed", bodyDigest: digest("stop"), now: entered }, from(row)));
+    gate.release?.();
+    await w.time.flush();
+    let alerts: Record<string, unknown>[] = [];
+    for (let i = 0; i < 95 && alerts.length === 0; i += 1) {
+      await w.time.advance(1_000);
+      alerts = w.events.filter((e) => e.event === "result_check_alert" && e.fields.reason === "result_wait_overdue").map((e) => e.fields);
+    }
+    const stayed = wall() - entered;
+    expect([alerts.length, stateOf(ledger, row.runId)]).toEqual([1, "checking"]);
+    expect(stayed).toBeGreaterThanOrEqual(90_000);
+    expect(alerts[0]?.waitedMs).toBeLessThanOrEqual(stayed);
+    expect(await result.running.stop()).toBe(0);
+  });
+
+  test("경보의 시계 읽기는 관측 전용(peek) 하나라 하한을 올리지 않는다: 박자 기록 중의 그 읽기가 하루 앞선 값을 내도 다음 박자의 하한·결과 검사·배정이 그대로다", async () => {
     const w = world();
     const log = w.deps.log;
     const pulse = { armed: false, on: false, reads: 0 };
@@ -160,7 +277,7 @@ describe("결과 검사 박자 + 조립", () => {
     await w.time.advance(w.settings.timing.beatEveryMs);
     expect(pulse.armed).toBe(false);
     const last = w.events.filter((e) => e.event === "beat" && e.fields.kind === "ran").at(-1)?.fields;
-    expect([pulse.reads, last?.clock, last?.resultCheck, String(last?.assign).includes("clock_untrusted")]).toEqual([0, "ok", "ran", false]);
+    expect([pulse.reads, last?.clock, last?.resultCheck, String(last?.assign).includes("clock_untrusted")]).toEqual([1, "ok", "ran", false]);
     expect(w.captured.shared?.read()).toEqual({ state: "ok", at: w.wall });
     expect(await result.running.stop()).toBe(0);
   });
