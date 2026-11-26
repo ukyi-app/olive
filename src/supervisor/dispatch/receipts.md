@@ -71,7 +71,7 @@
 | `result_refused` | 결과 보고를 장부에 넘기지 않았다. 확정된 이유(`reason`): 장부의 읽기로 본 `unknown_run`·`sender_mismatch`·`run_generation_mismatch`·`not_receivable`·`no_owner`, 보관소의 판단이 거절한 `conflict`·`too_large`·`digest_mismatch`·`invalid_input` | 없음 |
 | `result_unknown` | 결과 보고를 장부에 넘기지 않았다. 모름(`at`): `ports`(결과 포트가 없음), `ledger_read`(장부를 읽지 못함·꼴이 틀린 답·장부가 아는 목록과 꼴 밖의 값), `store`(보관이 `unknown`이거나 던짐) | 없음 |
 
-**장부의 경보(D-127·D-128).** 장부는 닫힌 실행(D-90·관리자 닫기)의 늦은 시작 영수증에 `alarm: "closed_run_started"`를, 같은 세대의 `running` 답에 `alarms`(`closed_run_running`)를 싣는다(`src/ledger/ledger.md` "경보를 밖으로 낸다"). 처리기는 그것을 결과에 옮기기만 한다: 영수증은 `ack`·`applied_without_ack`의 `alarm`(`runId`는 그 영수증의 실행), 답은 `applied`의 `alarms`다. 경보가 없으면 칸이 없다. 조립이 이 칸을 감독 로그 `ledger_alert` 한 줄씩으로 낸다(`src/supervisor/runtime/boot.md` S43).
+**장부의 경보(D-127·D-128).** 장부는 닫힌 실행(D-90·관리자 닫기)의 늦은 시작 영수증에 `alarm: "closed_run_started"`를, 같은 세대의 `running` 답에 `alarms`(`closed_run_running`)를 싣는다(`src/ledger/ledger.md` "경보를 밖으로 낸다"). 처리기는 그것을 결과에 옮기기만 한다: 영수증은 `ack`·`applied_without_ack`의 `alarm`(`runId`는 그 영수증의 실행), 답은 `applied`의 `alarms`다. 경보가 없으면 칸이 없다. 조립이 이 칸을 감독 로그 `ledger_alert` 한 줄씩으로 낸다(같은 경보는 프로세스에서 한 줄, `src/supervisor/runtime/boot.md` S43).
 
 - **경보 칸은 ack·반영을 가르지 않는다.** 경보 칸은 다른 칸과 따로 한 번만 읽고, 던지거나 약속 밖의 값(모르는 이름, 배열이 아님, 항목의 실행 ID·세대가 꼴 밖)이면 `unreadable`로 싣는다(답의 경보는 어느 실행인지 몰라 `runId: null` 하나). ack 초안·`delivery`, `applied`·밀린 사본·다시 물을 실행은 경보 칸이 없을 때와 같다: 경보 때문에 ack를 막으면 실행기가 같은 영수증을 끝없이 다시 보내고, 반영을 실패로 세면 같은 답을 다시 넘기며 그 실행기의 뒤 답을 막는다. 경보가 빠지는 쪽보다 남는 쪽이라 버리지 않는다.
 - **보고(`recordReport`)의 답에서는 경보 칸을 읽지 않는다.** 장부가 보고에 경보를 싣지 않는다.
