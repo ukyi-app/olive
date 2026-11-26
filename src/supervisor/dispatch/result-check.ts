@@ -1,7 +1,8 @@
 // 결과 검사의 한 박자. checking에 머문 작업자 실행마다 반영 전 결과 보고를 모으고, 판정 자리(resultVerdict)가 통과로 낸 결과만
 // 장부의 markResult로 ready_result에 옮긴다. 반영 전 결과 보고가 없는 채 기한(policy.reportWaitMs)이 지난 실행은
 // markResult(null)로 failed_stopped에 옮긴다(D-113). 기한은 종료 영수증 시각·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이
-// 인정된 시각 가운데 가장 늦은 때부터 센다(D-123). 확정(result_finalize)은 이 박자가 아니라 수명 박자가 낸다.
+// 인정된 시각 가운데 가장 늦은 때부터 센다(D-123). 같은 기한과 재전송 한 주기를 이 프로세스의 단조 경과로도 본다(벽시계만 앞으로
+// 뛰면 판정하지 않는다). 확정(result_finalize)은 이 박자가 아니라 수명 박자가 낸다.
 // 장부·접수·박자 유효 문은 포트로, 판정 시각(now)은 순서기가 부르기 직전에 다시 읽은 장부 시계로, 기한은 정책 인자로 받는다.
 // 소켓·타이머·시계·난수를 직접 부르지 않는다. 쥐는 것은 이 모듈의 박자가 진행 중이라는 표시 하나다(돌아오면 지운다).
 //
@@ -13,6 +14,7 @@
 //    실행 줄의 updated_at(checking이 된 시각)·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이 인정된 시각 가운데 가장 늦은 때다.
 //    그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기(RENEW_INTERVAL_MS)가 지나지 않았거나, 셋 중 하나라도 모르면 기다린다:
 //    실행기는 연결이 맞춰져 있을 때만 결과 보고를 보내고(src/executor/worker.ts의 transmit), 받음 확인이 없는 보고를 그 주기로 다시 보낸다.
+//    장부 시각의 비교와 함께 단조 경과(5단계 뒤·인정 뒤·이 프로세스가 그 실행을 처음 본 뒤)로도 기한과 그 주기가 지났어야 한다.
 // 3. markResult에는 늘 그 보고의 reportId를 넘긴다. 장부가 그 보고가 이 실행의 반영 전 보고이고 digest가 같은지 대조해(아니면
 //    reference_mismatch) 판정이 이 박자가 본 보고를 정확히 가리킨다. 확정을 여는 데에는 필요 없다: 빠져도 장부는 판정하면서
 //    그 실행의 반영 전 결과 보고를 모두 반영한다.
@@ -36,14 +38,23 @@ export interface ResultCheckPorts {
   readonly reach?: ResultReach;
 }
 
-// 결과 보고가 장부에 닿을 수 있게 된 때를 가늠하는 사실 둘(D-123). 시각은 모두 장부와 같은 시계다. 모르면 null이고, null이면 결과 없음
-// 판정을 하지 않는다. 던져도 null과 같다.
+// 결과 보고가 장부에 닿을 수 있게 된 때를 가늠하는 사실(D-123). 모르면 null이고, null이면 결과 없음 판정을 하지 않는다. 던져도 null과 같다.
+// ...At은 장부와 같은 시계의 시각이고, since...Ms는 이 프로세스의 단조 시계로 잰 그때부터 지금까지의 경과(ms, 0 이상의 유한수)다.
+// 장부 시계는 벽시계를 따라 앞으로 뛸 수 있다: 두 쪽이 모두 기한을 넘겨야 판정한다. 음수 경과(단조 시계가 뒤로 감)도 모름이다.
 export interface ResultReach {
   // 이 프로세스가 복원 5단계의 허가를 받아들인 시각. 받아들이기 전이거나 그때 시각을 읽지 못했으면 null.
   restoredAt(): number | null;
-  // 그 실행기의 연결이 지금 인정돼 있으면(이번 복원기로 맞춘 뒤 인사까지 끝났고 서버가 아직 닫지 않은 연결 하나) 그 인사를 받은 시각.
+  // 그 실행기의 연결이 지금 인정돼 있으면(이번 복원기로 맞춘 뒤 인사까지 끝났고 서버가 아직 닫지 않은 연결 하나) 그 연결이 인정된
+  // (greeted로 옮겨 간) 시각. 인사 바이트를 받은 시각이 아니다: 그 사이 서명 검증을 기다리는 동안 실행기는 아직 보고를 보낼 수 없다.
   // 연결이 없거나 둘 이상이거나 모르면 null.
   greetedAt(executorId: string): number | null;
+  // 5단계를 받아들인 뒤의 단조 경과.
+  sinceRestoredMs(): number | null;
+  // 그 실행기의 지금 인정된 연결이 인정된 뒤의 단조 경과. greetedAt과 같은 연결이다.
+  sinceGreetedMs(executorId: string): number | null;
+  // 이 프로세스가 그 실행을 결과 없음 판정을 기다리는 checking으로 처음 물은 뒤의 단조 경과(처음 물을 때 0). 종료 영수증 시각은 장부
+  // 시계뿐이라, 영수증이 기준일 때 단조 쪽 기준을 이것으로 대신한다(처음 물은 때는 영수증을 받은 때보다 이르지 않다).
+  sinceSeenMs(runId: string): number | null;
 }
 
 // 판정 자리가 보는 반영 전 결과 보고 하나. 장부의 pendingReports가 낸 차례(받은 시각, id) 그대로 넘긴다.
@@ -132,6 +143,8 @@ const REPORT_ACTIONS: readonly unknown[] = ["report_result", "report_session_bro
 const JUDGED: readonly unknown[] = ["ready_result", "cleanup_pending", "finalized"];
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isTime = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+// 단조 경과. performance.now처럼 소수일 수 있다.
+const isElapsed = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const isUuid = (value: unknown): value is string => typeof value === "string" && UUID.test(value);
 const isRefusal = (value: unknown): value is LedgerRefusal => (LEDGER_REFUSALS as readonly unknown[]).includes(value);
 const isState = (value: unknown): value is LedgerRunState => (LEDGER_RUN_STATES as readonly unknown[]).includes(value);
@@ -240,13 +253,16 @@ type Judged = { readonly outcome: ResultCheckOutcome | null; readonly halt: Resu
 // 결과 없음 판정의 기한 시작(D-123): 종료 영수증 시각(since)·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이 인정된 시각 가운데
 // 가장 늦은 때. 그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기가 지나지 않았거나(정각부터 지난 것으로 본다), 하나라도 모르면
 // null(기다림)이다. 감독이 멈춰 있던 동안이나 실행기 연결이 끊긴 동안은 실행기가 결과 보고를 장부에 닿게 할 수 없으므로 기한에 넣지
-// 않는다. 포트의 칸과 호출마다 한 번만 읽고, 던짐은 모름이다.
-function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now: number): number | null {
+// 않는다. 단조 경과도 같은 두 조건(인정 뒤 한 주기, 세 기준 모두에서 기한)을 넘어야 한다. 장부 시계만 보면 벽시계가 앞으로 뛴 만큼
+// 실행기가 실제로 기다린 시간 없이 기한이 지난다. 포트의 칸과 호출마다 한 번만 읽고, 던짐은 모름이다.
+function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now: number, wait: number): number | null {
   const executorId = run.executorId;
   if (executorId === null) return null;
   try {
     const reach = ports.reach;
     if (reach === undefined) return null;
+    // 처음 물은 때를 다른 사실보다 먼저 남긴다: 다른 사실을 모르는 동안에도 그 실행을 이미 보고 있었다.
+    const seenMs: unknown = reach.sinceSeenMs(run.runId);
     const restoredAt: unknown = reach.restoredAt();
     if (!isTime(restoredAt)) return null;
     const greetedAt: unknown = reach.greetedAt(executorId);
@@ -254,6 +270,11 @@ function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now:
     // 실행기는 받음 확인이 없는 보고를 마지막 송신에서 이 간격이 지나면 다시 보낸다(src/executor/worker.ts의 tick). 인정 뒤 이 간격 안에는
     // 다시 보낸 보고가 아직 장부에 닿지 않았을 수 있다.
     if (now - greetedAt < limits.RENEW_INTERVAL_MS) return null;
+    const restoredMs: unknown = reach.sinceRestoredMs();
+    const greetedMs: unknown = reach.sinceGreetedMs(executorId);
+    if (!isElapsed(seenMs) || !isElapsed(restoredMs) || !isElapsed(greetedMs)) return null;
+    if (greetedMs < limits.RENEW_INTERVAL_MS) return null;
+    if (Math.min(seenMs, restoredMs, greetedMs) < wait) return null;
     return Math.max(since, restoredAt, greetedAt);
   } catch {
     return null;
@@ -287,7 +308,7 @@ function tickOnce(ports: ResultCheckPorts, now: number, policy: ResultCheckPolic
     const verdict = resultVerdict(pending.get(runId) ?? []);
     if (verdict.kind === "wait") {
       // 기한 정각부터 판정한다. 시계가 기한 시작보다 뒤로 갔으면(now < from) 경과가 음수라 기다린다.
-      const from = wait === null || since === null ? null : waitFrom(ports, run, since, now);
+      const from = wait === null || since === null ? null : waitFrom(ports, run, since, now, wait);
       if (wait === null || since === null || from === null || now - from < wait) {
         runs.push({ runId, outcome: "waiting" });
         continue;

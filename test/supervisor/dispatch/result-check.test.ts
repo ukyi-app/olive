@@ -33,11 +33,16 @@ interface World {
   // 장부 포트의 함수를 바꿔 끼운다.
   wrap(over: Partial<ResultCheckPorts["ledger"]>): void;
   // 기한 시작의 사실(D-123)을 바꾼다. 기본은 복원 5단계 NOW, 인정 NOW - RENEW_INTERVAL_MS다: 둘 다 종료 영수증(NOW + 1)보다 이르고
-  // 인정 뒤 재전송 한 주기가 지났으므로 기한은 종료 영수증부터 센다.
-  setReach(facts: { restoredAt?: unknown; greetedAt?: unknown }): void;
-  // greetedAt에 넘긴 실행기 이름(부른 차례).
+  // 인정 뒤 재전송 한 주기가 지났으므로 기한은 종료 영수증부터 센다. 단조 경과 셋의 기본은 한 시간(LONG)이라 장부 시각이 판정을 가른다.
+  setReach(facts: ReachFacts): void;
+  // greetedAt·sinceGreetedMs에 넘긴 실행기 이름, sinceSeenMs에 넘긴 실행 ID(부른 차례).
   greeted: string[];
+  seen: string[];
 }
+
+// 단조 경과의 기본값. 이 파일의 어떤 기한보다 길다.
+const LONG = 3_600_000;
+type ReachFacts = { restoredAt?: unknown; greetedAt?: unknown; sinceRestoredMs?: unknown; sinceGreetedMs?: unknown; sinceSeenMs?: unknown };
 
 function world(ledger?: Ledger, path?: string): World {
   let clockAt = NOW;
@@ -47,8 +52,9 @@ function world(ledger?: Ledger, path?: string): World {
   let intake = true;
   let valid = true;
   let override: Partial<ResultCheckPorts["ledger"]> = {};
-  let reach: { restoredAt: unknown; greetedAt: unknown } = { restoredAt: NOW, greetedAt: NOW - limits.RENEW_INTERVAL_MS };
+  let reach: Required<ReachFacts> = { restoredAt: NOW, greetedAt: NOW - limits.RENEW_INTERVAL_MS, sinceRestoredMs: LONG, sinceGreetedMs: LONG, sinceSeenMs: LONG };
   const greeted: string[] = [];
+  const seen: string[] = [];
   const ports: ResultCheckPorts = {
     ledger: {
       listRuns: () => (override.listRuns ?? real.listRuns.bind(real))(),
@@ -66,6 +72,15 @@ function world(ledger?: Ledger, path?: string): World {
         greeted.push(executorId);
         return reach.greetedAt as number | null;
       },
+      sinceRestoredMs: () => reach.sinceRestoredMs as number | null,
+      sinceGreetedMs: (executorId) => {
+        greeted.push(executorId);
+        return reach.sinceGreetedMs as number | null;
+      },
+      sinceSeenMs: (runId) => {
+        seen.push(runId);
+        return reach.sinceSeenMs as number | null;
+      },
     },
   };
   return {
@@ -74,6 +89,7 @@ function world(ledger?: Ledger, path?: string): World {
     ports,
     marks,
     greeted,
+    seen,
     setReach: (facts) => {
       reach = { ...reach, ...facts };
     },
@@ -467,8 +483,8 @@ function line(policy: ResultCheckPolicy | undefined) {
             },
             intake,
             beatValid: () => true,
-            // 기한은 종료 영수증부터 센다(복원 5단계·인정 모두 그보다 이르고 재전송 한 주기가 지났다).
-            reach: { restoredAt: () => NOW, greetedAt: () => NOW - limits.RENEW_INTERVAL_MS },
+            // 기한은 종료 영수증부터 센다(복원 5단계·인정 모두 그보다 이르고 재전송 한 주기가 지났다). 단조 경과는 모두 충분하다.
+            reach: { restoredAt: () => NOW, greetedAt: () => NOW - limits.RENEW_INTERVAL_MS, sinceRestoredMs: () => LONG, sinceGreetedMs: () => LONG, sinceSeenMs: () => LONG },
           },
           now,
           policy,
@@ -783,7 +799,7 @@ describe("결과 없음 판정의 기한 시작과 연결 조건(D-123)", () => 
     const boom = () => {
       throw new Error("읽기 실패");
     };
-    const facts: [string, { restoredAt?: unknown; greetedAt?: unknown }][] = [
+    const facts: [string, ReachFacts][] = [
       ["연결 없음", { greetedAt: null }],
       ["인정 시각 꼴 틀림 0", { greetedAt: 0 }],
       ["인정 시각 꼴 틀림 1.5", { greetedAt: 1.5 }],
@@ -799,8 +815,8 @@ describe("결과 없음 판정의 기한 시작과 연결 조건(D-123)", () => 
     w.setReach({ restoredAt: NOW, greetedAt: NOW - RESEND });
     const ports: [string, ResultCheckPorts][] = [
       ["포트 없음", { ...w.ports, reach: undefined }],
-      ["인정 읽기 던짐", { ...w.ports, reach: { restoredAt: () => NOW, greetedAt: boom } }],
-      ["5단계 읽기 던짐", { ...w.ports, reach: { restoredAt: boom, greetedAt: () => NOW } }],
+      ["인정 읽기 던짐", { ...w.ports, reach: { ...w.ports.reach!, restoredAt: () => NOW, greetedAt: boom } }],
+      ["5단계 읽기 던짐", { ...w.ports, reach: { ...w.ports.reach!, restoredAt: boom, greetedAt: () => NOW } }],
       ["포트 접근자 던짐", Object.defineProperty({ ...w.ports }, "reach", { get: boom })],
     ];
     for (const [name, each] of ports) expect([name, ranOf(resultCheckTick(each, late, WAITING)).runs]).toEqual([name, waiting]);
@@ -832,6 +848,65 @@ describe("결과 없음 판정의 기한 시작과 연결 조건(D-123)", () => 
     expect(w.marks).toEqual([]);
     expect(ranOf(resultCheckTick(w.ports, BACK + RESEND, SHORT)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
     expect(w.marks).toStrictEqual([{ runId: run.runId, resultDigest: null, now: BACK + RESEND }]);
+  });
+
+  test("장부 시각으로는 기한이 지났어도 단조 경과(처음 본 뒤·5단계 뒤·인정 뒤) 하나라도 기한 전이거나 모르면 판정 0이고, 모두 정각이면 판정한다", () => {
+    // 벽시계만 앞으로 뛴 경우다: 장부 시각은 종료 영수증부터 기한 정각인데 이 프로세스가 실제로 기다린 시간은 모자란다. 종료 영수증이
+    // 기준일 때는 처음 본 뒤의 경과가 그 단조 쪽 기준이다.
+    const w = world();
+    const run = checking(w.ledger);
+    const at = SINCE + WAIT;
+    const waiting = [{ runId: run.runId, outcome: "waiting" as const }];
+    const boom = () => {
+      throw new Error("읽기 실패");
+    };
+    const enough = { sinceRestoredMs: LONG, sinceGreetedMs: LONG, sinceSeenMs: LONG };
+    const cases: [string, ReachFacts][] = [
+      ["처음 본 뒤 기한 1ms 전", { sinceSeenMs: WAIT - 1 }],
+      ["5단계 뒤 기한 1ms 전", { sinceRestoredMs: WAIT - 1 }],
+      ["인정 뒤 기한 1ms 전", { sinceGreetedMs: WAIT - 1 }],
+      ["단조 시계가 뒤로 감", { sinceSeenMs: -1 }],
+      ["처음 본 때 모름", { sinceSeenMs: null }],
+      ["5단계 단조 모름", { sinceRestoredMs: null }],
+      ["인정 단조 모름", { sinceGreetedMs: null }],
+      ["NaN", { sinceGreetedMs: Number.NaN }],
+      ["무한", { sinceRestoredMs: Number.POSITIVE_INFINITY }],
+      ["문자", { sinceSeenMs: String(LONG) }],
+    ];
+    for (const [name, over] of cases) {
+      w.setReach({ ...enough, ...over });
+      expect([name, ranOf(resultCheckTick(w.ports, at, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    w.setReach(enough);
+    for (const [name, method] of [
+      ["처음 본 때 던짐", "sinceSeenMs"],
+      ["5단계 단조 던짐", "sinceRestoredMs"],
+      ["인정 단조 던짐", "sinceGreetedMs"],
+    ] as const) {
+      expect([name, ranOf(resultCheckTick({ ...w.ports, reach: { ...w.ports.reach!, [method]: boom } }, at, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    expect([w.marks.length, stateOf(w.ledger, run.runId)]).toEqual([0, "checking"]);
+    // 처음 본 때는 그 실행 ID로, 인정된 연결이 없어 기다리는 박자에서도 묻는다(그동안에도 그 실행을 이미 보고 있었다).
+    const asked = w.seen.length;
+    w.setReach({ greetedAt: null });
+    expect(ranOf(resultCheckTick(w.ports, at, WAITING)).runs).toEqual(waiting);
+    expect([w.seen.length - asked, [...new Set(w.seen)]]).toEqual([1, [run.runId]]);
+    // 셋 모두 기한 정각이면 판정한다(위의 0이 다른 이유로 막힌 것이 아니다).
+    w.setReach({ greetedAt: NOW - RESEND, sinceRestoredMs: WAIT, sinceGreetedMs: WAIT, sinceSeenMs: WAIT });
+    expect(ranOf(resultCheckTick(w.ports, at, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
+    expect(w.marks).toStrictEqual([{ runId: run.runId, resultDigest: null, now: at }]);
+  });
+
+  test("단조 경과로도 인정 뒤 재전송 한 주기 전이면 기한이 더 짧아도 판정 0이고, 그 정각부터 판정한다", () => {
+    const SHORT: ResultCheckPolicy = { reportWaitMs: 1_000 };
+    const w = world();
+    const run = checking(w.ledger);
+    // 장부 시각으로는 인정 뒤 한 시간이 지났다. 단조 경과로는 인정 뒤 한 주기 1ms 전이다.
+    w.setReach({ sinceGreetedMs: RESEND - 1 });
+    expect(ranOf(resultCheckTick(w.ports, SINCE + LONG, SHORT)).runs).toEqual([{ runId: run.runId, outcome: "waiting" }]);
+    expect(w.marks).toEqual([]);
+    w.setReach({ sinceGreetedMs: RESEND });
+    expect(ranOf(resultCheckTick(w.ports, SINCE + LONG, SHORT)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
   });
 });
 

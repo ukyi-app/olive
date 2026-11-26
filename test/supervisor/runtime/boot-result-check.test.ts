@@ -1,10 +1,12 @@
 // 조립(boot.ts)이 결과 검사 박자를 순서기에 잇는 자리. 실제 장부·실제 박자 여섯으로, 5단계를 받아들인 감독의 장부에 checking 실행과
 // 결과 보고를 적고 박자를 돌린다. 판정 뒤 같은 박자의 수명 박자가 확정을 적는 것과, digest 충돌의 경보가 실행마다 한 줄인 것과,
 // 보고 없이 기한이 지난 실행의 결과 없음 판정(D-113)이 경보 한 줄과 실패 확정으로 이어지는 것과, 그 기한을 복원 5단계를 받아들인 때와
-// 실행기 연결이 인정된 때부터도 세는 것(D-123)을 본다.
+// 실행기 연결이 인정된 때부터도 세고 이 프로세스의 단조 경과로도 보는 것(D-123)을 본다. 장부 시계는 조립 세계의 벽시계(w.wall)이고
+// 단조 시계는 손으로 돌리는 시계(w.time)다: 박자(beat)는 단조 시계만 박자 간격만큼 옮긴다.
 import { describe, expect, test } from "bun:test";
-import { limits } from "../../../src/contract/v1/index.ts";
+import { limits, parsePrincipal } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
+import { KEEPALIVE_DETECT_MS, RESULT_CHECK } from "../../../src/main/supervisor.ts";
 import type { BootResult, SupervisorSettings } from "../../../src/supervisor/runtime/boot.ts";
 import { digest, from, id, must, worker } from "../../ledger/helpers.ts";
 import { EXECUTOR, FRONT_ROWS, WALL, type World, world } from "./boot-world.ts";
@@ -20,14 +22,14 @@ async function booted(settings: Partial<SupervisorSettings> = {}) {
   return { w, run: result.running, ledger, beat: () => w.time.advance(w.settings.timing.beatEveryMs) };
 }
 
-// 작업자 실행을 시작·접수하고 completed 종료 영수증으로 checking까지 옮긴다.
-function checking(ledger: Ledger) {
-  const run = must(ledger.admitRun(worker({ now: WALL, deadlineAt: WALL + 600_000 }))).run;
+// 작업자 실행을 at에 시작·접수하고 at + 1의 completed 종료 영수증으로 checking까지 옮긴다.
+function checking(ledger: Ledger, at = WALL) {
+  const run = must(ledger.admitRun(worker({ now: at, deadlineAt: at + 600_000 }))).run;
   const requestId = id();
-  must(ledger.startRun({ runId: run.runId, requestId, stopGeneration: 0, now: WALL }));
+  must(ledger.startRun({ runId: run.runId, requestId, stopGeneration: 0, now: at }));
   const sender = from(run);
-  must(ledger.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: run.runId, instructionRequestId: requestId, bodyDigest: digest(`accepted:${run.runId}`), now: WALL }, sender));
-  must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: run.runId, exit: "completed", bodyDigest: digest(`stopped:${run.runId}`), now: WALL + 1 }, sender));
+  must(ledger.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: run.runId, instructionRequestId: requestId, bodyDigest: digest(`accepted:${run.runId}`), now: at }, sender));
+  must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: run.runId, exit: "completed", bodyDigest: digest(`stopped:${run.runId}`), now: at + 1 }, sender));
   return { runId: run.runId, from: sender };
 }
 
@@ -37,13 +39,16 @@ function report(ledger: Ledger, run: ReturnType<typeof checking>, body: string, 
   return reportId;
 }
 
-// 가짜 서버가 그 실행기의 연결 하나(번호 7)를 지금 인정하고 그 연결의 인사를 at(장부 시계)에 받은 것으로 둔다. null이면 인정된 연결이 없다.
-// 조립은 recognized로 연결 번호를, 연결 표의 get으로 그 인사 시각을 읽는다.
-function greet(w: World, at: number | null) {
+// 가짜 서버가 그 실행기의 연결 하나(번호 7)를 지금 인정한 것으로 두고, 판단이 그 연결을 greeted로 옮긴 순간처럼 배정 후보를 조립의
+// deliver로 넘긴다. 조립은 그 순간의 장부 시각(지금의 w.wall)과 단조 시각을 인정 시각으로 적는다. helloAt은 연결 표의 greeting.at(인사
+// 바이트를 받은 시각)이다: 서명 검증을 기다린 만큼 인정보다 이르고, 조립은 이 값을 기한에 쓰지 않는다.
+function greet(w: World, helloAt = w.wall) {
   const server = w.fake.server as unknown as { table: () => object; recognized: (executorId: string) => number | null };
   const base = server.table();
-  server.recognized = (executorId) => (at !== null && executorId === EXECUTOR ? 7 : null);
-  server.table = () => ({ ...base, get: (connection: number) => (at !== null && connection === 7 ? { greeting: { at } } : undefined) });
+  server.recognized = (executorId) => (executorId === EXECUTOR ? 7 : null);
+  server.table = () => ({ ...base, get: (connection: number) => (connection === 7 ? { greeting: { at: helloAt } } : undefined) });
+  const candidate = { connection: 7, target: "store-a", principal: parsePrincipal(EXECUTOR), keyId: "k1", hello: { profile_revision: "p", policy_revision: "p" } };
+  w.fake.options!.deliver({ kind: "candidate", connection: 7, candidate } as never);
 }
 
 const outcomes = (w: World) => w.events.filter((e) => e.event === "beat" && e.fields.resultCheck === "ran").map((e) => e.fields.resultCheckOutcomes);
@@ -64,7 +69,7 @@ async function restarted() {
   const result: BootResult = await w.boot();
   if (!result.ok) throw new Error(`기동하지 못했다: ${result.step} ${result.reason}`);
   for (let i = 0; i < 5; i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
-  greet(w, RESTART);
+  greet(w);
   w.wall = RESTORED;
   peersReady = true;
   for (let i = 0; i < 20 && !w.events.some((e) => e.event === "restore_step" && e.fields.step === 5); i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
@@ -110,21 +115,27 @@ describe("결과 검사 박자 + 조립", () => {
   test("보고 없이 기한이 지난 checking은 결과 없음으로 판정해 경보 한 줄을 남기고, 같은 박자의 수명 박자가 실패 확정을 장부에 적는다", async () => {
     // 기한은 이 시험의 숫자다(박자 100ms 몇 번 안에 지나게).
     const b = await booted({ resultCheck: { reportWaitMs: 300 } });
-    // 결과 없음 판정은 그 실행기의 인정된 연결이 있을 때만이다(D-123). 인사와 5단계(WALL)가 모두 종료 영수증보다 이르고 인사 뒤 재전송
-    // 한 주기가 지났으므로 기한은 종료 영수증부터 센다.
-    greet(b.w, WALL - limits.RENEW_INTERVAL_MS);
-    const run = checking(b.ledger);
-    // 장부 시계는 조립 세계의 벽시계다(박자로 흐르지 않는다). 종료 영수증(WALL + 1)부터 기한 1ms 전과 정각으로 옮긴다.
-    b.w.wall = WALL + 1 + 299;
+    // 결과 없음 판정은 그 실행기의 인정된 연결이 있을 때만이다(D-123). 인정과 5단계(WALL)가 모두 종료 영수증보다 이르고 인정 뒤 재전송
+    // 한 주기가 장부 시각과 단조 경과 모두로 지났으므로 기한은 종료 영수증부터 센다.
+    greet(b.w);
+    await b.w.time.advance(limits.RENEW_INTERVAL_MS);
+    const AT = WALL + limits.RENEW_INTERVAL_MS;
+    b.w.wall = AT;
+    const run = checking(b.ledger, AT);
+    // 장부 시계는 조립 세계의 벽시계다(박자로 흐르지 않는다). 종료 영수증(AT + 1)부터 기한 1ms 전과 정각으로 옮긴다. 단조 쪽은 이
+    // 프로세스가 그 실행을 처음 본 박자부터 센다: 1ms 전에서 기한만큼 박자를 더 돌려 단조 경과를 먼저 채운다.
+    b.w.wall = AT + 1 + 299;
     await b.beat();
     const ran = () => b.w.events.filter((e) => e.event === "beat" && e.fields.resultCheck === "ran").map((e) => e.fields.resultCheckOutcomes);
     expect(ran().at(-1)).toBe("waiting=1");
-    b.w.wall = WALL + 1 + 300;
+    await b.w.time.advance(300);
+    expect(ran().at(-1)).toBe("waiting=1");
+    b.w.wall = AT + 1 + 300;
     for (let i = 0; i < 3; i += 1) await b.beat();
     // 조립은 설정의 정책 객체를 그대로 박자에 넘긴다.
     expect(b.w.captured.resultCheckPolicy).toBe(b.w.settings.resultCheck);
     expect(ran().filter((outcomes) => outcomes === "no_result=1")).toHaveLength(1);
-    expect(b.w.events.filter((e) => e.event === "result_check_alert").map((e) => e.fields)).toEqual([{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]);
+    expect(b.w.events.filter((e) => e.event === "result_check_alert").map((e) => e.fields)).toEqual([{ reason: "no_result", runId: run.runId, checkingSince: AT + 1 }]);
     const times = b.ledger.instructionTimes(run.runId);
     const unanswered = b.ledger.unansweredInstructions();
     expect([
@@ -153,6 +164,9 @@ describe("결과 검사 박자 + 조립", () => {
 
   test("다시 뜬 감독은 보고가 끝내 없으면 5단계를 받아들인 때부터 센 기한 정각에 결과 없음으로 판정한다", async () => {
     const r = await restarted();
+    // 단조 경과로도 5단계 뒤·처음 본 뒤 기한이 지나게 박자를 먼저 돌린다(장부 시각은 5단계 시각 그대로라 기다림).
+    await r.w.time.advance(60_000 + 1_000);
+    expect([...new Set(outcomes(r.w))]).toEqual(["waiting=1"]);
     r.w.wall = RESTORED + 60_000 - 1;
     await r.beat();
     expect(outcomes(r.w).at(-1)).toBe("waiting=1");
@@ -171,7 +185,11 @@ describe("결과 검사 박자 + 조립", () => {
     for (let i = 0; i < 3; i += 1) await b.beat();
     expect(outcomes(b.w).slice(-3)).toEqual(["waiting=1", "waiting=1", "waiting=1"]);
     const BACK = WALL + 20 * limits.RENEW_INTERVAL_MS;
-    greet(b.w, BACK);
+    b.w.wall = BACK;
+    greet(b.w);
+    // 단조 경과로도 인정 뒤 재전송 한 주기가 지나게 박자를 먼저 돌린다(장부 시각은 인정 시각 그대로라 기다림).
+    await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+    expect([outcomes(b.w).at(-1), alerts(b.w)]).toEqual(["waiting=1", []]);
     b.w.wall = BACK + limits.RENEW_INTERVAL_MS - 1;
     await b.beat();
     expect([outcomes(b.w).at(-1), alerts(b.w)]).toEqual(["waiting=1", []]);
@@ -180,5 +198,115 @@ describe("결과 검사 박자 + 조립", () => {
     expect(outcomes(b.w).filter((each) => each === "no_result=1")).toHaveLength(1);
     expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
     expect(await b.run.stop()).toBe(0);
+  });
+
+  test("벽시계만 앞으로 뛰면(단조 경과는 짧다) 재연결 뒤 재전송 한 주기와 기한 전이라 checking을 유지하고, 뒤따른 결과 보고를 판정한다", async () => {
+    // 기한은 조립 세계의 기본값(60000ms)이다.
+    const b = await booted();
+    const run = checking(b.ledger);
+    b.w.wall = WALL + 2;
+    greet(b.w);
+    await b.beat();
+    const mono = b.w.time.monoNow();
+    // 장부 시각으로는 인정 뒤 재전송 한 주기와 기한이 모두 지났다.
+    b.w.wall = WALL + 2 + 60_000 + limits.RENEW_INTERVAL_MS;
+    for (let i = 0; i < 3; i += 1) await b.beat();
+    expect(b.w.time.monoNow() - mono).toBeLessThan(limits.RENEW_INTERVAL_MS);
+    expect([outcomes(b.w).slice(-3), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], "checking", []]);
+    const resent = report(b.ledger, run, "다시 보낸 결과", b.w.wall);
+    await b.beat();
+    expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId), b.ledger.pendingReports()]).toEqual(["judged=1", "ready_result", { known: true, value: [] }]);
+    expect(typeof resent).toBe("string");
+    expect(await b.run.stop()).toBe(0);
+  });
+
+  test("종료 영수증이 기한 시작일 때도 벽시계만 앞으로 뛰면 이 프로세스가 그 실행을 처음 본 뒤 단조 경과로 기한 전이라 판정하지 않는다", async () => {
+    const b = await booted({ resultCheck: { reportWaitMs: 1_000 } });
+    greet(b.w);
+    // 인정·5단계 뒤 재전송 한 주기가 장부 시각과 단조 경과 모두로 지났다.
+    await b.w.time.advance(limits.RENEW_INTERVAL_MS);
+    const AT = WALL + limits.RENEW_INTERVAL_MS;
+    b.w.wall = AT;
+    const run = checking(b.ledger, AT);
+    await b.beat();
+    // 종료 영수증(AT + 1) 뒤 벽시계만 기한의 예순 배 앞으로 뛰었다.
+    b.w.wall = AT + 1 + 60_000;
+    for (let i = 0; i < 3; i += 1) await b.beat();
+    expect([outcomes(b.w).slice(-4), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1", "waiting=1"], "checking", []]);
+    report(b.ledger, run, "다시 보낸 결과", b.w.wall);
+    await b.beat();
+    expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId)]).toEqual(["judged=1", "ready_result"]);
+    expect(await b.run.stop()).toBe(0);
+  });
+
+  for (const wait of [1_000, 60_000]) {
+    test(`인사 바이트를 받은 뒤 서명 검증이 12초 걸려 늦게 인정되면 인정한 때부터 재전송 한 주기와 기한을 센다(기한 ${wait}ms)`, async () => {
+      const b = await booted({ resultCheck: { reportWaitMs: wait } });
+      const run = checking(b.ledger);
+      // 인사 바이트는 HELLO에 받았고(연결 표의 greeting.at), 검증이 12초 걸려 그 뒤에 인정됐다.
+      const HELLO = WALL + 2;
+      b.w.wall = HELLO;
+      await b.w.time.advance(12_000);
+      b.w.wall = HELLO + 12_000;
+      greet(b.w, HELLO);
+      const accepted = b.w.wall;
+      // 단조 경과는 넉넉히 채워 두고 장부 시각으로 가른다. 인사 바이트부터 세면 아래 1ms 전에 이미 판정한다.
+      await b.w.time.advance(Math.max(wait, limits.RENEW_INTERVAL_MS) + 1_000);
+      const until = Math.max(wait, limits.RENEW_INTERVAL_MS);
+      b.w.wall = accepted + until - 1;
+      await b.beat();
+      expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["waiting=1", "checking", []]);
+      b.w.wall = accepted + until;
+      for (let i = 0; i < 3; i += 1) await b.beat();
+      expect(outcomes(b.w).filter((each) => each === "no_result=1")).toHaveLength(1);
+      expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
+      expect(await b.run.stop()).toBe(0);
+    });
+  }
+
+  test("오래 기다리던 실행도 다시 인정된 뒤 벽시계만 앞으로 뛰면 인정 뒤 단조 경과로 재전송 한 주기 전이라 판정하지 않는다", async () => {
+    // 기한은 조립 세계의 기본값(60000ms)이다.
+    const b = await booted();
+    const run = checking(b.ledger);
+    // 연결 없이 장부 시각과 단조 경과 모두 기한의 두 배가 지났다(처음 본 뒤·5단계 뒤의 단조 경과도 길다).
+    for (let i = 0; i < 2; i += 1) {
+      b.w.wall += 60_000;
+      await b.w.time.advance(60_000);
+    }
+    expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId)]).toEqual(["waiting=1", "checking"]);
+    greet(b.w);
+    const back = b.w.wall;
+    await b.w.time.advance(5_000);
+    // 다시 인정된 뒤 벽시계만 기한과 한 주기보다 더 앞으로 뛰었다.
+    b.w.wall = back + 60_000 + limits.RENEW_INTERVAL_MS;
+    for (let i = 0; i < 3; i += 1) await b.beat();
+    expect([outcomes(b.w).slice(-3), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], "checking", []]);
+    // 단조 경과로도 인정 뒤 기한이 지나면 판정한다(위의 0이 다른 이유로 막힌 것이 아니다).
+    await b.w.time.advance(60_000);
+    expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
+    expect(await b.run.stop()).toBe(0);
+  });
+
+  test("철회된 연결의 인정 시각은 쓰지 않는다: 같은 번호가 다시 인정된 것처럼 보여도 새 후보가 오기 전에는 판정하지 않는다", async () => {
+    const b = await booted({ resultCheck: { reportWaitMs: 300 } });
+    const run = checking(b.ledger);
+    greet(b.w);
+    // 서버가 그 연결을 닫아 철회를 넘겼다. 가짜 서버의 recognized는 그대로 7을 낸다(인정 조회와 철회 사이의 어긋남).
+    b.w.fake.options!.deliver({ kind: "withdrawn", connection: 7, principal: EXECUTOR } as never);
+    await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+    b.w.wall = WALL + 1 + 10 * limits.RENEW_INTERVAL_MS;
+    for (let i = 0; i < 3; i += 1) await b.beat();
+    expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["waiting=1", "checking", []]);
+    expect(await b.run.stop()).toBe(0);
+  });
+});
+
+describe("결과 기한과 keepalive의 관계(D-113 시험 숫자)", () => {
+  test("운영 기한은 keepalive가 반쯤 열린 연결을 닫는 한계에 재전송 한 주기를 더한 것보다 길다", () => {
+    // 감독은 닫힘을 통보받지 못한 연결을 인정된 연결로 본다. 그 연결은 keepalive가 닫는다. KEEPALIVE_DETECT_MS는 olive #77
+    // (src/transport/keepalive.ts)의 KEEPALIVE_USER_TIMEOUT_MS(= KEEPALIVE_INITIAL_DELAY_MS 30000 + KEEPALIVE_INTERVAL_MS 10000 ×
+    // KEEPALIVE_PROBES 4)와 같아야 한다: 한쪽을 바꾸면 이 시험이 실패한다. #77이 이 저장소에 들어오면 그 상수를 가져다 대조한다.
+    expect(KEEPALIVE_DETECT_MS).toBe(30_000 + 10_000 * 4);
+    expect(RESULT_CHECK.reportWaitMs).toBeGreaterThan(KEEPALIVE_DETECT_MS + limits.RENEW_INTERVAL_MS);
   });
 });

@@ -479,6 +479,41 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   // 5단계를 받아들인 시각(장부 시계, 결과 검사의 기한 시작 D-123). 받아들이기 전이거나 그때 시각을 읽지 못했으면 null이고, 그러면 이
   // 프로세스의 결과 검사는 결과 없음 판정을 하지 않는다. 받아들인 순간에 읽으므로 장부가 허가를 낸 시각보다 이르지 않다.
   let restoredAt: number | null = null;
+  // 같은 순간의 단조 시계(deps.monoNow). 결과 검사는 장부 시각과 함께 이 단조 경과로도 기한을 본다: 공유 시계는 벽시계가 앞으로 뛰면
+  // 그만큼 앞서지만 단조 시계는 이 프로세스가 실제로 기다린 시간만 센다.
+  let restoredMono: number | null = null;
+  // 단조 시계 읽기. 던지거나 유한한 0 이상의 수가 아니면 모름(null)이다.
+  const monoRead = (): number | null => {
+    try {
+      const at: unknown = deps.monoNow();
+      return typeof at === "number" && Number.isFinite(at) && at >= 0 ? at : null;
+    } catch {
+      return null;
+    }
+  };
+  // 기준 단조 시각부터 지금까지. 단조 시계가 뒤로 갔으면 음수를 그대로 내고 결과 검사가 모름으로 읽는다.
+  const monoSince = (anchor: number | null): number | null => {
+    if (anchor === null) return null;
+    const at = monoRead();
+    return at === null ? null : at - anchor;
+  };
+  // 연결 번호 → 서버가 그 연결을 배정 후보로 넘긴 순간의 장부 시각(peek)과 단조 시각. 철회(withdrawn)되면 지운다. 번호는 다시 쓰이지
+  // 않는다. 읽지 못한 시각은 null로 두어 그 연결로는 결과 없음 판정을 하지 않는다.
+  const greetedLinks = new Map<number, { readonly at: number | null; readonly mono: number | null }>();
+  // 실행 ID → 결과 검사가 그 실행을 결과 없음 판정을 기다리는 checking으로 처음 물은 단조 시각.
+  const seenWaiting = new Map<string, number>();
+  // 서버의 출력을 답 줄에 넘기기 전에 본다. 후보는 판단이 연결을 greeted로 옮긴 같은 동기 구간에서 온다. 던지면 서버가 그 연결을
+  // 닫으므로 여기서는 던지지 않는다.
+  const noteLink = (output: Delivered) => {
+    try {
+      if (output.kind === "candidate") {
+        const seen = shared.peek();
+        greetedLinks.set(output.connection, { at: seen.state === "ok" ? seen.at : null, mono: monoRead() });
+      } else if (output.kind === "withdrawn") greetedLinks.delete(output.connection);
+    } catch {
+      // 적지 못한 연결은 greetedLinks에 없어 결과 없음 판정을 하지 않는다.
+    }
+  };
   const observationsSettled = () => stage >= 2;
 
   // 효과의 문. 끝 차례가 정한 코드, 진행 중인 박자의 절대 기한, 받아들인 5단계의 허가를 한 판단으로 본다.
@@ -587,23 +622,47 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     return value;
   };
   // 결과 검사의 기한 시작과 연결 조건(D-123). 실행기 연결은 서버가 지금 인정한 그 주체의 연결 하나(recognized: 이번 복원기로 맞춘 뒤
-  // 인사까지 끝났고 서버가 닫지 않은 연결)이고, 그 시각은 연결 표가 적은 인사를 받은 시각(greeting.at, 서버가 장부 시계로 읽는다)이다.
-  // 끊겼다 다시 붙으면 새 연결의 인사 시각이 된다. 박자가 부를 때마다 읽고 캐시하지 않는다. 던지면 결과 검사가 모름으로 읽는다.
+  // 인사까지 끝났고 서버가 닫지 않은 연결)이고, 그 시각은 서버가 그 연결을 배정 후보로 넘긴 순간(greeted로 옮긴 같은 동기 구간)에 이
+  // 조립이 읽은 장부 시각과 단조 시각이다(greetedLinks). 연결 표의 greeting.at은 인사 바이트를 받은 시각이라 서명 검증을 기다린
+  // 시간만큼 이르다. 끊겼다 다시 붙으면 새 연결의 시각이 된다. 박자가 부를 때마다 읽는다. 던지면 결과 검사가 모름으로 읽는다.
+  const linkOf = (executorId: string) => {
+    const connection = need(server).recognized(executorId);
+    return connection === null ? undefined : greetedLinks.get(connection);
+  };
   const reach: ResultReach = {
     restoredAt: () => restoredAt,
-    greetedAt: (executorId) => {
-      const live = need(server);
-      const connection = live.recognized(executorId);
-      if (connection === null) return null;
-      const at = live.table().get(connection)?.greeting?.at;
-      return typeof at === "number" ? at : null;
+    greetedAt: (executorId) => linkOf(executorId)?.at ?? null,
+    sinceRestoredMs: () => monoSince(restoredMono),
+    sinceGreetedMs: (executorId) => monoSince(linkOf(executorId)?.mono ?? null),
+    sinceSeenMs: (runId) => {
+      const at = monoRead();
+      if (at === null) return null;
+      const first = seenWaiting.get(runId);
+      if (first !== undefined) return at - first;
+      seenWaiting.set(runId, at);
+      return 0;
     },
+  };
+  // 처음 본 기록은 지난 박자에서 기다림으로 끝난 실행만 남긴다(판정됐거나 checking을 떠난 실행은 지운다). 박자가 끝까지 돌지 않았으면
+  // 목록이 다 있지 않아 지우지 않는다. 지우면 다음에 다시 처음부터 세므로 이른 판정 쪽으로는 틀리지 않는다.
+  const forgetSeen = (result: ResultCheckTickResult) => {
+    try {
+      if (result.kind !== "ran" || result.halted !== null) return;
+      const keep = new Set(result.runs.filter((run) => run.outcome === "waiting").map((run) => run.runId));
+      for (const runId of [...seenWaiting.keys()]) if (!keep.has(runId)) seenWaiting.delete(runId);
+    } catch {
+      // 기록 정리일 뿐이다.
+    }
   };
   const beats: CycleBeats = {
     linkLoss: (clocks, policy, input) =>
       make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
     // 판정은 접수 문을 본다: 정지 중·허가 폐기·복원 전에는 확정도 열리지 않으므로 판정만 앞당기지 않는다(result-check.md "접수").
-    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, reach }, now, settings.resultCheck),
+    resultCheck: (now) => {
+      const result = make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, reach }, now, settings.resultCheck);
+      forgetSeen(result);
+      return result;
+    },
     life: (clock, input) =>
       make.ticks.life(
         { ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen },
@@ -682,7 +741,10 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       nonces: ledger.nonceStore(),
       reply: signing.reply,
       settings: settings.connection,
-      deliver: (output) => deliver(output),
+      deliver: (output) => {
+        noteLink(output);
+        deliver(output);
+      },
       observe: (note) => log("server", note.kind === "closed" ? { kind: note.kind, cause: note.cause } : note.kind === "rejected_tls" ? { kind: note.kind, reason: note.reason } : { kind: note.kind }),
       maxPendingWriteBytes: settings.maxPendingWriteBytes,
       })),
@@ -861,6 +923,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
           // peek은 공유 하한을 올리지 않아 순서기의 시계 판정을 바꾸지 않는다. 원천을 읽지 못하면 unavailable이다(던지지 않는다).
           const seen = shared.peek();
           restoredAt = seen.state === "ok" ? seen.at : null;
+          restoredMono = monoRead();
         }
         if (stopping) return;
         if (step5 !== null) log("restore_step", { step: 5, intakeMayOpen: granted, closedBecause: step5.closedBecause.join(",") });

@@ -40,8 +40,9 @@ test("환경이 모두 있으면 경로·등록표 설정·정책 revision을 �
   expect(s.credentials.maxBytes).toBeLessThanOrEqual(16_384);
   // 서버의 송신 대기 상한(S35): 틀 하나의 최대 크기 네 배. 서버로 그대로 넘기는 것은 boot.test.ts "같은 객체"가 본다.
   expect(s.maxPendingWriteBytes).toBe(limits.MAX_MESSAGE_BYTES * 4);
-  // 결과 없음 판정의 기한(D-113): T1 실측 전의 시험 숫자, 실행기 보고 재전송 간격의 여섯 번.
-  expect(s.resultCheck).toEqual({ reportWaitMs: 6 * limits.RENEW_INTERVAL_MS });
+  // 결과 없음 판정의 기한(D-113): T1 실측 전의 시험 숫자, 실행기 보고 재전송 간격의 아홉 번(keepalive 한계 70초 + 재전송 한 주기 + 여유,
+  // 관계는 boot-result-check.test.ts가 묶는다).
+  expect(s.resultCheck).toEqual({ reportWaitMs: 9 * limits.RENEW_INTERVAL_MS });
   // 배정은 닫힌 값이다: 등록행·계정·실행 계획이 없다.
   expect([s.assign.assignment.registrations.length, s.assign.accounts.length, s.assign.plans.length]).toEqual([0, 0, 0]);
 });
