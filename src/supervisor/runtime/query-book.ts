@@ -26,6 +26,50 @@ export interface QueryRegistry extends QueryBook {
   dropConnection(connection: number, keep?: ReadonlySet<SentQuery>): number;
 }
 
+// 결과 기다림 조회(life-loop.ts의 cause "result_wait")의 항목을 실행마다 몇 개로 줄이고, 그 실행이 checking을 떠나면 모두 끝내도록 고른다.
+// 수명 박자는 답이 없으면 answerTimeoutMs마다 새 요청 ID로 다시 묻고 등록부는 실은 횟수만큼 항목을 쥐므로, 답하지 않는 실행기 하나에
+// 항목이 끝없이 쌓인다. 고르기만 한다: 끝내기는 답 줄(answers.ts의 releaseQueries)이 받은 답이 쥔 항목을 빼고 한다.
+// 남기는 수: 기본 간격 20초·조회 수명 30초에서 답이 아직 맞을 수 있는 조회는 많아야 둘이고 하나를 여유로 둔다. 함정: 간격을 답의 왕복
+// 시간보다 훨씬 짧게 잡으면 늦은 답의 항목이 먼저 끝나 unknown_query로 버려진다(판정이 늦어질 뿐, 다음 조회로 다시 묻는다).
+export const RESULT_WAIT_QUERIES_KEPT = 3;
+
+export interface ResultWaitQueries {
+  // sent: 이번 박자에 실은 result_wait 조회(실은 차례). checking: 박자 뒤에 읽은 checking 실행 ID이고 null이면 모름이다(떠난 실행을 고르지
+  // 않고 수만 줄인다). 끝낼 요청 ID를 낸다: 앞에서 끝내지 못한 것, 실행마다 최근 kept개 밖의 것, checking을 떠난 실행의 것 전부.
+  due(sent: readonly { readonly runId: string; readonly requestId: string }[], checking: ReadonlySet<string> | null): ReadonlySet<string>;
+  // due가 낸 것 가운데 끝내지 못하고 남은 요청 ID(받은 답이 쥔 항목). 다음 due가 다시 낸다.
+  unreleased(requestIds: ReadonlySet<string>): void;
+}
+
+export function createResultWaitQueries(kept: number = RESULT_WAIT_QUERIES_KEPT): ResultWaitQueries {
+  if (!Number.isSafeInteger(kept) || kept < 1) throw new RangeError("남기는 결과 기다림 조회 수는 1 이상의 정수여야 한다");
+  const byRun = new Map<string, string[]>();
+  let retry = new Set<string>();
+  return {
+    due(sent, checking) {
+      for (const { runId, requestId } of sent) {
+        const ids = byRun.get(runId) ?? [];
+        if (!ids.includes(requestId)) ids.push(requestId);
+        byRun.set(runId, ids);
+      }
+      const out = new Set(retry);
+      retry = new Set();
+      for (const [runId, ids] of [...byRun]) {
+        if (checking !== null && !checking.has(runId)) {
+          for (const requestId of ids) out.add(requestId);
+          byRun.delete(runId);
+        } else if (ids.length > kept) {
+          for (const requestId of ids.splice(0, ids.length - kept)) out.add(requestId);
+        }
+      }
+      return out;
+    },
+    unreleased(requestIds) {
+      for (const requestId of requestIds) retry.add(requestId);
+    },
+  };
+}
+
 export function createQueryBook(): QueryRegistry {
   // 더할 때 받은 객체 → 동결한 사본. 사본을 쥐어 더한 쪽이 나중에 객체를 고쳐도 대조 값이 바뀌지 않게 한다.
   const entries = new Map<SentQuery, SentQuery>();

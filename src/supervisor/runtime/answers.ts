@@ -184,6 +184,10 @@ export interface AnswerLines {
   takeRequery(): readonly string[];
   // D-90 닫기 박자(unreceived.ts)의 증거 포트. read·confirm 모두 읽기만 하고 줄을 넘기거나 버리지 않는다.
   readonly evidence: UnreceivedEvidence;
+  // 조립이 고른 요청 ID(query-book.ts의 createResultWaitQueries)의 등록부 항목을 끝낸다. 받은 답이 쥔 항목은 남긴다: 줄에 선 답이 받은 때
+  // 본 항목, 처리 중인 답의 항목, 끝내기를 미룬 항목. 지우면 받을 때 유효했던 답이 unknown_query로 버려진다. 남긴 항목의 요청 ID를
+  // 돌려준다. 등록부가 던지면 받은 요청 ID 전부를 돌려준다(부르는 쪽이 다음에 다시 부른다). 던지지 않는다.
+  releaseQueries(requestIds: ReadonlySet<string>): ReadonlySet<string>;
 }
 
 type StatusItem = {
@@ -905,6 +909,24 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       const runIds = [...requery];
       requery.clear();
       return runIds;
+    },
+    releaseQueries(requestIds: ReadonlySet<string>): ReadonlySet<string> {
+      try {
+        if (requestIds.size === 0) return new Set();
+        const held = new Set<SentQuery>([...claimed, ...unsettled]);
+        for (const line of lines.values()) {
+          for (const item of line.items) if (item.kind === "status" && item.asked !== null) for (const entry of item.asked) held.add(entry);
+        }
+        const remaining = new Set<string>();
+        for (const entry of ports.queries.pending()) {
+          if (!isRecord(entry) || !requestIds.has(entry.requestId)) continue;
+          if (held.has(entry)) remaining.add(entry.requestId);
+          else ports.queries.settle(entry);
+        }
+        return remaining;
+      } catch {
+        return new Set(requestIds);
+      }
     },
     evidence: {
       // 한 시점의 값: 외부 코드를 부르지 않고 이 객체가 쥔 줄과 장부만 읽어 데이터 칸만 가진 새 객체로 낸다(목록도 새 배열·새 원소).

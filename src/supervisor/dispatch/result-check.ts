@@ -224,7 +224,7 @@ function stopFactsOf(row: Record<string, unknown>): StopFacts | null {
 
 // checking인 작업자 실행을 실행 목록의 차례대로. 모든 줄의 실행 ID·종류·상태를 칸마다 한 번 읽는다. 한 줄이라도 읽지 못하거나
 // 꼴이 틀리거나 같은 실행 ID가 둘이면 목록 전체가 모름이다(그 줄이 checking 실행일 수 있다).
-function readChecking(ports: ResultCheckPorts): CheckingRun[] | null {
+function readChecking(ports: { readonly ledger: Pick<Ledger, "listRuns"> }): CheckingRun[] | null {
   try {
     const answer: unknown = ports.ledger.listRuns();
     if (!isObject(answer) || answer.known !== true) return null;
@@ -247,6 +247,14 @@ function readChecking(ports: ResultCheckPorts): CheckingRun[] | null {
   } catch {
     return null;
   }
+}
+
+// 결과 기다림 경보(D-151)와 결과 기다림 조회(result_wait)의 등록부 정리가 보는 checking 작업자 실행 ID. 장부의 읽기 하나(listRuns)만
+// 쓰고 접수 문·박자 유효 문을 보지 않는다: 복원 5단계가 접수를 닫은 채 끝나도 감독과 수명 박자는 돌고 checking 실행은 자리를 쥐므로,
+// 판정 박자의 결과에 묶으면 그동안 경보가 없다. 판정 박자의 1번과 같은 조건(한 줄이라도 읽지 못함·같은 ID 둘)이면 null이다.
+export function checkingRunIds(ledger: Pick<Ledger, "listRuns">): ReadonlySet<string> | null {
+  const checking = readChecking({ ledger });
+  return checking === null ? null : new Set(checking.map((run) => run.runId));
 }
 
 // 반영 전 결과 보고를 실행마다 장부의 차례대로 모은다. 결과 밖의 보고(세션 깨짐·훅)는 동작 칸만 본다. 결과 보고는 실행 ID·저장 자리·
@@ -389,27 +397,24 @@ function markStopped(ports: ResultCheckPorts, runId: string, lastReceiptId: stri
 // 결과를 잃지 않는다(경보가 이르거나 늦을 뿐이다).
 export const RESULT_WAIT_ALERT_MS = 90_000;
 
-// checking에 오래 머문 실행을 고르는 경보 자리(D-151). 장부를 읽거나 쓰지 않고 판정하지 않는다. 결과 검사 박자의 결과와 그 박자 뒤에
-// 읽은 장부 시계를 받아, 이번에 경보할 실행과 머문 시간을 낸다. 머문 시간은 이 자리가 그 실행을 checking으로 처음 본 박자부터 센다:
-// 감독이 다시 뜨면 다시 센다(경보가 늦어질 뿐이다). 같은 실행에는 한 번만 낸다: 보고·답이 끝내 오지 않는 실행은 관리자가 손댈 때까지
-// 박자마다 같은 상태로 남아, 거르지 않으면 박자 수만큼 같은 줄이 쌓인다. 그 실행이 checking을 떠나면 기억에서 뺀다.
+// checking에 오래 머문 실행을 고르는 경보 자리(D-151). 장부를 읽거나 쓰지 않고 판정하지 않는다. 박자 뒤에 읽은 checking 실행 ID
+// (checkingRunIds)와 그 박자의 시각을 받아, 이번에 경보할 실행과 머문 시간을 낸다. 머문 시간은 이 자리가 그 실행을 checking으로 처음 본
+// 박자부터 센다: 감독이 다시 뜨면 다시 센다(경보가 늦어질 뿐이다). 같은 실행에는 한 번만 낸다: 보고·답이 끝내 오지 않는 실행은 관리자가
+// 손댈 때까지 박자마다 같은 상태로 남아, 거르지 않으면 박자 수만큼 같은 줄이 쌓인다. 그 실행이 목록에서 빠지면 기억에서 뺀다.
 export interface ResultWaitAlarm {
-  observe(result: ResultCheckTickResult, now: number): readonly { readonly runId: string; readonly waitedMs: number }[];
+  // checking이 null이면 목록을 읽지 못한 박자다: 세지도 잊지도 않는다.
+  observe(checking: ReadonlySet<string> | null, now: number): readonly { readonly runId: string; readonly waitedMs: number }[];
 }
-
-// 판정으로 checking을 떠난 결과. 나머지(기다림·충돌·거절·장부 고장)는 박자 처음에 checking이었고 떠났는지 모르므로 계속 센다.
-const LEFT_CHECKING: readonly ResultCheckOutcome["outcome"][] = ["judged", "judged_no_result"];
 
 export function createResultWaitAlarm(limitMs: number): ResultWaitAlarm {
   if (!Number.isSafeInteger(limitMs) || limitMs <= 0) throw new RangeError("결과 기다림 경보 한도는 양의 정수 ms여야 한다");
   const firstSeen = new Map<string, number>();
   const alerted = new Set<string>();
   return {
-    observe(result, now) {
-      if (result.kind !== "ran" || !Number.isSafeInteger(now)) return [];
-      const staying = result.runs.filter((run) => !LEFT_CHECKING.includes(run.outcome)).map((run) => run.runId);
+    observe(checking, now) {
+      if (checking === null || !Number.isSafeInteger(now)) return [];
       const due: { runId: string; waitedMs: number }[] = [];
-      for (const runId of staying) {
+      for (const runId of checking) {
         const first = firstSeen.get(runId) ?? now;
         firstSeen.set(runId, first);
         const waitedMs = now - first;
@@ -418,12 +423,8 @@ export function createResultWaitAlarm(limitMs: number): ResultWaitAlarm {
           due.push({ runId, waitedMs });
         }
       }
-      // 멈춘 박자의 목록은 멈춘 실행까지라 그 뒤의 checking 실행이 빠져 있다. 그때는 줄이지 않는다.
-      if (result.halted === null) {
-        const kept = new Set(staying);
-        for (const runId of [...firstSeen.keys()]) if (!kept.has(runId)) firstSeen.delete(runId);
-        for (const runId of [...alerted]) if (!kept.has(runId)) alerted.delete(runId);
-      }
+      for (const runId of [...firstSeen.keys()]) if (!checking.has(runId)) firstSeen.delete(runId);
+      for (const runId of [...alerted]) if (!checking.has(runId)) alerted.delete(runId);
       return due;
     },
   };

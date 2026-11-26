@@ -383,28 +383,28 @@ describe("답 줄에서 실패 확정까지", () => {
 });
 
 describe("결과 기다림 경보", () => {
-  const ran = (runs: { runId: string; outcome: string }[], halted: "threw" | null = null): ResultCheckTickResult =>
-    ({ kind: "ran", runs, halted, haltedAt: halted === null ? null : (runs.at(-1)?.runId ?? null) }) as ResultCheckTickResult;
-
-  test("checking에 한도만큼 머문 실행마다 한 번만 낸다. 판정으로 떠나면 잊고, 멈춘 박자는 줄이지 않는다", () => {
+  // 감시 목록은 박자 뒤에 장부에서 읽은 checking 실행 ID다(checkingRunIds). 결과 검사 박자의 결과가 아니다: 접수가 닫혀 그 박자가 돌지 않아도 센다.
+  test("checking에 한도만큼 머문 실행마다 한 번만 낸다. 목록에서 빠지면 잊고, 목록을 읽지 못한 박자는 줄이지 않는다", () => {
     const alarm = createResultWaitAlarm(90_000);
     const a = id();
     const b = id();
-    expect(alarm.observe(ran([{ runId: a, outcome: "waiting" }]), AT)).toEqual([]);
-    expect(alarm.observe(ran([{ runId: a, outcome: "waiting" }, { runId: b, outcome: "digest_conflict" }]), AT + 89_999)).toEqual([]);
-    expect(alarm.observe(ran([{ runId: a, outcome: "waiting" }, { runId: b, outcome: "digest_conflict" }]), AT + 90_000)).toEqual([{ runId: a, waitedMs: 90_000 }]);
-    const both = ran([{ runId: a, outcome: "waiting" }, { runId: b, outcome: "waiting" }]);
+    expect(alarm.observe(new Set([a]), AT)).toEqual([]);
+    expect(alarm.observe(new Set([a, b]), AT + 89_999)).toEqual([]);
+    expect(alarm.observe(new Set([a, b]), AT + 90_000)).toEqual([{ runId: a, waitedMs: 90_000 }]);
+    const both = new Set([a, b]);
     expect(alarm.observe(both, AT + 90_001)).toEqual([]);
     expect(alarm.observe(both, AT + 179_999)).toEqual([{ runId: b, waitedMs: 90_000 }]);
     expect(alarm.observe(both, AT + 3_600_000)).toEqual([]);
-    // 멈춘 박자의 목록에 없는 실행은 잊지 않는다. 돌지 않은 박자도 같다.
-    expect(alarm.observe(ran([{ runId: a, outcome: "no_result_failed" }], "threw"), AT + 3_600_001)).toEqual([]);
-    expect(alarm.observe({ kind: "not_run", reason: "intake_closed" }, AT + 3_600_002)).toEqual([]);
-    expect(alarm.observe(ran([{ runId: a, outcome: "waiting" }, { runId: b, outcome: "waiting" }]), AT + 3_600_003)).toEqual([]);
-    // 판정으로 떠난 실행은 셈에서 빠진다.
-    expect(alarm.observe(ran([{ runId: a, outcome: "judged_no_result" }]), AT + 3_600_004)).toEqual([]);
+    // 목록을 읽지 못한 박자(null)는 세지도 잊지도 않는다.
+    expect(alarm.observe(null, AT + 3_600_001)).toEqual([]);
+    expect(alarm.observe(new Set([a, b]), AT + 3_600_002)).toEqual([]);
+    // 목록에서 빠진 실행(판정으로 떠남)은 셈에서 빠진다. 다시 보이면 처음부터 센다.
+    expect(alarm.observe(new Set([b]), AT + 3_600_003)).toEqual([]);
+    expect(alarm.observe(new Set([a, b]), AT + 3_600_004)).toEqual([]);
+    expect(alarm.observe(new Set([a, b]), AT + 3_690_004)).toEqual([{ runId: a, waitedMs: 90_000 }]);
     expect(() => createResultWaitAlarm(0)).toThrow(RangeError);
   });
+
 });
 
 // 답 자리의 값은 동결한 사본이다: 적은 쪽이 객체를 고쳐도 판정의 근거가 바뀌지 않는다.

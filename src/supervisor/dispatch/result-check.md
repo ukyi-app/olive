@@ -20,7 +20,8 @@ StoppedAnswer = { runId, executorId, runGeneration, lastReceiptId }   // 대조�
 createStoppedAnswerBook(): StoppedAnswerBook   // note(답 줄) · answers · retain(이 박자). 실행마다 마지막 하나, 메모리뿐
 stoppedAnswersOf(outcome: ReceiptOutcome): StoppedAnswer[]   // 답 줄이 처리기 결과에서 적을 것을 고른다
 
-createResultWaitAlarm(limitMs): { observe(result, now): { runId, waitedMs }[] }   // 결과 기다림 경보(D-151)
+createResultWaitAlarm(limitMs): { observe(checking, now): { runId, waitedMs }[] }   // 결과 기다림 경보(D-151). checking이 null이면 세지도 잊지도 않음
+checkingRunIds(ledger): Set<runId> | null   // 경보·조회 정리의 감시 목록. listRuns 하나, 접수·유효 문을 보지 않음. 읽기 모름이면 null
 RESULT_WAIT_ALERT_MS = 90_000   // 잠정 기본값
 
 resultVerdict(reports: PendingResult[]): { kind: "pass", resultDigest, reportId } | { kind: "wait" } | { kind: "conflict", digests }
@@ -84,10 +85,12 @@ ResultCheckTickResult =
 
 `checking`에 한도만큼 머문 실행마다 감독 로그에 경보 한 줄을 남긴다. 판정은 하지 않는다(숫자가 틀려도 결과를 잃지 않는다).
 
-- **줄의 꼴.** `result_check_alert` `{ reason: "result_wait_overdue", runId, waitedMs }`(digest 충돌 경보와 같은 이름, D-127 장부 경보와 같은 감독 로그 길). 조립(`runtime/boot.ts`)이 박자 기록 뒤에 낸다.
+- **줄의 꼴.** `result_check_alert` `{ reason: "result_wait_overdue", runId, waitedMs }`(digest 충돌 경보와 같은 이름, D-127 장부 경보와 같은 감독 로그 길). 조립(`runtime/boot.ts`의 `watchResultWait`)이 박자 기록 뒤에 낸다.
+- **감시 목록.** 박자 뒤에 장부의 `listRuns` 하나로 읽은 `checking` 작업자 실행이다(`checkingRunIds`). 이 박자의 결과에 묶지 않는다: 복원 5단계가 접수를 닫은 채 끝나면(`peer_unconfirmed` 등) 감독과 수명 박자는 돌지만 이 박자는 늘 `not_run:intake_closed`라, 결과에 묶으면 그동안 경보가 없다. 목록을 읽지 못한 박자는 세지도 잊지도 않는다.
+- **시각.** 순서기가 그 박자의 결과 검사에 넘긴 시각을 다시 쓰고 시계를 따로 읽지 않는다. 공유 시계의 `read()`는 하한을 올리므로, 경보의 읽기 하나가 앞선 값을 내면 다음 박자의 결과 검사·배정이 `clock_untrusted`로 건너뛴다. 결과 검사에 시각을 넘기지 않은 박자(복원 전, 박자 처음의 시계가 `ok`가 아님)는 경보를 건너뛰고 목록도 읽지 않는다: 복원 2단계 앞의 기다림 동안 장부를 읽지 않아야 한다(D-142). 그 박자의 조회 항목 정리는 수만 줄인다.
 - **한도.** 설정 `resultWaitAlertMs`(양의 정수 ms, 틀리면 기동하지 않는다). 없으면 `RESULT_WAIT_ALERT_MS` = 90초이고 **잠정값**이다: T1 다음 바퀴에서 `checking`에 머문 시간을 잰 뒤 정한다.
-- **세는 시작.** 이 감독 프로세스가 그 실행을 `checking`으로 처음 본 박자의 장부 시계(박자 뒤에 읽은 공유 시계)부터 센다. 감독이 다시 뜨면 다시 센다(경보가 늦어질 뿐이다).
-- **한 번만.** 같은 실행에는 프로세스에서 한 번만 낸다. 보고·답이 끝내 오지 않는 실행은 관리자가 손댈 때까지 박자마다 같은 상태라 거르지 않으면 박자 수만큼 같은 줄이 쌓인다. 판정으로 `checking`을 떠난 실행은 기억에서 뺀다(돌아오는 전이가 없다). 감독이 다시 뜨면 한 줄을 더 남긴다.
+- **세는 시작.** 이 감독 프로세스가 그 실행을 `checking`으로 처음 본 박자의 시각(위 "시각")부터 센다. 감독이 다시 뜨면 다시 센다(경보가 늦어질 뿐이다).
+- **한 번만.** 같은 실행에는 프로세스에서 한 번만 낸다. 보고·답이 끝내 오지 않는 실행은 관리자가 손댈 때까지 박자마다 같은 상태라 거르지 않으면 박자 수만큼 같은 줄이 쌓인다. 감시 목록에서 빠진 실행(판정 등으로 `checking`을 떠남)은 기억에서 뺀다(돌아오는 전이가 없다). 감독이 다시 뜨면 한 줄을 더 남긴다.
 
 ## 관리자 결정 대기
 
@@ -118,12 +121,15 @@ ResultCheckTickResult =
 | 다른 실행을 물은 조회(F9), 끝난 조회의 늦은 답(F12), 인정이 끝난 연결, 등록부를 읽지 못한 답(F10·F14) → 0 | "다른 실행을 물은 조회의 답" |
 | 늦어도 대조되는 `failed_stopped`는 판정(단조) | "먼저 낸 조회의 늦은 답도" |
 | 보고가 있으면 보고가 먼저, 충돌이면 둘 다 0 | "반영 전 결과 보고가 있으면" |
-| 경보 한 번, 떠나면 잊음, 멈춘 박자는 줄이지 않음, 한도 설정 | "결과 기다림 경보", 조립 "경보 한도만큼 머문", "경보 한도가 양의 정수가 아니면" |
+| 경보 한 번, 목록에서 빠지면 잊음, 목록을 읽지 못한 박자는 줄이지 않음, 한도 설정 | "결과 기다림 경보", 조립 "경보 한도만큼 머문", "경보 한도가 양의 정수가 아니면" |
+| 접수가 닫힌 5단계에서도 경보 한 줄·판정 0 | 조립 "복원 5단계가 접수를 닫은 채 끝나도" |
+| 경보가 공유 시계를 읽지 않음(다음 박자의 하한·결과 검사·배정 보존) | 조립 "경보는 공유 시계를 다시 읽지 않는다" |
+| 답하지 않는 실행기의 `result_wait` 조회 항목은 실행마다 3개까지, `checking`을 떠나면 0. 받은 답이 쥔 항목은 남김 | 조립 "답하지 않는 실행기에 낸 결과 기다림 조회는", `runtime/result-wait-queries.test.ts` |
 
 ## 남는 한계
 
 - **충돌한 실행은 자리를 쥔다.** 경보 뒤에 그 실행을 닫는 길은 아직 없다(관리자 닫기는 종료 확인이 있는 실행을 받지 않는다, `ledger.md`).
 - **보고도 그 종료의 `failed_stopped` 답도 오지 않는 `checking`은 자리를 쥔다**(위 "자동으로 풀리지 않고 자리를 쥐는 것"). 경보 한 줄이 남고, 푸는 길은 관리자 닫기(다음 조각)다.
-- **답하지 않는 실행기에는 조회 항목이 쌓인다.** 연결이 살아 있고 답이 없으면 `answerTimeoutMs`마다 `result_wait` 조회 항목이 등록부에 하나씩 남고, 그 연결이 철회될 때 함께 끝난다(`unknown_running` 실행의 조회와 같은 성질이다).
+- **답하지 않는 실행기의 `result_wait` 조회 항목은 실행마다 최근 3개만 남는다.** 연결이 살아 있고 답이 없으면 `answerTimeoutMs`마다 새 조회가 나가고, 조립이 박자마다 그 실행의 최근 3개 밖 항목을, 그 실행이 `checking`을 떠나면 남은 항목을 모두 끝낸다(`runtime/query-book.ts`의 `createResultWaitQueries`, `runtime/answers.ts`의 `releaseQueries`). 받아 줄에 선 답이 쥔 항목은 남기고 다음 박자에 다시 끝낸다. 함정: 간격을 답의 왕복 시간보다 훨씬 짧게 잡으면 늦은 답의 항목이 먼저 끝나 `unknown_query`가 된다(판정이 늦어질 뿐 다음 조회로 다시 묻는다). 다른 사유(`intent`·`stop_already_recorded`)의 조회는 이 정리 밖이다(연결이 철회될 때 끝난다).
 - **판정과 장부 호출 사이에 새 보고가 끼는 것은 막지 못한다.** 박자는 동기이고 보고는 소켓 사건으로만 오므로 실제로는 끼지 않는다. 장부 포트 안에서 다시 보고를 적는 경우는 장부가 다른 digest의 보고를 충돌로 닫는다.
 - **경보 기억은 메모리뿐이다.** 감독이 다시 뜨면 같은 충돌에 경보를 한 줄 더 남긴다.

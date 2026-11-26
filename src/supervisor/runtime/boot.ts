@@ -39,7 +39,7 @@ import { linkLossTick } from "../dispatch/link-loss.ts";
 import type { Random } from "../dispatch/ports.ts";
 import type { AnswerSettlement, LedgerAlarm } from "../dispatch/receipts.ts";
 import { resendTick } from "../dispatch/resend.ts";
-import { createResultWaitAlarm, createStoppedAnswerBook, RESULT_WAIT_ALERT_MS, type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
+import { checkingRunIds, createResultWaitAlarm, createStoppedAnswerBook, RESULT_WAIT_ALERT_MS, type ResultCheckTickResult, resultCheckTick } from "../dispatch/result-check.ts";
 import { createRehelloMemory, type UnreceivedRehello, type UnreceivedTickResult, unreceivedTick } from "../dispatch/unreceived.ts";
 import type { LifecyclePolicy } from "../scheduler/lifecycle.ts";
 import type { FileBackendAnswer, FileBackendOptions } from "../scheduler/result-store-file.ts";
@@ -53,7 +53,7 @@ import { testFactSource } from "./test-assign.ts";
 import { type BeatReport, type Cycle, type CycleBeats, type CyclePolicy, createCycle, type Step } from "./cycle.ts";
 import { createIssuance, type Issuance } from "./issuance.ts";
 import { createPeers, type FrontPeers } from "./peers.ts";
-import { createQueryBook } from "./query-book.ts";
+import { createQueryBook, createResultWaitQueries } from "./query-book.ts";
 import { createSharedClock, type PeekableClock } from "./shared-clock.ts";
 import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer.ts";
 import { createWireSink, type WireSink } from "./sink.ts";
@@ -386,6 +386,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const waitAlarm = createResultWaitAlarm(waitLimit);
   // 결과 없음 판정의 근거(실행기의 failed_stopped 답, D-147). 답 줄이 적고 결과 검사 박자가 읽는다. 프로세스에 하나다.
   const stoppedAnswers = createStoppedAnswerBook();
+  // 이 박자가 결과 검사에 넘긴 시각. 박자 기록 뒤의 경보가 읽고 비운다(watchResultWait).
+  let judgedAt: number | null = null;
   // 기한은 일을 부르기 전에 정한다. 부른 뒤에 정하면 일의 동기 비용(파일 읽기, 장부 조회)이 상한에서 빠진다.
   const deadline = (waitMs: number): number | null => {
     try {
@@ -631,13 +633,24 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     }
   };
 
-  // 결과 기다림 경보(D-151). 실행마다 이 프로세스에서 한 줄만 남긴다(result-check.ts의 createResultWaitAlarm). 시각은 박자가 돌아온 뒤 읽은
-  // 공유 장부 시계이고, 읽지 못한 박자는 건너뛴다(다음 박자에 다시 센다). 기록만 하고 장부·박자를 바꾸지 않는다.
-  const alertResultWait = (report: BeatReport): void => {
-    if (report.kind !== "ran" || report.resultCheck.kind !== "returned") return;
-    const reading = shared.read();
-    if (reading.state !== "ok") return;
-    for (const due of waitAlarm.observe(report.resultCheck.result, reading.at)) log("result_check_alert", { reason: "result_wait_overdue", runId: due.runId, waitedMs: due.waitedMs });
+  // 결과 기다림 경보(D-151)와 결과 기다림 조회의 등록부 정리. 경보는 실행마다 이 프로세스에서 한 줄만 남긴다(result-check.ts의
+  // createResultWaitAlarm). 감시 목록은 박자 뒤에 장부에서 읽은 checking 실행이다(checkingRunIds): 접수가 닫혀 결과 검사가 판정하지 않는
+  // 동안에도 센다. 시각은 이 박자가 결과 검사에 넘긴 값(judgedAt)이고 시계를 다시 읽지 않는다: 공유 시계의 read()는 하한을 올려, 그 읽기
+  // 하나가 앞선 값을 내면 다음 박자의 결과 검사·배정이 clock_untrusted로 건너뛴다. 넘기지 않은 박자(복원 전·시계를 믿지 못함)는 경보를
+  // 건너뛰고 장부도 읽지 않는다: 복원 2단계 앞의 기다림 동안 장부를 읽지 않아야 한다(D-142, 그 읽기가 던져도 감독이 끝나지 않게). 그 박자의
+  // 등록부 정리는 수만 줄인다. 기록과 등록부 정리만 하고 장부·박자를 바꾸지 않는다. 돌지 않은 박자(진행 중·발급 닫힘)는 보지 않는다:
+  // 진행 중인 박자가 넘긴 시각을 가로채지 않게.
+  const waitQueries = createResultWaitQueries();
+  const watchResultWait = (report: BeatReport): void => {
+    if (report.kind !== "ran") return;
+    const at = judgedAt;
+    judgedAt = null;
+    const checking = at === null ? null : checkingRunIds(ledger);
+    if (at !== null) for (const due of waitAlarm.observe(checking, at)) log("result_check_alert", { reason: "result_wait_overdue", runId: due.runId, waitedMs: due.waitedMs });
+    const life = report.life.kind === "returned" && report.life.result.kind === "ran" ? report.life.result.runs : [];
+    const sent = life.flatMap((run) => (run.outcome === "query_sent" && run.cause === "result_wait" ? [{ runId: run.runId, requestId: run.requestId }] : []));
+    const release = waitQueries.due(sent, checking);
+    if (release.size > 0) waitQueries.unreleased(lines === null ? release : lines.releaseQueries(release));
   };
 
   // 장부 경보(ledger_alert)도 같은 경보마다 이 프로세스에서 한 줄만 남긴다: 실행기는 ack를 받을 때까지 같은 시작 영수증을 다시 보내고
@@ -665,7 +678,10 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
     // 판정은 접수 문을 본다: 정지 중·허가 폐기·복원 전에는 확정도 열리지 않으므로 판정만 앞당기지 않는다(result-check.md "접수").
     // 실행기의 failed_stopped 답은 답 줄이 같은 자리(stoppedAnswers)에 적는다(result-check.md "결과 없음 판정").
-    resultCheck: (now) => make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, stopped: stoppedAnswers }, now),
+    resultCheck: (now) => {
+      judgedAt = now;
+      return make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, stopped: stoppedAnswers }, now);
+    },
     life: (clock, input) =>
       make.ticks.life(
         { ledger, intake, links: need(wire).links, clock, random: deps.random, signer: signing.signer, sink: need(wire).sink, beatValid: effectsOpen },
@@ -720,7 +736,7 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       observe: (report) => {
         log("beat", summarize(report));
         alertConflicts(report);
-        alertResultWait(report);
+        watchResultWait(report);
       },
     });
   } catch (error) {

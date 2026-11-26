@@ -74,6 +74,17 @@ test("재기동 대조: 결과 보고를 적지 못한 채 다시 뜬 실행도 
   expect(onDiskEvents(again.dir, runId).map((event) => event.action)).not.toContain("report_result");
 });
 
+test("띄우기 전에 끝난 실행(작업 폴더 준비 실패)은 종료 영수증 뒤 결과 보고가 없어도 failed_stopped가 아니라 not_started로 답한다", async () => {
+  const r = await make();
+  r.space.before = async () => {
+    throw new Error("작업 폴더를 준비하지 못함");
+  };
+  const { runId } = await start(r);
+  await r.worker.idle();
+  expect(await ask(r, runId)).toEqual({ run_id: runId, state: "not_started", run_generation: 1, last_receipt_id: stoppedId(r, runId) });
+  expect(reports(r, runId)).toEqual([]);
+});
+
 test("failed_stopped 뒤에는 조회·재전송·재연결·재기동·늦은 취소를 거쳐도 ready_result가 되지 않고 결과 보고를 만들지 않는다", async () => {
   const r = await make({ mode: "fail" });
   const { runId } = await start(r);
