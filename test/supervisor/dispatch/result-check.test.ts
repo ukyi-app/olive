@@ -34,15 +34,27 @@ interface World {
   wrap(over: Partial<ResultCheckPorts["ledger"]>): void;
   // 기한 시작의 사실(D-123)을 바꾼다. 기본은 복원 5단계 NOW, 인정 NOW - RENEW_INTERVAL_MS다: 둘 다 종료 영수증(NOW + 1)보다 이르고
   // 인정 뒤 재전송 한 주기가 지났으므로 기한은 종료 영수증부터 센다. 단조 경과 셋의 기본은 한 시간(LONG)이라 장부 시각이 판정을 가른다.
+  // 답한 조회의 기본(ANSWERED)은 NOW + 2·복원·인정 가운데 늦은 때 + 재전송 한 주기에 실은 조회이고, 그 단조 경과는 0이다: 기한 시작
+  // 뒤 한 주기에 실은 조회에 실행기가 방금 답했다. 그래서 기본값으로는 이 조건이 다른 조건의 경계를 바꾸지 않는다.
   setReach(facts: ReachFacts): void;
-  // greetedAt·sinceGreetedMs에 넘긴 실행기 이름, sinceSeenMs에 넘긴 실행 ID(부른 차례).
+  // greetedAt·sinceGreetedMs·answeredAt·sinceAnsweredMs에 넘긴 실행기 이름, sinceSeenMs에 넘긴 실행 ID(부른 차례).
   greeted: string[];
   seen: string[];
+  answered: string[];
 }
 
 // 단조 경과의 기본값. 이 파일의 어떤 기한보다 길다.
 const LONG = 3_600_000;
-type ReachFacts = { restoredAt?: unknown; greetedAt?: unknown; sinceRestoredMs?: unknown; sinceGreetedMs?: unknown; sinceSeenMs?: unknown };
+type ReachFacts = {
+  restoredAt?: unknown;
+  greetedAt?: unknown;
+  sinceRestoredMs?: unknown;
+  sinceGreetedMs?: unknown;
+  sinceSeenMs?: unknown;
+  answeredAt?: unknown;
+  sinceAnsweredMs?: unknown;
+};
+const ANSWERED = Symbol("기한 시작 + 한 주기에 실은 조회");
 
 function world(ledger?: Ledger, path?: string): World {
   let clockAt = NOW;
@@ -52,9 +64,19 @@ function world(ledger?: Ledger, path?: string): World {
   let intake = true;
   let valid = true;
   let override: Partial<ResultCheckPorts["ledger"]> = {};
-  let reach: Required<ReachFacts> = { restoredAt: NOW, greetedAt: NOW - limits.RENEW_INTERVAL_MS, sinceRestoredMs: LONG, sinceGreetedMs: LONG, sinceSeenMs: LONG };
+  let reach: Required<ReachFacts> = {
+    restoredAt: NOW,
+    greetedAt: NOW - limits.RENEW_INTERVAL_MS,
+    sinceRestoredMs: LONG,
+    sinceGreetedMs: LONG,
+    sinceSeenMs: LONG,
+    answeredAt: ANSWERED,
+    sinceAnsweredMs: 0,
+  };
   const greeted: string[] = [];
   const seen: string[] = [];
+  const answered: string[] = [];
+  const answeredDefault = () => Math.max(NOW + 2, ...[reach.restoredAt, reach.greetedAt].filter((at): at is number => typeof at === "number")) + limits.RENEW_INTERVAL_MS;
   const ports: ResultCheckPorts = {
     ledger: {
       listRuns: () => (override.listRuns ?? real.listRuns.bind(real))(),
@@ -81,6 +103,14 @@ function world(ledger?: Ledger, path?: string): World {
         seen.push(runId);
         return reach.sinceSeenMs as number | null;
       },
+      answeredAt: (executorId) => {
+        answered.push(executorId);
+        return (reach.answeredAt === ANSWERED ? answeredDefault() : reach.answeredAt) as number | null;
+      },
+      sinceAnsweredMs: (executorId) => {
+        answered.push(executorId);
+        return reach.sinceAnsweredMs as number | null;
+      },
     },
   };
   return {
@@ -90,6 +120,7 @@ function world(ledger?: Ledger, path?: string): World {
     marks,
     greeted,
     seen,
+    answered,
     setReach: (facts) => {
       reach = { ...reach, ...facts };
     },
@@ -484,7 +515,16 @@ function line(policy: ResultCheckPolicy | undefined) {
             intake,
             beatValid: () => true,
             // 기한은 종료 영수증부터 센다(복원 5단계·인정 모두 그보다 이르고 재전송 한 주기가 지났다). 단조 경과는 모두 충분하다.
-            reach: { restoredAt: () => NOW, greetedAt: () => NOW - limits.RENEW_INTERVAL_MS, sinceRestoredMs: () => LONG, sinceGreetedMs: () => LONG, sinceSeenMs: () => LONG },
+            // 실행기는 기한 시작(종료 영수증) + 한 주기에 실은 조회에 방금 답했다.
+            reach: {
+              restoredAt: () => NOW,
+              greetedAt: () => NOW - limits.RENEW_INTERVAL_MS,
+              sinceRestoredMs: () => LONG,
+              sinceGreetedMs: () => LONG,
+              sinceSeenMs: () => LONG,
+              answeredAt: () => SINCE + limits.RENEW_INTERVAL_MS,
+              sinceAnsweredMs: () => 0,
+            },
           },
           now,
           policy,
@@ -575,7 +615,9 @@ describe("결과 보고 없는 checking의 기한(D-113)과 그 실패 확정(D-
     const run = checking(l.ledger);
     const before = await l.beat(SINCE + WAIT - 1);
     expect(before.resultCheck).toEqual({ kind: "ran", runs: [{ runId: run.runId, outcome: "waiting" }], halted: null, haltedAt: null });
-    expect([l.marks, l.sent, stateOf(l.ledger, run.runId)]).toEqual([[], [], "checking"]);
+    // 기다리는 checking 실행에는 수명 박자가 같은 실행 ID로 상태 조회만 낸다(결과 검사가 볼 실행기의 답을 얻는 길).
+    const query = ["status_query", { run_ids: [run.runId] }];
+    expect([l.marks, l.sent.map((envelope) => [envelope.header.action, envelope.body]), stateOf(l.ledger, run.runId)]).toEqual([[], [query], "checking"]);
 
     const at = await l.beat(SINCE + WAIT);
     expect(at.resultCheck).toEqual({ kind: "ran", runs: [{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }], halted: null, haltedAt: null });
@@ -583,7 +625,7 @@ describe("결과 보고 없는 checking의 기한(D-113)과 그 실패 확정(D-
     expect(l.marks).toStrictEqual([{ runId: run.runId, resultDigest: null, now: SINCE + WAIT }]);
     expect(l.ledger.failedStop(run.runId)).toEqual({ known: true, value: { runId: run.runId, stoppedAt: SINCE + WAIT, requestedCancel: false, exit: "completed" } });
     expect(at.life.runs).toEqual([expect.objectContaining({ runId: run.runId, outcome: "finalize_sent" })]);
-    expect(l.sent.map((envelope) => [envelope.header.action, envelope.body])).toEqual([["result_finalize", { run_id: run.runId, outcome: "failed", result_digest: null, stored_at: SINCE + WAIT }]]);
+    expect(l.sent.map((envelope) => [envelope.header.action, envelope.body])).toEqual([query, ["result_finalize", { run_id: run.runId, outcome: "failed", result_digest: null, stored_at: SINCE + WAIT }]]);
     const unanswered = l.ledger.unansweredInstructions();
     expect(unanswered.known ? unanswered.value.instructions.filter((item) => item.action === "result_finalize").map((item) => item.rebuild) : unanswered).toEqual([
       { action: "result_finalize", outcome: "failed", resultDigest: null, storedAt: SINCE + WAIT },
@@ -596,7 +638,7 @@ describe("결과 보고 없는 checking의 기한(D-113)과 그 실패 확정(D-
     // 다음 박자는 그 실행을 다시 판정하지 않고 확정을 또 적지 않는다.
     const after = await l.beat(SINCE + WAIT + 1_000);
     expect(after.resultCheck).toEqual({ kind: "ran", runs: [], halted: null, haltedAt: null });
-    expect([l.marks.length, l.sent.length, stateOf(l.ledger, run.runId)]).toEqual([1, 1, "failed_stopped"]);
+    expect([l.marks.length, l.sent.length, stateOf(l.ledger, run.runId)]).toEqual([1, 2, "failed_stopped"]);
   });
 
   test("취소 지시(requested) 뒤 cancelled로 끝난 실행은 결과 검사를 거치지 않고 확정 outcome cancelled, stored_at은 failed_stopped가 된 시각이다", async () => {
@@ -907,6 +949,83 @@ describe("결과 없음 판정의 기한 시작과 연결 조건(D-123)", () => 
     expect(w.marks).toEqual([]);
     w.setReach({ sinceGreetedMs: RESEND });
     expect(ranOf(resultCheckTick(w.ports, SINCE + LONG, SHORT)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
+  });
+});
+
+// 인정된 연결 번호만으로는 실행기와 주고받을 수 있는지 모른다(TCP 탐침을 대신 받는 중계). 결과 없음 판정은 그 연결에서 실행기가 답한
+// 조회가 있고, 그 조회를 기한 시작 + 재전송 한 주기 이후에 실었을 때만이다(장부 시각과 단조 경과 모두).
+describe("결과 없음 판정 전 실행기의 실제 답", () => {
+  test("답한 조회가 없거나 기한 시작 + 한 주기 1ms 전에 실었으면 기한이 한참 지나도 판정 0이고, 그 정각에 실었으면 판정한다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    const late = SINCE + 10 * WAIT;
+    const waiting = [{ runId: run.runId, outcome: "waiting" as const }];
+    for (const [name, at] of [
+      ["답 없음", null],
+      ["기한 시작 전에 실음", SINCE - 1],
+      ["기한 시작에 실음", SINCE],
+      ["한 주기 1ms 전에 실음", SINCE + RESEND - 1],
+    ] as const) {
+      w.setReach({ answeredAt: at, sinceAnsweredMs: 0 });
+      expect([name, ranOf(resultCheckTick(w.ports, late, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    // 기한 시작이 인정이나 5단계로 늦춰지면 그 때부터 한 주기다(종료 영수증 + 한 주기에 실은 조회로는 모자란다).
+    for (const [name, over] of [
+      ["인정이 기한 시작", { greetedAt: SINCE + 5_000 }],
+      ["5단계가 기한 시작", { restoredAt: SINCE + 5_000 }],
+    ] as const) {
+      w.setReach({ restoredAt: NOW, greetedAt: NOW - RESEND, ...over, answeredAt: SINCE + RESEND, sinceAnsweredMs: 0 });
+      expect([name, ranOf(resultCheckTick(w.ports, late, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    expect([w.marks.length, stateOf(w.ledger, run.runId)]).toEqual([0, "checking"]);
+    w.setReach({ restoredAt: NOW, greetedAt: NOW - RESEND, answeredAt: SINCE + RESEND, sinceAnsweredMs: 0 });
+    expect(ranOf(resultCheckTick(w.ports, late, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
+    expect(w.answered.every((name) => name === WORKER_EXECUTOR)).toBe(true);
+  });
+
+  test("장부 시각으로는 넉넉해도 답한 조회를 기준들의 단조 시각 + 한 주기 전에 실었거나 모르면 판정 0이고, 그 정각이면 판정한다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    const at = SINCE + WAIT;
+    const waiting = [{ runId: run.runId, outcome: "waiting" as const }];
+    const boom = () => {
+      throw new Error("읽기 실패");
+    };
+    // 단조 기준 셋이 모두 WAIT 전이다. 답한 조회를 실은 뒤의 경과가 WAIT - RESEND보다 크면 기준 + 한 주기보다 일찍 실었다.
+    const anchors = { sinceSeenMs: WAIT, sinceRestoredMs: WAIT + 5_000, sinceGreetedMs: WAIT + 9_000 };
+    const cases: [string, ReachFacts][] = [
+      ["처음 본 때 + 한 주기 1ms 전", { sinceAnsweredMs: WAIT - RESEND + 1 }],
+      ["5단계 + 한 주기 1ms 전", { sinceSeenMs: LONG, sinceRestoredMs: WAIT, sinceAnsweredMs: WAIT - RESEND + 1 }],
+      ["인정 + 한 주기 1ms 전", { sinceSeenMs: LONG, sinceRestoredMs: LONG, sinceGreetedMs: WAIT, sinceAnsweredMs: WAIT - RESEND + 1 }],
+      ["단조 모름", { sinceAnsweredMs: null }],
+      ["단조가 뒤로 감", { sinceAnsweredMs: -1 }],
+      ["NaN", { sinceAnsweredMs: Number.NaN }],
+      ["문자", { sinceAnsweredMs: "0" }],
+      ["장부 시각 꼴 틀림", { answeredAt: 1.5 }],
+      ["장부 시각이 지금보다 뒤", { answeredAt: at + 1 }],
+    ];
+    for (const [name, over] of cases) {
+      w.setReach({ ...anchors, answeredAt: ANSWERED, sinceAnsweredMs: 0, ...over });
+      expect([name, ranOf(resultCheckTick(w.ports, at, WAITING)).runs]).toEqual([name, waiting]);
+    }
+    w.setReach({ ...anchors, answeredAt: ANSWERED, sinceAnsweredMs: 0 });
+    for (const method of ["answeredAt", "sinceAnsweredMs"] as const) {
+      expect([method, ranOf(resultCheckTick({ ...w.ports, reach: { ...w.ports.reach!, [method]: boom } }, at, WAITING)).runs]).toEqual([method, waiting]);
+    }
+    expect([w.marks.length, stateOf(w.ledger, run.runId)]).toEqual([0, "checking"]);
+    // 처음 본 때 + 한 주기 정각에 실은 조회면 판정한다(위의 0이 다른 이유로 막힌 것이 아니다).
+    w.setReach({ ...anchors, answeredAt: ANSWERED, sinceAnsweredMs: WAIT - RESEND });
+    expect(ranOf(resultCheckTick(w.ports, at, WAITING)).runs).toEqual([{ runId: run.runId, outcome: "no_result", checkingSince: SINCE, state: "failed_stopped" }]);
+  });
+
+  test("답한 조회는 통과 판정을 막지 않는다: 답이 없어도 반영 전 결과 보고는 판정한다", () => {
+    const w = world();
+    const run = checking(w.ledger);
+    w.setReach({ answeredAt: null, sinceAnsweredMs: null });
+    const result = report(w.ledger, run, "본문");
+    expect(ranOf(resultCheckTick(w.ports, SINCE + 10 * WAIT, WAITING)).runs).toEqual([
+      { runId: run.runId, outcome: "judged", reportId: result.reportId, resultDigest: result.resultDigest, state: "ready_result" },
+    ]);
   });
 });
 

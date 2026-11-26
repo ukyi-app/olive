@@ -529,6 +529,13 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   const greetedLinks = new Map<number, { readonly at: number | null; readonly mono: number | null }>();
   // 실행 ID → 결과 검사가 그 실행을 결과 없음 판정을 기다리는 checking으로 처음 물은 단조 시각.
   const seenWaiting = new Map<string, number>();
+  // 상태 조회의 요청 ID → 내보내기 포트가 그 조회를 등록한(연결에 싣기 직전) 순간의 연결 번호·장부 시각·단조 시각. 같은 요청 ID를 다시
+  // 실으면 처음 값을 둔다: 답이 어느 싣기에 대한 것인지 모르므로 이른 쪽이 답을 만든 때의 하한이다. 등록부에 그 요청 ID가 남아 있는
+  // 동안만 쥔다.
+  const queryStamps = new Map<string, { readonly connection: number; readonly at: number | null; readonly mono: number | null }>();
+  // 연결 번호 → 그 연결에서 실행기가 답해 대조된(status_matched) 조회 가운데 가장 늦게 실은 것의 두 시각. 결과 검사가 결과 없음 판정
+  // 전에 그 실행기와 실제로 주고받을 수 있었는지 본다(ResultReach.answeredAt). 철회되면 지운다.
+  const answeredLinks = new Map<number, { readonly at: number; readonly mono: number }>();
   // 서버의 출력을 답 줄에 넘기기 전에 본다. 후보는 판단이 연결을 greeted로 옮긴 같은 동기 구간에서 온다. 던지면 서버가 그 연결을
   // 닫으므로 여기서는 던지지 않는다.
   const noteLink = (output: Delivered) => {
@@ -536,7 +543,10 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
       if (output.kind === "candidate") {
         const seen = shared.peek();
         greetedLinks.set(output.connection, { at: seen.state === "ok" ? seen.at : null, mono: monoRead() });
-      } else if (output.kind === "withdrawn") greetedLinks.delete(output.connection);
+      } else if (output.kind === "withdrawn") {
+        greetedLinks.delete(output.connection);
+        answeredLinks.delete(output.connection);
+      }
     } catch {
       // 적지 못한 연결은 greetedLinks에 없어 결과 없음 판정을 하지 않는다.
     }
@@ -669,11 +679,18 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
     const connection = need(server).recognized(executorId);
     return connection === null ? undefined : greetedLinks.get(connection);
   };
+  // greetedAt과 같은 연결 번호에서 그 실행기가 답한 조회. 다른 연결의 답은 쓰지 않는다.
+  const answerOf = (executorId: string) => {
+    const connection = need(server).recognized(executorId);
+    return connection === null ? undefined : answeredLinks.get(connection);
+  };
   const reach: ResultReach = {
     restoredAt: () => restoredAt,
     greetedAt: (executorId) => linkOf(executorId)?.at ?? null,
     sinceRestoredMs: () => monoSince(restoredMono),
     sinceGreetedMs: (executorId) => monoSince(linkOf(executorId)?.mono ?? null),
+    answeredAt: (executorId) => answerOf(executorId)?.at ?? null,
+    sinceAnsweredMs: (executorId) => monoSince(answerOf(executorId)?.mono ?? null),
     sinceSeenMs: (runId) => {
       const at = monoRead();
       if (at === null) return null;
@@ -685,22 +702,46 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   };
   // 처음 본 기록은 지난 박자에서 기다림으로 끝난 실행만 남긴다(판정됐거나 checking을 떠난 실행은 지운다). 박자가 끝까지 돌지 않았으면
   // 목록이 다 있지 않아 지우지 않는다. 지우면 다음에 다시 처음부터 세므로 이른 판정 쪽으로는 틀리지 않는다.
-  const forgetSeen = (result: ResultCheckTickResult) => {
+  // 지울 후보(tracked)는 박자 전에 읽어 둔 것이다: 실패할 수 있는 열거를 판정 쓰기 뒤에 두면, 판정은 이미 적혔는데 정리만 모르는 박자가 생긴다.
+  const forgetSeen = (result: ResultCheckTickResult, tracked: readonly string[]) => {
     try {
       if (result.kind !== "ran" || result.halted !== null) return;
       const keep = new Set(result.runs.filter((run) => run.outcome === "waiting").map((run) => run.runId));
-      for (const runId of [...seenWaiting.keys()]) if (!keep.has(runId)) seenWaiting.delete(runId);
+      for (const runId of tracked) if (!keep.has(runId)) seenWaiting.delete(runId);
     } catch {
       // 기록 정리일 뿐이다.
+    }
+  };
+  // 상태 조회의 답이 대조됐으면(status_matched) 그 조회를 실은 때를 그 연결의 답한 조회로 적는다. 실은 때를 모르는 조회와 다른 연결로
+  // 실은 조회는 적지 않는다(결과 검사는 적힌 것이 없으면 결과 없음 판정을 하지 않는다).
+  const noteAnswered = (note: AnswerNote): void => {
+    try {
+      if (note.kind !== "status" || note.outcome.outcome !== "status_matched") return;
+      const connection = note.outcome.connection;
+      const stamp = queryStamps.get(note.outcome.queryRequestId);
+      if (stamp === undefined || stamp.connection !== connection || note.connection !== connection || stamp.at === null || stamp.mono === null) return;
+      if (!greetedLinks.has(connection)) return;
+      const prior = answeredLinks.get(connection);
+      if (prior === undefined || stamp.mono >= prior.mono) answeredLinks.set(connection, { at: stamp.at, mono: stamp.mono });
+    } catch {
+      // 적지 못한 답은 결과 없음 판정의 근거가 되지 않는다.
     }
   };
   const beats: CycleBeats = {
     linkLoss: (clocks, policy, input) =>
       make.ticks.linkLoss({ ledger, connections: { occupancy: (source) => table().occupancy(source) }, restorer, ...clocks, beatValid: effectsOpen }, policy, input),
     // 판정은 접수 문을 본다: 정지 중·허가 폐기·복원 전에는 확정도 열리지 않으므로 판정만 앞당기지 않는다(result-check.md "접수").
+    // 첫 관측 기록의 정리 대상을 판정보다 먼저 읽는다. 읽지 못한 박자는 사실 포트(reach)를 넘기지 않아 결과 없음 판정을 하지 않는다
+    // (통과 판정은 그대로다: 결과를 버리는 쪽이 아니다).
     resultCheck: (now) => {
-      const result = make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, reach }, now, settings.resultCheck);
-      forgetSeen(result);
+      let tracked: string[] | null;
+      try {
+        tracked = [...seenWaiting.keys()];
+      } catch {
+        tracked = null;
+      }
+      const result = make.ticks.resultCheck({ ledger, intake, beatValid: effectsOpen, ...(tracked === null ? {} : { reach }) }, now, settings.resultCheck);
+      if (tracked !== null) forgetSeen(result, tracked);
       return result;
     },
     life: (clock, input) =>
@@ -816,6 +857,49 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
   let madeIssuance: Issuance | null = null;
   try {
     const queries = make.queries();
+    // 등록부는 만든 그 객체를 내보내기 포트와 답 줄에 넘긴다(같은 객체여야 한다). 그 객체의 메서드를 제자리에서 감싸 조회를 등록하는
+    // 순간(내보내기 포트가 연결에 싣기 직전)의 시각을 요청 ID에 적는다. 그 기록은 등록부에 같은 요청 ID가 남아 있는 동안만 쥔다.
+    // 시각 읽기나 적기가 던져도 등록은 그대로 한다. 감싸지 못하면(동결된 객체) 적은 시각이 없어 결과 없음 판정을 하지 않는다.
+    try {
+      const { add, remove, settle, dropConnection } = queries;
+      const pruneStamps = () => {
+        try {
+          const live = new Set(queries.pending().map((entry) => entry.requestId));
+          for (const requestId of [...queryStamps.keys()]) if (!live.has(requestId)) queryStamps.delete(requestId);
+        } catch {
+          // 남은 기록은 답이 와야 쓰이고, 등록부에 없는 요청 ID의 답은 대조되지 않는다.
+        }
+      };
+      Object.assign(queries, {
+        add: (query: Parameters<typeof add>[0]) => {
+          add.call(queries, query);
+          try {
+            if (!queryStamps.has(query.requestId)) {
+              const seen = shared.peek();
+              queryStamps.set(query.requestId, { connection: query.connection, at: seen.state === "ok" ? seen.at : null, mono: monoRead() });
+            }
+          } catch {
+            // 시각을 적지 못한 조회의 답은 결과 없음 판정의 근거가 되지 않는다.
+          }
+        },
+        remove: (query: Parameters<typeof remove>[0]) => {
+          remove.call(queries, query);
+          pruneStamps();
+        },
+        settle: (entry: Parameters<typeof settle>[0]) => {
+          const settled = settle.call(queries, entry);
+          pruneStamps();
+          return settled;
+        },
+        dropConnection: (connection: number, keep?: Parameters<typeof dropConnection>[1]) => {
+          const dropped = dropConnection.call(queries, connection, keep);
+          pruneStamps();
+          return dropped;
+        },
+      });
+    } catch {
+      // 감싸지 못한 등록부는 그대로 쓴다.
+    }
     issuance = make.issuance({
       // 발급 깃발은 순서기의 깃발에 효과의 문을 더한 것이다. 내보내기 포트의 lastCheck와 자격 값의 두 문이 이 깃발을 맨 앞에서 본다.
       // 닫기는 순서기 그대로다.
@@ -859,6 +943,8 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
         if (note.kind === "fault") log("answer_fault", { where: note.where });
         else if (note.kind === "hello") log("hello", { outcome: note.outcome.kind });
         // 답 줄은 장부 반영·ack 초안·줄의 상태를 정한 뒤에 기록하고 기록의 예외를 삼킨다(answers.ts의 note). 그래서 경보 줄은 ack·장부·줄을 바꾸지 않는다.
+        // 답한 조회는 등록부가 그 항목을 끝내기 전에 적는다(답 줄은 이 기록 뒤에 항목을 끝낸다).
+        noteAnswered(note);
         alertLedger(note);
       },
       credentials: issuance.credentials,

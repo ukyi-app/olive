@@ -69,9 +69,10 @@ const LIFE: SupervisorSettings["life"] = { renewEveryMs: limits.RUN_LEASE_MAX_MS
 // 연결이 모두 이 안에 닫힌다. keepalive 값을 바꾸면 이 한계도 따라 바뀌고, 결과 기한과의 관계는 시험이 다시 본다.
 export const KEEPALIVE_DETECT_MS = KEEPALIVE_USER_TIMEOUT_MS;
 // 결과 보고 없는 checking 실행을 결과 없음으로 판정하기까지의 기다림(D-113). T1 실측 전의 시험 숫자다. 감독은 닫힘을 통보받지 못한
-// 연결(상대가 사라졌는데 FIN이 오지 않음)을 인정된 연결로 본다. 그 연결은 keepalive가 KEEPALIVE_DETECT_MS 안에 닫고, 실행기는 다시
-// 붙은 뒤 ack가 없는 보고를 RENEW_INTERVAL_MS(10초)마다 다시 보낸다(worker.ts의 tick). 그래서 기한은 둘을 더한 80초보다 길어야
-// 끊김을 알기 전에 판정하지 않는다: 여유 10초를 더해 90초(재전송 아홉 번)로 둔다. 관계는 시험이 묶는다.
+// 연결(상대가 사라졌는데 FIN이 오지 않음)을 인정된 연결로 본다. 직접 연결이면 keepalive가 KEEPALIVE_DETECT_MS 안에 닫고, 실행기는 다시
+// 붙은 뒤 ack가 없는 보고를 RENEW_INTERVAL_MS(10초)마다 다시 보낸다(worker.ts의 tick). 그래서 기한은 둘을 더한 80초보다 길게, 여유
+// 10초를 더해 90초(재전송 아홉 번)로 둔다. 관계는 시험이 묶는다. 함정: 감독 소켓의 TCP 상대가 중계이면 keepalive가 닫지 못한다. 그
+// 경우는 기한이 아니라 결과 검사가 그 연결에서 실행기가 실제로 답한 조회를 보는 조건이 막는다(result-check.ts의 ResultReach.answeredAt).
 export const RESULT_CHECK: SupervisorSettings["resultCheck"] = { reportWaitMs: 9 * limits.RENEW_INTERVAL_MS };
 const CYCLE: SupervisorSettings["cycle"] = { judgeMs: limits.DISCONNECT_JUDGE_MS, resendEveryMs: 5_000, assignCallsPerBeat: 4 };
 

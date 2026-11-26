@@ -53,7 +53,7 @@ LifeTickResult =
 | `query_held` + `lastQueryAt`, `cause` | 마지막 조회부터 `answerTimeoutMs`가 지나지 않아 묻지 않았다 |
 | `query_not_sent` + `at`, `cause`, `reason`, `delivery` | 조회를 싣지 못했다. `delivery: "unknown"`이면 기다리는 조회에는 넣었다 |
 
-`cause`는 `intent`(판단이 조회를 냄) 또는 `stop_already_recorded`(아래 "이미 적힌 종료"). 끝난 실행(`finalized`·`not_started`)은 목록에 없다. 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
+`cause`는 `intent`(판단이 조회를 냄), `stop_already_recorded`(아래 "이미 적힌 종료"), `result_wait`(판단은 기다림인 `checking` 실행, 아래 "조회") 가운데 하나다. 끝난 실행(`finalized`·`not_started`)은 목록에 없다. 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
 
 ## 한 박자의 순서
 
@@ -114,6 +114,7 @@ LifeTickResult =
 - **간격은 실제로 실은 시각부터 센다.** 결과의 `at`은 내보내기 포트가 돌아온 뒤에 읽은 시각이다. 포트는 돌아오기 전에 실었으므로 실은 시각보다 이르지 않다. 그 시계를 읽지 못하면(시계가 던지거나, 포트 묶음에서 시계 객체를 얻다 던지거나, 꼴이 틀림) **봉투 시한(`expires_at`)을 쓴다.** 포트는 시한 뒤에 싣지 않으므로(`ports.ts` `InstructionSink`) 실은 시각의 확실한 상한이다. 봉한 시각으로 되돌리면 간격이 실제보다 짧아지므로 쓰지 않는다. 대가로 다음 조회는 실은 시각부터 센 것보다 늦어진다(조회 수명 30000ms: 10000에 봉하고 29000에 실으면 `at`은 40000, 다음 조회는 60000부터).
 - **실었거나 실렸을 수 있는 조회는 시계와 무관하게 남긴다.** `sent`·`send_threw`·정의 밖의 답이면 시계를 읽기 전에 `pendingQueries`에 넣고 결과에도 항목을 낸다.
 - `stopping`의 조회는 판단이 `lastStopAt`부터 `answerTimeoutMs`를 기다린 뒤에 내고, 그 뒤로는 이 간격이 막는다.
+- **기다리는 `checking` 실행도 묻는다(`cause: "result_wait"`).** 판단(`nextIntent`)은 `checking`에 기다림을 낸다. 이 박자는 그 실행에 같은 실행 ID의 조회를 같은 간격으로 낸다. 결과 검사는 결과 없음 판정 전에 그 실행기가 지금 연결에서 이 조회에 답했는지 본다(`result-check.md` "인정된 연결 번호만으로 판정하지 않는다"). 장부에 쓰지 않고 새 계약 메시지도 없다. 반영 전 결과 보고가 있는 실행은 같은 순환의 앞 박자(결과 검사)가 먼저 판정하므로 보통 묻지 않는다.
 
 ## 종료
 

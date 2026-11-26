@@ -12,6 +12,8 @@
 //    뒤에만 적는다. 싣는 순간 min(앞 임대의 끝, 봉투 시한, 작업 기한) - 지금 >= RENEW_MARGIN_MS일 때만 싣는다. 부르는 쪽이 싣지 못했다고
 //    넘긴 갱신의 실행은 장부의 임대 끝을 판단에 넘기지 않는다(조회로 간다).
 // 3. 임대를 모르거나 판단이 조회를 내면 같은 실행 ID로 status_query를 내고, 내보낸 조회를 기다리는 조회로 결과에 싣는다.
+//    판단이 기다림인 checking 실행도 같은 길로 묻는다(result_wait): 결과 검사는 결과 없음 판정 전에 그 실행기가 지금 연결에서 이 조회에
+//    답했는지 본다(result-check.ts의 ResultReach.answeredAt). 간격은 다른 조회와 같은 answerTimeoutMs다.
 // 4. 취소(requested)와 기한(deadline)은 사유를 장부에 함께 적고 내보낸다(연결이 없어도 적는다). 이미 종료 지시가 적힌 실행에는 새 종료
 //    지시를 적지 않는다. 쓰기를 부른 항목은 결과에서 빠지지 않는다: 포트의 실패는 그 항목의 결과이고, 쓰기를 부른 뒤 내보내기의 결과가
 //    정해지기 전의 어느 줄에서 던져도 그 항목까지 싣고 halted로 멈춘다.
@@ -235,7 +237,8 @@ export type RunOutcome =
       readonly sealReason?: string;
     };
 
-export type QueryCause = "intent" | "stop_already_recorded";
+// result_wait: 판단은 기다림인 checking 실행이다. 결과 검사가 결과 없음 판정 전에 그 실행기의 답을 본다.
+export type QueryCause = "intent" | "stop_already_recorded" | "result_wait";
 
 export type LifeTickResult =
   | { readonly kind: "not_run"; readonly reason: "clock_unavailable" | "input_malformed" | "stop_generation_unknown" | "policy_rejected" | "tick_in_progress" }
@@ -714,6 +717,7 @@ async function act(ctx: Context, plan: Planned, trace: Trace): Promise<RunOutcom
   const { run, times } = plan.facts;
   switch (plan.intent.intent) {
     case "wait":
+      if (run.state === "checking") return queryOne(ctx, run, "result_wait");
       return { runId: run.runId, outcome: "wait" };
     case "finalize":
       // cleanup_pending의 정리 확인(O13)이 정해지지 않아 ready_result·failed_stopped만 연다.

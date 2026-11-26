@@ -15,6 +15,9 @@
 //    그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기(RENEW_INTERVAL_MS)가 지나지 않았거나, 셋 중 하나라도 모르면 기다린다:
 //    실행기는 연결이 맞춰져 있을 때만 결과 보고를 보내고(src/executor/worker.ts의 transmit), 받음 확인이 없는 보고를 그 주기로 다시 보낸다.
 //    장부 시각의 비교와 함께 단조 경과(5단계 뒤·인정 뒤·이 프로세스가 그 실행을 처음 본 뒤)로도 기한과 그 주기가 지났어야 한다.
+//    더해 그 연결에서 실행기가 실제로 답한 조회가 있고, 그 조회를 실은 때가 기한 시작 + 재전송 한 주기 이후여야 한다(장부 시각과
+//    단조 경과 모두). 인정된 연결 번호만으로는 실행기와 주고받을 수 있는지 모른다: TCP 탐침을 대신 받는 중계 뒤에서 실행기가 사라져도
+//    번호는 남는다. 실행기는 같은 연결에 먼저 실은 보고 뒤에 조회의 답을 싣으므로, 그 조회 전에 다시 보낼 기회가 있던 보고는 답보다 먼저 닿는다.
 // 3. markResult에는 늘 그 보고의 reportId를 넘긴다. 장부가 그 보고가 이 실행의 반영 전 보고이고 digest가 같은지 대조해(아니면
 //    reference_mismatch) 판정이 이 박자가 본 보고를 정확히 가리킨다. 확정을 여는 데에는 필요 없다: 빠져도 장부는 판정하면서
 //    그 실행의 반영 전 결과 보고를 모두 반영한다.
@@ -55,6 +58,11 @@ export interface ResultReach {
   // 이 프로세스가 그 실행을 결과 없음 판정을 기다리는 checking으로 처음 물은 뒤의 단조 경과(처음 물을 때 0). 종료 영수증 시각은 장부
   // 시계뿐이라, 영수증이 기준일 때 단조 쪽 기준을 이것으로 대신한다(처음 물은 때는 영수증을 받은 때보다 이르지 않다).
   sinceSeenMs(runId: string): number | null;
+  // greetedAt과 같은 연결에서 그 실행기가 답한(감독이 받아 대조한) 상태 조회 가운데 가장 늦게 실은 것의 실은 시각. 답을 받은 시각이
+  // 아니다: 실행기는 조회를 받은 뒤에 답을 만들므로 실은 시각이 답을 만든 때의 하한이다. 답한 조회가 없거나 모르면 null.
+  answeredAt(executorId: string): number | null;
+  // 같은 조회를 실은 뒤의 단조 경과.
+  sinceAnsweredMs(executorId: string): number | null;
 }
 
 // 판정 자리가 보는 반영 전 결과 보고 하나. 장부의 pendingReports가 낸 차례(받은 시각, id) 그대로 넘긴다.
@@ -251,10 +259,11 @@ function readPending(ports: ResultCheckPorts): Map<string, PendingResult[]> | nu
 type Judged = { readonly outcome: ResultCheckOutcome | null; readonly halt: ResultCheckHalt | null };
 
 // 결과 없음 판정의 기한 시작(D-123): 종료 영수증 시각(since)·복원 5단계를 받아들인 시각·그 실행기의 지금 연결이 인정된 시각 가운데
-// 가장 늦은 때. 그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기가 지나지 않았거나(정각부터 지난 것으로 본다), 하나라도 모르면
-// null(기다림)이다. 감독이 멈춰 있던 동안이나 실행기 연결이 끊긴 동안은 실행기가 결과 보고를 장부에 닿게 할 수 없으므로 기한에 넣지
-// 않는다. 단조 경과도 같은 두 조건(인정 뒤 한 주기, 세 기준 모두에서 기한)을 넘어야 한다. 장부 시계만 보면 벽시계가 앞으로 뛴 만큼
-// 실행기가 실제로 기다린 시간 없이 기한이 지난다. 포트의 칸과 호출마다 한 번만 읽고, 던짐은 모름이다.
+// 가장 늦은 때. 그 실행기가 연결돼 있지 않거나, 인정 뒤 재전송 한 주기가 지나지 않았거나(정각부터 지난 것으로 본다), 그 연결에서
+// 실행기가 답한 조회를 기한 시작 + 재전송 한 주기 이후에 싣지 않았거나, 하나라도 모르면 null(기다림)이다. 감독이 멈춰 있던 동안이나
+// 실행기 연결이 끊긴 동안은 실행기가 결과 보고를 장부에 닿게 할 수 없으므로 기한에 넣지 않는다. 단조 경과도 같은 조건(인정 뒤 한 주기,
+// 세 기준 모두에서 기한, 세 기준 모두에서 한 주기 뒤에 실은 답한 조회)을 넘어야 한다. 장부 시계만 보면 벽시계가 앞으로 뛴 만큼 실행기가
+// 실제로 기다린 시간 없이 기한이 지난다. 포트의 칸과 호출마다 한 번만 읽고, 던짐은 모름이다.
 function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now: number, wait: number): number | null {
   const executorId = run.executorId;
   if (executorId === null) return null;
@@ -274,8 +283,16 @@ function waitFrom(ports: ResultCheckPorts, run: CheckingRun, since: number, now:
     const greetedMs: unknown = reach.sinceGreetedMs(executorId);
     if (!isElapsed(seenMs) || !isElapsed(restoredMs) || !isElapsed(greetedMs)) return null;
     if (greetedMs < limits.RENEW_INTERVAL_MS) return null;
-    if (Math.min(seenMs, restoredMs, greetedMs) < wait) return null;
-    return Math.max(since, restoredAt, greetedAt);
+    const earliest = Math.min(seenMs, restoredMs, greetedMs);
+    if (earliest < wait) return null;
+    const from = Math.max(since, restoredAt, greetedAt);
+    // 답한 조회. 실은 시각이 지금보다 뒤면 장부 시계가 뒤로 간 것이라 모름이다.
+    const answeredAt: unknown = reach.answeredAt(executorId);
+    if (!isTime(answeredAt) || answeredAt > now || answeredAt - from < limits.RENEW_INTERVAL_MS) return null;
+    // 단조 경과는 다른 기준들보다 뒤에 읽는다: 읽기 사이에 흐른 시간이 실은 때와 기준 사이를 짧게 보이게 할 뿐 길게 보이게 하지 않는다.
+    const answeredMs: unknown = reach.sinceAnsweredMs(executorId);
+    if (!isElapsed(answeredMs) || earliest - answeredMs < limits.RENEW_INTERVAL_MS) return null;
+    return from;
   } catch {
     return null;
   }

@@ -52,6 +52,20 @@ function greet(w: World, helloAt = w.wall) {
   w.fake.options!.deliver({ kind: "candidate", connection: 7, candidate } as never);
 }
 
+// 그 실행기가 지금 인정된 연결 7에서 상태 조회 하나에 답한 것으로 둔다. 조회는 조립이 내보내기 포트에 넘긴 등록부에 지금 등록하고(조립은
+// 등록하는 순간의 w.wall과 단조 시각을 그 조회를 실은 때로 적는다), 답(status_report)은 연결 판단이 검증해 넘긴 꼴로 조립의 deliver에 넣는다.
+// 수명 박자가 실제로 싣는 조회는 가짜 서버가 싣지 못한다(not_recognized). 실제 조회의 송수신은 boot-relay.test.ts가 본다.
+function answer(w: World, runId: string) {
+  const requestId = id();
+  w.captured.sink!.ports.queries.add({ requestId, recipient: EXECUTOR, runIds: [runId], connection: 7 });
+  const read = w.opened!.getRun(runId);
+  if (!read.known || read.value === null) throw new Error("실행 없음");
+  const runs = [{ run_id: runId, state: "failed_stopped", run_generation: read.value.runGeneration, last_receipt_id: null }];
+  const header = { sender: EXECUTOR, action: "status_report", run_generation: 0, body_digest: digest(`status:${requestId}`), issued_at: w.wall };
+  w.fake.options!.deliver({ kind: "forward", connection: 7, verified: { ok: true, action: "status_report", header, body: { in_reply_to: requestId, runs } } } as never);
+  return requestId;
+}
+
 const outcomes = (w: World) => w.events.filter((e) => e.event === "beat" && e.fields.resultCheck === "ran").map((e) => e.fields.resultCheckOutcomes);
 const alerts = (w: World) => w.events.filter((e) => e.event === "result_check_alert").map((e) => e.fields);
 
@@ -114,8 +128,9 @@ describe("결과 검사 박자 + 조립", () => {
   });
 
   test("보고 없이 기한이 지난 checking은 결과 없음으로 판정해 경보 한 줄을 남기고, 같은 박자의 수명 박자가 실패 확정을 장부에 적는다", async () => {
-    // 기한은 이 시험의 숫자다(박자 100ms 몇 번 안에 지나게).
-    const b = await booted({ resultCheck: { reportWaitMs: 300 } });
+    // 기한은 이 시험의 숫자다(재전송 두 주기). 실행기가 답한 조회는 기한 시작 + 한 주기 뒤라야 하므로 그보다 길게 둔다.
+    const WAIT = 2 * limits.RENEW_INTERVAL_MS;
+    const b = await booted({ resultCheck: { reportWaitMs: WAIT } });
     // 결과 없음 판정은 그 실행기의 인정된 연결이 있을 때만이다(D-123). 인정과 5단계(WALL)가 모두 종료 영수증보다 이르고 인정 뒤 재전송
     // 한 주기가 장부 시각과 단조 경과 모두로 지났으므로 기한은 종료 영수증부터 센다.
     greet(b.w);
@@ -123,15 +138,20 @@ describe("결과 검사 박자 + 조립", () => {
     const AT = WALL + limits.RENEW_INTERVAL_MS;
     b.w.wall = AT;
     const run = checking(b.ledger, AT);
+    await b.beat();
+    // 그 실행기가 기한 시작(종료 영수증 AT + 1) + 한 주기에 실은 조회에 답했다(단조 쪽은 처음 본 박자 + 한 주기 뒤).
+    await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+    b.w.wall = AT + 1 + limits.RENEW_INTERVAL_MS;
+    answer(b.w, run.runId);
     // 장부 시계는 조립 세계의 벽시계다(박자로 흐르지 않는다). 종료 영수증(AT + 1)부터 기한 1ms 전과 정각으로 옮긴다. 단조 쪽은 이
     // 프로세스가 그 실행을 처음 본 박자부터 센다: 1ms 전에서 기한만큼 박자를 더 돌려 단조 경과를 먼저 채운다.
-    b.w.wall = AT + 1 + 299;
+    b.w.wall = AT + 1 + WAIT - 1;
     await b.beat();
     const ran = () => b.w.events.filter((e) => e.event === "beat" && e.fields.resultCheck === "ran").map((e) => e.fields.resultCheckOutcomes);
     expect(ran().at(-1)).toBe("waiting=1");
-    await b.w.time.advance(300);
+    await b.w.time.advance(WAIT);
     expect(ran().at(-1)).toBe("waiting=1");
-    b.w.wall = AT + 1 + 300;
+    b.w.wall = AT + 1 + WAIT;
     for (let i = 0; i < 3; i += 1) await b.beat();
     // 조립은 설정의 정책 객체를 그대로 박자에 넘긴다.
     expect(b.w.captured.resultCheckPolicy).toBe(b.w.settings.resultCheck);
@@ -168,6 +188,9 @@ describe("결과 검사 박자 + 조립", () => {
     // 단조 경과로도 5단계 뒤·처음 본 뒤 기한이 지나게 박자를 먼저 돌린다(장부 시각은 5단계 시각 그대로라 기다림).
     await r.w.time.advance(60_000 + 1_000);
     expect([...new Set(outcomes(r.w))]).toEqual(["waiting=1"]);
+    // 그 실행기가 5단계 + 한 주기에 실은 조회에 답했다.
+    r.w.wall = RESTORED + limits.RENEW_INTERVAL_MS;
+    answer(r.w, r.run.runId);
     r.w.wall = RESTORED + 60_000 - 1;
     await r.beat();
     expect(outcomes(r.w).at(-1)).toBe("waiting=1");
@@ -195,6 +218,10 @@ describe("결과 검사 박자 + 조립", () => {
     await b.beat();
     expect([outcomes(b.w).at(-1), alerts(b.w)]).toEqual(["waiting=1", []]);
     b.w.wall = BACK + limits.RENEW_INTERVAL_MS;
+    // 인정 뒤 한 주기가 지나도 그 연결에서 실행기가 답한 조회가 없으면 기다린다.
+    for (let i = 0; i < 3; i += 1) await b.beat();
+    expect([outcomes(b.w).slice(-3), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], []]);
+    answer(b.w, run.runId);
     for (let i = 0; i < 3; i += 1) await b.beat();
     expect(outcomes(b.w).filter((each) => each === "no_result=1")).toHaveLength(1);
     expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
@@ -254,10 +281,17 @@ describe("결과 검사 박자 + 조립", () => {
       // 단조 경과는 넉넉히 채워 두고 장부 시각으로 가른다. 인사 바이트부터 세면 아래 1ms 전에 이미 판정한다.
       await b.w.time.advance(Math.max(wait, limits.RENEW_INTERVAL_MS) + 1_000);
       const until = Math.max(wait, limits.RENEW_INTERVAL_MS);
+      // 그 실행기는 인정 + 한 주기에 실은 조회에 답한다(기한이 한 주기보다 길면 1ms 전 박자보다 먼저).
+      const answerAt = accepted + limits.RENEW_INTERVAL_MS;
+      if (answerAt < accepted + until) {
+        b.w.wall = answerAt;
+        answer(b.w, run.runId);
+      }
       b.w.wall = accepted + until - 1;
       await b.beat();
       expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["waiting=1", "checking", []]);
       b.w.wall = accepted + until;
+      if (answerAt === accepted + until) answer(b.w, run.runId);
       for (let i = 0; i < 3; i += 1) await b.beat();
       expect(outcomes(b.w).filter((each) => each === "no_result=1")).toHaveLength(1);
       expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
@@ -282,8 +316,12 @@ describe("결과 검사 박자 + 조립", () => {
     b.w.wall = back + 60_000 + limits.RENEW_INTERVAL_MS;
     for (let i = 0; i < 3; i += 1) await b.beat();
     expect([outcomes(b.w).slice(-3), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([["waiting=1", "waiting=1", "waiting=1"], "checking", []]);
-    // 단조 경과로도 인정 뒤 기한이 지나면 판정한다(위의 0이 다른 이유로 막힌 것이 아니다).
-    await b.w.time.advance(60_000);
+    // 단조 경과로도 인정 뒤 기한이 지나면 판정한다(위의 0이 다른 이유로 막힌 것이 아니다). 실행기는 인정 뒤 단조 한 주기가 지나 실은
+    // 조회에 답했다.
+    await b.w.time.advance(limits.RENEW_INTERVAL_MS);
+    expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["checking", []]);
+    answer(b.w, run.runId);
+    await b.w.time.advance(60_000 - limits.RENEW_INTERVAL_MS);
     expect([stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
     expect(await b.run.stop()).toBe(0);
   });
@@ -299,6 +337,51 @@ describe("결과 검사 박자 + 조립", () => {
     for (let i = 0; i < 3; i += 1) await b.beat();
     expect([outcomes(b.w).at(-1), stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual(["waiting=1", "checking", []]);
     expect(await b.run.stop()).toBe(0);
+  });
+});
+
+describe("첫 관측 기록의 정리 대상 읽기 실패", () => {
+  test("기한이 찬 박자에서 첫 관측 기록의 정리 대상 읽기만 실패하면 판정 쓰기(markResult)가 0이고, 읽기가 돌아오면 판정한다", async () => {
+    const b = await booted({ resultCheck: RESULT_CHECK });
+    try {
+      greet(b.w);
+      const run = checking(b.ledger);
+      await b.beat();
+      // 다른 조건을 모두 채운다: 인정·처음 본 때 + 한 주기 뒤 실은 조회에 답했고, 장부 시각과 단조 경과 모두 기한이 지났다.
+      await b.w.time.advance(limits.RENEW_INTERVAL_MS + 1_000);
+      b.w.wall = WALL + 1 + limits.RENEW_INTERVAL_MS;
+      answer(b.w, run.runId);
+      b.w.wall = WALL + 1 + RESULT_CHECK.reportWaitMs;
+      b.w.time.set(b.w.time.monoNow() + RESULT_CHECK.reportWaitMs);
+      const marks: unknown[] = [];
+      const mark = b.ledger.markResult.bind(b.ledger);
+      b.ledger.markResult = (input) => {
+        marks.push(input);
+        return mark(input);
+      };
+      // 조립의 첫 관측 기록(실행 ID → 단조 시각)의 열거만 던지게 한다.
+      const keys = Map.prototype.keys;
+      let thrown = 0;
+      Map.prototype.keys = function (this: Map<unknown, unknown>) {
+        if (typeof this.get(run.runId) === "number" && (new Error().stack ?? "").includes("runtime/boot.ts")) {
+          thrown += 1;
+          throw new Error("정리 대상 읽기 실패");
+        }
+        return keys.call(this);
+      } as typeof keys;
+      try {
+        await b.beat();
+      } finally {
+        Map.prototype.keys = keys;
+      }
+      expect(thrown).toBeGreaterThan(0);
+      expect([marks, stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([[], "checking", []]);
+      // 읽기가 돌아오면 판정한다(위의 0이 다른 이유로 막힌 것이 아니다).
+      await b.beat();
+      expect([marks, stateOf(b.ledger, run.runId), alerts(b.w)]).toEqual([[{ runId: run.runId, resultDigest: null, now: b.w.wall }], "failed_stopped", [{ reason: "no_result", runId: run.runId, checkingSince: WALL + 1 }]]);
+    } finally {
+      await b.run.stop();
+    }
   });
 });
 
