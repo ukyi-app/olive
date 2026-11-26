@@ -1,14 +1,15 @@
 // 대리 핵심의 시험. 링크는 가짜 Transport, 정리·띄우기·시계는 가짜다. 실제 프로세스는 test/executor/containment.test.ts의 "대리" 사례가 본다.
 import { expect, test } from "bun:test";
 import { AGENT_EXIT, type AgentParts, type AgentOptions, RoleAgent } from "../../src/agent/agent.ts";
-import { encodeControl } from "../../src/agent/link.ts";
+import { CredentialValue, encodeControl } from "../../src/agent/link.ts";
 import { encodeCredentialFrame, encodeFrame } from "../../src/transport/framing.ts";
-import { FakeLauncher, FakeRuntime, FakeSpace, RUN, RUN2, SECRET, SECRET_DIGEST, secretBytes, settle, startBytes, T0, Wire } from "./support.ts";
+import { FakeLauncher, FakeRuntime, FakeSpace, FakeWorkspace, RUN, RUN2, SECRET, SECRET_DIGEST, secretBytes, settle, startBytes, T0, Wire } from "./support.ts";
 
 async function agent(options: AgentOptions = {}, over: Partial<AgentParts> = {}) {
   const runtime = new FakeRuntime();
   const space = new FakeSpace();
   const launcher = new FakeLauncher();
+  const workspace = new FakeWorkspace();
   const wire = new Wire();
   const order: string[] = [];
   const parts: AgentParts = {
@@ -16,11 +17,12 @@ async function agent(options: AgentOptions = {}, over: Partial<AgentParts> = {})
     harden: () => (order.push("harden"), true),
     record: async () => (order.push("record"), space),
     launcher,
+    workspace,
     ...over,
   };
   const role = await RoleAgent.prepare(runtime, parts, options);
   role?.attach(wire);
-  return { role: role!, runtime, space, launcher, wire, order };
+  return { role: role!, runtime, space, launcher, workspace, wire, order };
 }
 
 const terminate = (seq: number) => encodeControl({ type: "terminate", seq });
@@ -47,7 +49,14 @@ test("대리: harden → PID 1 확인 → 정리 코어 기록 순서로 뜨고 
   ] as const) {
     const runtime = new FakeRuntime();
     let recorded = false;
-    const parts: AgentParts = { selfPid: 1, harden: () => true, record: async () => ((recorded = true), new FakeSpace()), launcher: new FakeLauncher(), ...over };
+    const parts: AgentParts = {
+      selfPid: 1,
+      harden: () => true,
+      record: async () => ((recorded = true), new FakeSpace()),
+      launcher: new FakeLauncher(),
+      workspace: new FakeWorkspace(),
+      ...over,
+    };
     expect(await RoleAgent.prepare(runtime, parts)).toBeNull();
     expect(runtime.exits).toEqual([code]);
     // non-dumpable이 아니거나 PID 1이 아니면 정리 코어를 기록하지도 않는다.
@@ -304,7 +313,7 @@ test("차례: attach 전에 받은 바이트는 디코딩·띄우기 없이 prot
   const runtime = new FakeRuntime();
   const space = new FakeSpace();
   const launcher = new FakeLauncher();
-  const role = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher }))!;
+  const role = (await RoleAgent.prepare(runtime, { selfPid: 1, harden: () => true, record: async () => space, launcher, workspace: new FakeWorkspace() }))!;
   const bytes = startBytes();
   const taken: boolean[] = [];
   const original = Uint8Array.prototype.fill;
@@ -421,4 +430,189 @@ test("자격: 값 틀이 start의 지문과 다르면 띄우지 않고 protocol�
   expect(ok.launcher.calls).toHaveLength(1);
   expect(filled.length).toBeGreaterThan(0);
   expect(filled.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
+});
+
+const clean = (seq: number) => encodeControl({ type: "clean", seq });
+const cleanedOf = (wire: Wire) => wire.messages().filter((message) => message.type === "cleaned");
+
+test("정리(D-153·D-154): 열린 실행이 없고 남은 수가 0이면 작업 공간을 비우고 남은 항목 수를 답한다(0, 그 수, 파일 오류면 null)", async () => {
+  const { role, wire, workspace, space, launcher } = await agent();
+  workspace.clearCounts = [0, 2, new Error("EACCES")];
+  for (const seq of [1, 2, 3]) {
+    role.receive(clean(seq));
+    await settle();
+  }
+  expect(cleanedOf(wire)).toEqual([
+    { type: "cleaned", seq: 1, left: 0 },
+    { type: "cleaned", seq: 2, left: 2 },
+    { type: "cleaned", seq: 3, left: null },
+  ]);
+  // 지울 때마다 남은 프로세스를 다시 센다.
+  expect([workspace.clears, space.countCalls]).toEqual([3, 3]);
+  expect(launcher.calls).toHaveLength(0);
+});
+
+test("정리: 남은 프로세스가 0이 아니거나 모르거나, 열린 실행이 있으면(프로그램이 끝났지만 0으로 닫히지 않은 실행 포함) 지우지 않고 null이다", async () => {
+  const { role, wire, workspace, space, launcher } = await agent();
+  space.counts = [2, null];
+  role.receive(clean(1));
+  await settle();
+  role.receive(clean(2));
+  await settle();
+  role.receive(startBytes());
+  await settle();
+  launcher.finish(0, new Uint8Array());
+  await settle();
+  role.receive(clean(3));
+  await settle();
+  expect(cleanedOf(wire).map((message) => message.type === "cleaned" && message.left)).toEqual([null, null, null]);
+  expect(workspace.clears).toBe(0);
+  // 대조군: 세기 0으로 실행이 닫힌 뒤에는 비운다.
+  role.receive(count(4));
+  await settle();
+  role.receive(clean(5));
+  await settle();
+  expect(cleanedOf(wire).at(-1)).toEqual({ type: "cleaned", seq: 5, left: 0 });
+  expect(workspace.clears).toBe(1);
+});
+
+test("띄우기 전(D-154): 작업 공간이 비지 않았거나 읽지 못하면 띄우지 않고 space_not_clean이다. 비었으면 cwd를 만든 뒤 띄운다", async () => {
+  const { role, wire, workspace, launcher } = await agent();
+  const RUN3 = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+  workspace.entryCounts = [1, new Error("EIO")];
+  role.receive(startBytes());
+  await settle();
+  role.receive(count(1));
+  await settle();
+  role.receive(startBytes({ run_id: RUN2 }));
+  await settle();
+  role.receive(count(2));
+  await settle();
+  expect(wire.messages().filter((message) => message.type === "not_spawned")).toEqual([
+    { type: "not_spawned", run_id: RUN, reason: "space_not_clean" },
+    { type: "not_spawned", run_id: RUN2, reason: "space_not_clean" },
+  ]);
+  expect([launcher.calls.length, workspace.entered]).toEqual([0, []]);
+  role.receive(startBytes({ run_id: RUN3, cwd: "/tmp/work" }));
+  await settle();
+  expect(workspace.entered).toEqual(["/tmp/work"]);
+  expect(launcher.calls.map((call) => call.plan.cwd)).toEqual(["/tmp/work"]);
+});
+
+test("정리 중에는 띄우지 않고(cleanup_busy), 지우는 사이 실행이 열렸으면 그 정리의 답은 null이다", async () => {
+  const { role, wire, workspace, launcher } = await agent();
+  let open!: () => void;
+  workspace.clearGate = new Promise((resolve) => (open = resolve));
+  role.receive(clean(1));
+  await settle();
+  expect(workspace.clears).toBe(1);
+  role.receive(startBytes());
+  await settle();
+  open();
+  await settle();
+  expect(wire.messages().filter((message) => message.type === "not_spawned" || message.type === "cleaned")).toEqual([
+    { type: "not_spawned", run_id: RUN, reason: "cleanup_busy" },
+    { type: "cleaned", seq: 1, left: null },
+  ]);
+  expect(launcher.calls).toHaveLength(0);
+});
+
+test("정리 중에 받은 start는 받은 때 cleanup_busy다: 사전 계수가 정리보다 늦게 끝나도 폴더 준비·띄우기가 0회이고, 자격 값은 꺼내지 않고 0으로 채워 버린다", async () => {
+  const { role, wire, workspace, space, launcher } = await agent();
+  let openClear!: () => void;
+  workspace.clearGate = new Promise((resolve) => (openClear = resolve));
+  role.receive(clean(1));
+  await settle();
+  expect(workspace.clears).toBe(1);
+  // 이 뒤의 계수(시작의 사전 계수)는 정리가 끝난 뒤에 끝난다.
+  let openCount!: () => void;
+  space.countGate = new Promise((resolve) => (openCount = resolve));
+  let taken = 0;
+  const filled: Uint8Array[] = [];
+  const take = CredentialValue.prototype.take;
+  const fill = Uint8Array.prototype.fill;
+  CredentialValue.prototype.take = function (this: CredentialValue) {
+    taken++;
+    return take.call(this);
+  };
+  Uint8Array.prototype.fill = function (this: Uint8Array, ...args: Parameters<Uint8Array["fill"]>) {
+    if (this.length === secretBytes().length && new TextDecoder().decode(this) === SECRET) filled.push(this);
+    return fill.apply(this, args);
+  };
+  try {
+    role.receive(startBytes({ cwd: "/tmp/work" }));
+  } finally {
+    CredentialValue.prototype.take = take;
+    Uint8Array.prototype.fill = fill;
+  }
+  await settle();
+  openClear();
+  await settle();
+  openCount();
+  await settle();
+  expect(wire.messages().filter((message) => ["not_spawned", "spawned", "cleaned"].includes(message.type))).toEqual([
+    { type: "not_spawned", run_id: RUN, reason: "cleanup_busy" },
+    { type: "cleaned", seq: 1, left: null },
+  ]);
+  expect([workspace.entered, launcher.calls.length]).toEqual([[], 0]);
+  expect(taken).toBe(0);
+  expect(filled.length).toBeGreaterThan(0);
+  expect(filled.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
+  // 거절한 실행도 다른 거절처럼 count의 0으로 닫혀 다음 start를 받는다.
+  role.receive(count(2));
+  await settle();
+  role.receive(startBytes({ run_id: RUN2 }));
+  await settle();
+  expect(launcher.calls).toHaveLength(1);
+});
+
+test("띄우기 전(D-154): 빈 공간을 읽는 사이 중단·기한·링크 닫힘이 오면 하위 cwd 폴더를 만들지 않고 띄우지 않는다", async () => {
+  const notSpawned = (wire: Wire) => wire.messages().filter((message) => message.type === "not_spawned");
+  const held = async () => {
+    const parts = await agent();
+    let open!: () => void;
+    parts.workspace.entriesGate = new Promise((resolve) => (open = resolve));
+    parts.role.receive(startBytes({ cwd: "/tmp/work" }));
+    await settle();
+    return { ...parts, open };
+  };
+
+  const aborted = await held();
+  aborted.role.receive(terminate(1));
+  await settle();
+  aborted.open();
+  await settle();
+  expect(notSpawned(aborted.wire)).toEqual([{ type: "not_spawned", run_id: RUN, reason: "aborted" }]);
+  expect([aborted.workspace.entered, aborted.launcher.calls.length]).toEqual([[], 0]);
+
+  // 임대 끝(T0 + 30초)이 지났다. 집행 시각(+ 여유)은 아직이다.
+  const expired = await held();
+  expired.runtime.advance(30_000);
+  expired.open();
+  await settle();
+  expect(notSpawned(expired.wire)).toEqual([{ type: "not_spawned", run_id: RUN, reason: "expired" }]);
+  expect([expired.workspace.entered, expired.launcher.calls.length]).toEqual([[], 0]);
+
+  const closed = await held();
+  closed.role.linkClosed();
+  closed.open();
+  await settle();
+  expect([closed.workspace.entered, closed.launcher.calls.length]).toEqual([[], 0]);
+  expect(closed.runtime.exits).toEqual([AGENT_EXIT.link_closed]);
+
+  // 대조군: 아무것도 오지 않으면 같은 순서에서 폴더를 만들고 띄운다.
+  const plain = await held();
+  plain.open();
+  await settle();
+  expect([plain.workspace.entered, plain.launcher.calls.length]).toEqual([["/tmp/work"], 1]);
+});
+
+test("차례: clean은 terminate·count와 seq를 함께 쓴다. 같거나 작은 seq의 clean은 비우기 전에 protocol로 끝난다", async () => {
+  const { role, runtime, workspace } = await agent();
+  role.receive(terminate(2));
+  await settle();
+  role.receive(clean(2));
+  await settle();
+  expect(runtime.exits).toEqual([AGENT_EXIT.protocol]);
+  expect(workspace.clears).toBe(0);
 });

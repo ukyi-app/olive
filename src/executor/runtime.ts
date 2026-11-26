@@ -44,6 +44,7 @@ import { type AgentLinkSession, type AgentLinkTransport, type DistrustReason, Re
 import { createExecutorSocket, type ExecutorSocket, type ReceivePolicy, type ReconnectPolicy, type SocketEvent } from "./socket.ts";
 import { type ExecutorStore, GENERATION_MARKER, type RunRecord, type StoredRunState } from "./store.ts";
 import { type RunSpace, WorkerExecutor } from "./worker.ts";
+import { insideWorkspace } from "./workspace.ts";
 
 // 종료 코드. 0은 요청된 멈춤(SIGTERM 등) 뒤뿐이다. 64·69는 이미지의 다른 진입점이, 75~80은 대리(src/agent/agent.ts)가,
 // 90~93·95·96은 init(src/main/agent-install.ts)이 쓴다.
@@ -169,13 +170,12 @@ export type StartResult =
 // 장부에 끝을 맺지 못한 채 남은 실행의 상태. 이 프로세스 전부터 있었다면 그 실행의 공간이 사라졌다는 따로 된 확인이 없다.
 const UNFINISHED: readonly StoredRunState[] = ["preparing", "running", "stopping", "checking", "unknown_running"];
 
-// 제어 컨테이너는 실행마다 만드는 폴더가 없다. 역할 프로그램의 작업 폴더는 역할 컨테이너에 있고 이 컨테이너에 붙지 않는다(D-100).
-// 그래서 준비할 것이 없다. 지우기는 확인할 수 없으므로 false다: receipt_cleaned는 자격·tmp·작업 폴더를 지웠다는 뜻이고
-// (계약 v1 receipt), 감독은 그 영수증으로 실행을 끝내고 슬롯을 푼다. 확인하지 못한 실행은 cleanup_pending으로 슬롯을 쥔 채 남는다.
-// 실행마다 작업 폴더를 지우고 그것을 확인하는 일은 뒤 작업(O13)이 이 자리를 바꿔 정한다.
-export const noRunFiles: RunSpace = {
+// 제어 컨테이너는 실행마다 만드는 파일이 없다. 역할 프로그램의 작업 공간은 역할 컨테이너의 /tmp 전체이고 이 컨테이너에 붙지 않는다(D-100·D-154).
+// 그래서 이쪽은 준비할 것도 지울 것도 없다. receipt_cleaned의 근거는 원격 공간(RemoteAgent.space)이 대리에게 받은 정리 확인이다(D-146·D-153).
+// 함정: 이 값을 worker에 바로 넘기지 않는다. 원격 공간으로 감싸야 지우기가 대리의 확인을 기다린다.
+const noControlFiles: RunSpace = {
   prepare: async () => {},
-  clean: async () => false,
+  clean: async () => true,
 };
 
 // 파드 전체 재시작의 증거(D-104). 회복 대조가 세대 표식이 요청 때와 다른 것을 본 뒤, 그 요청의 실행을 닫는 동안만 worker의 정리 자리에 들어간다.
@@ -283,6 +283,11 @@ export function parseProfile(text: string): RoleProfile {
     credentialEnv: value.credentialEnv,
   });
   if (!linkCarries(profile)) throw new MaterialError("profile_link_unencodable");
+  // 대리는 실행 사이에 작업 공간(/tmp) 전체를 비운다(D-154). 작업 폴더와 HOME이 그 밖이면 모델 CLI가 쓴 파일(자격 파일 포함)이 정리 밖에 남는다.
+  // 자격 환경 이름이 HOME이면 역할이 받는 HOME은 자격 문자열이라 기동 때 작업 공간 아래임을 보장할 수 없다.
+  if (!insideWorkspace(profile.cwd) || profile.credentialEnv === "HOME" || (Object.hasOwn(profile.env, "HOME") && !insideWorkspace(profile.env.HOME!))) {
+    throw new MaterialError("profile_outside_workspace");
+  }
   return profile;
 }
 
@@ -665,7 +670,7 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
     deps.monoNow,
   );
   remote = agent;
-  remoteSpace = agent.space(noRunFiles);
+  remoteSpace = agent.space(noControlFiles);
 
   step("agent_listen");
   let listener: UnixListening;

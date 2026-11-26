@@ -4,7 +4,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import type * as tls from "node:tls";
-import { encodeAgent, encodeControl } from "../../src/agent/link.ts";
+import { ControlDecoder, encodeAgent, encodeControl, type ReceivedControl } from "../../src/agent/link.ts";
 import type { Envelope } from "../../src/contract/v1/index.ts";
 import type { RemoteAgent } from "../../src/executor/remote-agent.ts";
 import { REVISION as CONTRACT_REVISION } from "../../src/contract/v1/schema.ts";
@@ -12,8 +12,8 @@ import {
   EXECUTOR_EXIT,
   type ExecutorDeps,
   type ExecutorSettings,
-  noRunFiles,
   type StartResult,
+  parseProfile,
   type StartStep,
   startExecutor,
 } from "../../src/executor/runtime.ts";
@@ -117,9 +117,15 @@ class Timers {
 class FakeAgent {
   remote: RemoteAgent | null = null;
   session: ReturnType<RemoteAgent["connect"]> = null;
+  readonly written: Uint8Array[] = [];
   attach(remote: RemoteAgent) {
     this.remote = remote;
-    this.session = remote.connect({ write: () => {}, close: () => {} });
+    this.session = remote.connect({ write: (bytes) => void this.written.push(bytes.slice()), close: () => {} });
+  }
+  // 제어가 이 대리에게 보낸 말.
+  controls(): ReceivedControl[] {
+    const decoder = new ControlDecoder();
+    return this.written.flatMap((bytes) => decoder.push(bytes));
   }
   hello() {
     this.session?.receive(encodeAgent({ type: "hello" }));
@@ -458,13 +464,74 @@ test("연결 뒤 지시 처리가 던지면(로컬 서명 실패 등) 그 worker
 const within = <T>(promise: Promise<T>, ms: number) => Promise.race([promise, Bun.sleep(ms).then(() => "timeout" as const)]);
 const optionsOf = (value: object) => (value as unknown as { options: Record<string, unknown> }).options;
 
-test("정리 확인: O13 전에는 지웠는지 확인할 수 없으므로 noRunFiles.clean과 worker가 받은 공간의 clean은 false다(cleanup_pending에 남고 receipt_cleaned 0)", async () => {
-  expect(await noRunFiles.clean(randomUUID())).toBe(false);
+test("정리 확인(O13-a): worker가 받은 공간의 clean은 대리에게 clean을 묻고, 기한 안에 남은 항목 0을 들었을 때만 true다(남음·모름·기한 넘김은 false)", async () => {
   const h = harness();
   const result = await begin(h);
   if (!result.ok) throw new Error(result.reason);
   const space = optionsOf(result.running.worker).space as { clean(runId: string): Promise<boolean> };
-  expect(await space.clean(randomUUID())).toBe(false);
+  const asked = () => h.agent.controls().filter((message): message is Extract<ReceivedControl, { type: "clean" }> => message.type === "clean");
+  const reply = (left: number | null) => h.agent.session?.receive(encodeAgent({ type: "cleaned", seq: asked().at(-1)!.seq, left }));
+  const outcomes: (boolean | "timeout")[] = [];
+  for (const left of [0, 3, null] as const) {
+    const cleaned = space.clean(randomUUID());
+    await until(() => asked().length === outcomes.length + 1);
+    reply(left);
+    outcomes.push(await within(cleaned, 1_000));
+  }
+  // 답이 없으면 기한(replyWaitMs)에 false로 돌아간다. worker는 이 호출에 상한을 걸지 않는다.
+  const silent = space.clean(randomUUID());
+  await until(() => asked().length === 4);
+  expect(await within(silent, 50)).toBe("timeout");
+  h.timers.advance(TIMING.replyWaitMs);
+  outcomes.push(await within(silent, 1_000));
+  expect(outcomes).toEqual([true, false, false, false]);
+});
+
+test("재료 틀림(D-154): 프로필 cwd나 HOME이 작업 공간(/tmp) 밖이면 82, 저장소·연결 0. /tmp 아래 하위 폴더는 기동한다", async () => {
+  for (const profile of [
+    { ...PROFILE, cwd: "/work" },
+    { ...PROFILE, cwd: "/tmpx" },
+    { ...PROFILE, cwd: "/tmp/../etc" },
+    { ...PROFILE, env: { HOME: "/home/role" } },
+  ]) {
+    const files = contents();
+    files.set(FILES.profile, JSON.stringify(profile));
+    const h = harness({ files });
+    expect(await begin(h), JSON.stringify(profile)).toMatchObject({ ok: false, step: "material", code: EXECUTOR_EXIT.material, reason: "profile_outside_workspace" });
+    expect(h.calls).not.toContain("openStore");
+    expect(h.connects).toBe(0);
+  }
+  const files = contents();
+  files.set(FILES.profile, JSON.stringify({ ...PROFILE, cwd: "/tmp/work", env: { HOME: "/tmp/home" } }));
+  expect(await begin(harness({ files }))).toMatchObject({ ok: true });
+});
+
+test("재료 틀림(D-154): 자격 환경 이름이 HOME이면(역할이 받는 HOME이 자격 문자열이다) cwd가 /tmp 아래여도 82, 저장소·연결 0. VM 시험 프로필 둘은 그대로 받는다", async () => {
+  for (const profile of [
+    { ...PROFILE, credentialEnv: "HOME" },
+    { ...PROFILE, cwd: "/tmp/work", credentialEnv: "HOME" },
+  ]) {
+    const files = contents();
+    files.set(FILES.profile, JSON.stringify(profile));
+    const h = harness({ files });
+    expect(await begin(h), JSON.stringify(profile)).toMatchObject({ ok: false, step: "material", code: EXECUTOR_EXIT.material, reason: "profile_outside_workspace" });
+    expect(h.calls).not.toContain("openStore");
+    expect(h.connects).toBe(0);
+  }
+  // VM 시험 프로필(진단·격리 읽기)의 꼴: cwd는 /tmp, 고정 HOME 없음, 자격 환경 이름은 HOME이 아니다.
+  const vm = (role: "diagnosis" | "isolated_reader") => ({
+    role,
+    revision: "t1-fixed-1",
+    program: "/bin/sh",
+    argv: ["-c", "printf '%s\\n' \"$FIXED_RESULT\""],
+    cwd: "/tmp",
+    env: { FIXED_RESULT: JSON.stringify({ role, outcome: "completed", summary: "고정 결과", items: [], refs: [] }) },
+    credentialEnv: "CLAUDE_CODE_OAUTH_TOKEN",
+  });
+  for (const role of ["diagnosis", "isolated_reader"] as const) expect(parseProfile(JSON.stringify(vm(role))), role).toMatchObject({ role, cwd: "/tmp" });
+  const files = contents();
+  files.set(FILES.profile, JSON.stringify(vm("diagnosis")));
+  expect(await begin(harness({ files }))).toMatchObject({ ok: true });
 });
 
 test("연결이 먼저 닫힌 뒤 지시 처리가 던져도 89로 끝나고, 같은 프로세스가 감독에 다시 붙지 않는다(루프백 TLS)", async () => {

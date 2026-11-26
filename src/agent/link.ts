@@ -51,7 +51,9 @@ export type ControlMessage =
     }
   | { readonly type: "renew"; readonly run_id: RunId; readonly lease_until: number }
   | { readonly type: "terminate"; readonly seq: number }
-  | { readonly type: "count"; readonly seq: number };
+  | { readonly type: "count"; readonly seq: number }
+  // 작업 공간(역할 컨테이너의 /tmp 전체)을 비우고 센다(D-154). 열린 실행 밖의 요청이다.
+  | { readonly type: "clean"; readonly seq: number };
 
 // 대리 → 제어
 export type NotSpawnedReason = "aborted" | "cleanup_busy" | "spawn_failed" | "refused" | "expired" | "space_not_clean";
@@ -72,7 +74,9 @@ export type AgentMessage =
   | { readonly type: "unconfirmed"; readonly run_id: RunId }
   | { readonly type: "terminated"; readonly seq: number }
   // 정리 코어의 survivors() 그대로. 0은 확인, null은 모름.
-  | { readonly type: "counted"; readonly seq: number; readonly survivors: number | null };
+  | { readonly type: "counted"; readonly seq: number; readonly survivors: number | null }
+  // 비운 뒤 작업 공간 루트 바로 아래 남은 항목 수. 0은 확인, null은 모름·거절(열린 실행, 남은 프로세스, 파일 오류).
+  | { readonly type: "cleaned"; readonly seq: number; readonly left: number | null };
 
 const NOT_SPAWNED: readonly NotSpawnedReason[] = ["aborted", "cleanup_busy", "spawn_failed", "refused", "expired", "space_not_clean"];
 
@@ -213,6 +217,7 @@ function checkControl(raw: unknown): ControlMessage | "unknown" | null {
       return keysAre(m, ["v", "type", "run_id", "lease_until"]) && runId(m.run_id) && epochMs(m.lease_until) ? (strip(m) as ControlMessage) : null;
     case "terminate":
     case "count":
+    case "clean":
       return keysAre(m, ["v", "type", "seq"]) && positive(m.seq) ? (strip(m) as ControlMessage) : null;
     default:
       return "unknown";
@@ -260,6 +265,10 @@ function checkAgent(raw: unknown): AgentMessage | "unknown" | null {
         (m.survivors === null || (Number.isSafeInteger(m.survivors) && (m.survivors as number) >= 0))
         ? (strip(m) as AgentMessage)
         : null;
+    case "cleaned":
+      return keysAre(m, ["v", "type", "seq", "left"]) && positive(m.seq) && (m.left === null || (Number.isSafeInteger(m.left) && (m.left as number) >= 0))
+        ? (strip(m) as AgentMessage)
+        : null;
     default:
       return "unknown";
   }
@@ -279,7 +288,7 @@ function strip(m: Fields): Fields {
 // ---- 디코딩 ----
 
 // 대리가 받는 쪽(제어 → 대리). 차례 규칙: start 바로 다음 틀은 그 start의 값 틀이어야 하고, 값 틀은 그 자리 밖에 오지 않는다.
-// terminate·count는 seq 하나를 함께 쓰고 오름차순이다. 같거나 작은 seq는 효과(정리, 답) 전에 여기서 거절한다.
+// terminate·count·clean은 seq 하나를 함께 쓰고 오름차순이다. 같거나 작은 seq는 효과(정리, 답) 전에 여기서 거절한다.
 // 실행의 차례(실행 중의 start, 실행이 없는 renew)는 대리의 상태라 agent.ts가 본다.
 export class ControlDecoder {
   private readonly frames: MixedFrameDecoder = createMixedFrameDecoder();
@@ -353,7 +362,7 @@ export class ControlDecoder {
 // 제어가 받는 쪽(대리 → 제어). 값 틀은 받지 않는다(봉투만 받는 디코더라 값 틀은 frame_too_large로 거절된다).
 // 차례 규칙: hello가 맨 처음 한 번. 실행 하나의 말은 spawned → output* → exited|unconfirmed, 또는 not_spawned 하나이고,
 // 한 실행의 말이 끝나기 전에 다른 실행의 말이 섞이지 않는다. output 합은 maxOutputBytes 이하이고 exited의 stdout_bytes와 같다.
-// terminated·counted의 seq는 오름차순이다. 어느 요청의 답인지(늦은 답, 없는 요청의 답)는 요청을 아는 제어가 따로 본다.
+// terminated·counted·cleaned의 seq는 오름차순이다. 어느 요청의 답인지(늦은 답, 없는 요청의 답)는 요청을 아는 제어가 따로 본다.
 export class AgentDecoder {
   private readonly frames: FrameDecoder = createFrameDecoder();
   private greeted = false;
@@ -401,6 +410,7 @@ export class AgentDecoder {
     switch (message.type) {
       case "terminated":
       case "counted":
+      case "cleaned":
         if (message.seq <= this.lastSeq) return "link_out_of_order";
         this.lastSeq = message.seq;
         return null;

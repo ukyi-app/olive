@@ -5,6 +5,7 @@ import { type AgentMessage, AgentDecoder, type ControlMessage, encodeControl } f
 import type { ProcessCleanup } from "../../src/executor/containment.ts";
 import type { Launcher, LaunchHooks, LaunchOutcome } from "../../src/executor/launcher.ts";
 import type { LaunchPlan } from "../../src/executor/profile.ts";
+import type { RunWorkspace } from "../../src/executor/workspace.ts";
 import { encodeCredentialFrame } from "../../src/transport/framing.ts";
 
 export const T0 = 1_800_000_000_000;
@@ -95,16 +96,47 @@ export class FakeSpace implements ProcessCleanup {
   counts: (number | null)[] = [];
   countCalls = 0;
   hangTerminate = false;
+  // 있으면 survivors가 이것이 풀린 뒤에 답한다(값은 부른 때 정한다). 계수가 다른 일보다 늦게 끝나는 순서를 만드는 자리.
+  countGate: Promise<void> | undefined;
   terminate(): Promise<void> {
     this.terminations++;
     return this.hangTerminate ? new Promise(() => {}) : Promise.resolve();
   }
   survivors(): Promise<number | null> {
     this.countCalls++;
-    return Promise.resolve(this.counts.length > 0 ? this.counts.shift()! : 0);
+    const value = this.counts.length > 0 ? this.counts.shift()! : 0;
+    return (this.countGate ?? Promise.resolve()).then(() => value);
   }
   busy(): boolean {
     return false;
+  }
+}
+
+// 작업 공간. entries·clear가 차례대로 돌려줄 값(비면 0). Error를 넣으면 그 호출이 던진다.
+export class FakeWorkspace implements RunWorkspace {
+  entryCounts: (number | Error)[] = [];
+  clearCounts: (number | Error)[] = [];
+  entered: string[] = [];
+  clears = 0;
+  // clear가 돌아오기 전에 시험이 끼어드는 자리.
+  clearGate: Promise<void> | undefined;
+  // entries가 돌아오기 전에 시험이 끼어드는 자리.
+  entriesGate: Promise<void> | undefined;
+  async entries(): Promise<number> {
+    await this.entriesGate;
+    const next = this.entryCounts.shift() ?? 0;
+    if (next instanceof Error) throw next;
+    return next;
+  }
+  async clear(): Promise<number> {
+    this.clears++;
+    await this.clearGate;
+    const next = this.clearCounts.shift() ?? 0;
+    if (next instanceof Error) throw next;
+    return next;
+  }
+  async enter(cwd: string): Promise<void> {
+    this.entered.push(cwd);
   }
 }
 

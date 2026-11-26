@@ -2,7 +2,7 @@
 // 그 안의 kill(-1)은 그 namespace 밖에 닿지 않는다.
 // 실제 신호 함수를 쓰는 PidSpace.record를 부르기 전에 bwrap이 만든 공간 안인지 스스로 확인한다. 밖에서 직접 띄우면 신호 없이 끝난다.
 import { readdir, readFile, stat } from "node:fs/promises";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -248,6 +248,13 @@ const AGENT_PLANS: Readonly<Record<string, LaunchPlan>> = {
   // TERM을 무시하고 증인 파일을 늘리는 후손을 남긴다.
   "agent-linkdrop": sh(`setsid sh -c 'trap "" TERM HUP INT; while :; do echo x >> "$WITNESS"; sleep 0.05; done' >/dev/null 2>&1 & sleep 0.1`),
   "agent-nondumpable": sh(PROBE),
+  // 실제 역할이 작업 공간에 파일을 쓴다: cwd(대리가 만드는 하위 폴더)와 HOME 아래, 숨김 파일, 깊은 폴더, 루트 밖을 가리키는 링크,
+  // UTF-8이 아닌 이름(Latin-1의 é 한 바이트). cwd·HOME은 agentMain이 주입한 작업 공간 아래로 바꾼다.
+  // 링크 대상($OUTSIDE)은 시험이 만든 표식 폴더다. 이 공간은 호스트 루트를 쓰기 가능하게 보므로(--dev-bind / /),
+  // 정리가 링크를 따라가는 회귀가 생겨도 잃는 것이 시험 데이터뿐이도록 호스트 경로(/ 등)를 대상으로 두지 않는다.
+  "agent-cleanfiles": sh(
+    'mkdir -p "$HOME/.config/cli" && echo token > "$HOME/.config/cli/credentials" && echo x > .hidden && mkdir -p deep/a/b && echo y > deep/a/b/leaf && ln -s "$OUTSIDE" outside-link && printf x > "$(printf \'legacy\\351\')"',
+  ),
 };
 
 // 가짜 제어. 바이트는 다음 틱에 건넨다(스트림처럼 받는 쪽의 처리 중에 다시 들어가지 않게).
@@ -291,7 +298,14 @@ async function agentMain(name: string): Promise<void> {
   };
   // linkdrop은 정리를 기다리지 않고 끝나게 해(TERM 무시 → KILL 전) 남은 후손을 커널이 끝내는지 본다.
   const options = { enforceWaitMs: name === "agent-linkdrop" ? 50 : 5_000 };
-  const agent = await RoleAgent.prepare(runtime, productionParts({ graceMs: GRACE_MS, killMs: 3_000 }), options);
+  // 이 공간은 호스트의 /tmp를 그대로 본다(--dev-bind / /). 비어 있는 작업 공간이 띄우기의 조건이라(D-154) 빈 임시 폴더를 루트로 준다.
+  const workspace = mkdtempSync(join(tmpdir(), "olive-agent-workspace-"));
+  // 표식 폴더가 없으면 띄우지 않는다. 빈 값이면 링크 대상이 바뀌어 시험이 뜻을 잃는다.
+  const outside = process.env.OLIVE_CLEAN_OUTSIDE ?? "";
+  if (name === "agent-cleanfiles" && !outside.startsWith("/")) throw new Error("no_outside_marker");
+  const launch =
+    name === "agent-cleanfiles" ? { ...plan, cwd: join(workspace, "work"), env: { ...plan.env, HOME: join(workspace, "home"), OUTSIDE: outside } } : plan;
+  const agent = await RoleAgent.prepare(runtime, productionParts({ graceMs: GRACE_MS, killMs: 3_000 }, workspace), options);
   if (agent === null) return;
   const control = new FakeControl();
   control.agent = agent;
@@ -304,10 +318,10 @@ async function agentMain(name: string): Promise<void> {
     encodeControl({
       type: "start",
       run_id: AGENT_RUN,
-      program: plan.program,
-      argv: [...plan.argv],
-      cwd: plan.cwd,
-      env: { ...plan.env },
+      program: launch.program,
+      argv: [...launch.argv],
+      cwd: launch.cwd,
+      env: { ...launch.env },
       credential_env: "OLIVE_CREDENTIAL",
       credential_digest: digest,
       output_bytes: 4_096,
@@ -339,7 +353,27 @@ async function agentMain(name: string): Promise<void> {
   control.send(encodeControl({ type: "count", seq: 2 }));
   const counted = await control.next("counted");
   const after = await independentCount(process.pid);
-  process.stdout.write(`${JSON.stringify({ name, pid: process.pid, exited, stdout, before, after, survivors: counted.survivors, beforeHarden })}\n`);
+  const cleaned = name === "agent-cleanfiles" ? await cleanWorkspace(control, workspace) : {};
+  process.stdout.write(`${JSON.stringify({ name, pid: process.pid, exited, stdout, before, after, survivors: counted.survivors, beforeHarden, ...cleaned })}\n`);
+}
+
+// 끝내기·세기로 실행을 닫은 뒤 링크 clean으로 비운다. 비우기 전후의 폴더는 대리의 작업 공간 코드와 따로 읽는다(같은 코드로 세면 같은 결함을 함께 놓친다).
+async function cleanWorkspace(control: FakeControl, root: string) {
+  const written = treeSize(Buffer.from(root));
+  control.send(encodeControl({ type: "clean", seq: 3 }));
+  const { left } = await control.next("cleaned");
+  return { workspace: root, written, left, remaining: readdirSync(root).length };
+}
+
+// 루트를 뺀 항목 수(파일·폴더·링크). 이름은 바이트로 읽어 UTF-8이 아닌 이름도 센다. 링크는 따라가지 않는다.
+function treeSize(path: Buffer): number {
+  let total = 0;
+  for (const name of readdirSync(path, { encoding: "buffer" })) {
+    total++;
+    const full = Buffer.concat([path, Buffer.from("/"), name]);
+    if (lstatSync(full).isDirectory()) total += treeSize(full);
+  }
+  return total;
 }
 
 main().then(

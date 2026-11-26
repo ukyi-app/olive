@@ -4,6 +4,7 @@
 // 띄우기 전 사전 계수를 하지 않고, 받은 terminate로 멈춘 실행의 launcher 중단 훅은 정리를 다시 부르지 않으며(그 terminate가 한 번 부른다),
 // 정리 호출은 받은 즉시 시작하고 답만 차례를 지킨다(실제 대리는 정리 자체를 하나씩 한다).
 // 시각(기한·임대)과 스스로 집행은 하지 않는다. 그것은 실제 대리의 시험(test/agent/)과 소켓 시험이 본다.
+// 작업 공간 정리(clean)는 파일을 만지지 않고 시험이 정한 남은 수(기본 0)로 답한다. 정리 확인의 조건은 test/agent/와 remote-clean.test.ts가 본다.
 import { ControlDecoder, encodeAgent, type AgentMessage, outputMessages, type ReceivedControl } from "../../src/agent/link.ts";
 import type { ProcessCleanup } from "../../src/executor/containment.ts";
 import { LaunchFailed, type Launcher } from "../../src/executor/launcher.ts";
@@ -13,6 +14,8 @@ import type { AgentLinkSession, AgentLinkTransport, RemoteAgent } from "../../sr
 export interface FakeAgentOptions {
   drainMs?: number;
   exitWaitMs?: number;
+  // clean의 답(cleaned.left). 주지 않으면 0.
+  cleanLeft?: () => number | null;
 }
 
 export class FakeAgent {
@@ -90,6 +93,8 @@ export class FakeAgent {
         const survivors = this.callNow(() => this.cleanup.survivors()).catch(() => null);
         return this.answerInOrder(survivors.then((value) => ({ type: "counted", seq: message.seq, survivors: value })));
       }
+      case "clean":
+        return this.answerInOrder(Promise.resolve({ type: "cleaned", seq: message.seq, left: this.options.cleanLeft?.() ?? 0 }));
     }
   }
 

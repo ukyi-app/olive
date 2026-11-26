@@ -9,7 +9,7 @@ import { RemoteAgent } from "../../src/executor/remote-agent.ts";
 import { EXECUTOR_EXIT } from "../../src/executor/runtime.ts";
 import { EXECUTOR_ENV, listenAgentSocket, settingsFromEnv } from "../../src/main/executor.ts";
 import { connectUnix, runRoleAgent } from "../../src/main/role-agent.ts";
-import { FakeLauncher, FakeRuntime, FakeSpace } from "../agent/support.ts";
+import { FakeLauncher, FakeRuntime, FakeSpace, FakeWorkspace } from "../agent/support.ts";
 import { root } from "../files.ts";
 import { until } from "./support.ts";
 
@@ -145,7 +145,7 @@ test("실제 경로 유닉스 소켓: 제어의 듣기(umask를 되돌림, 0606,
   const agent = await runRoleAgent({
     socketPath: path,
     runtime,
-    parts: { selfPid: 1, harden: () => true, record: async () => new FakeSpace(), launcher: new FakeLauncher() },
+    parts: { selfPid: 1, harden: () => true, record: async () => new FakeSpace(), launcher: new FakeLauncher(), workspace: new FakeWorkspace() },
     connect: connectUnix,
     connectWaitMs: 1_000,
     retryMs: 50,
