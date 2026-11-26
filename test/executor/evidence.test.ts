@@ -20,6 +20,7 @@ import {
   onDiskRun,
   outboxWrite,
   pause,
+  POD_UID,
   reconnect,
   reservationFreed,
   rig,
@@ -784,6 +785,7 @@ test("G08 서명에 쓸 수 없는 키로 떠도 정상 장부에 손상 표식�
     credentials: r.credentials,
     cleanup: r.cleanup,
     space: r.space,
+    podUid: POD_UID,
     now: r.clock.now,
   });
   expect(store.inconsistency()).toBeNull();
@@ -1152,6 +1154,7 @@ function workerOver(r: Rig, store: ExecutorStore, now: () => number) {
     credentials: r.credentials,
     cleanup: r.cleanup,
     space: r.space,
+    podUid: POD_UID,
     now,
   });
 }

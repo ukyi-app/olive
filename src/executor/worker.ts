@@ -44,7 +44,17 @@ import {
   launchPlan,
   type RoleProfile,
 } from "./profile.ts";
-import { type ExecutorStore, type ExitKind, HOLDS_SLOT, type NewEvent, type OutboxAction, type OutboxEntry, type RunRecord, type StoredRunState } from "./store.ts";
+import {
+  type CleanupIntent,
+  type ExecutorStore,
+  type ExitKind,
+  HOLDS_SLOT,
+  type NewEvent,
+  type OutboxAction,
+  type OutboxEntry,
+  type RunRecord,
+  type StoredRunState,
+} from "./store.ts";
 
 // 영수증·보고를 실어 보낼 곳. epoch()는 맞춘 연결마다 다른 수이고, 연결이 없거나 맞춤 전이면 null이다(보내지 않고 저장소에만 남긴다).
 export interface Outlet {
@@ -74,6 +84,10 @@ export interface WorkerOptions {
   credentials: CredentialSource;
   cleanup: ProcessCleanup;
   space: RunSpace;
+  // 이 파드의 UID(D-155, 진입점의 OLIVE_POD_UID). 새 정리 의도에 적고, 이어 쓰는 의도의 값과 다르면 파드가 바뀌었다고 본다(podReplaced).
+  podUid: string;
+  // 판정 근거를 남기는 한 줄. 값(자격, 메시지)은 넘기지 않는다.
+  log?: (line: string) => void;
   launcher?: Launcher;
   now?: () => number;
   // 역할 프로그램 stdout의 바이트 상한. 넘으면 끝내고 실패로 친다.
@@ -702,18 +716,26 @@ export class WorkerExecutor {
   }
 
   // 정리 의도를 먼저 지속한 뒤 지운다. 디스크에서도 슬롯을 쥐고(cleanup_pending), 재시작하면 정해 둔 영수증 ID로 잇는다.
-  // 끝나지 않은 의도의 요청은 바꾸지 않는다. 후속 요청이 지우기를 이어도 영수증은 처음 요청의 ID로 남는다.
+  // 끝나지 않은 의도는 바꾸지 않는다. 후속 요청이 지우기를 이어도 영수증은 처음 요청의 ID로 남고, 파드 UID도 처음 적은 파드의 값으로 남는다.
   // 지우기가 끝나지 않으면 슬롯을 쥔 채로 둔다. 삭제의 소유를 확인할 수 없으므로 시간 초과로 놓지 않는다.
   private async clean(runId: string, header: Header, epoch: number): Promise<void> {
-    const intent = this.store.run(runId)?.cleanup ?? { request_id: header.request_id, instruction_digest: header.body_digest, receipt_id: randomUUID() };
+    const intent: CleanupIntent = this.store.run(runId)?.cleanup ?? {
+      request_id: header.request_id,
+      instruction_digest: header.body_digest,
+      receipt_id: randomUUID(),
+      pod_uid: this.options.podUid,
+    };
     const saved = await this.transition(runId, { state: "cleanup_pending", cleanup: intent });
     // 의도를 적는 사이 바뀌었을 수 있다. 여기서 지우기 호출까지 await가 없다.
     if (!saved || !this.authorized(header.stop_generation, epoch)) return;
     let cleaned: boolean;
-    try {
-      cleaned = await this.options.space.clean(runId);
-    } catch {
-      cleaned = false;
+    if (this.podReplaced(runId, intent)) cleaned = true;
+    else {
+      try {
+        cleaned = await this.options.space.clean(runId);
+      } catch {
+        cleaned = false;
+      }
     }
     if (!cleaned) return;
     // 정리 영수증이 약속하는 셋째(D-153): 제어 우편함이 그 실행의 값을 0으로 채웠다. 실행이 끝날 때도 부르지만 영수증 직전에 다시 부른다:
@@ -730,6 +752,17 @@ export class WorkerExecutor {
     const fields = { run_id: runId, instruction_request_id: intent.request_id, cleaned_at: this.now() };
     const event = this.event("receipt_cleaned", runId, fields, intent.instruction_digest, intent.receipt_id);
     await this.transition(runId, { state: "finalized" }, [event]);
+  }
+
+  // 파드 교체(O13-b, D-146·D-155): 의도를 적은 파드가 지금 파드가 아니면 그 파드는 사라졌고, 실행이 돈 파드는 그 파드이거나 그보다 먼저 사라졌다.
+  // 작업 공간(역할 컨테이너의 /tmp, emptyDir)은 파드와 함께 사라지므로 대리에 묻지 않는다. 원격을 처음부터 잠근 기동에서도 같다.
+  // 함정: UID가 바뀐 것은 새 파드 객체가 생겼다는 사실이지 옛 컨테이너가 끝났다는 증거가 아니다. 두 파드가 겹치지 않는 교체(Recreate, replicas 0·1,
+  // 옛 파드의 끝을 확인한 뒤 1)가 전제다. pod_uid가 없는 의도는 어느 파드에서 적혔는지 몰라 이 길을 쓰지 않는다.
+  // 같은 파드의 전체 재시작(D-104)은 UID가 같아 이 길이 아니다. 그때는 남아 있는 /tmp를 새 대리가 지운다.
+  private podReplaced(runId: string, intent: CleanupIntent): boolean {
+    if (intent.pod_uid === undefined || intent.pod_uid === this.options.podUid) return false;
+    this.options.log?.(`정리 확인: 실행 ${runId}의 정리 의도를 적은 파드(${intent.pod_uid})가 지금 파드(${this.options.podUid})가 아니다. 작업 공간이 파드와 함께 사라졌다고 보고 대리에 묻지 않는다`);
+    return true;
   }
 
   // 이미 낸 같은 요청의 정리 영수증이 있으면 true다. 본문까지 같을 때만 같은 사실을 다시 보내고, 같은 요청 ID에 다른 본문이면 답하지 않는다.

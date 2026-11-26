@@ -30,6 +30,7 @@ import {
   executorKeys,
   FakeTransport,
   fromSupervisor,
+  POD_UID,
   type Rig,
   runWrite,
   scratch,
@@ -81,6 +82,7 @@ function settings(over: Partial<ExecutorSettings> = {}): ExecutorSettings {
     storeDir: scratch(),
     agentSocket: "/olive/link/agent.sock",
     generationMarker: GENERATION,
+    podUid: POD_UID,
     files: FILES,
     timing: TIMING,
     reconnect: { initialDelayMs: 100, maxDelayMs: 400, multiplier: 2, jitterRatio: 0 },
@@ -487,6 +489,17 @@ test("정리 확인(O13-a): worker가 받은 공간의 clean은 대리에게 cle
   expect(outcomes).toEqual([true, false, false, false]);
 });
 
+test("조립은 설정의 파드 UID와 기록 줄을 worker에 넘긴다(O13-b의 판정과 그 근거 줄, D-155)", async () => {
+  const h = harness();
+  const podUid = "7d1e4c2a-5b3f-4e8d-9a6c-2f0b8e4d1c57";
+  const result = await begin(h, settings({ podUid }));
+  if (!result.ok) throw new Error(result.reason);
+  const options = optionsOf(result.running.worker);
+  expect(options.podUid).toBe(podUid);
+  (options.log as (line: string) => void)("정리 확인 시험 줄");
+  expect(h.logs).toContain("정리 확인 시험 줄");
+});
+
 test("재료 틀림(D-154): 프로필 cwd나 HOME이 작업 공간(/tmp) 밖이면 82, 저장소·연결 0. /tmp 아래 하위 폴더는 기동한다", async () => {
   for (const profile of [
     { ...PROFILE, cwd: "/work" },
@@ -773,6 +786,7 @@ test("제품 설정의 응답 상한은 10초이고 worker의 exitWaitMs와 원�
     OLIVE_SIGNING_KEY_FILE: FILES.signingKey,
     OLIVE_PROFILE_FILE: FILES.profile,
     OLIVE_AGENT_SOCKET: "/olive/link/agent.sock",
+    OLIVE_POD_UID: POD_UID,
   });
   if (!parsed.ok) throw new Error(parsed.name);
   expect(parsed.settings.timing.replyWaitMs).toBe(10_000);

@@ -96,7 +96,7 @@ new WorkerExecutor({ ..., launcher: remote.launcher, cleanup: remote.cleanup, sp
 
 - `survivors()`가 0을 돌려주는 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle`이나 `ended` 단계에 새로 보낸 `count`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고, 그 `count`보다 먼저 보낸 가장 최근의 `terminate`도 `replyWaitMs` 안에 답했고, 그 값이 0이다. "안에"는 받은 때의 주입 단조 시계로 잰다.
 - `terminated`는 0으로 쓰이지 않는다. `terminate()`는 값을 돌려주지 않는다.
-- **정리 확인:** `space().clean`이 true인 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle` 단계이고 기다리는 `terminate`·`clean`이 없을 때 새로 보낸 `clean`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고 `left`가 0이다. false면 worker가 `cleanup_pending`으로 슬롯을 쥐고 감독의 확정 재전송이 다시 부른다. true여도 worker는 우편함을 비운 뒤 정리 영수증을 처음 적기 직전에 지금 연결·정지 세대의 권한을 다시 본다: 답을 기다리는 사이 감독 연결이 바뀌었으면 적지 않고 `cleanup_pending`과 예약 영수증 ID를 그대로 두며, 지금 연결의 확정 재전송이 다시 묻고 같은 ID로 낸다.
+- **정리 확인:** `space().clean`이 true인 길은 하나다: 잠기지 않은, `hello`를 한 연결에서, `idle` 단계이고 기다리는 `terminate`·`clean`이 없을 때 새로 보낸 `clean`의 답이 보낸 때와 같은 단계에서 `replyWaitMs` 안에 왔고 `left`가 0이다. false면 worker가 `cleanup_pending`으로 슬롯을 쥐고 감독의 확정 재전송이 다시 부른다. true여도 worker는 우편함을 비운 뒤 정리 영수증을 처음 적기 직전에 지금 연결·정지 세대의 권한을 다시 본다: 답을 기다리는 사이 감독 연결이 바뀌었으면 적지 않고 `cleanup_pending`과 예약 영수증 ID를 그대로 두며, 지금 연결의 확정 재전송이 다시 묻고 같은 ID로 낸다. 정리 의도를 다른 파드에서 적은 실행(파드 교체, O13-b)은 이 원격에 묻지 않고 worker가 맺는다(README "작업 공간 정리"). 그 길도 같은 권한 재확인을 지난다.
 - 서명하지 않는다. 대리의 답은 서명 없는 사실이고 영수증은 worker가 자기 키로 낸다.
 - 자격 값은 값 틀 하나에만 실린다. `state()`·`AgentUnavailable`·`AgentListenerRefused`에는 사유 이름만 있다.
 - 듣는 곳은 `agent-listener.ts`의 경로 유닉스 소켓 하나다. 경로는 `/`로 시작해야 하고 NUL을 담지 못한다(abstract 이름 거절). TCP·다른 소켓 API는 실행기 코드에 없다(`test/executor/static.test.ts`).

@@ -48,6 +48,8 @@ export function test(name: string, fn: () => void | Promise<void>, timeout?: num
 
 export const FAKE_ROLE = fileURLToPath(new URL("./fake-role.ts", import.meta.url));
 export const T0 = 1_800_000_000_000;
+// rig의 기본 파드 UID. 같은 폴더를 다시 여는 시험(make({ dir }))은 따로 주지 않으면 같은 파드에서 다시 뜬 기동이다.
+export const POD_UID = "0f0f0f0f-0000-4000-8000-000000000001";
 export const sha256 = (value: Uint8Array | string) => createHash("sha256").update(value).digest("hex");
 
 export const supervisorKeys = generateKeyPairSync("ed25519");
@@ -353,6 +355,9 @@ export interface RigOptions {
   extraEnv?: Record<string, string>;
   exitWaitMs?: number;
   stopWriteWaitMs?: number;
+  // 이 기동의 파드 UID(기본 POD_UID)와 worker의 기록 줄.
+  podUid?: string;
+  log?: (line: string) => void;
   // 원격 구현을 쓰고 대리 자리를 시험이 정한다(주지 않으면 implementation.remote일 때 FakeAgent).
   // runtime을 주면 원격 구현의 타이머·단조 시계를 시험이 정한다(주지 않으면 실제 타이머와 performance.now).
   remote?: { attach?: (remote: RemoteAgent) => void; inheritedUnverified?: boolean; runtime?: RemoteAgentRuntime };
@@ -392,6 +397,8 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
     supervisorKey: supervisorKeys.publicKey,
     credentials,
     ...parts,
+    podUid: options.podUid ?? POD_UID,
+    log: options.log,
     now: clock.now,
     drainMs: 100,
     exitWaitMs: options.exitWaitMs,
