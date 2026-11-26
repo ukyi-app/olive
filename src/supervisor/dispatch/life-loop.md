@@ -53,7 +53,7 @@ LifeTickResult =
 | `query_held` + `lastQueryAt`, `cause` | 마지막 조회부터 `answerTimeoutMs`가 지나지 않아 묻지 않았다 |
 | `query_not_sent` + `at`, `cause`, `reason`, `delivery` | 조회를 싣지 못했다. `delivery: "unknown"`이면 기다리는 조회에는 넣었다 |
 
-`cause`는 `intent`(판단이 조회를 냄) 또는 `stop_already_recorded`(아래 "이미 적힌 종료"). 끝난 실행(`finalized`·`not_started`)은 목록에 없다. 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
+`cause`는 `intent`(판단이 조회를 냄), `stop_already_recorded`(아래 "이미 적힌 종료"), `result_wait`(판단은 기다림인 `checking` 실행, 아래 "조회") 가운데 하나다. 끝난 실행(`finalized`·`not_started`)은 목록에 없다. 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
 
 ## 한 박자의 순서
 
@@ -115,6 +115,7 @@ LifeTickResult =
 - **간격은 실제로 실은 시각부터 센다.** 결과의 `at`은 내보내기 포트가 돌아온 뒤에 읽은 시각이다. 포트는 돌아오기 전에 실었으므로 실은 시각보다 이르지 않다. 그 시계를 읽지 못하면(시계가 던지거나, 포트 묶음에서 시계 객체를 얻다 던지거나, 꼴이 틀림) **봉투 시한(`expires_at`)을 쓴다.** 포트는 시한 뒤에 싣지 않으므로(`ports.ts` `InstructionSink`) 실은 시각의 확실한 상한이다. 봉한 시각으로 되돌리면 간격이 실제보다 짧아지므로 쓰지 않는다. 대가로 다음 조회는 실은 시각부터 센 것보다 늦어진다(조회 수명 30000ms: 10000에 봉하고 29000에 실으면 `at`은 40000, 다음 조회는 60000부터).
 - **실었거나 실렸을 수 있는 조회는 시계와 무관하게 남긴다.** `sent`·`send_threw`·정의 밖의 답이면 시계를 읽기 전에 `pendingQueries`에 넣고 결과에도 항목을 낸다.
 - `stopping`의 조회는 판단이 `lastStopAt`부터 `answerTimeoutMs`를 기다린 뒤에 내고, 그 뒤로는 이 간격이 막는다.
+- **기다리는 `checking` 실행도 묻는다(`cause: "result_wait"`, D-147).** 판단(`nextIntent`)은 `checking`에 늘 기다림을 낸다(장부의 전이 표가 `checking`에서 확정·조회로 가는 길을 두지 않는다). 이 박자는 그 실행에 같은 실행 ID의 조회를 같은 간격(`answerTimeoutMs`)으로 낸다. 장부에 쓰지 않고 새 계약 메시지도 없다. 그 답의 `failed_stopped`(종료 영수증 ID 그대로)가 결과 검사 박자의 결과 없음 판정 근거다(`result-check.md` "결과 없음 판정"). 간격을 따로 두지 않은 까닭: 판정에 기한이 없어 더 자주 물을 까닭이 없고, 같은 값이면 실행기 하나에 내는 조회의 빈도가 다른 조회와 같다. 반영 전 결과 보고가 있는 실행은 같은 박자의 앞 박자(결과 검사)가 먼저 판정하므로 보통 묻지 않는다.
 
 ## 종료
 
@@ -141,7 +142,7 @@ LifeTickResult =
 
 `failed_stopped` 실행의 본문은 장부 이력에서 온다. 읽기는 장부의 `failedStop` 하나다(`src/ledger/ledger.md` "스케줄러가 쓰는 읽기"). `failed_stopped` 실행에만 읽는다: 그 읽기의 고장이 다른 상태의 갱신·종료를 막지 않는다.
 
-- **`outcome`(`failedOutcome`).** 그 실행에 사유 `requested`의 취소 지시(`task_cancel`)가 적혔거나 종료 영수증 `exit`가 `cancelled`면 `cancelled`. 둘 중 하나만 맞아도 `cancelled`라 취소 쪽을 먼저 본다. 그 밖의 `exit`(`deadline`·`failed`, 그리고 `completed`로 `checking`이 된 뒤 결과 없음 판정 `markResult(null)`로 `failed_stopped`가 된 실행)는 `failed`다. 지금 감독에는 `markResult(null)`을 부르는 자리가 없다(결과 검사 박자는 결과 보고가 있는 `checking`만 판정한다, `result-check.md`). 그래서 결과 보고가 끝내 오지 않는 `checking`은 이 확정에 닿지 않고 자리를 쥔다. `exit`는 장부가 종료 확인 영수증을 반영할 때 실행 줄에 함께 적은 값이다(판 8, D-124). 그래서 영수증이 곧바로 `failed_stopped`로 옮긴 실행도 확정을 적고, 실행기의 정리 영수증이 `finalized`로 옮기면 자리가 풀린다(실행기가 연결돼 있고 확정 뒤 정리를 확인해야 한다, 아래 "확정 뒤 정리 확인을 잇는다").
+- **`outcome`(`failedOutcome`).** 그 실행에 사유 `requested`의 취소 지시(`task_cancel`)가 적혔거나 종료 영수증 `exit`가 `cancelled`면 `cancelled`. 둘 중 하나만 맞아도 `cancelled`라 취소 쪽을 먼저 본다. 그 밖의 `exit`(`deadline`·`failed`, 그리고 `completed`로 `checking`이 된 뒤 결과 없음 판정 `markResult(null)`로 `failed_stopped`가 된 실행)는 `failed`다. `markResult(null)`을 부르는 자리는 결과 검사 박자의 결과 없음 판정 하나다(실행기가 그 종료에 대해 `failed_stopped`라고 답했을 때만, `result-check.md` "결과 없음 판정"). 그 답이 오지 않는 `checking`은 이 확정에 닿지 않고 자리를 쥔다. `exit`는 장부가 종료 확인 영수증을 반영할 때 실행 줄에 함께 적은 값이다(판 8, D-124). 그래서 영수증이 곧바로 `failed_stopped`로 옮긴 실행도 확정을 적고, 실행기의 정리 영수증이 `finalized`로 옮기면 자리가 풀린다(실행기가 연결돼 있고 확정 뒤 정리를 확인해야 한다, 아래 "확정 뒤 정리 확인을 잇는다").
 - **`cancelled`는 사용자가 취소했다는 뜻이 아니다.** 실행기는 사유 `requested` 밖의 취소 지시(`budget`·`emergency_stop`)에도, 준비·자격·spawn 사이에 정지 세대가 바뀌어 띄우지 않고 끝낸 실행에도 `exit` `cancelled`를 낸다(`src/executor/worker.ts`의 `launchBlocked`·`onCancel`). 그래서 취소 지시가 없거나 `requested`가 아닌 실행도 `exit`만으로 `cancelled` 확정과 정리를 받는다. D-114의 두 조건 가운데 영수증 조건 하나로 충분하므로 그대로 둔다.
 - **정하지 못하면 적지 않는다**(`finalize_withheld`). `outcome_unknown`: 사유 없이 적힌 취소 지시(판 4 전의 줄, 사유를 넘기지 않은 기록)는 `requested`였을 수 있어, `exit`가 `cancelled`가 아니면 정하지 못한다. 장부가 `exit`를 모르는 줄(아래, `src/ledger/ledger.md`의 `failedStop`)도 `cancelled`였을 수 있어, 사유 `requested`의 취소 지시가 없으면 정하지 못한다. `stored_at_unknown`: `outcome`은 정했지만 `failed_stopped`가 된 장부 시각을 모른다(아래). 둘 다 그 실행은 자리를 쥔 채 남는다.
 - **`exit`·실패 시각 칸이 빈 줄.** 판 8 전에 종료 확인을 받거나 `failed_stopped`가 된 줄, 원 SQL로 그 칸 없이 적은 줄이다(장부 코드는 늘 함께 적는다).
@@ -193,6 +194,6 @@ LifeTickResult =
 - **`lastQueries`를 넘긴다.** 결과의 `at`(실은 뒤의 시각, 또는 봉투 시한)을 쓴다. 넘기지 않으면 조회가 필요한 실행을 박자마다 묻는다.
 - **실행별 연결·정지 세대를 실행기와 맞춘다.** 정지 중의 종료는 장부의 지금 세대를 싣는다. 실행기가 그 세대를 적용하기 전이면 `requested`·`deadline` 종료를 받지 않는다(높은 세대는 `emergency_stop`만 받는다). 세대 맞춤과 비상 종료는 다른 조각이고 기존 경로를 쓴다. 재전송은 장부의 기존 요청 ID와 본문을 쓴다.
 - **`halted`를 본다.** `threw`이면 앞 결과를 반영하고, 멈춘 실행(`haltedAt`)과 결과 목록에 없는 실행을 장부에서 다시 대조한다. `*_record_unknown`은 장부를 다시 읽어(종료는 `unansweredInstructions`의 그 요청 ID, 갱신은 `instructionTimes.renewIssued`의 발행 시각) 적혔는지 가린다.
-- **보고 없는 판정을 잇는다.** 결과 보고가 있는 `checking`의 판정은 결과 검사 박자(`result-check.md`)가 같은 박자에서 이 박자 앞에 한다. 남은 몫은 결과 보고가 끝내 오지 않는 `checking`의 기한과 판정(`markResult(null)`)이다. 그 판정은 `failed_stopped`로 옮겨 위 "실패 확정"으로 간다. `exit`가 `completed`라 사유 `requested`의 취소 지시가 있으면 `cancelled`, 취소 지시가 없거나 다른 사유뿐이면 `failed`, 사유 없는 취소 지시만 있으면 정하지 않는다(`outcome_unknown`. 위 "`exit`·실패 시각 칸이 빈 줄"의 판 8 뒤 판정과 같은 조건). 성공 확정은 `ready_result`에서만 열리고 그 상태는 `markResult`만 만든다. `reportId`는 필수가 아니다: 같은 digest의 결과 보고가 판정 전에 적혀 있으면 판정이 함께 반영하고, 판정 뒤에 오면 장부가 적자마자 반영한다. 결과 보고가 하나도 없이 digest로 판정하면 성공 확정은 열리지 않는다.
+- **보고 없는 판정은 결과 검사 박자가 한다.** 결과 보고가 있는 `checking`의 판정과, 실행기가 그 종료에 대해 `failed_stopped`라고 답한 `checking`의 결과 없음 판정(`markResult(null)`, 기한 없음)은 결과 검사 박자(`result-check.md`)가 같은 박자에서 이 박자 앞에 한다. 이 박자는 그 답을 받을 조회(`result_wait`)만 낸다. 결과 없음 판정은 `failed_stopped`로 옮겨 위 "실패 확정"으로 간다. `exit`가 `completed`라 사유 `requested`의 취소 지시가 있으면 `cancelled`, 취소 지시가 없거나 다른 사유뿐이면 `failed`, 사유 없는 취소 지시만 있으면 정하지 않는다(`outcome_unknown`. 위 "`exit`·실패 시각 칸이 빈 줄"의 판 8 뒤 판정과 같은 조건). 성공 확정은 `ready_result`에서만 열리고 그 상태는 `markResult`만 만든다. `reportId`는 필수가 아니다: 같은 digest의 결과 보고가 판정 전에 적혀 있으면 판정이 함께 반영하고, 판정 뒤에 오면 장부가 적자마자 반영한다. 결과 보고가 하나도 없이 digest로 판정하면 성공 확정은 열리지 않는다.
 - **확정 뒤 정리 확인을 잇는다(O13).** 실행기가 작업 폴더를 지우지 못하면 `cleanup_pending`으로 자리를 쥐고, 이 박자는 그 상태의 확정을 다시 내지 않는다.
 - **박자를 되풀이해 부른다.** 갱신을 낼 수 있는 구간은 기본값에서 7000ms라(`ledger.md` "판단을 갱신 구간 안에서 부른다") 그 안에서 여러 번 부른다.

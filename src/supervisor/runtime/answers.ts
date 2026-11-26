@@ -43,6 +43,7 @@ import {
   type ResultPorts,
   type SentQuery,
 } from "../dispatch/receipts.ts";
+import { type StoppedAnswerBook, stoppedAnswersOf } from "../dispatch/result-check.ts";
 import type { UnreceivedConfirm, UnreceivedEvidence, UnreceivedEvidenceRead, UnreceivedFull } from "../dispatch/unreceived.ts";
 import type { Delivered } from "../transport/server.ts";
 import type { Cycle } from "./cycle.ts";
@@ -79,6 +80,9 @@ export interface AnswerLinePorts {
   // D-90 증거의 장부(createAnswerEvidenceBook). 서버를 새로 만들어 답 줄을 다시 만들 때 같은 값을 넘겨야 변경 번호가 이어지고
   // 앞 줄이 쥔 채 버린 답이 오염으로 남는다. 빠지면 이 답 줄만 쓰는 장부를 새로 만든다.
   readonly evidenceBook?: AnswerEvidenceBook;
+  // 실행기의 failed_stopped 답을 결과 검사 박자에 넘기는 자리(D-147, result-check.ts의 StoppedAnswerBook). 처리기가 status_matched로 낸
+  // 상태 보고에서 stoppedAnswersOf가 고른 것만 적는다. 빠지면 적지 않는다(결과 없음 판정이 없고 그 실행은 checking으로 자리를 쥔다).
+  readonly stopped?: Pick<StoppedAnswerBook, "note">;
 }
 
 // 실행기마다 변경 번호·오염·마지막 반영 인사를 쥐는 장부. 프로세스에 하나를 만들어 그 프로세스의 답 줄마다 넘긴다.
@@ -419,6 +423,18 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
     }
   };
 
+  // 대조된 상태 보고의 failed_stopped 답을 결과 검사 박자에 넘긴다. 줄의 상태를 옮긴 뒤에 부르고 던져도 처리는 그대로다: 적지 못한 답은
+  // 그 실행을 다음 조회로 다시 묻게 될 뿐이다(결과 없음 판정이 늦어지고 결과는 잃지 않는다).
+  const noteStopped = (outcome: ReceiptOutcome): void => {
+    try {
+      const book = ports.stopped;
+      if (book === undefined) return;
+      for (const answer of stoppedAnswersOf(outcome)) book.note(answer);
+    } catch {
+      // 위와 같다.
+    }
+  };
+
   const lineOf = (executorId: string): Line => {
     let line = lines.get(executorId);
     if (line === undefined) {
@@ -734,6 +750,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       if (outcome.outcome === "status_matched") {
         takeSettlements(outcome.settled);
         line.backlog = keepCopies(outcome.backlog);
+        noteStopped(outcome);
       } else if (outcome.outcome === "status_not_current") {
         markRequery(outcome.answer.runs);
         // 관측만 적는 연산에 적힌 답은 쥐지 않는다(뒤 답을 막지 않는다). 적지 못했거나 앞 사본 때문에 부르지 않은 "안다"는 답은 버리지 않고
