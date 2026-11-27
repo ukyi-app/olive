@@ -126,6 +126,20 @@ export const REFUSALS = [
   "stop_confirmed",
   "start_may_launch",
   "pod_started_too_early",
+  // 판 9의 관리자 자리 풀기만 내는 거절(ledger.md "관리자가 결과 포기"·"저장소 비움 닫기"·"점유 관측 풀기"). 나머지는 위의 이름을 같은 뜻으로 쓴다.
+  // abandonResult: 실행이 checking이 아니다(이미 판정됐거나 아직 종료 확인 전).
+  "not_checking",
+  // closeRunByOperator의 store_reset: 종료가 확인되지 않은 실행이다(그런 실행은 pod_replaced로 닫는다).
+  "stop_unconfirmed",
+  // releaseSlotHold: 그 관측은 이미 자리를 막지 않는다.
+  "slot_not_held",
+  // abandonResult: 그 실행에 받아 두고 판정에 아직 반영하지 않은 결과 보고가 있다. 결과가 오지 않는 실행이 아니다(결과 검사 박자가 판정한다).
+  "report_pending",
+  // abandonResult: 사유 requested의 취소 지시는 없고 사유 없이 적힌 취소 지시가 있어, 버린 뒤의 확정 outcome(D-114)을 정할 수 없다.
+  // recordStopInstruction: 결과를 버린 실행에 사유 requested의 취소 지시가 없는데 사유 없는 취소를 적으면 같은 까닭으로 확정을 정할 수 없다.
+  "outcome_unknown",
+  // closeRunByOperator의 store_reset: failed_stopped인데 실패 시각(판 8의 칸)이 없다. 판 8 전에 실패한 줄이라 장부 초기화로 넘긴다(D-162).
+  "failed_at_unknown",
 ] as const;
 export type Refusal = (typeof REFUSALS)[number];
 export type Refused = { ok: false; reason: Refusal };
@@ -376,11 +390,13 @@ export interface UnreceivedClosureInput {
   now: number;
 }
 
-// D-91 관리자 닫기(closeRunByOperator)의 입력(D-93·D-96·D-97). checkedBy는 관리자가 확인한 방법(고정 목록 OPERATOR_CHECKS: 작업자
-// 파드를 바꿨다 하나), podName은 확인한 파드(바꾼 뒤의 작업자 파드)의 이름(Kubernetes 이름 규칙, POD_NAME), podStartedAt은 그 파드가
-// 뜬 시각(Unix epoch 밀리초, 클러스터의 시계), now는 닫는 시각(감독의 시계)이다. 장부는 확인과 파드의 시각을 다시 보지 못한다:
-// 사람·명령이 넘긴 값의 기록이다. 목록을 늘리려면 이관 0007의 트리거도 다음 판에서 함께 다시 만든다.
-export const OPERATOR_CHECKS = ["pod_replaced"] as const;
+// D-91 관리자 닫기(closeRunByOperator)의 입력(D-93·D-96·D-97·D-158). checkedBy는 관리자가 확인한 방법(고정 목록 OPERATOR_CHECKS)이고
+// 방법마다 받는 앞 상태가 다르다: pod_replaced(작업자 파드를 바꿨다)는 종료가 확인되지 않은 unknown_running·stopping, store_reset(그
+// 실행기 저장소를 비우고 작업자 파드를 새로 띄웠다, 판 9)은 종료가 확인된 checking·ready_result·failed_stopped. podName은 확인한 파드
+// (바꾼 뒤의 작업자 파드)의 이름(Kubernetes 이름 규칙, POD_NAME), podStartedAt은 그 파드가 뜬 시각(Unix epoch 밀리초, 클러스터의 시계),
+// now는 닫는 시각(감독의 시계)이다. 장부는 확인과 파드의 시각을 다시 보지 못한다: 사람·명령이 넘긴 값의 기록이다. 목록을 늘리려면
+// 이관의 트리거(operator_closures_proven, 판 9가 다시 만든 것)도 다음 판에서 함께 다시 만든다.
+export const OPERATOR_CHECKS = ["pod_replaced", "store_reset"] as const;
 export type OperatorCheck = (typeof OPERATOR_CHECKS)[number];
 export interface OperatorClosureInput {
   runId: string;
@@ -399,6 +415,66 @@ export interface OperatorClosure {
   podStartedAt: number;
   stopGeneration: number;
   closedAt: number;
+}
+
+// D-148 결과 포기(abandonResult)의 입력(D-157). reason은 관리자가 결과를 버린 까닭(고정 목록 RESULT_ABANDON_REASONS: 실행기가 답하지
+// 않음, 실행기가 그 실행을 모름, 결과가 있다는데 감독이 보관하지 못함), stopReceiptId는 버리는 실행 줄의 종료 확인 영수증 ID(달라지면
+// 버리지 않는다), now는 버리는 시각(감독의 시계)이다. 사유는 사람이 고른 값이라 장부가 확인하지 못한다. 목록을 늘리려면 이관 0009의
+// 트리거(result_abandons_proven)도 다음 판에서 함께 다시 만든다.
+export const RESULT_ABANDON_REASONS = ["no_answer", "not_known", "unstorable"] as const;
+export type ResultAbandonReason = (typeof RESULT_ABANDON_REASONS)[number];
+export interface ResultAbandonInput {
+  runId: string;
+  reason: ResultAbandonReason;
+  stopReceiptId: string;
+  now: number;
+}
+
+// 결과 포기의 근거 줄 그대로(result_abandons). stopGeneration은 버린 때의 정지 세대다.
+export interface ResultAbandon {
+  runId: string;
+  reason: ResultAbandonReason;
+  stopReceiptId: string;
+  stopGeneration: number;
+  abandonedAt: number;
+}
+
+// 결과를 버린 실행에 온 결과 보고의 받은 기록(recordAbandonedReport, D-169)의 입력. 본문·저장 자리·결과 digest는 받지 않는다(버린 결과라
+// 보관하지 않는다). bodyDigest는 봉투 본문의 digest(재전송이 같은 보고인지 가르는 값), now는 받은 시각(감독의 시계)이다. 낸 쪽과 실행
+// 세대는 from(검증된 봉투의 머리)으로 따로 넘긴다.
+export interface AbandonedReportInput {
+  reportId: string;
+  runId: string;
+  bodyDigest: string;
+  now: number;
+}
+
+// 점유 관측 풀기(releaseSlotHold)의 입력(D-161). executorId·runId·runGeneration·observation은 푸는 관측(slotHolds()의 한 줄) 그대로다.
+// checkedBy는 관리자가 확인한 방법(고정 목록 SLOT_HOLD_CHECKS: 그 실행기의 파드를 지워 새로 띄웠다 하나), podName·podStartedAt은 새로
+// 띄운 파드의 이름(Kubernetes 이름 규칙)과 뜬 시각(Unix epoch 밀리초, 클러스터의 시계), now는 푸는 시각(감독의 시계)이다.
+export const SLOT_HOLD_CHECKS = ["pod_replaced"] as const;
+export type SlotHoldCheck = (typeof SLOT_HOLD_CHECKS)[number];
+export interface SlotHoldReleaseInput {
+  executorId: string;
+  runId: string;
+  runGeneration: number;
+  observation: number;
+  checkedBy: SlotHoldCheck;
+  podName: string;
+  podStartedAt: number;
+  now: number;
+}
+
+// 점유 관측 풀기의 근거 줄 그대로(slot_hold_releases).
+export interface SlotHoldRelease {
+  observation: number;
+  executorId: string;
+  runId: string;
+  runGeneration: number;
+  checkedBy: SlotHoldCheck;
+  podName: string;
+  podStartedAt: number;
+  releasedAt: number;
 }
 
 // 송신 표식의 입력. requestId는 그 실행의 시작 지시(task_start)의 요청 ID, now는 표식을 적는 시각이다.
@@ -1479,8 +1555,10 @@ const COVERAGES = ["full", "partial"] as const;
 
 // D-90 닫기가 받는 앞 상태(작업자). 전이표의 두 줄(preparing·unknown_running → not_started)과 같다.
 const UNRECEIVED_CLOSABLE: readonly LedgerRunState[] = ["preparing", "unknown_running"];
-// 닫기 근거가 있는 not_started 실행에 늦게 와도 ack하는 영수증(계약의 실행기 영수증 셋). 나머지 동작은 닫힌 실행에도 원래 분기를 탄다.
-const CLOSED_RUN_RECEIPTS: readonly ReceiptInput["action"][] = ["receipt_accepted", "receipt_stopped", "receipt_started"];
+// 닫기 근거가 있는 not_started 실행에 늦게 와도 ack하는 영수증(그 실행 자신의 실행기 영수증 넷). 세션 인수 영수증은 닫힌 실행에도
+// 원래 분기를 탄다. 정리 영수증은 그 실행의 확정 지시를 가리킬 때만 여기 온다: 저장소 비움으로 닫기 전에 낸 확정, 관리자가 닫은
+// 실행에 낸 확정(D-159의 C-2)에 실행기가 정리를 마치고 낸 것이다.
+const CLOSED_RUN_RECEIPTS: readonly ReceiptInput["action"][] = ["receipt_accepted", "receipt_stopped", "receipt_started", "receipt_cleaned"];
 // 실행기가 그 시작을 더는 받지도 띄우지도 못하는 때까지의 길이(시작 지시의 발행 시각부터, 실행기 시계). 실행기는 봉투 시한
 // (발행 + MESSAGE_TTL_MAX_MS) 뒤로는 시작을 받지 않고, 발행 + RUN_LEASE_MAX_MS부터는(정각 포함) 준비·자격·spawn 직전에 멈춘다.
 // v1에서 둘 다 30000ms이고, 하나가 커져도 닫는 쪽으로 틀리지 않게 큰 쪽을 쓴다. 이관 0006의 트리거에 같은 값(30000)이 숫자로 있다(시험이 대조한다).
@@ -1504,8 +1582,13 @@ const OPERATOR_CLOSABLE: readonly LedgerRunState[] = ["unknown_running", "stoppi
 // 실행기 시계가 뒤처질 수 있는 CLOCK_SKEW_MS를 더한다(홈랩은 한 머신이라 세 시계가 같다는 전제). D-90이 갱신을 보지 않는 것은 그 실행을
 // 받은 적 없는 실행기에는 갱신이 닿아도 늘릴 임대가 없어서다. 이관 0007의 트리거에 같은 값(31000)이 숫자로 두 번 있다(시험이 대조한다).
 const OPERATOR_CLOSE_AFTER_MS = START_UNREACHABLE_MS + limits.CLOCK_SKEW_MS;
-// 종료 확인 영수증이 적힌 뒤의 상태. 확정·정리의 정상 길이 있어 관리자 닫기를 받지 않는다(stop_confirmed).
+// 종료 확인 영수증이 적힌 뒤의 상태. 확정·정리의 정상 길이 있어 파드 교체 닫기를 받지 않는다(stop_confirmed).
 const STOP_CONFIRMED: readonly LedgerRunState[] = ["checking", "ready_result", "failed_stopped", "cleanup_pending"];
+// 저장소 비움 닫기(D-158, 판 9)가 받는 앞 상태(작업자, 종료 확인 있음). 전이표의 세 줄(→ not_started)과 같다. 실행기가 영영 돌아오지
+// 않으면 정리 영수증이 오지 않아 이 상태들은 자리를 풀지 못한다. cleanup_pending은 D-158의 목록 밖이다(감독 장부를 그 상태로 옮기는 운영
+// 코드도 없다).
+const STORE_RESET_CLOSABLE: readonly LedgerRunState[] = ["checking", "ready_result", "failed_stopped"];
+const closableBy = (check: OperatorCheck): readonly LedgerRunState[] => (check === "store_reset" ? STORE_RESET_CLOSABLE : OPERATOR_CLOSABLE);
 // Kubernetes 이름 규칙(RFC 1123 DNS 서브도메인): 라벨은 소문자·숫자·'-'이고 영숫자로 시작하고 끝나며, 점으로 잇고, 전체 253자 이하.
 // 이관 0007의 트리거가 같은 규칙을 GLOB로 다시 본다.
 const POD_NAME = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
@@ -1597,6 +1680,9 @@ export class Ledger {
   readonly #stopExitColumn: boolean;
   // 판 8의 실패 상태가 된 시각 칸. 위와 같이 판 목록을 끊어 연 장부에는 없어서 적지 않고, 그 줄은 판 8 전의 줄처럼 읽는다.
   readonly #failedAtColumn: boolean;
+  // 판 9(0009-operator-release)의 근거 표 둘(result_abandons·slot_hold_releases)과 store_reset을 받는 트리거. 판 목록을 그 앞에서 끊어
+  // 연 장부(시험용 길)에는 없어서, 결과 포기·저장소 비움 닫기·점유 풀기를 거절하고 포기한 실행이 없는 것으로 읽는다.
+  readonly #releases: boolean;
   // 이 장부 객체의 열기 ID. 송신 표식이 "이 열기가 실었다"를 적는 값이다. 열 때마다(객체마다) 새로 만들어 다시 열면 달라진다.
   // 장부의 식별(ledger_id)·사본 ID와 같이 장부가 스스로 만드는 식별이라 crypto.randomUUID()로 만든다(업무 참조처럼 부르는 쪽이
   // 넘기게 하면 다시 연 객체가 앞 열기의 값을 쓸 수 있다). 파일에는 표식·닫기 근거 줄에만 남는다.
@@ -1614,6 +1700,7 @@ export class Ledger {
     this.#operatorClosures = sqlOf(db, "operator_closures") !== null;
     this.#stopExitColumn = db.query("SELECT 1 AS x FROM pragma_table_info('runs') WHERE name = 'stop_exit'").get() !== null;
     this.#failedAtColumn = db.query("SELECT 1 AS x FROM pragma_table_info('runs') WHERE name = 'failed_stopped_at'").get() !== null;
+    this.#releases = sqlOf(db, "result_abandons") !== null;
     this.#openId = crypto.randomUUID();
   }
 
@@ -2457,6 +2544,7 @@ export class Ledger {
   // 종료·취소 지시. 정지 중에도, 접수가 닫혀도, 장부가 실패한 뒤에도 시도한다. 아직 지시를 내지 않은 대기 실행은 not_started로 닫는다.
   // 지시의 정지 세대는 장부의 지금 값과 같아야 한다. 장부를 쓸 수 없어 이 기록이 실패해도 호출자는 최선 노력의 종료를 보낼 수 있지만,
   // 그것은 "지금 세대로 발급하도록 기록한 지시"가 아니다.
+  // 결과를 버린 실행에 사유 requested의 취소 지시가 없으면 사유 없는 취소는 outcome_unknown으로 거절한다(#recordStop, D-148).
   recordStopInstruction(input: StopInstructionInput): { ok: true; run: Run } | Refused {
     const v = exact(input, ["runId", "requestId", "action", "stopGeneration", "now", "reason"], "recordStopInstruction");
     const runId = str(v.runId, UUID, "runId");
@@ -2483,12 +2571,20 @@ export class Ledger {
     }
     if (stopGeneration === null) throw new Refuse("stop_unknown");
     this.#requireStopGeneration(stopGeneration);
+    // D-148: 결과를 버린 실행의 확정 outcome은 취소 지시의 사유로만 갈린다(abandonResult). requested가 없는데 사유 없는 취소를 더하면
+    // failedStop의 requestedCancel이 null이 되어 수명 박자가 이미 낼 수 있던 확정을 보류하고 자리를 쥔다. 이관 0009의
+    // instructions_abandoned_outcome_known이 원 SQL에도 같은 조건을 본다.
+    if (action === "task_cancel" && reason === null && this.#resultAbandoned(row.run_id) && !this.#requestedCancel(row.run_id)) throw new Refuse("outcome_unknown");
     if (["preparing", "running", "unknown_running"].includes(row.state)) this.#setState(row, "stopping", now);
     this.#insertInstruction({ requestId, runId: row.run_id, action, stopGeneration, issuedAt: now }, { reason });
     return this.#runRow(row.run_id) as RunRow;
   }
 
-  // 결과 확정 지시. 결과 쪽 상태(종료 확인이 있는)에서만 적는다. 정리 영수증은 이 지시만 가리킬 수 있다.
+  // 결과 확정 지시. 결과 쪽 상태(종료 확인이 있는)에서 적는다. 정리 영수증은 이 지시만 가리킬 수 있다.
+  // 관리자가 닫은 실행(not_started + operator_closures 줄)에도 outcome failed의 확정만 적는다(D-159의 C-2): 실행기 저장소에 남은 그
+  // 실행의 기록을 실행기가 정리해 맺게 하려는 것이다. 실행 줄의 상태는 그대로이고, 그 확정의 정리 영수증은 받은 기록과 ack로 마친다
+  // (#effect). 관리자 닫기는 늘 실패라(D-94) 다른 outcome이나 본문 없는 지시는 받지 않는다. D-90으로 닫은 실행과 대기에서 취소된
+  // 실행은 실행기가 받은 적 없는 실행이라 받지 않는다.
   recordFinalizeInstruction(input: FinalizeInstructionInput): { ok: true } | Refused {
     const v = exact(input, ["runId", "requestId", "stopGeneration", "now", "outcome", "resultDigest", "storedAt"], "recordFinalizeInstruction");
     const runId = str(v.runId, UUID, "runId");
@@ -2499,7 +2595,8 @@ export class Ledger {
     return this.#write("finalize_instruction", "continue", () => {
       const row = this.#runRow(runId);
       if (row === null) throw new Refuse("unknown_run");
-      if (!["ready_result", "failed_stopped", "cleanup_pending"].includes(row.state)) throw new Refuse("transition_denied");
+      const closed = row.state === "not_started" && this.#operatorClosed(runId) && fields.outcome === "failed";
+      if (!closed && !["ready_result", "failed_stopped", "cleanup_pending"].includes(row.state)) throw new Refuse("transition_denied");
       this.#requireStopGeneration(stopGeneration);
       this.#insertInstruction({ requestId, runId, action: "result_finalize", stopGeneration, issuedAt: now }, fields);
       return { ok: true as const };
@@ -2880,8 +2977,13 @@ export class Ledger {
   // (start_may_launch). podStartedAt ≤ now를 먼저 요구하므로 now가 한도 전이면 그 파드도 한도 전에 떴고, 같은 파드로는 기다려도
   // 닫히지 않는다: 이력이 맞으면 한도까지 기다린 뒤 파드를 교체하고, 새 파드가 뜬 시각을 다시 읽어 닫는다. podStartedAt이 같은 한도 전이면 pod_started_too_early다(새 파드가 그 시작을 받을 수 있었다: 파드를
   // 한 번 더 바꾼다). 장부는 사람이 언제 확인했는지, 넘긴 파드의 시각이 맞는지 모른다(부르는 쪽이 지킬 조건).
+  // 저장소 비움(store_reset, D-158, 판 9): 실행기가 영영 돌아오지 않아 정리 영수증이 오지 않는, 종료가 확인된 실행(checking·
+  // ready_result·failed_stopped)을 같은 근거 표에 같은 칸으로 닫는다. 파드 이름·뜬 시각은 새로 띄운 작업자 파드의 값이고 시각 조건은
+  // 같다. 장부는 저장소를 정말 비웠는지 확인하지 못한다. 결과를 보관했던 실행도 본체에는 실패로 보인다(OPERATOR_CLOSED_PHASE).
   // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 작업자(run_not_worker) → 끝 상태 아님(run_ended) →
-  // 종료 확인 없음(stop_confirmed) → unknown_running·stopping(transition_denied) → 정지 기록 있음(stop_unknown) →
+  // pod_replaced면 종료 확인 없음(stop_confirmed), store_reset이면 종료 확인 있음(stop_unconfirmed) → 방법이 받는 앞 상태
+  // (pod_replaced는 unknown_running·stopping, store_reset은 checking·ready_result·failed_stopped, 아니면 transition_denied) →
+  // failed_stopped면 실패 시각이 있음(failed_at_unknown: 판 8 전에 실패한 줄, D-162) → 정지 기록 있음(stop_unknown) →
   // task_start 지시가 있고 session_start 지시가 없으며 닫을 수 있게 되는 시각이 지남(start_may_launch) → 파드가 그 시각 뒤에 뜸
   // (pod_started_too_early).
   // 확인 방법·파드 이름·파드의 시각이 꼴 밖이거나 파드의 시각이 now보다 늦으면 트랜잭션을 열기 전에 LedgerInputError다(아무것도 쓰지 않는다).
@@ -2905,10 +3007,15 @@ export class Ledger {
       if (row === null) throw new Refuse("unknown_run");
       if (row.kind !== "worker") throw new Refuse("run_not_worker");
       if (TERMINAL.includes(row.state)) throw new Refuse("run_ended");
-      if (row.stop_receipt_id !== null || STOP_CONFIRMED.includes(row.state)) throw new Refuse("stop_confirmed");
-      if (!OPERATOR_CLOSABLE.includes(row.state)) throw new Refuse("transition_denied");
-      // 판 7의 기록이 없는 장부(판 목록을 그 앞에서 끊어 연 시험용 길)에는 근거 표가 없다.
-      if (!this.#operatorClosures) throw new Refuse("transition_denied");
+      const stopConfirmed = row.stop_receipt_id !== null || STOP_CONFIRMED.includes(row.state);
+      if (checkedBy === "pod_replaced" && stopConfirmed) throw new Refuse("stop_confirmed");
+      if (checkedBy === "store_reset" && !stopConfirmed) throw new Refuse("stop_unconfirmed");
+      if (!closableBy(checkedBy).includes(row.state)) throw new Refuse("transition_denied");
+      // 판 7의 기록이 없는 장부(판 목록을 그 앞에서 끊어 연 시험용 길)에는 근거 표가 없고, 판 9 전의 장부에는 store_reset을 받는
+      // 트리거가 없다.
+      if (!this.#operatorClosures || (checkedBy === "store_reset" && !this.#releases)) throw new Refuse("transition_denied");
+      // 실패 시각이 없는 failed_stopped는 판 8 전에 실패한 줄이다. 확정을 못 내 자리를 쥔 줄이지만 D-162가 이 판의 출구 밖으로 두었다.
+      if (row.state === "failed_stopped" && stopFacts(row).stoppedAt === null) throw new Refuse("failed_at_unknown");
       const stop = this.#stopRow();
       if (stop === null) throw new Refuse("stop_unknown");
       // task_start가 없는 실행은 시간의 근거가 없다: 갱신·세션 시작 한 줄만으로 한도를 정하지 않는다. session_start가 섞인 실행은
@@ -2948,7 +3055,8 @@ export class Ledger {
         closed_at: number;
       } | null;
       if (row === null) return null;
-      if (!OPERATOR_CLOSABLE.includes(row.from_state as LedgerRunState) || !(OPERATOR_CHECKS as readonly string[]).includes(row.checked_by)) {
+      const check = OPERATOR_CHECKS.find((c) => c === row.checked_by);
+      if (check === undefined || !closableBy(check).includes(row.from_state as LedgerRunState)) {
         throw new LedgerUnavailableError("corrupt", "operator_closures: 꼴이 맞지 않는 줄");
       }
       return {
@@ -2965,6 +3073,86 @@ export class Ledger {
 
   #operatorClosed(runId: string): boolean {
     return this.#operatorClosures && this.#db.query("SELECT 1 AS x FROM operator_closures WHERE run_id = ?").get(runId) !== null;
+  }
+
+  // D-148: 종료는 확인됐는데 결과가 끝내 오지 않는 작업자 실행(checking)의 결과를 관리자가 버린다(D-157의 근거와 함께). 근거 줄을 넣는
+  // 문장 하나가 실행 줄을 failed_stopped로 옮긴다(failed_stopped_at = now, 이관 0009의 result_abandons_fail_run). 확정은 이 연산이
+  // 적지 않는다: 수명 박자가 failedStop을 읽어 D-114대로(사유 requested의 취소 지시가 있으면 cancelled, 아니면 failed, stored_at = now) 내고, 실행기의 정리 영수증이 finalized로 옮겨 자리를 푼다. 파드 교체는 필요 없다
+  // (종료가 확인돼 프로세스는 0개). 실행기가 영영 돌아오지 않으면 저장소 비움 닫기(closeRunByOperator의 store_reset)로 간다.
+  // 포기한 실행에 뒤늦게 온 결과 보고는 본문 없이 받은 기록만 남기고 ack로 마친다(recordAbandonedReport, 저장 자리가 있으면 #resultDisposition).
+  // 버리지 않는 실행 둘(근거·실행 줄·보고를 그대로 둔다): 받아 두고 판정에 반영하지 않은 결과 보고가 있는 실행(D-168: 감독이 본문을 보관하고
+  // ack했다. 결과 검사 박자가 ready_result로 판정한다), 버린 뒤 D-114 확정 outcome을 정할 수 없는 실행(사유 없는 취소 지시만 있음. 버리면
+  // 확정도 정리도 없이 자리를 쥔다). 뒤의 것은 결과를 기다리거나 저장소 비움 닫기(store_reset)로 닫는다. 버린 뒤에 같은 이력을 만드는
+  // 사유 없는 취소는 recordStopInstruction이 같은 이름(outcome_unknown)으로 거절한다.
+  // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 작업자(run_not_worker) → 끝 상태 아님(run_ended) →
+  // checking(not_checking: 이미 판정됐거나 종료 확인 전) → 판 9 전의 장부(transition_denied) → 종료 영수증 ID가 실행 줄과 같음
+  // (reference_mismatch) → 정지 기록 있음(stop_unknown) → 미반영 결과 보고 없음(report_pending) → 확정 outcome을 정할 수 있음
+  // (outcome_unknown). 사유·영수증 ID·시각이 꼴 밖이면 트랜잭션을 열기 전에 LedgerInputError다.
+  // 이관 0009의 트리거가 앞 상태·영수증·정지 세대(result_abandons_proven), 미반영 결과 보고(result_abandons_report_pending), 취소 지시의
+  // 사유(result_abandons_outcome_known)를 원 SQL에도 다시 본다.
+  // 쓰기 모드 new(관리자 닫기와 같은 묶음): 장부가 한 번이라도 실패했으면 거절하고, 사본 보류·정지·접수 닫힘은 막지 않는다.
+  abandonResult(input: ResultAbandonInput): { ok: true; run: Run; abandon: ResultAbandon } | Refused {
+    const v = exact(input, ["runId", "reason", "stopReceiptId", "now"], "abandonResult");
+    const runId = str(v.runId, UUID, "runId");
+    const reason = oneOf(v.reason, RESULT_ABANDON_REASONS, "reason");
+    const stopReceiptId = str(v.stopReceiptId, UUID, "stopReceiptId");
+    const now = time(v.now, "now");
+    return this.#write("result_abandon", "new", () => {
+      const row = this.#runRow(runId);
+      if (row === null) throw new Refuse("unknown_run");
+      if (row.kind !== "worker") throw new Refuse("run_not_worker");
+      if (TERMINAL.includes(row.state)) throw new Refuse("run_ended");
+      if (row.state !== "checking") throw new Refuse("not_checking");
+      if (!this.#releases) throw new Refuse("transition_denied");
+      if (row.stop_receipt_id !== stopReceiptId) throw new Refuse("reference_mismatch");
+      const stop = this.#stopRow();
+      if (stop === null) throw new Refuse("stop_unknown");
+      if (this.#db.query("SELECT 1 AS x FROM deliveries WHERE run_id = ? AND action = 'report_result' AND applied_at IS NULL").get(runId) !== null) {
+        throw new Refuse("report_pending");
+      }
+      // 버린 실행의 exit는 늘 completed라(checking의 stop_exit는 completed이거나 비었고, 비면 실패 시각과 함께 completed로 읽는다) 확정
+      // outcome은 취소 지시의 사유로만 갈린다. failedStop의 requestedCancel이 null이 되는 조건과 같다.
+      const cancels = (this.#db.query("SELECT reason FROM instructions WHERE run_id = ? AND action = 'task_cancel'").all(runId) as { reason: string | null }[]).map((c) => c.reason);
+      if (!cancels.includes("requested") && cancels.includes(null)) throw new Refuse("outcome_unknown");
+      this.#db
+        .query("INSERT INTO result_abandons (run_id, reason, stop_receipt_id, stop_generation, abandoned_at) VALUES (?, ?, ?, ?, ?)")
+        .run(runId, reason, stopReceiptId, stop.generation, now);
+      const abandon: ResultAbandon = { runId, reason, stopReceiptId, stopGeneration: stop.generation, abandonedAt: now };
+      return { ok: true as const, run: toRun(this.#runRow(runId) as RunRow), abandon };
+    });
+  }
+
+  // 결과 포기의 근거 줄. 없으면 null이다(포기하지 않았거나 판 9 전의 장부).
+  resultAbandon(runId: string): Read<ResultAbandon | null> {
+    return this.#read(() => {
+      if (!this.#releases) return null;
+      const row = this.#db.query("SELECT run_id, reason, stop_receipt_id, stop_generation, abandoned_at FROM result_abandons WHERE run_id = ?").get(runId) as {
+        run_id: string;
+        reason: string;
+        stop_receipt_id: string;
+        stop_generation: number;
+        abandoned_at: number;
+      } | null;
+      if (row === null) return null;
+      const reason = RESULT_ABANDON_REASONS.find((r) => r === row.reason);
+      if (reason === undefined) throw new LedgerUnavailableError("corrupt", "result_abandons: 꼴이 맞지 않는 줄");
+      return {
+        runId: row.run_id,
+        reason,
+        stopReceiptId: row.stop_receipt_id,
+        stopGeneration: safe(row.stop_generation, "result_abandons.stop_generation"),
+        abandonedAt: safe(row.abandoned_at, "result_abandons.abandoned_at"),
+      };
+    });
+  }
+
+  #resultAbandoned(runId: string): boolean {
+    return this.#releases && this.#db.query("SELECT 1 AS x FROM result_abandons WHERE run_id = ?").get(runId) !== null;
+  }
+
+  // 사유 requested의 취소 지시가 있는가. 판 4 전의 장부는 사유 칸이 없어 늘 false다.
+  #requestedCancel(runId: string): boolean {
+    return this.#rebuildColumns && this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'task_cancel' AND reason = 'requested'").get(runId) !== null;
   }
 
   // 부탁 줄을 값으로 바꾼다. 이은 실행이 not_started면 관리자 닫기의 근거가 있는지 읽어 단계를 가른다(toToolRequest).
@@ -3173,12 +3361,86 @@ export class Ledger {
     });
   }
 
+  // D-161: 관리자가 그 실행기의 파드를 지워 새로 띄운 뒤, 그 근거(확인 방법, 새 파드의 이름과 뜬 시각)를 남기고 점유 관측 하나의 자리
+  // 막기를 내린다(holds_slot = 0). 근거 줄을 넣는 문장 하나가 막기를 내린다(이관 0009의 slot_hold_releases_release). 줄은 남아 그 실행
+  // ID는 계속 시작하지 않는다. 대조는 clearSlotHold와 같다(실행기·실행·세대·관측 번호가 지금의 줄과 같음). 새 파드는 그 관측을 적은
+  // 시각(held_at) 이후에 떠야 한다: 그 전에 뜬 파드면 관측한 것이 바로 그 파드의 실행기였을 수 있다. 장부는 파드를 정말 바꿨는지,
+  // 실행기가 그 실행을 아직 쥐고 있는지 확인하지 못한다. 작업자 자리를 실제로 쓸 수 있는지는 slotFree로 따로 읽는다.
+  // 거절의 순서: 못 씀(ledger_unwritable) → 판 9 전의 장부(transition_denied) → 그 실행기·실행의 관측 있음(unknown_run) → 세대·관측
+  // 번호가 지금의 줄과 같음(reference_mismatch) → 그 관측이 자리를 막음(slot_not_held) → 파드가 관측을 적은 시각 이후에 뜸
+  // (pod_started_too_early). 방법·파드 이름·시각이 꼴 밖이거나 파드의 시각이 now보다 늦으면 트랜잭션을 열기 전에 LedgerInputError다.
+  // 쓰기 모드 new(관리자 닫기와 같은 묶음).
+  releaseSlotHold(input: SlotHoldReleaseInput): { ok: true; release: SlotHoldRelease } | Refused {
+    const v = exact(input, ["executorId", "runId", "runGeneration", "observation", "checkedBy", "podName", "podStartedAt", "now"], "releaseSlotHold");
+    const executorId = str(v.executorId, REF, "executorId");
+    const runId = str(v.runId, UUID, "runId");
+    const runGeneration = count(v.runGeneration, "runGeneration");
+    const observation = count(v.observation, "observation");
+    if (!(SLOT_HOLD_CHECKS as readonly unknown[]).includes(v.checkedBy)) throw new LedgerInputError("checkedBy: 확인 방법의 목록 밖이다");
+    const checkedBy = v.checkedBy as SlotHoldCheck;
+    if (typeof v.podName !== "string" || v.podName.length > POD_NAME_MAX || !POD_NAME.test(v.podName)) throw new LedgerInputError("podName: Kubernetes 이름 규칙 밖이다");
+    const podName = v.podName;
+    const podStartedAt = time(v.podStartedAt, "podStartedAt");
+    const now = time(v.now, "now");
+    if (podStartedAt > now) throw new LedgerInputError("podStartedAt: 푸는 시각보다 늦다");
+    return this.#write("slot_hold_release", "new", () => {
+      if (!this.#releases) throw new Refuse("transition_denied");
+      const held = this.#db.query("SELECT 1 AS x FROM slot_holds WHERE executor_id = ? AND run_id = ? LIMIT 1").get(executorId, runId);
+      if (held === null) throw new Refuse("unknown_run");
+      const row = this.#db
+        .query("SELECT holds_slot, held_at FROM slot_holds WHERE executor_id = ? AND run_id = ? AND run_generation = ? AND observation = ?")
+        .get(executorId, runId, runGeneration, observation) as { holds_slot: number; held_at: number } | null;
+      if (row === null) throw new Refuse("reference_mismatch");
+      if (row.holds_slot !== 1) throw new Refuse("slot_not_held");
+      if (podStartedAt < safe(row.held_at, "slot_holds.held_at")) throw new Refuse("pod_started_too_early");
+      this.#db
+        .query("INSERT INTO slot_hold_releases (observation, executor_id, run_id, run_generation, checked_by, pod_name, pod_started_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .run(observation, executorId, runId, runGeneration, checkedBy, podName, podStartedAt, now);
+      return { ok: true as const, release: { observation, executorId, runId, runGeneration, checkedBy, podName, podStartedAt, releasedAt: now } };
+    });
+  }
+
+  // 점유 관측 풀기의 근거 줄(관측 번호로). 없으면 null이다(풀지 않았거나 근거 없이 clearSlotHold로 풀었거나 판 9 전의 장부).
+  slotHoldRelease(observation: number): Read<SlotHoldRelease | null> {
+    return this.#read(() => {
+      if (!this.#releases) return null;
+      const row = this.#db
+        .query("SELECT observation, executor_id, run_id, run_generation, checked_by, pod_name, pod_started_at, released_at FROM slot_hold_releases WHERE observation = ?")
+        .get(observation) as {
+        observation: number;
+        executor_id: string;
+        run_id: string;
+        run_generation: number;
+        checked_by: string;
+        pod_name: string;
+        pod_started_at: number;
+        released_at: number;
+      } | null;
+      if (row === null) return null;
+      const checkedBy = SLOT_HOLD_CHECKS.find((c) => c === row.checked_by);
+      if (checkedBy === undefined) throw new LedgerUnavailableError("corrupt", "slot_hold_releases: 꼴이 맞지 않는 줄");
+      return {
+        observation: safe(row.observation, "slot_hold_releases.observation"),
+        executorId: row.executor_id,
+        runId: row.run_id,
+        runGeneration: safe(row.run_generation, "slot_hold_releases.run_generation"),
+        checkedBy,
+        podName: row.pod_name,
+        podStartedAt: safe(row.pod_started_at, "slot_hold_releases.pod_started_at"),
+        releasedAt: safe(row.released_at, "slot_hold_releases.released_at"),
+      };
+    });
+  }
+
   // ---- 영수증·보고 ----
 
   // 이미 받은 id인가. 같은 본문이면 "duplicate", 다른 본문이면 receipt_conflicts에 남기고 거절, 처음이면 null이다.
   // 새 id에만 원 지시 대조와 효과를 적용하도록 그 앞에서 부른다(반영할 수 없는 새 id는 적지 않고 거절한다. 실행기는 ack가 올 때까지 다시 보낸다).
+  // 받은 ID는 deliveries와 결과를 버린 실행의 받은 기록(판 9의 abandoned_result_reports) 두 표에 걸쳐 하나다: 어느 쪽에 적혔든 같은 ID의
+  // 재전송은 같은 본문이면 duplicate, 다르면 충돌이다. 두 표에 같은 ID가 함께 들어가지 않는다(두 표의 BEFORE INSERT 트리거, recordAbandonedReport).
   #redelivery(id: string, digest: string, now: number): "duplicate" | Refused | null {
-    const before = this.#db.query("SELECT body_digest FROM deliveries WHERE id = ?").get(id) as { body_digest: string } | null;
+    const before = (this.#db.query("SELECT body_digest FROM deliveries WHERE id = ?").get(id) ??
+      (this.#releases ? this.#db.query("SELECT body_digest FROM abandoned_result_reports WHERE report_id = ?").get(id) : null)) as { body_digest: string } | null;
     if (before === null) return null;
     if (before.body_digest === digest) return "duplicate";
     this.#recordConflict(id, before.body_digest, digest, now);
@@ -3264,8 +3526,10 @@ export class Ledger {
     // 닫기 근거가 있는 not_started 실행에 늦게 온 영수증: 받은 기록(위의 deliveries 줄)만 남기고 상태·증거 칸은 바꾸지 않는다(되살리지 않는다).
     // 접수·종료 영수증은 띄운 것이 없다는 말이라 ack만 받는다. 시작 영수증은 그 실행이 실제로 떴다는 말이라 그 종류의 자리를 다시 막는다:
     // 자리를 푼 뒤 같은 종류의 다른 실행이 시작됐을 수 있다(겹침). 막은 줄은 clearSlotHold로만 풀린다.
-    // 이 처리는 그 실행 자신의 세 영수증에만 건다. 세션 인수 영수증은 닫힌 작업자를 앞 실행으로 가리켜도 아래의 종류 검사로 가야 하고,
-    // 정리 영수증은 닫힌 실행에 확정 지시가 없어 여기 오기 전에 거절된다.
+    // 정리 영수증도 ack만 받는다: 확정 지시를 가리키는 대조는 위에서 이미 지났고(저장소 비움으로 닫기 전에 낸 확정, 관리자가 닫은
+    // 실행에 낸 확정), 실행 줄은 not_started 그대로 두며 정리 증거 칸도 채우지 않는다(not_started → finalized는 전이가 없다). 거절하면
+    // ack가 없어 실행기가 그 영수증을 끝없이 다시 보낸다.
+    // 이 처리는 그 실행 자신의 네 영수증에만 건다. 세션 인수 영수증은 닫힌 작업자를 앞 실행으로 가리켜도 아래의 종류 검사로 가야 한다.
     if (CLOSED_RUN_RECEIPTS.includes(r.action) && this.#closedAfterStart(row)) {
       if (r.action === "receipt_started") this.#hold({ executorId: row.executor_id, runId: row.run_id, kind: row.kind, runGeneration: row.run_generation, holdsSlot: true, why: "ended_in_ledger" }, r.now);
       return;
@@ -3339,8 +3603,12 @@ export class Ledger {
   // 결과 보고를 적어도 되는지 ack 전에 정한다. 판정이 끝난 실행은 상태를 다시 옮기지 않는다.
   // pending: 아직 판정 전이라 미반영으로 둔다. settled: 같은 결과가 이미 반영돼 적자마자 마친다.
   // 다른 결과는 충돌을 남기고 거절하고, 결과가 없다고 판정한 실행이나 시작하지 않은 실행의 결과는 적지 않고 거절한다(ack 없음).
+  // 관리자가 결과를 버린 실행(result_abandons, D-148)의 결과는 적자마자 마친다(settled): 그 결과는 이미 버렸고, 거절하면 ack가 없어
+  // 실행기가 그 보고를 끝없이 다시 보낸다. 실행 줄은 그대로이고 충돌도 적지 않는다. 감독 수신기는 그 실행의 보고를 보관하지 않고
+  // recordAbandonedReport로 보내므로, 이 길은 저장 자리를 이미 얻은 보고에만 남는다.
   #resultDisposition(row: RunRow, reportId: string, resultDigest: string, now: number): "pending" | "settled" | Refused {
     if (row.kind !== "worker" || row.state === "queued" || row.state === "not_started") throw new Refuse("transition_denied");
+    if (this.#resultAbandoned(row.run_id)) return "settled";
     if (!["ready_result", "failed_stopped", "cleanup_pending", "finalized"].includes(row.state)) return "pending";
     if (row.result_digest === null) throw new Refuse("transition_denied");
     if (row.result_digest === resultDigest) return "settled";
@@ -3376,6 +3644,37 @@ export class Ledger {
       if (typeof disposition === "object") return disposition;
       this.#insertDelivery(reportId, action, runId, digest, now, { storedRef, resultDigest, appliedAt: disposition === "settled" ? now : null });
       if (signal !== null) this.#insertSignal(reportId, signal);
+      return { ok: true as const, delivery: "new" as const, ack: reportId };
+    });
+  }
+
+  // D-169: 결과를 버린 실행(result_abandons 줄이 있는 실행)에 온 결과 보고를 본문 보관 없이 받은 기록으로 남긴다. 감독 결과 수신기가
+  // 그 실행의 보고를 보관소에 넣는 대신 부른다(receipts.ts). 보관소에 장애가 이어져도(포기 사유 unstorable) 실행기가 ack를 받아 같은
+  // 보고를 끝없이 다시 보내지 않는다. 버린 실행의 상태(failed_stopped·cleanup_pending·finalized, 저장소 비움 닫기 뒤의 not_started)와
+  // 무관하게 받고, 실행 줄·보고 줄·자리는 바꾸지 않는다.
+  // 같은 ID는 recordReport와 같이 가른다(#redelivery): 같은 본문 digest의 재전송은 duplicate, 다른 digest는 충돌(receipt_conflict, ack 없음).
+  // 거절의 순서: 못 씀(ledger_unwritable) → 실행 있음(unknown_run) → 낸 쪽·세대가 지정 실행기·실행 줄과 같음(sender_mismatch·
+  // run_generation_mismatch) → 같은 ID(duplicate·receipt_conflict) → 판 9 전의 장부이거나 결과를 버린 실행이 아님(transition_denied).
+  // 쓰기 모드 continue(recordReport와 같은 묶음): 받은 것을 닫는 기록이라 장부가 실패한 뒤에도 시도한다.
+  // 이관 0009의 트리거(abandoned_result_reports_proven)가 포기 근거, 낸 쪽·세대, 두 표의 ID 겹침을 원 SQL에도 다시 본다.
+  recordAbandonedReport(input: AbandonedReportInput, from: EnvelopeFrom): { ok: true; delivery: Delivery; ack: string } | Refused {
+    const v = exact(input, ["reportId", "runId", "bodyDigest", "now"], "recordAbandonedReport");
+    const reportId = str(v.reportId, UUID, "reportId");
+    const runId = str(v.runId, UUID, "runId");
+    const digest = str(v.bodyDigest, SHA256, "bodyDigest");
+    const sender = validateFrom(from);
+    const now = time(v.now, "now");
+    return this.#write("abandoned_report", "continue", () => {
+      const row = this.#runRow(runId);
+      if (row === null) throw new Refuse("unknown_run");
+      this.#requireSender(row, sender);
+      const seen = this.#redelivery(reportId, digest, now);
+      if (seen === "duplicate") return { ok: true as const, delivery: "duplicate" as const, ack: reportId };
+      if (seen !== null) return seen;
+      if (!this.#resultAbandoned(runId)) throw new Refuse("transition_denied");
+      this.#db
+        .query("INSERT INTO abandoned_result_reports (report_id, run_id, sender, run_generation, body_digest, received_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(reportId, runId, sender.sender, sender.runGeneration, digest, now);
       return { ok: true as const, delivery: "new" as const, ack: reportId };
     });
   }

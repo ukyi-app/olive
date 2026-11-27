@@ -3,6 +3,7 @@
 export { classify, type Faults, LedgerUnavailableError, UNAVAILABLE_REASONS, type UnavailableReason } from "./errors.ts";
 export { type CredentialRef, LedgerInputError, type SourceRef } from "./input.ts";
 export {
+  type AbandonedReportInput,
   type AdmitRunInput,
   type AnswerAlarm,
   type AnswerSightingsInput,
@@ -41,6 +42,10 @@ export {
   type Refused,
   type ReportInput,
   type ReportSignal,
+  RESULT_ABANDON_REASONS,
+  type ResultAbandon,
+  type ResultAbandonInput,
+  type ResultAbandonReason,
   type RuleCheckEvidence,
   type RuleCheckFrom,
   type Run,
@@ -50,7 +55,11 @@ export {
   type SessionStopReason,
   type SettledResult,
   type SlotHold,
+  SLOT_HOLD_CHECKS,
+  type SlotHoldCheck,
   type SlotHoldObservation,
+  type SlotHoldRelease,
+  type SlotHoldReleaseInput,
   SNAPSHOT_STALE_RECORDS,
   type SnapshotOrigin,
   type SnapshotRequest,

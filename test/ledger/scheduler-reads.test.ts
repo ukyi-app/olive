@@ -465,15 +465,16 @@ test("시작 전에 닫힌 줄은 상한이 아님", () => {
       .filter(([, to]) => to?.includes("not_started"))
       .map(([from]) => from);
     // 예외는 작업자의 닫기 줄뿐이다. 장부 트리거가 근거 줄이 있을 때만 허락한다: D-90(preparing·unknown_running, 실행기가 받은 적
-    // 없는 실행, 쓴 예산 없음)과 관리자 닫기(unknown_running·stopping, 이미 돌았을 수 있음).
+    // 없는 실행, 쓴 예산 없음)과 관리자 닫기(파드 교체의 unknown_running·stopping, 저장소 비움의 checking·ready_result·failed_stopped,
+    // 이미 돌았을 수 있음).
     const unreceived: readonly LedgerRunState[] = kind === "worker" ? ["preparing", "unknown_running"] : [];
-    const operator: readonly LedgerRunState[] = kind === "worker" ? ["unknown_running", "stopping"] : [];
+    const operator: readonly LedgerRunState[] = kind === "worker" ? ["unknown_running", "stopping", "checking", "ready_result", "failed_stopped"] : [];
     const closure = LEDGER_RUN_STATES.filter((state) => unreceived.includes(state) || operator.includes(state));
-    expect(closure, kind).toEqual(kind === "worker" ? ["preparing", "stopping", "unknown_running"] : []);
+    expect(closure, kind).toEqual(kind === "worker" ? ["preparing", "stopping", "checking", "ready_result", "failed_stopped", "unknown_running"] : []);
     expect(into, kind).toEqual(["queued", ...closure]);
     const withoutClosure = Object.fromEntries(Object.entries(TRANSITIONS[kind]).map(([from, to]) => [from, closure.includes(from as LedgerRunState) ? to?.filter((s) => s !== "not_started") : to]));
     expect(startedReachesNotStarted(withoutClosure), kind).toBe(false);
-    // 닫기 간선 셋(preparing·stopping·unknown_running → not_started)을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
+    // 닫기 간선(위 closure의 상태 → not_started)을 뺀 표에 시작한 줄이 대기로 돌아가는 간선(running → queued)을 더하면 이 검사가 잡는다.
     const requeue = { ...withoutClosure, running: [...(withoutClosure.running ?? []), "queued" as const] };
     expect(startedReachesNotStarted(requeue), kind).toBe(true);
   }

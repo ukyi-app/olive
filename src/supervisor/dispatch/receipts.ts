@@ -20,6 +20,8 @@
 //    목록뿐이다(resultGate): 장부가 모르는 실행, 지정 실행기·세대가 다른 보고, 세션·queued·시작 지시가 없던 not_started 실행,
 //    소유자가 없는 실행, 장부 읽기가 약속 밖의 값을 준 경우. 그 밖에 장부가 끝내 받지 않는 보고(판정이 끝난 실행의 맞지 않는 결과 등)는
 //    본문부터 보관된다.
+//    예외 하나: 관리자가 결과를 버린 실행(장부의 결과 포기 근거가 있는 실행, D-148)의 보고는 보관소에 넣지 않고 장부에 받은 기록만
+//    적은 뒤(recordAbandonedReport) ack한다(D-169). 보관소 장애가 이어져도 그 보고는 ack로 끝난다.
 import {
   type AnswerAlarm,
   type AnswerSightingsInput,
@@ -141,9 +143,12 @@ export interface ReceiptPorts {
 // 결과 보고의 포트. 읽기(getRun, not_started일 때만 instructionTimes)와 쓰기(recordReport)를 같은 객체에서 부른다: 거른 그 장부에
 // 적어야 거른 판단이 그 기록에 맞는다.
 // 백엔드는 동기다(result-store.ts 머리 주석): 보관과 장부 기록 사이에 지연 실행과 이벤트 루프의 양보가 없다.
+// resultAbandon·recordAbandonedReport는 결과를 버린 실행의 보고에 쓴다(ABANDONED_STATES의 실행에만 부른다). 선택 칸인 이유: 그 상태의
+// 결과 보고까지 가지 않는 가짜 장부가 그대로 맞는다. 조립은 실제 장부를 넘겨 늘 있다. 그 상태의 보고인데 둘 중 하나라도 없으면 버린
+// 실행인지 모르므로 보관하지 않고 ack 없는 result_unknown(ports)이다.
 export interface ResultPorts {
   readonly backend: ResultBackend;
-  readonly ledger: Pick<Ledger, "getRun" | "instructionTimes" | "recordReport">;
+  readonly ledger: Pick<Ledger, "getRun" | "instructionTimes" | "recordReport"> & Partial<Pick<Ledger, "resultAbandon" | "recordAbandonedReport">>;
 }
 
 // 지금 답을 기다리는 상태 조회 하나. 부르는 쪽이 statusQueryDraft의 초안에서 보존한 값이다.
@@ -482,6 +487,25 @@ function resultGate(run: ResultRunView | null | "unknown", from: EnvelopeFrom): 
   return { owner: run.inputRequestId };
 }
 
+// 결과를 버린 실행이 있을 수 있는 상태. 결과 포기는 checking을 failed_stopped로 옮기고(장부 판 9) 그 뒤로는 확정·정리(cleanup_pending·
+// finalized)나 저장소 비움 닫기(not_started)로만 간다. 이 밖의 상태에는 포기 근거가 있을 수 없어 장부를 더 읽지 않는다.
+const ABANDONED_STATES: readonly LedgerRunState[] = ["failed_stopped", "cleanup_pending", "finalized", "not_started"];
+
+// 그 실행에 결과 포기 근거가 있는가. 포트가 없으면 ports, 읽지 못하거나 꼴이 틀리거나 다른 실행의 줄이면 모름이다(보관소에 닿지 않는다).
+function readAbandoned(ledger: ResultPorts["ledger"], runId: string): boolean | "ports" | "unknown" {
+  try {
+    const read = ledger.resultAbandon;
+    if (typeof read !== "function" || typeof ledger.recordAbandonedReport !== "function") return "ports";
+    const answer: unknown = read.call(ledger, runId);
+    if (!isRecord(answer) || answer.known !== true) return "unknown";
+    const value: unknown = answer.value;
+    if (value === null) return false;
+    return isRecord(value) && value.runId === runId ? true : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 // 결과 보고: 거르기 → 보관 → 장부 → ack. 셋 사이에 await·이벤트 루프의 양보·지연 콜백의 예약이 없다(이 함수와 storeResult·settle은
 // 동기이고, settle은 넘겨받은 콜백을 그 자리에서 부른다).
 // 장부가 보관 뒤에 거절하거나 모르면 ack가 없고 본문은 보관소에 남는다: 같은 보고가 다시 오면 storeResult가 같은 참조(created: false)를
@@ -505,8 +529,21 @@ function handleResult(action: string, header: Record<string, unknown>, read: Rea
     throw new BodyFault("result");
   }
   const from = envelopeFrom(header);
-  const gate = resultGate(readResultRun(results.ledger, runId), from);
+  const run = readResultRun(results.ledger, runId);
+  const gate = resultGate(run, from);
   if (gate === "unknown") return { outcome: "result_unknown", ...base, at: "ledger_read" };
+  if (typeof gate === "string" && gate !== "no_owner") return { outcome: "result_refused", ...base, reason: gate };
+  // 결과를 버린 실행은 보관하지 않고 받은 기록만 적는다(D-169). 소유자보다 먼저 본다: 보관하지 않으니 소유자가 없어도 받는다.
+  if (run !== null && run !== "unknown" && ABANDONED_STATES.includes(run.state)) {
+    const abandoned = readAbandoned(results.ledger, runId);
+    if (abandoned === "ports") return { outcome: "result_unknown", ...base, at: "ports" };
+    if (abandoned === "unknown") return { outcome: "result_unknown", ...base, at: "ledger_read" };
+    if (abandoned) {
+      const record = results.ledger.recordAbandonedReport as Ledger["recordAbandonedReport"];
+      const report = { reportId, runId, bodyDigest: header.body_digest as string, now: input.now };
+      return settle(action, reportId, () => record.call(results.ledger, report, from), header.sender as string, input.stopGeneration, ports.random);
+    }
+  }
   if (typeof gate === "string") return { outcome: "result_refused", ...base, reason: gate };
 
   let stored: ReturnType<typeof storeResult>;
