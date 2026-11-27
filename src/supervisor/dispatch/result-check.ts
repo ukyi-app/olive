@@ -413,7 +413,8 @@ function markStopped(ports: ResultCheckPorts, runId: string, lastReceiptId: stri
 export const RESULT_WAIT_ALERT_MS = 90_000;
 
 // checking에 오래 머문 실행을 고르는 경보 자리(D-151). 장부를 읽거나 쓰지 않고 판정하지 않는다. 박자 뒤에 읽은 checking 실행 ID
-// (checkingRunIds)와 그 박자의 시각을 받아, 이번에 경보할 실행과 머문 시간을 낸다. 머문 시간은 이 자리가 그 실행을 checking으로 처음 본
+// (checkingRunIds)와 그 목록을 읽은 뒤의 프로세스 단조 시각(정수 ms)을 받아, 이번에 경보할 실행과 머문 시간을 낸다. 벽시계를 넘기면
+// 표본 하나가 앞설 때 머문 시간이 그만큼 틀린다(조립 boot.ts의 watchResultWait). 머문 시간은 이 자리가 그 실행을 checking으로 처음 본
 // 박자부터 센다: 감독이 다시 뜨면 다시 센다(경보가 늦어질 뿐이다). 같은 실행에는 한 번만 낸다: 보고·답이 끝내 오지 않는 실행은 관리자가
 // 손댈 때까지 박자마다 같은 상태로 남아, 거르지 않으면 박자 수만큼 같은 줄이 쌓인다. 그 실행이 목록에서 빠지면 기억에서 뺀다.
 export interface ResultWaitAlarm {

@@ -635,21 +635,22 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
 
   // 결과 기다림 경보(D-151)와 결과 기다림 조회의 등록부 정리. 경보는 실행마다 이 프로세스에서 한 줄만 남긴다(result-check.ts의
   // createResultWaitAlarm). 감시 목록은 박자 뒤에 장부의 관측 읽기로 본 checking 실행이다(checkingRunIds): 접수가 닫혀 결과 검사가
-  // 판정하지 않는 동안에도 센다. 그 읽기는 실패해도 장부 건강·허가를 바꾸지 않고, 읽지 못한 박자는 세지도 잊지도 않는다. 시각은 목록을
-  // 읽은 뒤의 공유 시계 peek()다: 판정 시각(judgedAt)으로 재면 박자 도중(배정을 기다리는 동안) checking이 된 실행의 대기가 앞당겨진다.
-  // 목록 뒤에 읽어야 장부가 적은 진입 시각(하한 이하) 이상이다. read()는 하한을 올려, 그 읽기 하나가 앞선 값을 내면 다음 박자의 결과
-  // 검사·배정이 clock_untrusted로 건너뛰므로 쓰지 않는다. peek()가 시각을 내지 못한 박자도 세지 않는다. 결과 검사에 시각을 넘기지 않은
-  // 박자(복원 전·시계를 믿지 못함)는 경보를 건너뛰고 장부도 읽지 않는다: 복원 2단계 앞의 기다림 동안 장부를 읽지 않아야 한다(D-142, 그
-  // 읽기가 던져도 감독이 끝나지 않게). 그 박자의 등록부 정리는 수만 줄인다. 기록과 등록부 정리만 하고 장부·박자를 바꾸지 않는다. 돌지
-  // 않은 박자(진행 중·발급 닫힘)는 보지 않는다: 진행 중인 박자가 넘긴 시각을 가로채지 않게.
+  // 판정하지 않는 동안에도 센다. 그 읽기는 실패해도 장부 건강·허가를 바꾸지 않고, 읽지 못한 박자는 세지도 잊지도 않는다.
+  // 머문 시간은 프로세스 단조 시계(monoNow)로 잰다. 경보 기억이 이 프로세스의 메모리뿐이라 같은 프로세스 안의 차이면 된다. 벽시계(공유
+  // 시계)는 쓰지 않는다: peek()의 표본 하나가 앞서면 그것이 첫 관측이면 경보가 그만큼 늦고 뒤 관측이면 실제 몇 초에 울리며, read()는
+  // 하한까지 올려 다음 박자의 결과 검사·배정을 clock_untrusted로 건너뛰게 한다. 판정·배정의 시각은 이 자리와 따로 공유 시계로 간다.
+  // 단조 시각도 목록을 읽은 뒤에 읽는다: 판정 시각(judgedAt)이나 목록 앞의 시각으로 재면 박자 도중(배정을 기다리는 동안 등) checking이
+  // 된 실행의 대기가 앞당겨진다. judgedAt은 이 박자의 결과 검사가 시각을 받았는지로만 본다. 받지 않은 박자(복원 전·시계를 믿지 못함)는
+  // 경보를 건너뛰고 장부도 읽지 않는다: 복원 2단계 앞의 기다림 동안 장부를 읽지 않아야 한다(D-142, 그 읽기가 던져도 감독이 끝나지 않게).
+  // 그 박자의 등록부 정리는 수만 줄인다. 기록과 등록부 정리만 하고 장부·박자·공유 시계를 바꾸지 않는다. 돌지 않은 박자(진행 중·발급
+  // 닫힘)는 보지 않는다: 진행 중인 박자가 넘긴 시각을 가로채지 않게.
   const waitQueries = createResultWaitQueries();
   const watchResultWait = (report: BeatReport): void => {
     if (report.kind !== "ran") return;
     const at = judgedAt;
     judgedAt = null;
     const checking = at === null ? null : checkingRunIds(ledger);
-    const seen = at === null ? null : shared.peek();
-    if (seen?.state === "ok") for (const due of waitAlarm.observe(checking, seen.at)) log("result_check_alert", { reason: "result_wait_overdue", runId: due.runId, waitedMs: due.waitedMs });
+    if (at !== null) for (const due of waitAlarm.observe(checking, Math.floor(deps.monoNow()))) log("result_check_alert", { reason: "result_wait_overdue", runId: due.runId, waitedMs: due.waitedMs });
     const life = report.life.kind === "returned" && report.life.result.kind === "ran" ? report.life.result.runs : [];
     const sent = life.flatMap((run) => (run.outcome === "query_sent" && run.cause === "result_wait" ? [{ runId: run.runId, requestId: run.requestId }] : []));
     const release = waitQueries.due(sent, checking);

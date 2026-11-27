@@ -88,15 +88,16 @@ describe("결과 검사 박자 + 조립", () => {
   test("checking에 경보 한도만큼 머문 실행은 감독 로그에 경보 한 줄을 남기고, 박자가 이어져도 같은 실행에는 다시 남기지 않는다(판정 없음)", async () => {
     const b = await booted({ resultWaitAlertMs: 1_000 });
     const run = checking(b.ledger);
+    // 머문 시간은 감독 프로세스의 단조 시계로 잰다. 벽시계도 같이 옮겨 공유 시계가 멈춰 보이지 않게 한다.
+    const pass = async (ms: number) => {
+      b.w.wall += ms;
+      await b.w.time.advance(ms);
+    };
     await b.beat();
-    b.w.wall += 999;
-    await b.beat();
+    await pass(999);
     expect(b.w.events.filter((e) => e.event === "result_check_alert")).toEqual([]);
-    b.w.wall += 1;
-    for (let i = 0; i < 5; i += 1) {
-      await b.beat();
-      b.w.wall += 1_000;
-    }
+    await pass(1);
+    for (let i = 0; i < 5; i += 1) await pass(1_000);
     expect(b.w.events.filter((e) => e.event === "result_check_alert").map((e) => e.fields)).toEqual([{ reason: "result_wait_overdue", runId: run.runId, waitedMs: 1_000 }]);
     expect(stateOf(b.ledger, run.runId)).toBe("checking");
     expect(await b.run.stop()).toBe(0);
@@ -116,7 +117,7 @@ describe("결과 검사 박자 + 조립", () => {
     for (let i = 0; i < 40 && !w.events.some((e) => e.event === "restore_step" && e.fields.step === 5); i += 1) await w.time.advance(w.settings.timing.beatEveryMs);
     for (let i = 0; i < 7; i += 1) {
       w.wall += 1_000;
-      await w.time.advance(w.settings.timing.beatEveryMs);
+      await w.time.advance(1_000);
     }
     expect(w.events.filter((e) => e.event === "restore_step").at(-1)?.fields).toMatchObject({ step: 5, intakeMayOpen: false, closedBecause: "peer_unconfirmed" });
     const checks = w.events.filter((e) => e.event === "beat" && e.fields.kind === "ran").map((e) => e.fields.resultCheck);
@@ -129,7 +130,8 @@ describe("결과 검사 박자 + 조립", () => {
   });
 
   test("경보의 감시 목록 읽기가 한 번 실패해도 장부 건강이 그대로라 감독이 끝나지 않고, 그 박자는 세지도 잊지도 않는다", async () => {
-    const w = world({ settings: { resultWaitAlertMs: 1_000 } });
+    // 머문 시간은 단조 시계로 재므로 박자 하나를 1초로 둔다: 아래 세 박자가 단조 시각 0·1초·2초다.
+    const w = world({ settings: { resultWaitAlertMs: 1_000, timing: { beatEveryMs: 1_000, beatWaitMs: 5_000, restoreStepWaitMs: 30_000, startupWaitMs: 10_000, stopWaitMs: 10_000 } } });
     const seed = open(w.ledgerPath);
     const run = startedWorker(seed);
     must(seed.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: run.runId, instructionRequestId: run.requestId, bodyDigest: digest("start"), now: NOW }, run.from));
@@ -245,7 +247,7 @@ describe("결과 검사 박자 + 조립", () => {
     expect(await result.running.stop()).toBe(0);
   });
 
-  test("경보의 시계 읽기는 관측 전용(peek) 하나라 하한을 올리지 않는다: 박자 기록 중의 그 읽기가 하루 앞선 값을 내도 다음 박자의 하한·결과 검사·배정이 그대로다", async () => {
+  test("경보는 공유 시계를 읽지 않는다: 박자 기록 중에 벽시계가 하루 앞서도 다음 박자의 하한·결과 검사·배정이 그대로다", async () => {
     const w = world();
     const log = w.deps.log;
     const pulse = { armed: false, on: false, reads: 0 };
@@ -277,10 +279,67 @@ describe("결과 검사 박자 + 조립", () => {
     await w.time.advance(w.settings.timing.beatEveryMs);
     expect(pulse.armed).toBe(false);
     const last = w.events.filter((e) => e.event === "beat" && e.fields.kind === "ran").at(-1)?.fields;
-    expect([pulse.reads, last?.clock, last?.resultCheck, String(last?.assign).includes("clock_untrusted")]).toEqual([1, "ok", "ran", false]);
+    expect([pulse.reads, last?.clock, last?.resultCheck, String(last?.assign).includes("clock_untrusted")]).toEqual([0, "ok", "ran", false]);
     expect(w.captured.shared?.read()).toEqual({ state: "ok", at: w.wall });
     expect(await result.running.stop()).toBe(0);
   });
+
+  // 경보의 머문 시간은 단조 시계로 잰다. 박자 기록 중의 벽시계 표본 하나가 하루 앞서도, 그 표본이 첫 관측이면 경보가 하루 늦지 않고
+  // 뒤 관측이면 실제 몇 초에 울리지 않는다. 그 박자 뒤의 결과 검사도 그대로 돈다(판정 시계와 따로).
+  for (const sample of ["첫 관측", "둘째 관측"] as const) {
+    test(`checking 실행의 머문 시간은 단조 시계로 잰다: ${sample} 박자의 기록 중 벽시계가 한 번 하루 앞서도 실제 90초에 경보 한 줄이다`, async () => {
+      const w = world({ settings: { resultWaitAlertMs: 90_000, timing: { beatEveryMs: 1_000, beatWaitMs: 5_000, restoreStepWaitMs: 30_000, startupWaitMs: 10_000, stopWaitMs: 10_000 } } });
+      const base = w.time.monoNow();
+      const wall = () => WALL + w.time.monoNow() - base;
+      const log = w.deps.log;
+      const pulse = { armed: false, on: false };
+      // 결과 검사가 돈 박자를 기록하는 동기 구간(경보가 목록을 읽고 시각을 재는 자리)에서만 벽시계가 하루 앞선다.
+      w.deps = {
+        ...w.deps,
+        wallNow: () => wall() + (pulse.on ? 86_400_000 : 0),
+        log(event, fields) {
+          log(event, fields);
+          if (pulse.armed && event === "beat" && fields?.resultCheck === "ran") {
+            pulse.armed = false;
+            pulse.on = true;
+            queueMicrotask(() => {
+              pulse.on = false;
+            });
+          }
+        },
+      };
+      const result = await w.boot();
+      if (!result.ok) throw new Error(`기동하지 못했다: ${result.step} ${result.reason}`);
+      await w.time.flush();
+      for (let i = 0; i < 40 && !w.events.some((e) => e.event === "restore_step" && e.fields.step === 5); i += 1) await w.time.advance(1_000);
+      const ledger = w.opened!;
+      const row = must(ledger.admitRun(worker({ now: wall(), deadlineAt: wall() + 600_000 }))).run;
+      const requestId = id();
+      must(ledger.startRun({ runId: row.runId, requestId, stopGeneration: 0, now: wall() }));
+      must(ledger.applyReceipt({ action: "receipt_accepted", instruction: "task_start", receiptId: id(), runId: row.runId, instructionRequestId: requestId, bodyDigest: digest("accepted"), now: wall() }, from(row)));
+      const entered = wall();
+      must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: row.runId, exit: "completed", bodyDigest: digest("stop"), now: entered }, from(row)));
+      const alerts = () => w.events.filter((e) => e.event === "result_check_alert" && e.fields.reason === "result_wait_overdue" && e.fields.runId === row.runId).map((e) => e.fields);
+      if (sample === "둘째 관측") await w.time.advance(1_000);
+      pulse.armed = true;
+      let firstAlert: number | null = null;
+      for (let i = 0; i < 95; i += 1) {
+        await w.time.advance(1_000);
+        if (firstAlert === null && alerts().length > 0) firstAlert = wall() - entered;
+      }
+      const last = w.events.filter((e) => e.event === "beat" && e.fields.kind === "ran").at(-1)?.fields;
+      expect({ fired: !pulse.armed, alerts: alerts(), clock: last?.clock, resultCheck: last?.resultCheck, state: stateOf(ledger, row.runId) }).toEqual({
+        fired: true,
+        alerts: [{ reason: "result_wait_overdue", runId: row.runId, waitedMs: 90_000 }],
+        clock: "ok",
+        resultCheck: "ran",
+        state: "checking",
+      });
+      expect(firstAlert).toBeGreaterThanOrEqual(90_000);
+      expect(firstAlert).toBeLessThanOrEqual(91_000);
+      expect(await result.running.stop()).toBe(0);
+    });
+  }
 
   test("답하지 않는 실행기에 낸 결과 기다림 조회는 등록부에 실행마다 세 개까지만 남고, 그 실행이 checking을 떠나면 남지 않는다", async () => {
     const b = await booted();
