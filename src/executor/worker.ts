@@ -387,6 +387,7 @@ export class WorkerExecutor {
         credential_digest: body.credential.digest,
         exit: null,
         last_receipt_id: null,
+        pod_uid: this.options.podUid,
       };
       if (!(await this.store.beginRun(record))) return finish();
       // 기록을 적는 사이 연결·세대·접수가 바뀌었으면 새 접수 영수증을 내지 않는다. 여기서 사건의 예약까지 await가 없다.
@@ -759,6 +760,7 @@ export class WorkerExecutor {
   // 함정: UID가 바뀐 것은 새 파드 객체가 생겼다는 사실이지 옛 컨테이너가 끝났다는 증거가 아니다. 두 파드가 겹치지 않는 교체(Recreate, replicas 0·1,
   // 옛 파드의 끝을 확인한 뒤 1)가 전제다. pod_uid가 없는 의도는 어느 파드에서 적혔는지 몰라 이 길을 쓰지 않는다.
   // 같은 파드의 전체 재시작(D-104)은 UID가 같아 이 길이 아니다. 그때는 남아 있는 /tmp를 새 대리가 지운다.
+  // 이 판정은 정리 의도의 pod_uid를 본다. 실행 기록의 pod_uid(접수한 파드)는 아래 fromReplacedPod가 본다.
   private podReplaced(runId: string, intent: CleanupIntent): boolean {
     if (intent.pod_uid === undefined || intent.pod_uid === this.options.podUid) return false;
     this.options.log?.(`정리 확인: 실행 ${runId}의 정리 의도를 적은 파드(${intent.pod_uid})가 지금 파드(${this.options.podUid})가 아니다. 작업 공간이 파드와 함께 사라졌다고 보고 대리에 묻지 않는다`);
@@ -879,6 +881,15 @@ export class WorkerExecutor {
     );
   }
 
+  // 다른 파드에서 물려받은 실행 기록인가(D-159의 C-1, D-171): 접수한 파드의 UID가 있고 지금 파드가 아니다. 그 파드의 프로세스는 파드와 함께
+  // 끝났다고 보고, 기동 대조가 unknown_running도 IN_FLIGHT와 같이 다시 센다(지금 대리의 계수가 0일 때만 종료 영수증을 낸다).
+  // 함정: UID가 바뀐 것은 옛 컨테이너가 끝났다는 증거가 아니다. 겹치지 않는 교체(Recreate, replicas 0·1, 옛 파드의 끝을 확인한 뒤 1)가
+  // 전제다(podReplaced와 같다). 칸이 없는 기록(칸을 쓰기 전의 판이 접수)과 같은 파드의 기록은 이 길이 아니다(지금 동작 그대로).
+  // 조립은 같은 판정으로 그 기록을 원격 잠금(inheritedUnverified)에서 뺀다(runtime.ts).
+  fromReplacedPod(record: RunRecord): boolean {
+    return record.pod_uid !== undefined && record.pod_uid !== this.options.podUid;
+  }
+
   // 끝을 맺지 못한 모든 상태를 같은 방식으로 대조한다: 유효한 사건이 있으면 그 사건으로 최종 상태와 마지막 영수증을 맺고(같은 ID, 같은 본문),
   // 없으면 남은 수를 센다. 다시 띄우지 않는다(결과가 없어도 새 실행으로 바꾸지 않는다).
   // 시작 영수증이 없어도 띄우지 않았다는 증거는 아니므로, 종료만 확인된 실행은 not_started가 아니라 failed_stopped로 맺는다.
@@ -886,7 +897,8 @@ export class WorkerExecutor {
   // 저장소가 후보 상태의 전제를 거절하면 그 자리에서 보류가 서므로, 끝을 맺지 못한 실행은 남은 수를 센다.
   private reconcile(record: RunRecord): Promise<unknown> {
     const runId = record.run_id;
-    const unfinished = IN_FLIGHT.includes(record.state);
+    const replaced = record.state === "unknown_running" && this.fromReplacedPod(record);
+    const unfinished = IN_FLIGHT.includes(record.state) || replaced;
     if (this.store.suspectRun(runId)) return unfinished ? this.reclaim(runId, record.exit ?? "failed") : Promise.resolve();
     const entries = this.store.validEvents(runId);
     const has = (action: OutboxAction) => entries.some((entry) => entry.action === action);
@@ -904,7 +916,9 @@ export class WorkerExecutor {
     if (latest !== record.last_receipt_id) patch.last_receipt_id = latest;
     const writing = Object.keys(patch).length > 0 ? this.transition(runId, patch) : Promise.resolve();
     if (!unfinished || (patch.state !== undefined && !this.store.suspectRun(runId))) return writing;
-    return Promise.all([writing, this.reclaim(runId, record.exit ?? "failed")]);
+    // 물려받은 unknown_running의 원래 출력은 사라졌다. 결과 보고가 없는 completed는 failed로 맺는다(restartedExit, D-104와 같은 까닭).
+    if (replaced) this.options.log?.(`기동 대조: 실행 ${runId}를 접수한 파드(${record.pod_uid})가 지금 파드(${this.options.podUid})가 아니다. 다시 센다`);
+    return Promise.all([writing, this.reclaim(runId, replaced ? this.restartedExit(runId, record) : (record.exit ?? "failed"))]);
   }
 
   // ---- 영수증·보고 ----

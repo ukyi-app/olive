@@ -341,6 +341,53 @@ test("물려받은 끝나지 않은 실행이 있으면 원격을 처음부터 �
   expect(h.connects).toBe(1);
 });
 
+// D-159의 C-1: 다른 파드에서 물려받은 기록(접수한 파드의 UID가 지금과 다름)은 잠그지 않고, recover가 지금 대리의 계수 0으로 맺는다.
+// 같은 파드의 기록은 위와 같이 처음부터 잠근다.
+test("물려받은 끝나지 않은 실행을 다른 파드가 접수했으면 원격을 잠그지 않고 대리의 계수 0으로 failed_stopped로 맺는다. 같은 파드면 잠근다", async () => {
+  const OTHER_POD = "5b2c8e1f-3a4d-4f6b-9c7e-1d2a3b4c5d6e";
+  for (const podUid of [OTHER_POD, POD_UID]) {
+    const dir = scratch();
+    const seeded = await ExecutorStore.open(dir, { now: () => 1_800_000_000_000 });
+    const runId = randomUUID();
+    const written = await seeded.beginRun({
+      run_id: runId,
+      run_generation: 1,
+      state: "unknown_running",
+      start_stop_generation: 0,
+      instruction_request_id: randomUUID(),
+      deadline_at: 1_800_000_100_000,
+      lease_until: 1_800_000_030_000,
+      credential_digest: "0".repeat(64),
+      exit: "failed",
+      last_receipt_id: null,
+      pod_uid: podUid,
+    });
+    expect(written).toBe(true);
+    const h = harness();
+    const run = begin(h, settings({ storeDir: dir }));
+    if (podUid === OTHER_POD) {
+      // 대리가 끝내기·세기에 답한다(남은 0).
+      for (const type of ["terminate", "count"] as const) {
+        await until(() => h.agent.controls().some((c) => c.type === type));
+        const control = h.agent.controls().find((c) => c.type === type) as { seq: number };
+        h.agent.session?.receive(encodeAgent(type === "terminate" ? { type: "terminated", seq: control.seq } : { type: "counted", seq: control.seq, survivors: 0 }));
+      }
+    }
+    const result = await run;
+    expect(result.ok, podUid).toBe(true);
+    if (!result.ok) continue;
+    const answered = (result.running.worker.hello().body as { runs: { run_id: string; state: string }[] }).runs.find((x) => x.run_id === runId);
+    if (podUid === OTHER_POD) {
+      expect(result.running.remote.state().distrusted).toBeNull();
+      expect(answered?.state).toBe("failed_stopped");
+    } else {
+      expect(result.running.remote.state().distrusted).toBe("inherited_unverified");
+      expect(answered?.state).toBe("unknown_running");
+      expect(h.agent.controls().filter((c) => c.type === "count")).toEqual([]);
+    }
+  }
+});
+
 test("감독 소켓은 하나이고, stop()은 붙는 중인 연결을 거둔 뒤에 클라이언트를 닫고 0으로 끝난다", async () => {
   const h = harness();
   const result = await begin(h);

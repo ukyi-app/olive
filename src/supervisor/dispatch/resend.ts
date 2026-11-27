@@ -28,8 +28,11 @@ import { type Drafted, type DraftAction, finalizeDraft, type RefusalReason as Dr
 import type { Clock, InstructionSink, Random, Signer } from "./ports.ts";
 import { type MarkFailure, sendInstruction } from "./send-gate.ts";
 
-// 장부 포트. 읽기 하나와 시작의 송신 표식이다. 표식은 그 항목을 다시 읽은 이 장부 객체로 적는다(표식은 장부 열기마다 따로 센다).
-export type ResendLedger = Pick<Ledger, "unansweredInstructions" | "markStartDispatch">;
+// 장부 포트. 읽기 둘과 시작의 송신 표식이다. 표식은 그 항목을 다시 읽은 이 장부 객체로 적는다(표식은 장부 열기마다 따로 센다).
+// closedRunFinalizes는 관리자가 파드 교체로 닫은 실행의 확정이다(D-159의 C-2). unansweredInstructions가 not_started 실행의 지시를
+// 내지 않아 따로 읽고 같은 목록에 잇는다. 그 읽기가 없는 포트는 닫힌 실행의 확정을 다시 내지 않는다(이 부품 단독의 쓰임). 조립은 실제
+// 장부를 넘기므로 늘 있다.
+export type ResendLedger = Pick<Ledger, "unansweredInstructions" | "markStartDispatch"> & Partial<Pick<Ledger, "closedRunFinalizes">>;
 
 // 접수. 시작을 다시 낼 때만 본다(새 일을 여는 지시다). 종료·확정은 정지 중에도 접수가 닫혀도 다시 낸다.
 export type ResendIntake = Pick<Restorer, "intakeOpen">;
@@ -245,16 +248,26 @@ function snapshotItem(raw: unknown): Entry {
   }
 }
 
-// 장부의 읽기. known이 불리언 true가 아니거나, 값의 꼴이 틀리거나, 읽다 던지면 null(모름)이다.
+// 읽기 하나의 답에서 정지 세대와 항목 목록을 꺼낸다. 꼴이 틀리면 null이다.
+function readList(answer: unknown, field: "instructions"): { stopGeneration: number | null; items: unknown[] } | null {
+  if (!isObject(answer) || answer.known !== true || !isObject(answer.value)) return null;
+  const { stopGeneration, [field]: items } = answer.value;
+  if (!(stopGeneration === null || isGeneration(stopGeneration)) || !Array.isArray(items)) return null;
+  return { stopGeneration, items: items as unknown[] };
+}
+
+// 장부의 읽기. 둘 가운데 하나라도 known이 불리언 true가 아니거나, 값의 꼴이 틀리거나, 읽다 던지거나, 두 읽기의 정지 세대가 다르면
+// null(모름)이다. 닫힌 실행의 확정은 미응답 지시 뒤에 잇는다.
 // 같은 요청 ID의 항목이 둘 이상이면 어느 것이 맞는지 모르므로 모두 malformed다(장부의 지시 줄은 요청 ID마다 하나다).
 function readUnanswered(ledger: ResendLedger): Unanswered | null {
-  let answer: unknown;
   try {
-    answer = ledger.unansweredInstructions();
-    if (!isObject(answer) || answer.known !== true || !isObject(answer.value)) return null;
-    const { stopGeneration, instructions } = answer.value;
-    if (!(stopGeneration === null || isGeneration(stopGeneration)) || !Array.isArray(instructions)) return null;
-    const entries = (instructions as unknown[]).map(snapshotItem);
+    const main = readList(ledger.unansweredInstructions(), "instructions");
+    if (main === null) return null;
+    const closedRead = ledger.closedRunFinalizes;
+    const closed = closedRead === undefined ? { stopGeneration: main.stopGeneration, items: [] } : readList(closedRead.call(ledger), "instructions");
+    if (closed === null || closed.stopGeneration !== main.stopGeneration) return null;
+    const stopGeneration = main.stopGeneration;
+    const entries = [...main.items, ...closed.items].map(snapshotItem);
     const seen = new Map<string, number>();
     for (const entry of entries) {
       const id = "item" in entry ? entry.item.requestId : entry.requestId;

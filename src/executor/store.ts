@@ -2,7 +2,7 @@
 //
 //   storage-id            저장소 ID. 없으면 새로 만든다. 주체 이름의 마지막 칸이 이 값이라, 폴더가 초기화되면 옛 지시는 wrong_recipient다.
 //   stop-generation.json  정지 세대. 파일이 없으면 세대 없음(null)이다. 0도 파일로 적는다(0은 "한 번도 정지하지 않음"이라는 알려진 값).
-//   runs/<run_id>.json    실행 기록(세대, 상태, 마지막 영수증 id, 정리 의도 등). 정리 의도의 pod_uid는 아래 CleanupIntent.
+//   runs/<run_id>.json    실행 기록(세대, 상태, 마지막 영수증 id, 정리 의도, 접수한 파드의 UID 등). 정리 의도의 pod_uid는 아래 CleanupIntent.
 //   outbox/<id>.json      보낸 영수증·보고의 본문과 그 사건의 최초 순번. 같은 id와 같은 본문으로 다시 보낸다
 //   nonces/<hash>         쓴 nonce 하나가 빈 파일 하나다
 //   ledger-hold           설명할 수 없는 장부의 표식. 운영자가 장부를 대조하고 이 파일을 지울 때까지 접수를 열지 않는다
@@ -75,6 +75,10 @@ export interface RunRecord {
   exit: ExitKind | null;
   last_receipt_id: string | null;
   cleanup?: CleanupIntent | null;
+  // 그 실행을 접수한 파드의 UID(D-155·D-171). 접수 때 한 번 적고 뒤 전이는 바꾸지 않는다. 기동 때 지금 파드와 다르면 그 기록은 다른 파드에서
+  // 물려받은 것이다(worker.ts의 fromReplacedPod). 이 칸이 없는 기록은 칸을 쓰기 전의 판이 접수한 것이라 어느 파드에서 접수됐는지 모른다.
+  // 함정: 그 전의 판은 칸 수가 10·11이 아닌 기록을 store_corrupt(83)로 거절한다. 이 칸을 한 번 적은 저장소는 비우지 않고는 그 판으로 되돌릴 수 없다.
+  pod_uid?: string;
 }
 
 export type OutboxAction = "receipt_accepted" | "receipt_started" | "receipt_stopped" | "receipt_cleaned" | "report_result";
@@ -266,7 +270,8 @@ function parseRun(value: unknown): RunRecord {
     (r.exit === null || EXITS.includes(r.exit as ExitKind)) &&
     (r.last_receipt_id === null || (typeof r.last_receipt_id === "string" && UUID.test(r.last_receipt_id))) &&
     (r.cleanup === undefined || r.cleanup === null || validIntent(r.cleanup)) &&
-    Object.keys(r).length === (r.cleanup === undefined ? 10 : 11);
+    (r.pod_uid === undefined || (typeof r.pod_uid === "string" && POD_UID.test(r.pod_uid))) &&
+    Object.keys(r).length === 10 + (r.cleanup === undefined ? 0 : 1) + (r.pod_uid === undefined ? 0 : 1);
   if (!ok) throw new StoreError("store_corrupt");
   return r as unknown as RunRecord;
 }

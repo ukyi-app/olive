@@ -1,6 +1,6 @@
 # 답을 받지 못한 지시의 재전송 (`resend.ts`)
 
-배정기 순환의 한 박자다. 장부의 `unansweredInstructions()`가 낸 지시(시작, 취소, 확정)마다 그 항목의 값만으로 초안을 다시 만들어 봉하고 지정 실행기의 연결에 싣는다. **장부에 쓰는 것은 시작의 송신 표식(`markStartDispatch`) 하나뿐이다**: 지시 줄·실행 줄은 쓰지 않고, 표식도 공유 함수 `sendInstruction`(`send-gate.md`)이 싣기 직전에 적는다. 새 요청 ID를 만들지 않는다. 실행기는 같은 요청 ID·같은 본문의 재전송에 이미 낸 영수증을 다시 보내므로(`src/ledger/ledger.md` "답을 받지 못한 지시"), 답이 오면 그 지시는 읽기에서 사라지고 재전송은 저절로 멈춘다.
+배정기 순환의 한 박자다. 장부의 `unansweredInstructions()`가 낸 지시(시작, 취소, 확정)와 `closedRunFinalizes()`가 낸 닫힌 실행의 확정(아래 "닫힌 실행의 확정")마다 그 항목의 값만으로 초안을 다시 만들어 봉하고 지정 실행기의 연결에 싣는다. **장부에 쓰는 것은 시작의 송신 표식(`markStartDispatch`) 하나뿐이다**: 지시 줄·실행 줄은 쓰지 않고, 표식도 공유 함수 `sendInstruction`(`send-gate.md`)이 싣기 직전에 적는다. 새 요청 ID를 만들지 않는다. 실행기는 같은 요청 ID·같은 본문의 재전송에 이미 낸 영수증을 다시 보내므로(`src/ledger/ledger.md` "답을 받지 못한 지시"), 답이 오면 그 지시는 읽기에서 사라지고 재전송은 저절로 멈춘다.
 
 장부·접수·연결·시계·난수·서명·내보내기는 포트로, 정책과 앞 박자들의 기억(지시마다 마지막으로 내보낸 시각)은 인자로 받는다. 소켓·타이머·시계·난수를 직접 부르지 않는다(시험이 소스를 읽어 지킨다). 쥐는 것은 같은 장부 포트로 박자가 진행 중이라는 표시 하나다.
 
@@ -10,7 +10,7 @@
 resendTick(ports: ResendPorts, policy: ResendPolicy, input: ResendTickInput): Promise<ResendTickResult>
 
 ResendPorts = {
-  ledger: Pick<Ledger, "unansweredInstructions" | "markStartDispatch">  // 표식은 그 항목을 다시 읽은 이 객체로 적는다
+  ledger: Pick<Ledger, "unansweredInstructions" | "markStartDispatch"> & Partial<Pick<Ledger, "closedRunFinalizes">>  // 표식은 그 항목을 다시 읽은 이 객체로 적는다
   intake: Pick<Restorer, "intakeOpen">        // 시작을 다시 낼 때만 본다
   links: ResendLinkGate                        // { mayIssue(executorId, "task_start" | "task_cancel" | "result_finalize"): { ok: true } | { ok: false, reason } }, 동기
   clock: Clock                                 // 장부 시계와 같은 시계
@@ -118,6 +118,15 @@ START_LAST_SEAL_MS = 19000   // 시작을 다시 봉할 수 있는 발행 뒤 �
 - **그래도 항목 처리 밖으로 예외가 나오면** 남은 항목을 하지 않고 `halted: "threw"`, `haltedAt`은 그 항목의 요청 ID다. 그때까지의 결과는 그대로 싣는다(시험이 본다). 내보내기를 부른 뒤였으면 그 항목을 `not_sent`(`send_threw`, `delivery: "unknown"`, `at`은 그 봉투의 시한)로 싣는다. 포트의 메서드 호출은 모두 예외 처리 안에 있지만, 항목 안에서 포트 묶음의 세 속성(`ports.ledger`·`ports.intake`·`ports.links`)을 읽는 접근은 그 밖에 있다. 이 세 접근(getter)이 던질 때만 이 길로 온다. 장부에는 표식만 쓰고 표식은 항목 처리 안에서 결과가 되므로 멈춰도 잃는 기록은 없다.
 - **박자 처음에 장부 포트를 얻지 못하면** 예외를 내지 않고 `not_run`/`read_unknown`이다(아무것도 읽거나 봉하지 않는다).
 - **겹쳐 부르기:** 같은 장부 포트 객체로 박자가 진행 중이면 다음 호출은 읽기 없이 `not_run`/`tick_in_progress`다. 다른 포트 객체로 겹쳐 부르면 알아채지 못한다.
+
+## 닫힌 실행의 확정 (D-159의 C-2)
+
+관리자가 파드 교체로 닫은 실행(`not_started`)의 확정은 `unansweredInstructions()`에 나오지 않는다(끝난 실행의 지시를 내지 않는다). 그 확정은 수명 박자가 한 번 적고(`life-loop.md` "닫힌 실행의 버림 확정"), 이 박자는 장부의 `closedRunFinalizes()`의 `instructions`를 미응답 지시 뒤에 이어 같은 규칙으로 다시 낸다: 같은 요청 ID·같은 본문, 정지 세대가 다르면 `stop_generation_mismatch`, 간격 `resendEveryMs`. 그 실행의 정리 영수증을 받으면 읽기에서 빠지므로 저절로 멈춘다.
+
+- **읽기 둘은 한 읽기다.** 박자 처음과 항목마다의 다시 읽기에서 둘을 함께 읽는다. 하나라도 모름이거나 꼴이 틀리거나 두 읽기의 정지 세대가 다르면 `read_unknown`이다(닫힌 실행의 확정 읽기만 버리고 나머지를 내면 그 항목은 다시 읽기에서 사라져 `answered`로 잘못 읽힌다). 같은 요청 ID가 두 읽기에 함께 나오면 다른 중복과 같이 `malformed`다.
+- **포트에 그 읽기가 없으면** 닫힌 실행의 확정을 다시 내지 않는다(이 부품 단독의 쓰임). 조립은 실제 장부를 넘기므로 늘 있다.
+- **대상 밖은 다시 내지 않는다.** 저장소 비움 닫기의 확정, 영수증을 받은 적 없는 닫힌 실행은 읽기에 없다(`src/ledger/ledger.md` "답을 받지 못한 지시"의 `closedRunFinalizes()`).
+- **남는 한계:** 실행기 저장소의 그 기록이 `unknown_running`이면 실행기는 그 확정을 받지 않아(정리할 수 있는 상태가 아니다) 이 박자가 간격마다 계속 다시 낸다. 다른 파드가 접수한 기록은 새 파드의 실행기가 기동 때 다시 세어 맺으므로(D-159의 C-1) 그 뒤의 재전송이 정리를 부른다. 칸이 없는 옛 기록(그 칸을 쓰기 전의 판이 접수)과 같은 파드의 기록, 다시 센 계수가 0이 아닌 기록은 저장소 비움 닫기(D-158) 전까지 남는다.
 
 ## 이 박자가 하지 않는 것
 
