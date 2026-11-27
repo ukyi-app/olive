@@ -3,7 +3,8 @@
 //   다르면 다시 세어, 지금 대리·프로세스의 계수가 0일 때만 종료 영수증을 내고 failed_stopped(보고가 있으면 ready_result)로 맺는다.
 //   칸이 없는 기록(칸을 쓰기 전의 판)과 같은 파드의 기록은 지금 동작 그대로다(unknown_running은 다시 세지 않는다).
 //   다른 파드의 기록에서 새로 내는 종료 사유: 보고 없는 completed는 failed, 옛 파드가 정한 cancelled·deadline과 이미 적힌 종료 영수증은 그대로다.
-// - 다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리를 예약하지 않는다. 같은 요청의 재전송이 그 실행이 끝난 뒤 정리한다.
+// - 다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리를 예약하지 않고 기억한다. 그 실행이 자리를 놓을 때 다음 시작보다 먼저 한 번 다시 처리한다
+//   (그때의 연결·정지 세대·접수로 다시 본다). 맞지 않으면 같은 요청의 재전송이 정리한다.
 // - 확정되지 않은 기록이 STATUS_MAX_RUNS(8)개면 새 시작을 받지 않는다. 감독의 outcome failed 확정 하나가 그 기록을 정리해 finalized로 맺는다(C-2).
 // 같은 폴더를 새 저장소·다른 파드 UID로 다시 여는 것으로 파드 교체를 흉내 낸다.
 import { expect, test } from "bun:test";
@@ -12,7 +13,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { limits } from "../../src/contract/v1/index.ts";
 import { ExecutorStore, type RunRecord, type StoreError } from "../../src/executor/store.ts";
-import { barrier, fromSupervisor, POD_UID, pause, type Rig, rig, start, sync, until } from "./support.ts";
+import { barrier, fromSupervisor, POD_UID, pause, type Rig, reconnect, rig, start, sync, until } from "./support.ts";
 
 // 교체 뒤 새 파드의 UID. rig의 기본(POD_UID)이 교체 전 파드다.
 const POD_B = "3a9e6b1c-7d2f-4c8a-b5e0-9f1d2c3b4a56";
@@ -249,7 +250,7 @@ test("같은 파드의 기록과 칸이 없는 옛 기록은 지금 규칙 그�
   expect(restarted.store.run(runId)).toMatchObject({ state: "failed_stopped", exit: "failed" });
 });
 
-test("다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리를 예약하지 않는다: 그 실행이 결과를 내고, 같은 요청의 재전송으로 한 번만 정리한다", async () => {
+test("다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리를 예약하지 않는다: 그 실행이 결과를 내고, 자리를 놓을 때 한 번 정리하며 같은 요청의 재전송에는 같은 영수증만 낸다", async () => {
   const r = await rig();
   const first = await start(r);
   await r.worker.idle();
@@ -260,17 +261,29 @@ test("다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리�
   r.space.cleanGate = sweep.pass();
   const next = await start(r);
   await take.entered;
+  // 물리적 정리가 시작될 때 다른 실행이 어디까지 왔는지 본다.
+  const clean = r.space.clean.bind(r.space);
+  let nextAtClean: string | undefined;
+  r.space.clean = (runId: string) => {
+    if (runId === first.runId) nextAtClean ??= r.store.run(next.runId)?.state ?? "none";
+    return clean(runId);
+  };
   const discard = failedFinalize(r, first.runId);
   const cleaning = r.connection.receive(discard);
   // 정리를 예약했다면 지우기가 cleanGate에서 멈춰 있다. 예약하지 않았으면 곧바로 돌아온다.
   await Promise.race([cleaning, pause(50)]);
+  const deferred = r.store.run(first.runId)?.cleanup ?? null;
   take.open();
   await r.worker.idle();
   const nextEvents = r.store.validEvents(next.runId).map((entry) => [entry.action, (entry.body as { exit?: string }).exit ?? null]);
   const cleanedMeanwhile = r.space.cleaned.filter((runId) => runId === first.runId).length;
+  // 자리를 놓은 그 동기 구간에서 미룬 확정을 처리해, 끝나기를 기다린 쪽이 돌아올 때 이미 정리 의도가 그 요청으로 적혀 있다.
+  const atRelease = { state: r.store.run(first.runId)?.state, request: r.store.run(first.runId)?.cleanup?.request_id };
   sweep.open();
   await cleaning;
+  expect(deferred).toBeNull();
   expect(cleanedMeanwhile).toBe(0);
+  expect(atRelease).toEqual({ state: "cleanup_pending", request: discard.header.request_id });
   expect(r.store.run(next.runId)?.state).toBe("ready_result");
   expect(nextEvents).toEqual([
     ["receipt_accepted", null],
@@ -278,9 +291,9 @@ test("다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리�
     ["receipt_stopped", "completed"],
     ["report_result", null],
   ]);
-  // 미룬 확정은 의도도 남기지 않는다. 같은 요청 ID·같은 본문의 재전송이 처음부터 정리한다.
-  expect(r.store.run(first.runId)).toMatchObject({ state: "ready_result" });
-  expect(r.store.run(first.runId)?.cleanup ?? null).toBeNull();
+  await until(() => r.store.run(first.runId)?.state === "finalized");
+  expect(nextAtClean).toBe("ready_result");
+  // 같은 요청 ID·같은 본문의 재전송은 정리를 되풀이하지 않고 같은 영수증을 받는다.
   const resend = () =>
     fromSupervisor(r.clock, r.worker.name, "result_finalize", discard.body as never, { stop_generation: 0, run_generation: 1, request_id: discard.header.request_id });
   await r.connection.receive(resend());
@@ -314,4 +327,71 @@ test("버림 확정의 정리가 도는 동안 온 시작은 기록·영수증 �
   await r.worker.idle();
   expect(ofRun(r, "receipt_accepted", next.runId)).toHaveLength(1);
   expect(r.store.run(next.runId)?.state).toBe("ready_result");
+});
+
+test("자리를 놓을 때 다시 처리한 미룬 확정의 정리가 도는 동안 온 시작은 기록·영수증 없이 버리고, 정리가 끝난 뒤 같은 시작 지시의 재전송을 받는다", async () => {
+  const r = await rig();
+  const first = await start(r);
+  await r.worker.idle();
+  const take = barrier();
+  const sweep = barrier();
+  r.credentials.before = take.pass;
+  r.space.cleanGate = sweep.pass();
+  const next = await start(r);
+  await take.entered;
+  const discard = failedFinalize(r, first.runId);
+  await r.connection.receive(discard);
+  expect(r.store.run(first.runId)?.cleanup ?? null).toBeNull();
+  r.credentials.before = undefined;
+  take.open();
+  await r.worker.idle();
+  await until(() => r.space.cleaned.includes(first.runId));
+  const third = await start(r);
+  expect(r.store.run(third.runId)).toBeUndefined();
+  expect(ofRun(r, "receipt_accepted", third.runId)).toEqual([]);
+  expect(r.credentials.calls.filter((call) => call.runId === third.runId)).toEqual([]);
+  sweep.open();
+  await until(() => r.store.run(first.runId)?.state === "finalized");
+  expect(r.store.run(next.runId)?.state).toBe("ready_result");
+  await r.connection.receive(
+    fromSupervisor(r.clock, r.worker.name, "task_start", third.envelope.body as never, { stop_generation: 0, run_generation: 1, request_id: third.envelope.header.request_id }),
+  );
+  await r.worker.idle();
+  expect(ofRun(r, "receipt_accepted", third.runId)).toHaveLength(1);
+  expect(r.store.run(third.runId)?.state).toBe("ready_result");
+  expect(r.space.cleaned.filter((runId) => runId === first.runId)).toHaveLength(1);
+  const cleaned = ofRun(r, "receipt_cleaned", first.runId).map((e) => (e.body as { instruction_request_id: string }).instruction_request_id);
+  expect(new Set(cleaned)).toEqual(new Set([discard.header.request_id]));
+});
+
+test("미룬 확정은 자리를 놓을 때의 연결·정지 세대로 다시 보고, 바뀌었으면 정리 의도도 적지 않은 채 지금 연결·세대의 재전송을 기다린다", async () => {
+  for (const generation of [0, 1]) {
+    const r = await rig();
+    const first = await start(r);
+    await r.worker.idle();
+    const take = barrier();
+    r.credentials.before = take.pass;
+    const next = await start(r);
+    await take.entered;
+    const discard = failedFinalize(r, first.runId);
+    await r.connection.receive(discard);
+    // 미룬 뒤 감독 연결이 바뀐다(같은 세대로 다시 맞춤, 또는 새 세대로 맞춤). 기다리던 실행은 바뀐 연결을 보고 띄우지 않고 닫는다.
+    await reconnect(r, generation);
+    take.open();
+    await r.worker.idle();
+    await pause(50);
+    const label = `generation ${generation}`;
+    expect(r.store.run(next.runId)?.state, label).toBe("not_started");
+    expect(r.store.run(first.runId), label).toMatchObject({ state: "ready_result" });
+    expect(r.store.run(first.runId)?.cleanup ?? null, label).toBeNull();
+    expect(r.space.cleaned.includes(first.runId), label).toBe(false);
+    expect(r.store.validEvents(first.runId).filter((e) => e.action === "receipt_cleaned"), label).toEqual([]);
+    // 지금 연결·세대의 확정(같은 세대면 같은 요청의 재전송, 새 세대면 감독이 새로 적은 요청)이 한 번 정리한다.
+    const request = generation === 0 ? discard.header.request_id : randomUUID();
+    await r.connection.receive(fromSupervisor(r.clock, r.worker.name, "result_finalize", discard.body as never, { stop_generation: generation, run_generation: 1, request_id: request }));
+    await r.worker.idle();
+    expect(r.store.run(first.runId)?.state, label).toBe("finalized");
+    expect(r.space.cleaned.filter((runId) => runId === first.runId), label).toHaveLength(1);
+    expect(r.store.validEvents(first.runId).filter((e) => e.action === "receipt_cleaned").map((e) => e.body.instruction_request_id), label).toEqual([request]);
+  }
 });

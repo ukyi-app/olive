@@ -174,6 +174,8 @@ export class WorkerExecutor {
   private heldSends = false;
   // 지우는 중인 실행. 첫 await 전에 넣어 슬롯을 쥐고, 같은 실행의 확정은 진행 중인 작업에 합류한다.
   private readonly cleaning = new Map<string, Promise<void>>();
+  // 다른 실행이 시작 자리를 쥐어 정리를 미룬 확정(실행마다 마지막 하나). 시작 자리가 차 있는 동안만 남고, 자리를 놓는 자리가 비운다.
+  private readonly deferredFinalize = new Map<string, { header: Header; body: Bodies["result_finalize"]; epoch: number }>();
   // 프로세스를 끝내고 세는 물리적 정리가 도는 실행. 첫 종료와 재정리가 함께 쓰고, 같은 실행의 정리가 겹치지 않는다.
   private readonly reclaiming = new Map<string, Promise<void>>();
   private readonly lastSent = new Map<string, number>();
@@ -371,6 +373,8 @@ export class WorkerExecutor {
       } catch {
         // 우편함의 실패가 슬롯을 놓는 일을 막지 않는다
       }
+      // 자리를 놓은 이 동기 구간에서 미룬 확정을 처리한다. 다음 시작 지시가 먼저 자리를 잡으면 미룬 실행은 짧은 실행이 이어지는 동안 계속 밀린다.
+      if (this.active === undefined) this.retryDeferredFinalize();
       release();
     };
     let accepted: boolean;
@@ -700,10 +704,13 @@ export class WorkerExecutor {
     // 프로세스가 살아 있을 수 있는 실행은 지우지 않는다. 쓰는 중인 파일을 지우거나 자격을 거둔 척하게 된다.
     if (!MAY_CLEAN.includes(record.state) || !this.store.settled(runId)) return;
     // 다른 실행이 시작 자리(active)를 쥐었으면(시작 지시로 자리를 잡은 때부터 그 실행의 종료 확인까지) 이 실행의 새 정리를 예약하지 않는다.
-    // 예약하면 그 실행의 시작 직전 검사(launchBlocked)가 다른 실행의 정리를 보고 띄우지 않고 닫는다. 의도도 적지 않으므로 같은 요청의 재전송이
-    // 그 실행이 끝난 뒤 처음부터 정리한다.
+    // 예약하면 그 실행의 시작 직전 검사(launchBlocked)가 다른 실행의 정리를 보고 띄우지 않고 닫는다. 의도도 적지 않고 답하지 않는다.
+    // 이 확정은 기억해 두고, 그 실행이 자리를 놓을 때(onStart의 finish) 한 번 다시 처리한다(retryDeferredFinalize).
     // 함정: 이 검사와 아래 cleaning 예약 사이에 await가 없어야 한다. 시작 쪽(refusesStart)은 반대로 정리 중이면 받지 않는다.
-    if (this.active !== undefined && this.active.runId !== runId) return;
+    if (this.active !== undefined && this.active.runId !== runId) {
+      this.deferredFinalize.set(runId, { header, body, epoch });
+      return;
+    }
     // 점유가 hello의 상한에 이르렀으면 점유하지 않던 실행에 새 정리를 예약하지 않는다(아홉째 점유가 생기면 인사할 수 없어 정리 재시도도 받지 못한다).
     // 이미 점유 중인 실행의 재시도는 받는다. 여기서 clean의 메모리 예약까지 await가 없다.
     const occupying = this.occupying();
@@ -719,6 +726,17 @@ export class WorkerExecutor {
     // 먼저 남은 정리 의도의 요청이 이 정리를 맡았으면, 그 사실이 확정된 뒤 이 요청에 따로 답한다.
     const finished = this.store.run(runId);
     if (finished?.state === "finalized" && finished.cleanup?.request_id !== header.request_id && this.mayFinalize(header, body, epoch)) await this.answerCleaned(runId, header);
+  }
+
+  // 미룬 확정마다 한 번: 기억을 비우고 받은 그대로 onFinalize에 다시 넣는다. 그 연결·정지 세대·접수가 지금도 맞는지는 onFinalize(mayFinalize)가
+  // 이 시점에 처음부터 다시 본다. 맞지 않으면 아무것도 적지 않고 지금 연결·세대로 오는 감독의 재전송을 기다린다.
+  // 함정: onFinalize는 첫 await 전에 정리 자리(cleaning)를 잡는다. 그래서 자리를 놓는 동기 구간에서 부르면 다음 시작(refusesStart)은
+  // 이 정리가 끝난 뒤의 재전송으로 받는다. 비동기로 미루면 다음 시작이 먼저 자리를 잡는다.
+  private retryDeferredFinalize(): void {
+    const held = [...this.deferredFinalize.values()];
+    this.deferredFinalize.clear();
+    // 실패하면 감독의 재전송이 다시 부른다. 기다리는 쪽이 없으므로 거절을 여기서 거둔다.
+    for (const { header, body, epoch } of held) void this.onFinalize(header, body, epoch).catch(() => {});
   }
 
   // 정리 의도를 먼저 지속한 뒤 지운다. 디스크에서도 슬롯을 쥐고(cleanup_pending), 재시작하면 정해 둔 영수증 ID로 잇는다.

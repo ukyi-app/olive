@@ -5,12 +5,12 @@
 // 파드 이름·ID·digest·시각은 이 시험이 지어낸 값이다.
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { type Envelope, sealEnvelope, verifyEnvelope } from "../../../src/contract/v1/index.ts";
+import { type Envelope, resultDigest, sealEnvelope, verifyEnvelope } from "../../../src/contract/v1/index.ts";
 import type { Ledger } from "../../../src/ledger/index.ts";
 import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
 import { createAnswerEvidenceBook, createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
-import { barrier, executorKeys, fromSupervisor, pause, type Rig, reconnect, rig, start, supervisorKeys, sync } from "../../executor/support.ts";
+import { barrier, executorKeys, fromSupervisor, pause, type Rig, reconnect, rig, start, supervisorKeys, sync, until } from "../../executor/support.ts";
 import { digest, id, must, NOW, open, ready, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 const POD = "worker-diagnosis-4c2d-q8mv";
@@ -418,7 +418,8 @@ test("실제 실행기: 닫힌 실행의 확정이 새로 접수한 다른 실�
   expect(cleanedMeanwhile).toBe(false);
   expect(nextState).toBe("ready_result");
   expect(nextActions).toEqual(["receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
-  // 실행기가 미룬 확정은 답이 없어 재전송 박자가 같은 요청 ID로 다시 낸다. 그 재전송이 한 번 정리한다.
+  // 실행기는 미룬 확정을 그 실행이 자리를 놓을 때 한 번 다시 처리하지만, 그 정리 영수증을 이 시험은 감독에 넘기지 않는다.
+  // 그래서 재전송 박자가 같은 요청 ID로 다시 내고, 실행기는 정리를 되풀이하지 않고 같은 영수증으로 답한다.
   r.clock.t += RESEND.resendEveryMs;
   h.at.t = r.clock.now();
   expect(forRun(await h.resend(), first.runId)[0]?.outcome).toBe("resent");
@@ -429,4 +430,103 @@ test("실제 실행기: 닫힌 실행의 확정이 새로 접수한 다른 실�
   expect(r.store.run(first.runId)?.state).toBe("finalized");
   expect(r.space.cleaned.filter((runId) => runId === first.runId)).toHaveLength(1);
   expect(r.store.validEvents(first.runId).filter((e) => e.action === "receipt_cleaned").map((e) => e.body.instruction_request_id)).toEqual([finalize!.header.request_id]);
+});
+
+// 짧은 새 실행이 감독의 재전송 시각마다 자리를 쥐는 일정. 감독 박자는 1초, 재전송 간격은 5초라 빈 시간에 닫힌 실행의 확정을 보낼 차례가
+// 아니면 감독은 다음 작업을 배정할 수 있다(src/supervisor/dispatch/resend.ts·src/supervisor/runtime/cycle.ts). 실행기가 미룬 확정을 기억해
+// 그 실행이 자리를 놓을 때 다음 시작보다 먼저 정리하지 않으면, 닫힌 실행은 새 작업이 이어지는 동안 정리되지 않는다.
+test("실제 실행기: 짧은 새 실행이 이어져도 닫힌 실행의 미룬 확정은 첫 새 실행이 자리를 놓을 때 한 번 정리되고, 새 실행마다 결과를 낸다", async () => {
+  const r = await rig({ remote: {} });
+  const clock = r.clock;
+  const ledger = ready(open(tempPath(), { clock: clock.now }));
+  const { sent, ports, forward } = supervisorSide(ledger, () => r);
+  const message = (runId: string, action: string) => runEvents(r, action, runId)[0]!;
+  const receive = async (runId: string, action: string) => expect(await forward(message(runId, action))).toBe("ack:new");
+  const admit = async (job: Awaited<ReturnType<typeof start>>) => {
+    const row = must(ledger.admitRun(worker({ runId: job.runId, executorId: r.worker.name, now: clock.now() }))).run;
+    must(ledger.startRun({ runId: job.runId, requestId: job.envelope.header.request_id, stopGeneration: 0, now: clock.now() }));
+    await receive(job.runId, "receipt_accepted");
+    return { sender: r.worker.name, runGeneration: row.runGeneration };
+  };
+  const life = () => lifeTick(ports as never, POLICY, { lastQueries: [], unsentRenews: [] });
+  const a = await start(r);
+  await r.worker.idle();
+  await admit(a);
+  must(ledger.markLostFor({ executorId: r.worker.name, now: clock.now() + 1 }));
+  clock.t += 60_000;
+  must(ledger.closeRunByOperator({ runId: a.runId, checkedBy: "pod_replaced", podName: POD, podStartedAt: clock.now(), now: clock.now() }));
+  let request: string | undefined;
+  let lastResends: { requestId: string; at: number }[] = [];
+  const retry = async () => {
+    const result = await resendTick(ports as never, RESEND, { lastResends });
+    expect(result.kind).toBe("ran");
+    if (result.kind !== "ran") return undefined;
+    const item = forRun(result.instructions, a.runId)[0] as { outcome: string; requestId: string | null; at: number } | undefined;
+    if (item?.outcome === "resent") {
+      expect(item.requestId).toBe(request!);
+      lastResends = [{ requestId: request!, at: item.at }];
+      await r.connection.receive(finalizesOf(sent, a.runId).at(-1)!);
+    }
+    return item?.outcome;
+  };
+  const JOBS = 12;
+  const reports: string[] = [];
+  for (let i = 0; i < JOBS; i++) {
+    expect(ledger.slotFree("worker")).toMatchObject({ known: true, value: true });
+    const take = barrier();
+    r.credentials.before = take.pass;
+    const b = await start(r);
+    const from = await admit(b);
+    await take.entered;
+    if (i === 0) {
+      // 새 실행이 자격을 기다리는 동안 닫힌 실행의 첫 확정이 닿는다. 실행기는 정리를 미룬다.
+      await life();
+      const first = finalizesOf(sent, a.runId).at(-1)!;
+      request = first.header.request_id;
+      await r.connection.receive(first);
+      expect(r.store.run(a.runId)?.cleanup ?? null).toBeNull();
+    } else {
+      // 닫힌 실행은 이미 정리 영수증을 ack받아 재전송 대상이 아니다.
+      clock.t += 2_000;
+      expect(await retry()).toBeUndefined();
+    }
+    take.open();
+    await r.worker.idle();
+    expect(r.store.run(b.runId)?.state).toBe("ready_result");
+    if (i === 0) {
+      // 새 실행이 자리를 놓은 뒤, 다음 시작을 배정하기 전에 닫힌 실행이 정리되어 그 영수증이 감독 장부에서 ack로 끝난다.
+      await until(() => r.store.run(a.runId)?.state === "finalized", 2_000);
+      await receive(a.runId, "receipt_cleaned");
+    }
+    await receive(b.runId, "receipt_started");
+    await receive(b.runId, "receipt_stopped");
+    const report = message(b.runId, "report_result");
+    const body = report.body as { report_id: string; result: Parameters<typeof resultDigest>[0] };
+    const hash = resultDigest(body.result);
+    must(
+      ledger.recordReport(
+        { action: "report_result", reportId: body.report_id, runId: b.runId, bodyDigest: report.header.body_digest, resultDigest: hash, storedRef: `results/${id()}`, signal: null, now: clock.now() },
+        from,
+      ),
+    );
+    must(ledger.markResult({ runId: b.runId, reportId: body.report_id, resultDigest: hash, now: clock.now() }));
+    reports.push(body.report_id);
+    clock.t += 1_000;
+    await life();
+    const finalize = finalizesOf(sent, b.runId).at(-1)!;
+    expect((finalize.body as { outcome: string }).outcome).toBe("succeeded");
+    await r.connection.receive(finalize);
+    await receive(b.runId, "receipt_cleaned");
+    expect(r.store.run(b.runId)?.state).toBe("finalized");
+    expect(await retry()).toBeUndefined();
+    clock.t += 2_000;
+    expect(await retry()).toBeUndefined();
+  }
+  expect(new Set(reports).size).toBe(JOBS);
+  // 닫힌 실행: 첫 확정 하나로 물리적 정리 1회·정리 영수증 1개, 그 요청 ID로 맺었다.
+  expect(finalizesOf(sent, a.runId).map((e) => e.header.request_id)).toEqual([request!]);
+  expect(r.space.cleaned.filter((runId) => runId === a.runId)).toHaveLength(1);
+  expect(r.store.validEvents(a.runId).filter((e) => e.action === "receipt_cleaned").map((e) => e.body.instruction_request_id)).toEqual([request!]);
+  expect(r.store.runs().filter((run) => run.state !== "finalized")).toEqual([]);
+  expect(ledger.closedRunFinalizes()).toMatchObject({ known: true, value: { instructions: [], runs: [] } });
 });
