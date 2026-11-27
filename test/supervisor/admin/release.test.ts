@@ -185,7 +185,7 @@ describe("말의 꼴", () => {
     expect(parseReply(refused.slice(0, -1))).toEqual(ledgerRefused("start_may_launch"));
     // 시험 작업의 ledger_refused는 칸 없이 그대로다.
     expect(parseReply('{"reply":"refused","reason":"ledger_refused"}')).toEqual({ kind: "refused", reason: "ledger_refused" });
-    const run = { runId, kind: "worker", state: "checking", executorId: WORKER_EXECUTOR, runGeneration: 1, accepted: true, finalizeSent: false, closableAt: CLOSABLE_AT, stopReceiptId: id(), next: "abandon_result" } as const;
+    const run = { runId, kind: "worker", state: "checking", executorId: WORKER_EXECUTOR, runGeneration: 1, accepted: true, finalizeSent: false, closableAt: CLOSABLE_AT, checkingSince: NOW + 1, stopReceiptId: id(), next: "abandon_result" } as const;
     const hold = { observation: 3, executorId: WORKER_EXECUTOR, runId: id(), kind: "worker", runGeneration: 1, why: "outside_ledger", heldAt: NOW, next: "release_hold" } as const;
     const holds = { slotFree: false, runs: [run], slotHolds: [hold], truncated: false };
     const line = encodeReply({ kind: "holds", holds }).slice(0, -1);
@@ -202,6 +202,10 @@ describe("말의 꼴", () => {
       line.replace(`"executorId":"${WORKER_EXECUTOR}"`, '"executorId":"-bad"'),
       line.replace('"truncated":false', '"truncated":false,"more":1'),
       line.replace('"closableAt":1800000031000', '"closableAt":"1800000031000"'),
+      line.replace('"checkingSince":1800000000001', '"checkingSince":"1800000000001"'),
+      line.replace('"checkingSince":1800000000001', '"checkingSince":0'),
+      line.replace(',"checkingSince":1800000000001', ""),
+      line.replace(HOLDS_SCHEMA, "olive-holds/v1"),
     ]) {
       expect(parseReply(bad), bad).toBeNull();
     }
@@ -350,7 +354,7 @@ describe("쓰기 처리기: 실제 장부", () => {
     const before = holdsOf(sources, ports);
     expect(before).toEqual({
       slotFree: false,
-      runs: [{ runId: c.runId, kind: "worker", state: "checking", executorId: WORKER_EXECUTOR, runGeneration: 1, accepted: true, finalizeSent: false, closableAt: CLOSABLE_AT, stopReceiptId: c.stopReceiptId, next: "abandon_result" }],
+      runs: [{ runId: c.runId, kind: "worker", state: "checking", executorId: WORKER_EXECUTOR, runGeneration: 1, accepted: true, finalizeSent: false, closableAt: CLOSABLE_AT, checkingSince: NOW + 1, stopReceiptId: c.stopReceiptId, next: "abandon_result" }],
       slotHolds: [],
       truncated: false,
     });
@@ -359,7 +363,7 @@ describe("쓰기 처리기: 실제 장부", () => {
     // holds가 실은 종료 영수증 ID를 그대로 넘긴다.
     expect(ask(sources, ports, abandon(c.runId, before.runs[0]!.stopReceiptId!))).toEqual({ kind: "release", release: { outcome: "abandoned", runId: c.runId, released: false, slotFree: false } });
     expect(ledger.resultAbandon(c.runId)).toEqual({ known: true, value: { runId: c.runId, reason: "no_answer", stopReceiptId: c.stopReceiptId, stopGeneration: 0, abandonedAt: NOW + 5_000 } });
-    expect(holdsOf(sources, ports).runs.map((run) => [run.state, run.next, run.finalizeSent, run.stopReceiptId])).toEqual([["failed_stopped", "wait_cleanup", false, null]]);
+    expect(holdsOf(sources, ports).runs.map((run) => [run.state, run.next, run.finalizeSent, run.stopReceiptId, run.checkingSince])).toEqual([["failed_stopped", "wait_cleanup", false, null, null]]);
     // 같은 포기를 다시 부르면 not_checking이다.
     expect(ask(sources, ports, abandon(c.runId, c.stopReceiptId))).toEqual(ledgerRefused("not_checking"));
     const sent: Envelope[] = [];
@@ -469,10 +473,80 @@ describe("holds", () => {
     const holds = holdsOf(sourcesOf(ledger), portsOf(ledger).ports);
     expect(holds).toEqual({
       slotFree: false,
-      runs: [{ runId: lost.runId, kind: "worker", state: "unknown_running", executorId: WORKER_EXECUTOR, runGeneration: 1, accepted: true, finalizeSent: false, closableAt: CLOSABLE_AT, stopReceiptId: null, next: "close_unconfirmed" }],
+      runs: [{ runId: lost.runId, kind: "worker", state: "unknown_running", executorId: WORKER_EXECUTOR, runGeneration: 1, accepted: true, finalizeSent: false, closableAt: CLOSABLE_AT, checkingSince: null, stopReceiptId: null, next: "close_unconfirmed" }],
       slotHolds: [{ observation: hold.observation, executorId: WORKER_EXECUTOR, runId: hold.runId, kind: "worker", runGeneration: 1, why: "outside_ledger", heldAt: NOW + 100, next: "release_hold" }],
       truncated: false,
     });
+  });
+
+  test("실제 장부: checking 줄만 checkingSince에 결과를 기다리기 시작한 장부 시각(종료 확인 영수증을 받은 시각)을 싣고, 다른 상태는 null이다", () => {
+    const since = (ledger: Ledger) => holdsOf(sourcesOf(ledger), portsOf(ledger).ports).runs.map((run) => [run.state, run.checkingSince]);
+    const ledger = open(tempPath());
+    const c = checkingRun(ledger);
+    // 종료 영수증은 NOW + 1에 받았다. 그 뒤 갱신 시각(updated_at)이 바뀌고 같은 실행의 늦은 종료 영수증(다른 ID)이 와도 값은 그대로다.
+    must(ledger.recordBudget({ runId: c.runId, budgetLeft: 1, now: NOW + 30 }));
+    must(ledger.applyReceipt({ action: "receipt_stopped", receiptId: id(), runId: c.runId, exit: "completed", bodyDigest: digest("stopped:late"), now: NOW + 50 }, c.from));
+    expect(since(ledger)).toEqual([["checking", NOW + 1]]);
+    // 결과가 온 실행(ready_result)과 실패로 끝난 실행(failed_stopped)도 종료 확인이 있지만 결과를 기다리지 않는다.
+    must(ledger.markResult({ runId: c.runId, resultDigest: digest("result"), now: NOW + 60 }));
+    expect(since(ledger)).toEqual([["ready_result", null]]);
+    const failed = open(tempPath());
+    stopped(failed, runningRun(failed), "failed");
+    expect(since(failed)).toEqual([["failed_stopped", null]]);
+    const lost = open(tempPath());
+    lostRun(lost);
+    expect(since(lost)).toEqual([["unknown_running", null]]);
+    const preparing = open(tempPath());
+    startedWorker(preparing);
+    expect(since(preparing)).toEqual([["preparing", null]]);
+  });
+
+  test("재시작: 장부와 처리기를 새로 열고 감독 시계가 달라도 checkingSince는 같다(프로세스 안의 첫 관측이 아니라 장부 값)", () => {
+    const path = tempPath();
+    const first = open(path);
+    const c = checkingRun(first);
+    const before = holdsOf(sourcesOf(first, { at: NOW + 5_000 }), portsOf(first).ports);
+    first.close();
+    const reopened = openLedger(path, { clock: () => LATER + 3_600_000, mode: "reopen" });
+    if (!reopened.ok) throw new Error(reopened.reason);
+    try {
+      const after = holdsOf(sourcesOf(reopened.ledger, { at: LATER + 3_600_000 }), portsOf(reopened.ledger).ports);
+      expect(before.runs.map((run) => [run.runId, run.checkingSince])).toEqual([[c.runId, NOW + 1]]);
+      expect(after).toEqual(before);
+    } finally {
+      reopened.ledger.close();
+    }
+  });
+
+  test("꼴 이름은 olive-holds/v2다: 실행 줄에 checkingSince가 더해져 v1을 읽는 쪽이 새 줄을 해석하지 않게 판을 올렸다", () => {
+    expect(HOLDS_SCHEMA).toBe("olive-holds/v2");
+    const line = encodeReply({ kind: "holds", holds: { slotFree: true, runs: [], slotHolds: [], truncated: false } });
+    expect(line).toBe('{"reply":"holds","holds":{"schema":"olive-holds/v2","slotFree":true,"runs":[],"slotHolds":[],"truncated":false}}\n');
+  });
+
+  test("4,096바이트 상한: checkingSince가 실린 실행 줄도 뒤의 줄부터 빼고 truncated다", () => {
+    const runs = Array.from({ length: 40 }, () => ({
+      runId: id(),
+      kind: "worker" as const,
+      state: "checking" as const,
+      executorId: `${WORKER_EXECUTOR}-${"x".repeat(60)}`,
+      runGeneration: 1,
+      accepted: true,
+      finalizeSent: false,
+      closableAt: CLOSABLE_AT,
+      checkingSince: NOW + 1,
+      stopReceiptId: id(),
+      next: "abandon_result" as const,
+    }));
+    const fitted = fitHolds(false, runs, [], false);
+    expect(fitted.truncated).toBe(true);
+    expect(fitted.runs.length).toBeGreaterThan(0);
+    expect(fitted.runs).toEqual(runs.slice(0, fitted.runs.length));
+    const line = encodeReply({ kind: "holds", holds: fitted });
+    expect(bytes(line)).toBeLessThanOrEqual(ADMIN_LIMITS.replyMaxBytes);
+    // 실린 줄마다 checkingSince가 있고, 한 줄 더 실으면 상한을 넘는다(뺀 수가 최소다).
+    expect(parseReply(line.slice(0, -1))).toEqual({ kind: "holds", holds: fitted });
+    expect(bytes(encodeReply({ kind: "holds", holds: { ...fitted, runs: runs.slice(0, fitted.runs.length + 1) } }))).toBeGreaterThan(ADMIN_LIMITS.replyMaxBytes);
   });
 
   test("4,096바이트를 넘으면 뒤의 줄부터 빼고 truncated다. 장부 읽기가 상한에서 멈춰도 truncated다", () => {

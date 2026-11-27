@@ -284,6 +284,9 @@ export function holdsHandler(sources: AdminSources, ports: ReleasePorts): (args:
         accepted: run.accepted,
         finalizeSent: run.finalizeSent,
         closableAt: run.closableAt,
+        // 결과 포기 전에 관리자가 결과를 얼마나 기다렸는지 보는 값. 종료 확인 시각은 ready_result·failed_stopped에도 있지만 그 줄은 결과를
+        // 기다리지 않으므로 checking에만 싣는다.
+        checkingSince: run.state === "checking" ? run.stopReceivedAt : null,
         // 결과 포기 후보에만 싣는다: CLI가 이 값을 그대로 abandon-result에 넘긴다(ledger.md "판 9의 자리 풀기를 부르는 쪽").
         stopReceiptId: run.state === "checking" ? run.stopReceiptId : null,
         next: nextFor(run),

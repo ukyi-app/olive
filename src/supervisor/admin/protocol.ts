@@ -72,7 +72,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const EXECUTOR_REF = /^[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,199}$/;
 
 // 관리 진입점이 holds·자리 풀기를 받았을 때 stdout에 쓰는 한 줄의 판. 칸을 바꾸면 판을 올린다(CLI는 따로 배포된다).
-export const HOLDS_SCHEMA = "olive-holds/v1";
+export const HOLDS_SCHEMA = "olive-holds/v2";
 export const RELEASE_SCHEMA = "olive-release/v1";
 // 장부의 실행 상태(ledger/states.ts의 LEDGER_RUN_STATES와 같은 차례, 시험이 대조한다).
 export const RUN_STATES = ["queued", "preparing", "running", "stopping", "checking", "ready_result", "finalized", "not_started", "failed_stopped", "unknown_running", "cleanup_pending"] as const;
@@ -94,6 +94,9 @@ export interface HoldRun {
   readonly accepted: boolean;
   readonly finalizeSent: boolean;
   readonly closableAt: number | null;
+  // checking 실행이 결과를 기다리기 시작한 장부 시각(Unix epoch ms, 종료 확인 영수증을 받은 시각). 다른 상태는 null이다. 감독이 다시 떠도
+  // 같다. 결과 기다림 경보의 waitedMs는 그 프로세스가 checking을 처음 본 박자부터 세어 재시작하면 다시 센다.
+  readonly checkingSince: number | null;
   readonly stopReceiptId: string | null;
   readonly next: HoldAction;
 }
@@ -327,6 +330,7 @@ export function holdsLine(holds: Holds): string {
       accepted: run.accepted,
       finalizeSent: run.finalizeSent,
       closableAt: run.closableAt,
+      checkingSince: run.checkingSince,
       stopReceiptId: run.stopReceiptId,
       next: run.next,
     })),
@@ -369,10 +373,11 @@ function holdsOf(value: unknown): Holds | null {
   if (typeof value.slotFree !== "boolean" || typeof value.truncated !== "boolean" || !Array.isArray(value.runs) || !Array.isArray(value.slotHolds)) return null;
   const runs: HoldRun[] = [];
   for (const run of value.runs as unknown[]) {
-    if (!isRecord(run) || !exactKeys(run, ["runId", "kind", "state", "executorId", "runGeneration", "accepted", "finalizeSent", "closableAt", "stopReceiptId", "next"])) return null;
+    if (!isRecord(run) || !exactKeys(run, ["runId", "kind", "state", "executorId", "runGeneration", "accepted", "finalizeSent", "closableAt", "checkingSince", "stopReceiptId", "next"])) return null;
     if (typeof run.runId !== "string" || !UUID.test(run.runId) || !oneOf(run.kind, RUN_KINDS) || !oneOf(run.state, RUN_STATES)) return null;
     if (typeof run.executorId !== "string" || !EXECUTOR_REF.test(run.executorId) || !isInt(run.runGeneration, 0)) return null;
     if (typeof run.accepted !== "boolean" || typeof run.finalizeSent !== "boolean" || !(run.closableAt === null || isInt(run.closableAt, 1))) return null;
+    if (!(run.checkingSince === null || isInt(run.checkingSince, 1))) return null;
     if (!(run.stopReceiptId === null || (typeof run.stopReceiptId === "string" && UUID.test(run.stopReceiptId))) || !oneOf(run.next, HOLD_ACTIONS)) return null;
     runs.push({
       runId: run.runId,
@@ -383,6 +388,7 @@ function holdsOf(value: unknown): Holds | null {
       accepted: run.accepted,
       finalizeSent: run.finalizeSent,
       closableAt: run.closableAt,
+      checkingSince: run.checkingSince,
       stopReceiptId: run.stopReceiptId,
       next: run.next,
     });
