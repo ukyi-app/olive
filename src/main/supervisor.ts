@@ -238,9 +238,9 @@ export const adminFs: AdminFs = {
 };
 
 // 관리 통로(D-60·D-101)를 듣는다. 듣지 못해도 감독은 계속 돈다: 감독의 일은 관리 통로에 기대지 않고, 상태 조회는 "감독에 닿지 못함(모름)"으로
-// 남는다(시험 작업도 넣지 못한다). 사유는 기록에 남긴다. 시험 작업 넣기가 켜졌는지는 듣기 시작 기록에 남긴다.
+// 남는다(시험 작업도 자리 풀기도 하지 못한다). 사유는 기록에 남긴다. 시험 작업 넣기가 켜졌는지는 듣기 시작 기록에 남긴다. 자리 풀기는 늘 켜져 있다.
 function startAdmin(running: RunningSupervisor): AdminListening | null {
-  const handlers = createAdminHandlers(running.admin, running.testJob);
+  const handlers = createAdminHandlers(running.admin, running.testJob, running.release);
   try {
     const listening = listenAdmin({
       path: ADMIN_SOCKET_PATH,

@@ -9,7 +9,14 @@ import {
   type AdminCommand,
   type AdminReply,
   encodeRequest,
+  holdsLine,
+  isReleaseCommand,
   parseReply,
+  RELEASE_COMMANDS,
+  RELEASE_EXPECTED,
+  RELEASE_FIELDS,
+  type ReleaseAnswer,
+  releaseLine,
   statusLine,
   TEST_JOB_FIELDS,
   type TestJobRequest,
@@ -38,7 +45,9 @@ export type AskOutcome =
   // 감독에 닿지 못했다: 소켓 파일이 없다(감독이 없거나 아직 듣기 전), 파일은 있으나 듣는 프로세스가 없다, 그 밖의 연결 실패.
   | { readonly kind: "unreachable"; readonly reason: "no_socket" | "not_listening" | "connect_failed" }
   // 붙었지만 답 한 줄을 받지 못했다.
-  | { readonly kind: "failed"; readonly reason: "timeout" | "closed" | "too_long" | "malformed" | "write_failed" | "clock" };
+  | { readonly kind: "failed"; readonly reason: "timeout" | "closed" | "too_long" | "malformed" | "write_failed" | "clock" }
+  // 자리 풀기 쓰기 요청 한 줄을 다 보낸 뒤 답 한 줄을 받지 못했다: 감독이 이미 장부에 적었을 수 있다(write_unknown).
+  | { readonly kind: "unanswered"; readonly reason: "timeout" | "closed" | "too_long" | "malformed" | "clock" };
 
 const NEWLINE = 0x0a;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
@@ -57,8 +66,12 @@ export function ask(command: AdminCommand | AdminCall, deps: ClientDeps, path: s
     let socket: ClientSocket | null = null;
     const chunks: Uint8Array[] = [];
     let bytes = 0;
-    const end = (outcome: AskOutcome) => {
+    // 장부에 쓰는 요청을 다 보냈는가. 그 뒤의 실패는 감독이 적었는지 모르는 것이다(연결 전 실패·덜 보낸 요청은 감독이 처리하지 않는다).
+    const writes = typeof command !== "string" && isReleaseCommand(command.command);
+    let sent = false;
+    const end = (settled: AskOutcome) => {
       if (ended) return;
+      const outcome: AskOutcome = writes && sent && settled.kind === "failed" && settled.reason !== "write_failed" ? { kind: "unanswered", reason: settled.reason } : settled;
       ended = true;
       try {
         cancel();
@@ -155,8 +168,9 @@ export function ask(command: AdminCommand | AdminCall, deps: ClientDeps, path: s
         } catch {
           wrote = -1;
         }
-        // 요청은 수십 바이트라 한 번에 써진다. 다 못 쓰면 이어 쓰지 않고 실패로 본다.
+        // 요청은 수십 바이트라 한 번에 써진다. 다 못 쓰면 이어 쓰지 않고 실패로 본다(줄바꿈이 가지 않아 감독은 처리하지 않는다).
         if (wrote !== request.length) accept({ kind: "failed", reason: "write_failed" });
+        else sent = true;
       },
       (error: unknown) => accept(unreachable(error)),
     );
@@ -176,22 +190,32 @@ export interface EntryResult {
 
 const PREFIX = "olive admin";
 
+const form = (command: string, fields: readonly string[]) => [command, ...fields.map((field) => `<${field}>`)].join(" ");
+
 export const USAGE: EntryResult = {
   code: ADMIN_EXIT.usage,
   stdout: "",
-  stderr: `${PREFIX}: 사용법: bun src/main/admin.ts status | test-job ${TEST_JOB_FIELDS.map((field) => `<${field}>`).join(" ")}\n`,
+  stderr: `${PREFIX}: 사용법: bun src/main/admin.ts ${["status", "holds", form("test-job", TEST_JOB_FIELDS), ...RELEASE_COMMANDS.map((command) => form(command, RELEASE_FIELDS[command]))].join(" | ")}\n`,
 };
 
 const BYTES = new TextEncoder();
 
-// argv(실행 파일·진입점 뒤)에서 요청 하나. status는 인자가 없고, test-job은 TEST_JOB_FIELDS 차례의 값 여섯이다. 수가 다르거나,
-// 빈 값이 있거나, 요청 한 줄이 감독의 상한(requestMaxBytes)을 넘으면 null이다(넘는 줄은 감독이 답하지 않고 닫는다). 값의 꼴은 감독이 본다.
+// argv(실행 파일·진입점 뒤)에서 요청 하나. status·holds는 인자가 없고, test-job은 TEST_JOB_FIELDS 차례의 값 여섯, 자리 풀기 쓰기는
+// RELEASE_FIELDS 차례의 값이다. 수가 다르거나, 빈 값이 있거나, 요청 한 줄이 감독의 상한(requestMaxBytes)을 넘으면 null이다(넘는 줄은
+// 감독이 답하지 않고 닫는다). 값의 꼴은 감독이 본다.
 export function requestOf(argv: readonly string[]): AdminCall | null {
   const [word, ...rest] = argv;
-  if (word === "status") return rest.length === 0 ? { command: "status" } : null;
-  if (word !== "test-job" || rest.length !== TEST_JOB_FIELDS.length || rest.some((value) => value === "")) return null;
-  const job = Object.fromEntries(TEST_JOB_FIELDS.map((field, index) => [field, rest[index]!])) as TestJobRequest;
-  const call: AdminCall = { command: "test-job", job };
+  if (word === "status" || word === "holds") return rest.length === 0 ? { command: word } : null;
+  let call: AdminCall;
+  if (word === "test-job") {
+    if (rest.length !== TEST_JOB_FIELDS.length || rest.some((value) => value === "")) return null;
+    const job = Object.fromEntries(TEST_JOB_FIELDS.map((field, index) => [field, rest[index]!])) as TestJobRequest;
+    call = { command: "test-job", job };
+  } else if (isReleaseCommand(word)) {
+    const names = RELEASE_FIELDS[word];
+    if (rest.length !== names.length || rest.some((value) => value === "")) return null;
+    call = { command: word, fields: Object.fromEntries(names.map((field, index) => [field, rest[index]!])) };
+  } else return null;
   return BYTES.encode(encodeRequest(call)).length > ADMIN_LIMITS.requestMaxBytes ? null : call;
 }
 
@@ -201,21 +225,42 @@ export function commandOf(argv: readonly string[]): AdminCommand | null {
   return call?.command === "status" ? "status" : null;
 }
 
-// 명령마다 받을 수 있는 답이 다르다: status는 상태, test-job은 시험 작업. 다른 명령의 답이 오면 꼴이 틀린 답이다.
-export function exitFor(outcome: AskOutcome, command: AdminCommand = "status"): EntryResult {
-  const subject = command === "status" ? "상태" : "시험 작업";
+// 명령마다 받을 수 있는 답이 다르다: status는 상태, test-job은 시험 작업, holds는 자리 목록, 자리 풀기 쓰기는 자리 풀기. 다른 명령의 답이
+// 오면 꼴이 틀린 답이다. 장부가 자리 풀기를 거절하면 stderr의 사유는 ledger_refused:<장부의 거절 이름>이다.
+// 자리 풀기 쓰기는 요청(AdminCall)을 받아 답의 runId·outcome·released를 대조한다. 다르거나 다른 명령의 답 꼴이거나 보낸 뒤 답을 잃으면
+// 감독이 적었는지 모르므로 write_unknown:<까닭>이다. 명령 이름만 받으면 대조할 runId가 없어 0을 내지 않는다.
+const matches = (request: AdminCommand | AdminCall, command: (typeof RELEASE_COMMANDS)[number], answer: ReleaseAnswer): boolean => {
+  if (typeof request === "string" || !("fields" in request)) return false;
+  const expected = RELEASE_EXPECTED[command];
+  if (request.fields.runId !== answer.runId || answer.outcome !== expected.outcome || answer.released !== expected.released) return false;
+  // 포기한 실행은 failed_stopped로 자리를 쥐므로 같은 처리에서 읽은 자리는 false이거나 모름(null)이다. 닫기·점유 풀기는 다른 실행이
+  // 자리를 쥘 수 있어 세 값 모두 받는다.
+  return command !== "abandon-result" || answer.slotFree !== true;
+};
+
+export function exitFor(outcome: AskOutcome, request: AdminCommand | AdminCall = "status"): EntryResult {
+  const command = typeof request === "string" ? request : request.command;
+  const subject = command === "status" ? "상태" : command === "test-job" ? "시험 작업" : command === "holds" ? "자리 목록" : "자리 풀기";
   const fail = (code: number, message: string): EntryResult => ({ code, stdout: "", stderr: `${PREFIX}: ${message}\n` });
   if (outcome.kind === "unreachable") return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독에 닿지 못했다(${outcome.reason})`);
   if (outcome.kind === "failed") return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(${outcome.reason})`);
+  const unwritten = (why: string) => fail(ADMIN_EXIT.failed, `${subject} 모름: 장부에 적혔는지 모른다(write_unknown:${why})`);
+  if (outcome.kind === "unanswered") return unwritten(outcome.reason);
   const reply = outcome.reply;
-  if (reply.kind === "status" || reply.kind === "test_job") {
-    if (command === "status" && reply.kind === "status") return { code: ADMIN_EXIT.ok, stdout: `${statusLine(reply.status)}\n`, stderr: "" };
-    if (command === "test-job" && reply.kind === "test_job") return { code: ADMIN_EXIT.ok, stdout: `${testJobLine(reply)}\n`, stderr: "" };
+  if (reply.kind === "status" || reply.kind === "test_job" || reply.kind === "holds" || reply.kind === "release") {
+    const ok = (line: string): EntryResult => ({ code: ADMIN_EXIT.ok, stdout: `${line}\n`, stderr: "" });
+    if (command === "status" && reply.kind === "status") return ok(statusLine(reply.status));
+    if (command === "test-job" && reply.kind === "test_job") return ok(testJobLine(reply));
+    if (command === "holds" && reply.kind === "holds") return ok(holdsLine(reply.holds));
+    if (isReleaseCommand(command)) return reply.kind === "release" && matches(request, command, reply.release) ? ok(releaseLine(reply.release)) : unwritten("mismatched");
     return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(malformed)`);
   }
-  if (reply.kind === "refused") return fail(ADMIN_EXIT.failed, `감독이 요청을 거절했다(${reply.reason})`);
+  // 자리 풀기의 장부 거절은 거절 이름(refusal)이 필수다. 이름이 빠진 ledger_refused는 test-job과의 호환 꼴일 뿐이라, 자리 풀기 쓰기 뒤에
+  // 받으면 적혔는지 모른다. 그 밖의 거절(장부 이름이 없는 사유)과 test-job의 두 칸 거절은 그대로다.
+  if (reply.kind === "refused" && reply.reason === "ledger_refused" && reply.refusal === undefined && isReleaseCommand(command)) return unwritten("mismatched");
+  if (reply.kind === "refused") return fail(ADMIN_EXIT.failed, `감독이 요청을 거절했다(${reply.refusal === undefined ? reply.reason : `${reply.reason}:${reply.refusal}`})`);
   if (reply.reason === "restore_not_done") return fail(ADMIN_EXIT.waiting, `${subject} 모름: 감독이 복원을 마치지 않았다(restore_not_done)`);
-  // 시험 작업의 write_unknown만 장부에 적혔을 수 있다(다시 부르는 법은 README "감독 관리 통로").
+  // 시험 작업·자리 풀기의 write_unknown만 장부에 적혔을 수 있다(다시 부르는 법은 README "감독 관리 통로").
   if (reply.reason === "write_unknown") return fail(ADMIN_EXIT.failed, `${subject} 모름: 장부에 적혔는지 모른다(write_unknown)`);
   return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독이 상태를 읽지 못했다(${reply.reason})`);
 }
