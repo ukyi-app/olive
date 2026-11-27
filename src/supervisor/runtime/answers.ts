@@ -43,6 +43,7 @@ import {
   type ResultPorts,
   type SentQuery,
 } from "../dispatch/receipts.ts";
+import { type StoppedAnswerBook, stoppedAnswersOf } from "../dispatch/result-check.ts";
 import type { UnreceivedConfirm, UnreceivedEvidence, UnreceivedEvidenceRead, UnreceivedFull } from "../dispatch/unreceived.ts";
 import type { Delivered } from "../transport/server.ts";
 import type { Cycle } from "./cycle.ts";
@@ -79,6 +80,9 @@ export interface AnswerLinePorts {
   // D-90 증거의 장부(createAnswerEvidenceBook). 서버를 새로 만들어 답 줄을 다시 만들 때 같은 값을 넘겨야 변경 번호가 이어지고
   // 앞 줄이 쥔 채 버린 답이 오염으로 남는다. 빠지면 이 답 줄만 쓰는 장부를 새로 만든다.
   readonly evidenceBook?: AnswerEvidenceBook;
+  // 실행기의 failed_stopped 답을 결과 검사 박자에 넘기는 자리(D-147, result-check.ts의 StoppedAnswerBook). 처리기가 status_matched로 낸
+  // 상태 보고에서 stoppedAnswersOf가 고른 것만 적는다. 빠지면 적지 않는다(결과 없음 판정이 없고 그 실행은 checking으로 자리를 쥔다).
+  readonly stopped?: Pick<StoppedAnswerBook, "note">;
 }
 
 // 실행기마다 변경 번호·오염·마지막 반영 인사를 쥐는 장부. 프로세스에 하나를 만들어 그 프로세스의 답 줄마다 넘긴다.
@@ -180,6 +184,10 @@ export interface AnswerLines {
   takeRequery(): readonly string[];
   // D-90 닫기 박자(unreceived.ts)의 증거 포트. read·confirm 모두 읽기만 하고 줄을 넘기거나 버리지 않는다.
   readonly evidence: UnreceivedEvidence;
+  // 조립이 고른 요청 ID(query-book.ts의 createResultWaitQueries)의 등록부 항목을 끝낸다. 받은 답이 쥔 항목은 남긴다: 줄에 선 답이 받은 때
+  // 본 항목, 처리 중인 답의 항목, 끝내기를 미룬 항목. 지우면 받을 때 유효했던 답이 unknown_query로 버려진다. 남긴 항목의 요청 ID를
+  // 돌려준다. 등록부가 던지면 받은 요청 ID 전부를 돌려준다(부르는 쪽이 다음에 다시 부른다). 던지지 않는다.
+  releaseQueries(requestIds: ReadonlySet<string>): ReadonlySet<string>;
 }
 
 type StatusItem = {
@@ -416,6 +424,18 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       ports.observe?.(value);
     } catch {
       // 기록이 던져도 처리는 그대로다.
+    }
+  };
+
+  // 대조된 상태 보고의 failed_stopped 답을 결과 검사 박자에 넘긴다. 줄의 상태를 옮긴 뒤에 부르고 던져도 처리는 그대로다: 적지 못한 답은
+  // 그 실행을 다음 조회로 다시 묻게 될 뿐이다(결과 없음 판정이 늦어지고 결과는 잃지 않는다).
+  const noteStopped = (outcome: ReceiptOutcome): void => {
+    try {
+      const book = ports.stopped;
+      if (book === undefined) return;
+      for (const answer of stoppedAnswersOf(outcome)) book.note(answer);
+    } catch {
+      // 위와 같다.
     }
   };
 
@@ -734,6 +754,7 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       if (outcome.outcome === "status_matched") {
         takeSettlements(outcome.settled);
         line.backlog = keepCopies(outcome.backlog);
+        noteStopped(outcome);
       } else if (outcome.outcome === "status_not_current") {
         markRequery(outcome.answer.runs);
         // 관측만 적는 연산에 적힌 답은 쥐지 않는다(뒤 답을 막지 않는다). 적지 못했거나 앞 사본 때문에 부르지 않은 "안다"는 답은 버리지 않고
@@ -888,6 +909,24 @@ export function createAnswerLines(ports: AnswerLinePorts): AnswerLines {
       const runIds = [...requery];
       requery.clear();
       return runIds;
+    },
+    releaseQueries(requestIds: ReadonlySet<string>): ReadonlySet<string> {
+      try {
+        if (requestIds.size === 0) return new Set();
+        const held = new Set<SentQuery>([...claimed, ...unsettled]);
+        for (const line of lines.values()) {
+          for (const item of line.items) if (item.kind === "status" && item.asked !== null) for (const entry of item.asked) held.add(entry);
+        }
+        const remaining = new Set<string>();
+        for (const entry of ports.queries.pending()) {
+          if (!isRecord(entry) || !requestIds.has(entry.requestId)) continue;
+          if (held.has(entry)) remaining.add(entry.requestId);
+          else ports.queries.settle(entry);
+        }
+        return remaining;
+      } catch {
+        return new Set(requestIds);
+      }
     },
     evidence: {
       // 한 시점의 값: 외부 코드를 부르지 않고 이 객체가 쥔 줄과 장부만 읽어 데이터 칸만 가진 새 객체로 낸다(목록도 새 배열·새 원소).

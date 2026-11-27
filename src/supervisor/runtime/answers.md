@@ -15,11 +15,13 @@
 | `AnswerLines.withheld` | `WithheldSource`(`dispatch/assign-loop.ts`). 배정 박자와 내보내기 포트가 읽는 맡기지 않을 실행기 집합 |
 | `AnswerLines.backlog(executorId)` | 그 실행기의 밀린 사본(받은 차례). 원소는 동결한 값이다 |
 | `AnswerLines.takeRequery()` | 같은 실행 ID로 다시 물어야 할 실행. 꺼내면 비운다 |
+| `AnswerLines.releaseQueries(requestIds)` | 그 요청 ID의 등록부 항목을 끝낸다. 받은 답이 쥔 항목(줄에 선 답이 받은 때 본 항목, 처리 중인 답의 항목, 끝내기를 미룬 항목)은 남기고 그 요청 ID를 돌려준다. 등록부가 던지면 받은 요청 ID 전부를 돌려준다 |
+| `createResultWaitQueries(kept = 3)` | → `due(sent, checking)`·`unreleased(ids)`. 결과 기다림 조회(`result_wait`)의 요청 ID를 실행마다 기억해, 최근 `kept`개 밖의 것과 `checking`을 떠난 실행의 것을 끝낼 것으로 고른다(`checking`이 `null`이면 수만 줄인다). 끝내지 못하고 남은 것은 다음 `due`가 다시 낸다. 조립이 박자 기록 뒤에 부른다(`boot.ts`의 `watchResultWait`) |
 | `AnswerLines.evidence` | D-90 닫기 박자(`dispatch/unreceived.ts`)의 증거 포트 `UnreceivedEvidence`: `read(executorId)`·`confirm(executorId, connection, version, stopGeneration)`. 아래 "D-90 증거" |
 | `createAnswerEvidenceBook()` | → `AnswerEvidenceBook`. 실행기마다 변경 번호·오염·마지막 반영 인사를 쥐는 장부의 표지(칸이 없다). 프로세스에 하나 |
 | `AnswerNote` | 기록: `receipt`, `status`, `backlog`, `hello`(처리기의 결과 그대로), `ack`(`writeAck`의 결과 또는 `seal_refused`·`seal_threw`), `fault` |
 
-받는 포트(`AnswerLinePorts`): `table`(연결 서버의 `table`), `restorer`(서버·내보내기 포트와 같은 복원기 게시 함수), `ledger`(`applyReceipt`·`recordReport`·`applyExecutorAnswer`·`recordAnswerSightings`), `results`(결과 보고의 보관과 장부 읽기, 필수), `random`, `signer`, `clock`(공유 시계), `wire`(내보내기 포트의 `answers`·`writeAck`), `queries`(위 등록부), `cycle`(순서기의 `noteCandidate`), `observationsSettled`(복원 2단계가 붙든 관측을 적었는가), `observe`(선택), `credentials`(선택. `AnswerCredentials`: `onReceipt(forward, 결과)`·`forgetConnection(연결)`. 감독의 조립은 늘 넘긴다. 빠지면 자격 값을 보내지 않아 실행기가 그 시작을 띄우지 못한다), `evidenceBook`(선택. `createAnswerEvidenceBook()`의 표지. 빠지면 이 답 줄만 쓰는 장부를 새로 만든다. 만들지 않은 표지면 증거는 늘 모름이다).
+받는 포트(`AnswerLinePorts`): `table`(연결 서버의 `table`), `restorer`(서버·내보내기 포트와 같은 복원기 게시 함수), `ledger`(`applyReceipt`·`recordReport`·`applyExecutorAnswer`·`recordAnswerSightings`), `results`(결과 보고의 보관과 장부 읽기, 필수), `random`, `signer`, `clock`(공유 시계), `wire`(내보내기 포트의 `answers`·`writeAck`), `queries`(위 등록부), `cycle`(순서기의 `noteCandidate`), `observationsSettled`(복원 2단계가 붙든 관측을 적었는가), `observe`(선택), `credentials`(선택. `AnswerCredentials`: `onReceipt(forward, 결과)`·`forgetConnection(연결)`. 감독의 조립은 늘 넘긴다. 빠지면 자격 값을 보내지 않아 실행기가 그 시작을 띄우지 못한다), `evidenceBook`(선택. `createAnswerEvidenceBook()`의 표지. 빠지면 이 답 줄만 쓰는 장부를 새로 만든다. 만들지 않은 표지면 증거는 늘 모름이다), `stopped`(선택. 결과 검사 박자와 같은 `createStoppedAnswerBook()`의 `note`. 처리기가 `status_matched`로 낸 상태 보고마다 줄의 상태를 옮긴 뒤 `stoppedAnswersOf`가 고른 `failed_stopped` 항목을 적는다. 적다 던져도 줄의 처리는 그대로다. 빠지면 적지 않아 결과 없음 판정이 없다, `dispatch/result-check.md` "결과 없음 판정").
 
 ## 출력마다 하는 일 (`answers.ts`의 `take`)
 

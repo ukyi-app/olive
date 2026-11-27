@@ -427,7 +427,7 @@ describe("정적", () => {
       expect([String(banned), banned.test(source)]).toEqual([String(banned), false]);
     }
     // 장부 메서드 이름 가운데 쓰기로 보이는 것(record·mark·apply·settle·close·admit·start·grant·assign 등)은 markResult뿐이다.
-    const writes = [...new Set([...source.matchAll(/\bledger\.(\w+)/g)].map((match) => match[1]))].filter((name) => !["listRuns", "pendingReports"].includes(name as string));
+    const writes = [...new Set([...source.matchAll(/\bledger\.(\w+)/g)].map((match) => match[1]))].filter((name) => !["listRuns", "pendingReports", "peekCheckingRuns"].includes(name as string));
     expect(writes).toEqual(["markResult"]);
   });
 });
