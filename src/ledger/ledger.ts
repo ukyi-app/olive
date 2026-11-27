@@ -1031,6 +1031,17 @@ export interface UnansweredInstructions {
   instructions: UnansweredInstruction[];
 }
 
+// 관리자가 파드 교체로 닫은 작업자 실행에 낼 버림 확정의 재료(closedRunFinalizes, D-159의 C-2).
+export interface ClosedRunFinalizes {
+  // 장부의 지금 정지 세대. 정지 기록이 없으면 null.
+  stopGeneration: number | null;
+  // 대상 실행. closedAt은 근거 줄(operator_closures)의 닫은 시각, finalizeRecorded는 그 실행에 확정 지시가 하나라도 적혔는지다.
+  runs: { runId: string; executorId: string; runGeneration: number; closedAt: number; finalizeRecorded: boolean }[];
+  // 대상에 적힌 확정 지시 전부. 대상에는 정리 영수증이 없으므로 모두 답을 받지 못한 지시다. 꼴은 unansweredInstructions()의 항목과
+  // 같다(runState는 not_started).
+  instructions: UnansweredInstruction[];
+}
+
 interface UnansweredRow {
   request_id: string;
   action: UnansweredInstruction["action"];
@@ -3392,6 +3403,64 @@ export class Ledger {
         };
       });
       return { stopGeneration: this.#stopRow()?.generation ?? null, instructions };
+    });
+  }
+
+  // 관리자가 파드 교체로 닫은 작업자 실행(not_started + operator_closures의 pod_replaced 줄)에 낼 버림 확정의 재료(D-159의 C-2).
+  // 장부를 바꾸지 않는다. unansweredInstructions()는 not_started 실행의 지시를 내지 않으므로, 첫 확정을 적는 수명 박자와 같은 요청을
+  // 다시 내는 재전송 박자가 이 읽기를 함께 본다. 대상은 셋을 모두 지난 실행이다:
+  // - 그 실행의 영수증·보고를 하나라도 받았다(deliveries). 받은 적이 없으면 실행기가 그 실행을 모를 수 있고(D-94의 접수 전 닫기),
+  //   모르는 실행의 확정은 실행기가 답하지 않아 같은 확정을 끝없이 다시 내게 된다. 늦게라도 받으면 그때부터 대상이다.
+  // - 방법이 pod_replaced다. 저장소 비움 닫기(store_reset)는 실행기 저장소를 비워 정리할 기록이 없다(D-158).
+  // - 그 실행의 정리 영수증을 하나도 받지 않았다. 정리는 실행 하나에 한 번이다: 정지 세대를 건너 둘째 확정을 낸 뒤 하나에 답이 오면
+  //   나머지 옛 확정은 답이 없어도 다시 적거나 다시 보내지 않는다.
+  closedRunFinalizes(): Read<ClosedRunFinalizes> {
+    return this.#read(() => {
+      const stopGeneration = this.#stopRow()?.generation ?? null;
+      if (!this.#operatorClosures) return { stopGeneration, runs: [], instructions: [] };
+      const targets = this.#db
+        .query(
+          `SELECT r.run_id, c.closed_at,
+             EXISTS (SELECT 1 FROM instructions i WHERE i.run_id = r.run_id AND i.action = 'result_finalize') AS finalized
+           FROM runs r JOIN operator_closures c ON c.run_id = r.run_id
+           WHERE r.kind = 'worker' AND r.state = 'not_started' AND c.checked_by = 'pod_replaced'
+             AND EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = r.run_id)
+             AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.run_id = r.run_id AND d.action = 'receipt_cleaned')
+           ORDER BY r.queue_seq`,
+        )
+        .all() as { run_id: string; closed_at: number; finalized: number }[];
+      const fields = this.#rebuildColumns
+        ? "budget_left, reason, outcome, result_digest, stored_at"
+        : "NULL AS budget_left, NULL AS reason, NULL AS outcome, NULL AS result_digest, NULL AS stored_at";
+      const runs: ClosedRunFinalizes["runs"] = [];
+      const instructions: UnansweredInstruction[] = [];
+      for (const target of targets) {
+        const run = this.#runRow(target.run_id) as RunRow;
+        const runGeneration = safe(run.run_generation, "run_generation");
+        const finalizeRecorded = target.finalized !== 0;
+        runs.push({ runId: run.run_id, executorId: run.executor_id, runGeneration, closedAt: safe(target.closed_at, "operator_closures.closed_at"), finalizeRecorded });
+        if (!finalizeRecorded) continue;
+        const rows = this.#db
+          .query(
+            `SELECT request_id, action, run_id, stop_generation, issued_at, ${fields} FROM instructions
+             WHERE run_id = ? AND action = 'result_finalize' ORDER BY issued_at, request_id`,
+          )
+          .all(run.run_id) as UnansweredRow[];
+        for (const row of rows) {
+          instructions.push({
+            requestId: row.request_id,
+            action: row.action,
+            runId: row.run_id,
+            runGeneration,
+            executorId: run.executor_id,
+            runState: run.state,
+            stopGeneration: safe(row.stop_generation, "instructions.stop_generation"),
+            issuedAt: safe(row.issued_at, "instructions.issued_at"),
+            rebuild: rebuildOf(row, run),
+          });
+        }
+      }
+      return { stopGeneration, runs, instructions };
     });
   }
 

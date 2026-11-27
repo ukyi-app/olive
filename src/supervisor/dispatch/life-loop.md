@@ -53,7 +53,7 @@ LifeTickResult =
 | `query_held` + `lastQueryAt`, `cause` | 마지막 조회부터 `answerTimeoutMs`가 지나지 않아 묻지 않았다 |
 | `query_not_sent` + `at`, `cause`, `reason`, `delivery` | 조회를 싣지 못했다. `delivery: "unknown"`이면 기다리는 조회에는 넣었다 |
 
-`cause`는 `intent`(판단이 조회를 냄), `stop_already_recorded`(아래 "이미 적힌 종료"), `result_wait`(판단은 기다림인 `checking` 실행, 아래 "조회") 가운데 하나다. 끝난 실행(`finalized`·`not_started`)은 목록에 없다. 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
+`cause`는 `intent`(판단이 조회를 냄), `stop_already_recorded`(아래 "이미 적힌 종료"), `result_wait`(판단은 기다림인 `checking` 실행, 아래 "조회") 가운데 하나다. 끝난 실행(`finalized`·`not_started`)은 목록에 없다. 예외는 관리자가 파드 교체로 닫은 실행 가운데 버림 확정의 대상인 실행이고, 목록 끝에 한 항목씩 온다(아래 "닫힌 실행의 버림 확정"). 결과에는 원문·자격 참조의 값·봉투·서명·nonce가 없다(시험이 결과의 JSON에 자격 digest·서명·nonce가 없음을 본다).
 
 ## 한 박자의 순서
 
@@ -150,6 +150,18 @@ LifeTickResult =
   - **판 8 전에 `failed_stopped`가 된 줄**은 확정을 보류하고 자리를 쥔다(main과 같다). 실패 시각도 `exit`도 모르기 때문이다: 사유 `requested`의 취소 지시가 있으면 `stored_at_unknown`, 그 밖(취소 지시가 없거나 다른 사유뿐이거나 사유 없는 지시만 있음)은 `outcome_unknown`. `updated_at`이 종료 확인 영수증을 받은 시각과 같아도 그 시각으로 보지 않는다: 감독이 다시 뜨면 공유 시계의 하한이 0부터라(`src/supervisor/runtime/shared-clock.ts`) 늦은 결과 없음 판정 뒤의 예산 기록(`recordBudget`)이 영수증 시각을 다시 적을 수 있고, 그 장부는 판정이 영수증과 같은 시각인 장부와 모든 표가 같다. 시각으로 `completed`를 추론하지 않는 까닭도 같다: `cancelled`로 곧바로 끝난 뒤 예산이 적힌 실행을 `failed`로 확정하지 않기 위해서다.
 - **`stored_at`은 실행 줄이 `failed_stopped`가 된 장부 시각이다.** 판 8부터는 그 전이와 같은 UPDATE가 `runs.failed_stopped_at`에 적고 그 뒤로 바뀌지 않는다. `updated_at`으로 읽지 않는다: 예산 기록 같은 뒤 쓰기가 상태와 무관하게 그 칸을 바꾼다. 실행기는 `succeeded`가 아닌 확정의 `stored_at`·digest를 대조하지 않는다(`src/executor/worker.ts`의 정리 길). 확정을 적으면 본문 세 칸이 지시 줄에 고정되므로, 뒤 전이(`finalized`·`cleanup_pending`)가 `updated_at`을 바꿔도 재전송의 본문은 같다.
 - **같은 정지 세대에 한 번, 접수가 열렸을 때만.** `already_recorded`·정지 세대를 건넌 확정·`intake_closed`·쓰기 직전의 확인은 `ready_result`와 같다. `already_recorded`를 `outcome_unknown`·`stored_at_unknown`보다 먼저 본다.
+
+### 닫힌 실행의 버림 확정(D-159의 C-2)
+
+관리자가 파드 교체로 닫은 실행(`not_started` + `operator_closures`의 `pod_replaced` 줄, D-91·D-96)은 감독 장부에서는 끝났지만 실행기 저장소에는 그 실행의 기록이 남을 수 있다. 다시 뜬 실행기가 진행 중 기록을 다시 세어 `failed_stopped`·`ready_result`로 맺어도 확정이 오지 않으면 `finalized`가 되지 않고, 그런 기록이 `STATUS_MAX_RUNS`(8)개 쌓이면 그 실행기는 새 시작을 받지 않는다(README "관리자 닫기 뒤 실행기 저장소에 남는 기록"). 그래서 이 박자는 그 실행에도 확정을 한 번 적고 내보낸다.
+
+- **읽기.** 실행 목록에 관리자 닫기 근거가 있는 작업자 `not_started` 줄(`closedByOperator`)이 하나라도 있을 때만 장부의 `closedRunFinalizes()`를 읽는다(`src/ledger/ledger.md` "답을 받지 못한 지시"). 이 박자 안에서 그 읽기가 모름을 돌려주면 닫힌 실행만 `read_unknown`(`instruction_times`)으로 만들고 다른 실행의 갱신·종료·확정을 막지 않는다. 다만 실제 장부에서 읽기가 고장 나면(SQLite 오류 등) 장부의 공통 고장 처리가 쓰기 허가를 거두고(`src/ledger/ledger.ts`의 `#read`, `health().writable`이 `false`) 접수도 닫히며, 조립은 그 상태를 보고 감독 전체 박자를 멈춘다(`src/supervisor/runtime/boot.ts`의 `haltReason`). 그래서 실제 운영에서 그 읽기의 고장은 다른 실행의 갱신·종료·확정도 멈춘다. 포트에 그 읽기가 없으면(이 부품 단독의 쓰임) 닫힌 실행에는 아무것도 하지 않는다. 조립은 실제 장부를 넘기므로 늘 있다.
+- **대상과 결과의 항목.** 대상은 그 읽기가 정한다: `pod_replaced`로 닫았고, 그 실행의 영수증·보고를 하나라도 받았고, 정리 영수증은 하나도 받지 않은 실행. 대상이 아닌 닫힌 실행(저장소 비움 닫기, 영수증을 받은 적 없음, 정리 영수증을 받음)은 지금처럼 결과에 항목이 없다. 대상의 지정 실행기·실행 세대가 실행 목록의 줄과 다르면 `read_unknown`(`runs`)이다.
+- **본문.** `outcome`은 `failed`(관리자 닫기는 늘 실패, D-94. 장부도 닫힌 실행에는 `failed`만 받는다), `result_digest`는 `null`, `stored_at`은 근거 줄의 닫은 시각(`closedAt`)이다. 실행 줄이 실패로 끝난 장부 시각이라는 뜻이 실패 확정(D-114)의 `stored_at`과 같다. 실행기는 `succeeded`가 아닌 확정의 `stored_at`을 대조하지 않는다.
+- **한 번, 세대마다 한 건.** 지금 정지 세대의 확정이 적혔으면 `finalize_withheld`(`already_recorded`)이고 새로 적지 않는다. 답 없는 확정은 재전송 박자가 같은 요청 ID로 다시 낸다(`resend.md` "닫힌 실행의 확정"). 옛 세대의 확정만 있으면 위 "정지 세대를 건넌 확정"과 같이 지금 세대로 새 요청 ID의 확정을 한 건 적고, 본문은 앞 지시 줄의 세 칸 그대로다(칸이 모두 없으면 위 본문). 정리 영수증을 하나라도 받으면 대상에서 빠지므로 다시 적지도 보내지도 않는다.
+- **쓰기 직전의 확인.** 확정과 같은 차례다: 요청 ID → 다시 읽기(`closedRunFinalizes()`) → 접수(닫혔으면 `intake_closed`) → 마지막 시계 읽기 → 판단 → 장부 호출. 다시 읽은 대상이 없어졌거나, 지금 세대의 확정이 그 사이 적혔거나, 지정 실행기·실행 세대·닫은 시각·앞 본문이 박자 처음과 다르거나, 지정 실행기가 작업자 실행기의 주체가 아니면 `superseded`다. 결과의 종류는 확정과 같다(`finalize_sent`·`finalize_refused`·`finalize_failed`·`finalize_record_unknown`·`finalize_recorded_not_sent`).
+- **실행기 쪽.** 실행기는 `not_started`·`failed_stopped`·`ready_result` 기록의 `succeeded`가 아닌 확정을 결과 대조 없이 받아 정리하고 `receipt_cleaned`로 `finalized`가 된다(`src/executor/worker.ts`의 `MAY_CLEAN`). 감독 장부는 그 영수증을 닫힌 실행의 늦은 영수증으로 받아 ack한다(실행 줄은 `not_started` 그대로). 실행기 저장소의 기록이 `unknown_running`이면 정리 상태가 아니라 받지 않고 재전송이 답 없이 이어진다. 다른 파드가 접수한 기록은 새 파드의 실행기가 기동 때 다시 세어 `failed_stopped`로 맺으므로(D-159의 C-1, README "관리자 닫기 뒤 실행기 저장소에 남는 기록") 그 뒤의 재전송으로 정리된다. 칸이 없는 옛 기록과 같은 파드의 기록은 남는다.
+- 시험: `test/supervisor/dispatch/closed-run-finalize.test.ts`(한 번 적기와 `already_recorded`, 재전송 둘과 정리 영수증 뒤 멈춤, 저장소 비움 닫기·영수증 없는 닫기는 대상 밖이고 늦은 영수증 뒤에 대상, 세대를 건넌 한 건과 옛 확정의 `stop_generation_mismatch`, 실제 실행기로 정리·ack·다시 붙은 뒤의 한 번 정리·새 시작).
 
 ## 겹쳐 부르기
 

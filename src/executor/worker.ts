@@ -174,6 +174,8 @@ export class WorkerExecutor {
   private heldSends = false;
   // 지우는 중인 실행. 첫 await 전에 넣어 슬롯을 쥐고, 같은 실행의 확정은 진행 중인 작업에 합류한다.
   private readonly cleaning = new Map<string, Promise<void>>();
+  // 다른 실행이 시작 자리를 쥐어 정리를 미룬 확정(실행마다 마지막 하나). 시작 자리가 차 있는 동안만 남고, 자리를 놓는 자리가 비운다.
+  private readonly deferredFinalize = new Map<string, { header: Header; body: Bodies["result_finalize"]; epoch: number }>();
   // 프로세스를 끝내고 세는 물리적 정리가 도는 실행. 첫 종료와 재정리가 함께 쓰고, 같은 실행의 정리가 겹치지 않는다.
   private readonly reclaiming = new Map<string, Promise<void>>();
   private readonly lastSent = new Map<string, number>();
@@ -371,6 +373,8 @@ export class WorkerExecutor {
       } catch {
         // 우편함의 실패가 슬롯을 놓는 일을 막지 않는다
       }
+      // 자리를 놓은 이 동기 구간에서 미룬 확정을 처리한다. 다음 시작 지시가 먼저 자리를 잡으면 미룬 실행은 짧은 실행이 이어지는 동안 계속 밀린다.
+      if (this.active === undefined) this.retryDeferredFinalize();
       release();
     };
     let accepted: boolean;
@@ -387,6 +391,7 @@ export class WorkerExecutor {
         credential_digest: body.credential.digest,
         exit: null,
         last_receipt_id: null,
+        pod_uid: this.options.podUid,
       };
       if (!(await this.store.beginRun(record))) return finish();
       // 기록을 적는 사이 연결·세대·접수가 바뀌었으면 새 접수 영수증을 내지 않는다. 여기서 사건의 예약까지 await가 없다.
@@ -698,6 +703,14 @@ export class WorkerExecutor {
     if (record.state === "finalized") return this.answerCleaned(runId, header);
     // 프로세스가 살아 있을 수 있는 실행은 지우지 않는다. 쓰는 중인 파일을 지우거나 자격을 거둔 척하게 된다.
     if (!MAY_CLEAN.includes(record.state) || !this.store.settled(runId)) return;
+    // 다른 실행이 시작 자리(active)를 쥐었으면(시작 지시로 자리를 잡은 때부터 그 실행의 종료 확인까지) 이 실행의 새 정리를 예약하지 않는다.
+    // 예약하면 그 실행의 시작 직전 검사(launchBlocked)가 다른 실행의 정리를 보고 띄우지 않고 닫는다. 의도도 적지 않고 답하지 않는다.
+    // 이 확정은 기억해 두고, 그 실행이 자리를 놓을 때(onStart의 finish) 한 번 다시 처리한다(retryDeferredFinalize).
+    // 함정: 이 검사와 아래 cleaning 예약 사이에 await가 없어야 한다. 시작 쪽(refusesStart)은 반대로 정리 중이면 받지 않는다.
+    if (this.active !== undefined && this.active.runId !== runId) {
+      this.deferredFinalize.set(runId, { header, body, epoch });
+      return;
+    }
     // 점유가 hello의 상한에 이르렀으면 점유하지 않던 실행에 새 정리를 예약하지 않는다(아홉째 점유가 생기면 인사할 수 없어 정리 재시도도 받지 못한다).
     // 이미 점유 중인 실행의 재시도는 받는다. 여기서 clean의 메모리 예약까지 await가 없다.
     const occupying = this.occupying();
@@ -713,6 +726,17 @@ export class WorkerExecutor {
     // 먼저 남은 정리 의도의 요청이 이 정리를 맡았으면, 그 사실이 확정된 뒤 이 요청에 따로 답한다.
     const finished = this.store.run(runId);
     if (finished?.state === "finalized" && finished.cleanup?.request_id !== header.request_id && this.mayFinalize(header, body, epoch)) await this.answerCleaned(runId, header);
+  }
+
+  // 미룬 확정마다 한 번: 기억을 비우고 받은 그대로 onFinalize에 다시 넣는다. 그 연결·정지 세대·접수가 지금도 맞는지는 onFinalize(mayFinalize)가
+  // 이 시점에 처음부터 다시 본다. 맞지 않으면 아무것도 적지 않고 지금 연결·세대로 오는 감독의 재전송을 기다린다.
+  // 함정: onFinalize는 첫 await 전에 정리 자리(cleaning)를 잡는다. 그래서 자리를 놓는 동기 구간에서 부르면 다음 시작(refusesStart)은
+  // 이 정리가 끝난 뒤의 재전송으로 받는다. 비동기로 미루면 다음 시작이 먼저 자리를 잡는다.
+  private retryDeferredFinalize(): void {
+    const held = [...this.deferredFinalize.values()];
+    this.deferredFinalize.clear();
+    // 실패하면 감독의 재전송이 다시 부른다. 기다리는 쪽이 없으므로 거절을 여기서 거둔다.
+    for (const { header, body, epoch } of held) void this.onFinalize(header, body, epoch).catch(() => {});
   }
 
   // 정리 의도를 먼저 지속한 뒤 지운다. 디스크에서도 슬롯을 쥐고(cleanup_pending), 재시작하면 정해 둔 영수증 ID로 잇는다.
@@ -759,6 +783,7 @@ export class WorkerExecutor {
   // 함정: UID가 바뀐 것은 새 파드 객체가 생겼다는 사실이지 옛 컨테이너가 끝났다는 증거가 아니다. 두 파드가 겹치지 않는 교체(Recreate, replicas 0·1,
   // 옛 파드의 끝을 확인한 뒤 1)가 전제다. pod_uid가 없는 의도는 어느 파드에서 적혔는지 몰라 이 길을 쓰지 않는다.
   // 같은 파드의 전체 재시작(D-104)은 UID가 같아 이 길이 아니다. 그때는 남아 있는 /tmp를 새 대리가 지운다.
+  // 이 판정은 정리 의도의 pod_uid를 본다. 실행 기록의 pod_uid(접수한 파드)는 아래 fromReplacedPod가 본다.
   private podReplaced(runId: string, intent: CleanupIntent): boolean {
     if (intent.pod_uid === undefined || intent.pod_uid === this.options.podUid) return false;
     this.options.log?.(`정리 확인: 실행 ${runId}의 정리 의도를 적은 파드(${intent.pod_uid})가 지금 파드(${this.options.podUid})가 아니다. 작업 공간이 파드와 함께 사라졌다고 보고 대리에 묻지 않는다`);
@@ -879,6 +904,15 @@ export class WorkerExecutor {
     );
   }
 
+  // 다른 파드에서 물려받은 실행 기록인가(D-159의 C-1, D-171): 접수한 파드의 UID가 있고 지금 파드가 아니다. 그 파드의 프로세스는 파드와 함께
+  // 끝났다고 보고, 기동 대조가 unknown_running도 IN_FLIGHT와 같이 다시 센다(지금 대리의 계수가 0일 때만 종료 영수증을 낸다).
+  // 함정: UID가 바뀐 것은 옛 컨테이너가 끝났다는 증거가 아니다. 겹치지 않는 교체(Recreate, replicas 0·1, 옛 파드의 끝을 확인한 뒤 1)가
+  // 전제다(podReplaced와 같다). 칸이 없는 기록(칸을 쓰기 전의 판이 접수)과 같은 파드의 기록은 이 길이 아니다(지금 동작 그대로).
+  // 조립은 같은 판정으로 그 기록을 원격 잠금(inheritedUnverified)에서 뺀다(runtime.ts).
+  fromReplacedPod(record: RunRecord): boolean {
+    return record.pod_uid !== undefined && record.pod_uid !== this.options.podUid;
+  }
+
   // 끝을 맺지 못한 모든 상태를 같은 방식으로 대조한다: 유효한 사건이 있으면 그 사건으로 최종 상태와 마지막 영수증을 맺고(같은 ID, 같은 본문),
   // 없으면 남은 수를 센다. 다시 띄우지 않는다(결과가 없어도 새 실행으로 바꾸지 않는다).
   // 시작 영수증이 없어도 띄우지 않았다는 증거는 아니므로, 종료만 확인된 실행은 not_started가 아니라 failed_stopped로 맺는다.
@@ -886,7 +920,8 @@ export class WorkerExecutor {
   // 저장소가 후보 상태의 전제를 거절하면 그 자리에서 보류가 서므로, 끝을 맺지 못한 실행은 남은 수를 센다.
   private reconcile(record: RunRecord): Promise<unknown> {
     const runId = record.run_id;
-    const unfinished = IN_FLIGHT.includes(record.state);
+    const replaced = this.fromReplacedPod(record);
+    const unfinished = IN_FLIGHT.includes(record.state) || (replaced && record.state === "unknown_running");
     if (this.store.suspectRun(runId)) return unfinished ? this.reclaim(runId, record.exit ?? "failed") : Promise.resolve();
     const entries = this.store.validEvents(runId);
     const has = (action: OutboxAction) => entries.some((entry) => entry.action === action);
@@ -904,7 +939,11 @@ export class WorkerExecutor {
     if (latest !== record.last_receipt_id) patch.last_receipt_id = latest;
     const writing = Object.keys(patch).length > 0 ? this.transition(runId, patch) : Promise.resolve();
     if (!unfinished || (patch.state !== undefined && !this.store.suspectRun(runId))) return writing;
-    return Promise.all([writing, this.reclaim(runId, record.exit ?? "failed")]);
+    // 다른 파드에서 물려받은 기록(진행 중·unknown_running)의 원래 출력은 그 파드와 함께 사라졌다. 결과 보고가 없는 completed는 failed로 맺는다
+    // (restartedExit, D-104와 같은 까닭). 옛 파드가 정한 cancelled·deadline은 그대로 둔다: 감독은 exit cancelled를 확정 outcome cancelled로
+    // 읽는다(D-114). 이미 적힌 종료 영수증은 위 대조나 confirmStopped가 같은 ID·본문으로 맺고, 저장된 보고가 있으면 completed가 남는다(D-150).
+    if (replaced) this.options.log?.(`기동 대조: 실행 ${runId}를 접수한 파드(${record.pod_uid})가 지금 파드(${this.options.podUid})가 아니다. 다시 센다`);
+    return Promise.all([writing, this.reclaim(runId, replaced ? this.restartedExit(runId, record) : (record.exit ?? "failed"))]);
   }
 
   // ---- 영수증·보고 ----

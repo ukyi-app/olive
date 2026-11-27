@@ -23,6 +23,10 @@
 //    시각) 적고 내보낸다. 읽기가 모름이면 확정하지 않는다. 지금 정지 세대의 확정이 이미 적힌 실행에는 새 요청 ID로 또 적지 않고(다시
 //    보내는 것은 재전송 박자의 일), 옛 세대의 확정만 적힌 실행에는 지금 세대로 한 건을 새 요청 ID로 적는다(아래 currentFinalize).
 //    접수가 닫혔으면(정지 포함) 적지 않는다. cleanup_pending의 확정은 내지 않는다(정리 확인이 정해지지 않았다).
+// 6. 관리자가 파드 교체로 닫은 실행(not_started + 근거)에는 outcome failed의 확정을 한 번 적고 내보낸다(D-159의 C-2, 아래 closedTargets).
+//    실행기 저장소에 남은 그 실행의 기록(failed_stopped·ready_result·not_started)을 실행기가 정리해 finalized로 맺게 하려는 것이다.
+//    stored_at은 근거 줄의 닫은 시각이다(관리자 닫기는 늘 실패, D-94). 답이 없는 확정은 재전송 박자가 같은 요청 ID로 다시 낸다
+//    (resend.ts). 옛 세대의 확정만 남았으면 5번과 같이 지금 세대로 한 건을 앞 본문 그대로 적는다.
 import { type Envelope, parsePrincipal } from "../../contract/v1/index.ts";
 import {
   FINALIZE_OUTCOMES,
@@ -48,7 +52,8 @@ import { type PlainCheck, sendInstruction } from "./send-gate.ts";
 
 // 장부 포트. 실제 장부(openLedger가 연 Ledger)가 그대로 맞는 꼴이다. settledResult는 ready_result 실행에만, failedStop은 failed_stopped
 // 실행에만 읽는다: 그 읽기의 고장이 다른 상태의 갱신·종료를 막지 않게 한다. unansweredInstructions도 같은 까닭으로 확정이 이미 적힌
-// 실행에 판단이 확정을 낼 때만 읽는다(그 확정의 정지 세대를 가른다).
+// 실행에 판단이 확정을 낼 때만 읽는다(그 확정의 정지 세대를 가른다). closedRunFinalizes도 같은 까닭으로 관리자가 닫은 실행이 목록에
+// 있을 때만 읽는다. 그 읽기가 없는 포트는 닫힌 실행에 아무것도 하지 않는다(이 부품 단독의 쓰임). 조립은 실제 장부를 넘기므로 늘 있다.
 export type LifeLoopLedger = Pick<
   Ledger,
   | "listRuns"
@@ -60,7 +65,8 @@ export type LifeLoopLedger = Pick<
   | "recordRenewInstruction"
   | "recordStopInstruction"
   | "recordFinalizeInstruction"
->;
+> &
+  Partial<Pick<Ledger, "closedRunFinalizes">>;
 
 // 접수와 정지 세대. 실제로는 재시작 복원기(Restorer)다. 접수는 갱신·확정 직전에만 본다: 갱신은 장부에서 새 업무와 같은 전제를 거치고,
 // 종료 지시는 정지 중에도 접수가 닫혀도 적힌다(장부의 쓰기 모드 continue). 확정은 장부가 continue로 받지만 이 박자가 접수로 막는다.
@@ -260,7 +266,8 @@ export type LifeTickResult =
   | { readonly kind: "not_run"; readonly reason: "read_unknown"; readonly read: Exclude<LifeRead, "instruction_times" | "result"> }
   | {
       readonly kind: "ran";
-      // 끝나지 않은 실행(finalized·not_started 밖)마다 한 항목. 멈췄으면 멈춘 실행의 항목(쓰기를 불렀다면)까지 있고 그 뒤는 없다.
+      // 끝나지 않은 실행(finalized·not_started 밖)마다 한 항목, 그 뒤에 버림 확정의 대상인 닫힌 실행(6번)마다 한 항목.
+      // 멈췄으면 멈춘 실행의 항목(쓰기를 불렀다면)까지 있고 그 뒤는 없다.
       readonly runs: readonly RunOutcome[];
       // 이번 박자에 내보낸(또는 실렸는지 모르는) 조회. 부르는 쪽이 영수증 처리기의 pendingQueries에 더한다.
       readonly pendingQueries: readonly PendingQuery[];
@@ -383,8 +390,11 @@ function validMemory(input: unknown): Memory | null {
 }
 
 // 판단과 지시에 쓰는 실행 줄의 칸. 읽은 줄에서 칸마다 한 번만 읽어 옮겨 적는다(같은 칸을 두 번 읽어 다른 값을 보지 않는다).
-// resultDigest는 ready_result 줄에서만 읽고(그 밖은 null) 확정의 대조에만 쓴다.
-type RunRow = Pick<Run, "runId" | "runGeneration" | "kind" | "state" | "deadlineAt" | "executorId" | "inputRequestId" | "acceptedReceiptId" | "startedReceiptId" | "resultDigest">;
+// resultDigest는 ready_result 줄에서만 읽고(그 밖은 null) 확정의 대조에만 쓴다. closedByOperator는 not_started 줄에서만 읽는다(그 밖은 false).
+type RunRow = Pick<
+  Run,
+  "runId" | "runGeneration" | "kind" | "state" | "deadlineAt" | "executorId" | "inputRequestId" | "acceptedReceiptId" | "startedReceiptId" | "resultDigest"
+> & { readonly closedByOperator: boolean };
 type Times = Pick<InstructionTimes, "lease" | "lastStopAt" | "lastFinalizeAt">;
 
 interface Facts {
@@ -424,9 +434,22 @@ function snapshotRun(raw: Record<string, unknown>): { runId: string; row: RunRow
       if (!isDigest(read)) return { runId, row: null };
       resultDigest = read;
     }
+    const closedByOperator = state === "not_started" && raw.closedByOperator === true;
     return {
       runId,
-      row: { runId, kind, state: state as Run["state"], runGeneration: runGeneration as number, deadlineAt, executorId, inputRequestId, acceptedReceiptId, startedReceiptId, resultDigest },
+      row: {
+        runId,
+        kind,
+        state: state as Run["state"],
+        runGeneration: runGeneration as number,
+        deadlineAt,
+        executorId,
+        inputRequestId,
+        acceptedReceiptId,
+        startedReceiptId,
+        resultDigest,
+        closedByOperator,
+      },
     };
   } catch {
     return { runId, row: null };
@@ -739,13 +762,17 @@ async function tickOnce(ports: LifeLoopPorts, policy: LifecyclePolicy, input: Li
   const cancels = cancelIndex(inputs);
 
   // 쓰기 전의 읽기와 판단을 모든 실행에 먼저 한다. 정책이 틀려 판단이 던지면 어느 실행에도 쓰지 않는다.
-  const plans: (Planned | RunOutcome)[] = [];
+  const plans: (Planned | ClosedPlan | RunOutcome)[] = [];
+  const closed: RunRow[] = [];
   for (const [runId, run] of runs) {
     if (run === null) {
       plans.push({ runId, outcome: "read_unknown", read: "runs" });
       continue;
     }
-    if (DONE.includes(run.state)) continue;
+    if (DONE.includes(run.state)) {
+      if (run.kind === "worker" && run.closedByOperator) closed.push(run);
+      continue;
+    }
     if (run.kind !== "worker") {
       plans.push({ runId, outcome: "not_worker" });
       continue;
@@ -764,6 +791,7 @@ async function tickOnce(ports: LifeLoopPorts, policy: LifecyclePolicy, input: Li
     }
     plans.push({ facts, view, intent });
   }
+  plans.push(...closedPlans(ports.ledger, closed, stopGeneration as number));
 
   const ctx: Context = { ports, policy, now, stopGeneration: stopGeneration as number, ...memory, pendingQueries: [] };
   const outcomes: RunOutcome[] = [];
@@ -775,10 +803,10 @@ async function tickOnce(ports: LifeLoopPorts, policy: LifecyclePolicy, input: Li
     }
     const trace: Trace = { fallback: null };
     try {
-      outcomes.push(await act(ctx, plan, trace));
+      outcomes.push(await ("closed" in plan ? closedFinalizeOne(ctx, plan.closed, trace) : act(ctx, plan, trace)));
     } catch {
       if (trace.fallback !== null) outcomes.push(trace.fallback());
-      return { kind: "ran", runs: outcomes, pendingQueries: ctx.pendingQueries, halted: "threw", haltedAt: plan.facts.run.runId };
+      return { kind: "ran", runs: outcomes, pendingQueries: ctx.pendingQueries, halted: "threw", haltedAt: "closed" in plan ? plan.closed.runId : plan.facts.run.runId };
     }
   }
   return { kind: "ran", runs: outcomes, pendingQueries: ctx.pendingQueries, halted: null, haltedAt: null };
@@ -1063,7 +1091,22 @@ async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<R
     return { runId, outcome: "superseded", planned: "finalize" };
   }
   const { executorId, runGeneration } = fresh.run;
-  const { outcome, resultDigest, storedAt } = body;
+  return recordFinalize(ctx, trace, { runId, requestId, recordAt, executorId, runGeneration, body });
+}
+
+// 확정을 장부에 적고, 적힌 뒤에만 봉해 싣는다. 부르는 쪽은 마지막 시계 읽기와 판단을 마친 뒤 await 없이 부른다: 이 함수도 장부 호출까지
+// 기다리지 않는다(박자 유효 문 → 호출).
+interface FinalizeWrite {
+  readonly runId: string;
+  readonly requestId: string;
+  readonly recordAt: number;
+  readonly executorId: string;
+  readonly runGeneration: number;
+  readonly body: FinalizeBody;
+}
+async function recordFinalize(ctx: Context, trace: Trace, write: FinalizeWrite): Promise<RunOutcome> {
+  const { runId, requestId, recordAt, executorId, runGeneration } = write;
+  const { outcome, resultDigest, storedAt } = write.body;
   const stopGeneration = ctx.stopGeneration;
   const recordUnknown = (reason: RecordUnknown): RunOutcome => ({ runId, outcome: "finalize_record_unknown", requestId, stopGeneration, issuedAt: recordAt, executorId, reason });
   // 본문 세 칸(outcome·resultDigest·storedAt)을 늘 함께 넘긴다: 빼고 적은 확정은 재전송 박자가 본문을 다시 만들 수 없다.
@@ -1120,6 +1163,115 @@ async function finalizeOne(ctx: Context, plan: Planned, trace: Trace): Promise<R
   if (sent === "sent") return { runId, outcome: "finalize_sent", requestId, issuedAt: recordAt, executorId };
   if (sent === "no_connection" || sent === "too_late_to_send") return notSent(sent);
   return notSent("send_answer_malformed", { delivery: "unknown" });
+}
+
+// 관리자가 파드 교체로 닫은 실행의 버림 확정 대상 하나(장부의 closedRunFinalizes, D-159의 C-2). current는 지금 정지 세대의 확정이
+// 이미 적혔는지, earlier는 앞서 적힌 확정 가운데 본문 칸이 있는 첫 지시의 본문이다(5번의 finalizeRecords와 같은 뜻).
+interface ClosedTarget {
+  readonly runId: string;
+  readonly executorId: string;
+  readonly runGeneration: number;
+  readonly closedAt: number;
+  readonly current: boolean;
+  readonly earlier: FinalizeBody | null;
+}
+type ClosedPlan = { readonly closed: ClosedTarget };
+
+// 대상을 실행 ID로 묶는다. 읽기가 없으면 빈 묶음, 모름이거나 던지거나 꼴이 틀리면 null(모름)이다. 대상이 아닌 닫힌 실행(저장소 비움 닫기,
+// 영수증을 받은 적 없음, 정리 영수증을 받음)은 묶음에 없다. 확정 항목의 세대·본문 칸이 틀린 대상은 "malformed"다: 건너뛰면 지금 세대의
+// 확정을 놓쳐 같은 세대에 둘째 확정을 적는다.
+function closedTargets(ledger: LifeLoopLedger, stopGeneration: number): Map<string, ClosedTarget | "malformed"> | null {
+  try {
+    const read = ledger.closedRunFinalizes;
+    if (read === undefined) return new Map();
+    const answer: unknown = read.call(ledger);
+    if (!isObject(answer) || answer.known !== true || !isObject(answer.value)) return null;
+    const { runs, instructions } = answer.value;
+    if (!Array.isArray(runs) || !Array.isArray(instructions)) return null;
+    const targets = new Map<string, ClosedTarget | "malformed">();
+    // 확정이 적혔다는 대상인데 그 확정 항목이 하나도 없으면 읽기가 틀렸다(새 확정을 적으면 둘째 확정이다).
+    const recorded = new Set<string>();
+    for (const raw of runs as unknown[]) {
+      if (!isObject(raw)) return null;
+      const { runId, executorId, runGeneration, closedAt, finalizeRecorded } = raw;
+      if (!isUuid(runId)) return null;
+      const fits = typeof executorId === "string" && Number.isSafeInteger(runGeneration) && (runGeneration as number) >= 1 && isTime(closedAt) && typeof finalizeRecorded === "boolean";
+      targets.set(runId, targets.has(runId) || !fits ? "malformed" : { runId, executorId: executorId as string, runGeneration: runGeneration as number, closedAt, current: false, earlier: null });
+      if (finalizeRecorded === true) recorded.add(runId);
+    }
+    for (const item of instructions as unknown[]) {
+      if (!isObject(item)) return null;
+      const { runId: of, action } = item;
+      if (typeof of !== "string" || action !== "result_finalize") return null;
+      const target = targets.get(of);
+      if (target === undefined || target === "malformed") continue;
+      const { stopGeneration: generation, rebuild } = item;
+      if (!Number.isSafeInteger(generation) || (generation as number) < 0) {
+        targets.set(of, "malformed");
+        continue;
+      }
+      const body = rebuild === null ? null : finalizeRebuildOf(rebuild);
+      if (rebuild !== null && body === null) {
+        targets.set(of, "malformed");
+        continue;
+      }
+      targets.set(of, { ...target, current: target.current || generation === stopGeneration, earlier: target.earlier ?? body });
+      recorded.delete(of);
+    }
+    for (const runId of recorded) targets.set(runId, "malformed");
+    return targets;
+  } catch {
+    return null;
+  }
+}
+
+// 닫힌 실행마다의 계획. 대상이고 지금 세대의 확정이 없으면 확정을 적는 계획, 이미 있으면 already_recorded(다시 보내는 것은 재전송 박자의
+// 일), 읽기가 모름이면 read_unknown이다. 목록의 실행 줄과 지정 실행기·실행 세대가 다르면 잘못 읽은 것이라 read_unknown이다.
+function closedPlans(ledger: LifeLoopLedger, closed: readonly RunRow[], stopGeneration: number): (ClosedPlan | RunOutcome)[] {
+  if (closed.length === 0) return [];
+  const targets = closedTargets(ledger, stopGeneration);
+  const plans: (ClosedPlan | RunOutcome)[] = [];
+  for (const run of closed) {
+    const target = targets?.get(run.runId);
+    if (targets === null || target === "malformed") plans.push({ runId: run.runId, outcome: "read_unknown", read: "instruction_times" });
+    else if (target === undefined) continue;
+    else if (target.executorId !== run.executorId || target.runGeneration !== run.runGeneration) plans.push({ runId: run.runId, outcome: "read_unknown", read: "runs" });
+    else if (target.current) plans.push({ runId: run.runId, outcome: "finalize_withheld", reason: "already_recorded" });
+    else plans.push({ closed: target });
+  }
+  return plans;
+}
+
+const sameBody = (a: FinalizeBody | null, b: FinalizeBody | null): boolean =>
+  a === null || b === null ? a === b : a.outcome === b.outcome && a.resultDigest === b.resultDigest && a.storedAt === b.storedAt;
+
+// 닫힌 실행의 버림 확정. 확정(finalizeOne)과 같은 차례다: 요청 ID → 다시 읽기 → 접수 → 마지막 시계 읽기 → 판단 → 장부 호출.
+// 본문은 앞서 적힌 확정의 본문 그대로, 없으면 outcome failed·결과 없음·stored_at = 닫은 시각이다. 장부는 닫힌 실행에 failed만 받는다.
+async function closedFinalizeOne(ctx: Context, planned: ClosedTarget, trace: Trace): Promise<RunOutcome> {
+  const runId = planned.runId;
+  const requestId = freshUuid(ctx.ports.random);
+  if (requestId === null) return { runId, outcome: "finalize_failed", failure: "random_unavailable" };
+  // 다시 읽기: 박자 처음의 읽기 뒤에 다른 경로가 확정을 적었거나 정리 영수증이 왔을 수 있다.
+  const targets = closedTargets(ctx.ports.ledger, ctx.stopGeneration);
+  const fresh = targets?.get(runId);
+  if (targets === null || fresh === "malformed") return { runId, outcome: "read_unknown", read: "instruction_times" };
+  if (!intakeOpen(ctx.ports.intake)) return { runId, outcome: "finalize_withheld", reason: "intake_closed" };
+  const recordAt = readClock(ctx.ports, ctx.now);
+  if (recordAt === null) return { runId, outcome: "finalize_failed", failure: "clock_unavailable" };
+  // 여기부터 장부 호출까지 박자 유효 문 밖의 포트를 부르지 않고 await도 없다. 지정 실행기는 작업자 실행기의 주체여야 한다(writable과 같은 까닭).
+  if (
+    fresh === undefined ||
+    fresh.current ||
+    fresh.executorId !== planned.executorId ||
+    fresh.runGeneration !== planned.runGeneration ||
+    fresh.closedAt !== planned.closedAt ||
+    !sameBody(fresh.earlier, planned.earlier) ||
+    parsePrincipal(fresh.executorId)?.kind !== "worker_executor"
+  ) {
+    return { runId, outcome: "superseded", planned: "finalize" };
+  }
+  const body: FinalizeBody = fresh.earlier ?? { outcome: "failed", resultDigest: null, storedAt: fresh.closedAt };
+  return recordFinalize(ctx, trace, { runId, requestId, recordAt, executorId: fresh.executorId, runGeneration: fresh.runGeneration, body });
 }
 
 // 같은 실행 ID의 상태 조회. 장부에 적지 않는다(지시 줄이 생기지 않는다). 요청 ID는 초안이 새로 만든다.

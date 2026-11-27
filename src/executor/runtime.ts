@@ -564,8 +564,12 @@ export async function startExecutor(settings: ExecutorSettings, deps: ExecutorDe
   // 모두 같은 세대의 유효한 receipt_stopped를 전제한다(store.ts REQUIRED_EVENTS). receipt_cleaned만 있으면 finalized가 거절돼 보류가 서고
   // recover가 남은 수를 센다: 그때 잠기지 않은 원격이면 방금 붙은 대리에 정리 요청을 보낸다. 그래서 receipt_cleaned 하나로는 풀지 않는다.
   const settledByEvent = (runId: string) => !store.suspectRun(runId) && store.validEvents(runId).some((entry) => entry.action === "receipt_stopped");
+  // 다른 파드에서 물려받은 기록(D-159의 C-1)은 그 파드가 끝났다는 교체 절차의 전제로 따로 확인된 것으로 친다. 잠그지 않아야 recover가 지금
+  // 대리의 계수로 그 기록을 맺는다. 장부가 설명하지 못하는 기록은 그대로 잠근다.
+  // 함정: 회복 대조(아래 stillOpen)는 이 예외를 쓰지 않는다. 회복 요청 뒤에 파드가 바뀌었으면 새 파드의 새 표식으로 요청의 실행을 그대로 닫는다.
+  const replacedRun = (run: RunRecord) => !store.suspectRun(run.run_id) && worker.fromReplacedPod(run);
   const unverifiedRun = (run: RunRecord) => UNFINISHED.includes(run.state) && !settledByEvent(run.run_id);
-  const unverified = () => store.ledgerHeld() || store.runs().some(unverifiedRun);
+  const unverified = () => store.ledgerHeld() || store.runs().some((run) => unverifiedRun(run) && !replacedRun(run));
   const stillOpen = (runId: string) => {
     const run = store.run(runId);
     return run !== undefined && unverifiedRun(run);
