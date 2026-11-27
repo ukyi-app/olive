@@ -264,3 +264,47 @@ test("F4 대조: 취소가 없어 실패로 확정할 수 있는 failed_stopped�
   const { send } = sendOf(ledger);
   expect(holdsRun(send, c.runId).next).toBe("wait_cleanup");
 });
+
+const MISMATCHED = "olive admin: 자리 풀기 모름: 장부에 적혔는지 모른다(write_unknown:mismatched)\n";
+
+for (const variant of ["slot_free", "test_job_refusal"] as const) {
+  test(`G2·G3: 결과 포기가 적힌 뒤 명령별 계약 밖의 답(${variant})은 빈 stdout·1·write_unknown:mismatched다`, async () => {
+    const ledger = open(tempPath());
+    const c = checking(ledger);
+    const { handlers } = sendOf(ledger);
+    const call = abandonCall(c);
+    // slot_free: 포기한 실행은 failed_stopped로 자리를 쥐므로 slotFree:true는 장부와 어긋난다. test_job_refusal: 자리 풀기의 장부 거절은 refusal이 필수다.
+    const reply = variant === "slot_free"
+      ? encodeReply({ kind: "release", release: { runId: c.runId, outcome: "abandoned", released: false, slotFree: true } })
+      : encodeReply({ kind: "refused", reason: "ledger_refused" });
+    const result = exitFor(await ask(call, deliver(handlers, { reply })), call);
+    expect(val(ledger.resultAbandon(c.runId))?.reason).toBe("no_answer");
+    expect(val(ledger.peekHolds(1)).workerSlotFree).toBe(false);
+    expect(result).toEqual({ code: 1, stdout: "", stderr: MISMATCHED });
+  });
+}
+
+test("G2·G3 대조: 포기의 slotFree false·null, 닫기·점유 풀기의 slotFree 세 값, 이름 있는 장부 거절, test-job의 두 칸 거절은 그대로다", () => {
+  const runId = id();
+  const abandon = requestOf(["abandon-result", runId, "no_answer", id()])!;
+  const close = requestOf(["close-store-reset", runId, "ready_result", POD, "1"])!;
+  const unconfirmed = requestOf(["close-unconfirmed", runId, "unknown_running", POD, "1"])!;
+  const hold = requestOf(["release-hold", "executor-1", runId, "1", "2", POD, "1"])!;
+  const answer = (outcome: string, released: boolean, slotFree: boolean | null): AskOutcome => ({ kind: "reply", reply: { kind: "release", release: { outcome, runId, released, slotFree } as never } });
+  for (const slotFree of [false, null]) {
+    expect(exitFor(answer("abandoned", false, slotFree), abandon), String(slotFree)).toEqual({ code: 0, stdout: `${JSON.stringify({ schema: "olive-release/v1", outcome: "abandoned", runId, released: false, slotFree })}\n`, stderr: "" });
+  }
+  expect(exitFor(answer("abandoned", false, true), abandon)).toEqual({ code: 1, stdout: "", stderr: MISMATCHED });
+  for (const slotFree of [true, false, null]) {
+    expect(exitFor(answer("closed", true, slotFree), close).code, `close ${slotFree}`).toBe(0);
+    expect(exitFor(answer("closed", true, slotFree), unconfirmed).code, `unconfirmed ${slotFree}`).toBe(0);
+    expect(exitFor(answer("hold_released", true, slotFree), hold).code, `hold ${slotFree}`).toBe(0);
+  }
+  const bare: AskOutcome = { kind: "reply", reply: { kind: "refused", reason: "ledger_refused" } as never };
+  for (const call of [abandon, close, unconfirmed, hold]) expect(exitFor(bare, call), call.command).toEqual({ code: 1, stdout: "", stderr: MISMATCHED });
+  const named: AskOutcome = { kind: "reply", reply: { kind: "refused", reason: "ledger_refused", refusal: "report_pending" } };
+  expect(exitFor(named, abandon)).toEqual({ code: 1, stdout: "", stderr: "olive admin: 감독이 요청을 거절했다(ledger_refused:report_pending)\n" });
+  expect(exitFor(bare, "test-job")).toEqual({ code: 1, stdout: "", stderr: "olive admin: 감독이 요청을 거절했다(ledger_refused)\n" });
+  // 자리 풀기의 다른 명시 거절(장부 이름이 없는 사유)은 그대로 거절이다.
+  expect(exitFor({ kind: "reply", reply: { kind: "refused", reason: "state_changed" } }, close).stderr).toBe("olive admin: 감독이 요청을 거절했다(state_changed)\n");
+});

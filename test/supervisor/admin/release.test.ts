@@ -7,7 +7,7 @@ import { type Envelope, sealEnvelope } from "../../../src/contract/v1/index.ts";
 import { type Ledger, LEDGER_RUN_STATES, openLedger, REFUSALS } from "../../../src/ledger/index.ts";
 import { REF } from "../../../src/ledger/input.ts";
 import { RESTORE_KEY } from "../../../src/ledger/ledger.ts";
-import { type LifeLoopPorts, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
+import { failedOutcome, type LifeLoopPorts, lifeTick, type RunOutcome } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { exitFor, requestOf, USAGE } from "../../../src/supervisor/admin/client.ts";
 import { answerLine, createAdminHandlers } from "../../../src/supervisor/admin/commands.ts";
 import {
@@ -431,10 +431,11 @@ describe("문과 켜는 조건", () => {
 describe("holds", () => {
   test("다음 행동은 장부의 앞 상태로 정한다", () => {
     type Facts = { requestedCancel: boolean | null; exit: "completed" | "failed" | "deadline" | "cancelled" | null };
-    const row = (state: string, over: Partial<{ kind: string; stopReceiptId: string | null; failedStoppedAt: number | null; failedFacts: Facts | null }> = {}) => ({
+    const row = (state: string, over: Partial<{ kind: string; stopReceiptId: string | null; finalizeCurrent: boolean; failedStoppedAt: number | null; failedFacts: Facts | null }> = {}) => ({
       kind: "worker",
       state,
       stopReceiptId: null,
+      finalizeCurrent: false,
       failedStoppedAt: null,
       failedFacts: null,
       ...over,
@@ -452,6 +453,10 @@ describe("holds", () => {
     expect(nextFor(row("failed_stopped", { stopReceiptId: id(), failedStoppedAt: NOW }))).toBe("close_store_reset");
     // 판 8 전에 실패한 줄(실패 시각 없음)은 장부 초기화로 넘긴다(D-162).
     expect(nextFor(row("failed_stopped", { stopReceiptId: id() }))).toBe("none");
+    // 지금 정지 세대의 확정이 이미 적혔으면 outcome·실패 시각보다 먼저 본다(수명 박자의 already_recorded): 그 정리 영수증을 기다린다.
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), finalizeCurrent: true, failedStoppedAt: NOW, failedFacts: { requestedCancel: null, exit: "completed" } }))).toBe("wait_cleanup");
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), finalizeCurrent: true, failedStoppedAt: NOW }))).toBe("wait_cleanup");
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), finalizeCurrent: true }))).toBe("wait_cleanup");
     expect(nextFor(row("preparing"))).toBe("none");
     expect(nextFor(row("running"))).toBe("none");
     expect(nextFor(row("unknown_running", { kind: "session" }))).toBe("none");
@@ -538,10 +543,10 @@ describe("holds", () => {
 });
 
 // 수명 박자의 포트(test/ledger/operator-release.test.ts와 같은 꼴). 장부는 실제 장부이고 서명·내보내기는 이 시험의 키와 목록이다.
-function lifePorts(ledger: Ledger, at: number, sent: Envelope[]): LifeLoopPorts {
+function lifePorts(ledger: Ledger, at: number, sent: Envelope[], generation = 0): LifeLoopPorts {
   return {
     ledger,
-    intake: { intakeOpen: () => ledger.intakeOpen(), stopGeneration: () => 0 },
+    intake: { intakeOpen: () => ledger.intakeOpen(), stopGeneration: () => generation },
     links: { mayIssue: () => ({ ok: true }) as never },
     clock: { now: () => at },
     random: { bytes: (length: number) => getRandomValues(new Uint8Array(length)) },
@@ -555,8 +560,8 @@ function lifePorts(ledger: Ledger, at: number, sent: Envelope[]): LifeLoopPorts 
   } as never;
 }
 
-async function lifeOutcome(ledger: Ledger, runId: string, at: number, sent: Envelope[]): Promise<RunOutcome> {
-  const result = await lifeTick(lifePorts(ledger, at, sent), { renewEveryMs: 10_000, answerTimeoutMs: 20_000 }, { lastQueries: [], unsentRenews: [] });
+async function lifeOutcome(ledger: Ledger, runId: string, at: number, sent: Envelope[], generation = 0): Promise<RunOutcome> {
+  const result = await lifeTick(lifePorts(ledger, at, sent, generation), { renewEveryMs: 10_000, answerTimeoutMs: 20_000 }, { lastQueries: [], unsentRenews: [] });
   if (result.kind !== "ran") throw new Error(`박자가 돌지 않음: ${JSON.stringify(result)}`);
   const outcome = result.runs.find((r) => r.runId === runId);
   if (outcome === undefined) throw new Error(`결과 없음: ${JSON.stringify(result)}`);
@@ -605,5 +610,40 @@ describe("실제 감독 조립의 자리 풀기 포트", () => {
     expect(JSON.stringify(lines)).not.toContain(POD);
     await running.stop();
     expect(running.release.gate(Number.MAX_SAFE_INTEGER)).toBe("closed");
+  });
+});
+
+describe("G1: 이미 보낸 확정과 holds의 다음 행동", () => {
+  test("지금 정지 세대의 확정이 먼저 송신된 실행은 뒤에 사유 없는 취소가 적혀도 wait_cleanup이고, 그 확정의 정리 영수증으로 끝난다", async () => {
+    const ledger = open(tempPath());
+    const c = checkingRun(ledger);
+    must(ledger.markResult({ runId: c.runId, resultDigest: null, now: NOW + 100 }));
+    const first = await lifeOutcome(ledger, c.runId, NOW + 1000, []);
+    if (first.outcome !== "finalize_sent") throw Error(JSON.stringify(first));
+    must(ledger.recordStopInstruction({ runId: c.runId, requestId: id(), action: "task_cancel", stopGeneration: 0, now: NOW + 1001 }));
+    // 지금 사실로는 확정 outcome을 정할 수 없다(사유 없는 취소 + completed): 새 확정이라면 outcome_unknown이다.
+    const facts = ledger.failedStop(c.runId);
+    if (!facts.known || facts.value === null) throw Error(JSON.stringify(facts));
+    expect(failedOutcome(facts.value)).toBeNull();
+    const snapshot = holdsOf(sourcesOf(ledger), portsOf(ledger).ports).runs[0]!;
+    expect([snapshot.state, snapshot.next, snapshot.finalizeSent]).toEqual(["failed_stopped", "wait_cleanup", true]);
+    // 수명 박자도 already_recorded를 먼저 보고, 처음 보낸 확정의 정리 영수증 한 장으로 finalized가 된다.
+    expect(await lifeOutcome(ledger, c.runId, NOW + 25000, [])).toMatchObject({ outcome: "finalize_withheld", reason: "already_recorded" });
+    must(ledger.applyReceipt({ action: "receipt_cleaned", receiptId: id(), runId: c.runId, instructionRequestId: first.requestId, bodyDigest: digest("cleaned"), now: NOW + 25001 }, c.from));
+    expect(state(ledger, c.runId)).toBe("finalized");
+  });
+
+  test("대조: 옛 정지 세대의 확정만 있으면(finalizeSent는 true) 지금 사실로 outcome을 정할 수 없을 때 close_store_reset이다", async () => {
+    const ledger = open(tempPath());
+    const c = checkingRun(ledger);
+    must(ledger.markResult({ runId: c.runId, resultDigest: null, now: NOW + 100 }));
+    const first = await lifeOutcome(ledger, c.runId, NOW + 1000, []);
+    if (first.outcome !== "finalize_sent") throw Error(JSON.stringify(first));
+    must(ledger.applyStop({ generation: 1, stopped: false, now: NOW + 1001 }));
+    must(ledger.recordStopInstruction({ runId: c.runId, requestId: id(), action: "task_cancel", stopGeneration: 1, now: NOW + 1002 }));
+    const snapshot = holdsOf(sourcesOf(ledger), portsOf(ledger).ports).runs[0]!;
+    expect([snapshot.state, snapshot.next, snapshot.finalizeSent]).toEqual(["failed_stopped", "close_store_reset", true]);
+    // 수명 박자도 세대 1에서는 옛 확정을 already_recorded로 보지 않고, 새 확정의 outcome을 정하지 못한다.
+    expect(await lifeOutcome(ledger, c.runId, NOW + 25000, [], 1)).toMatchObject({ outcome: "finalize_withheld", reason: "outcome_unknown" });
   });
 });

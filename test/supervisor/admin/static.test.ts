@@ -39,9 +39,36 @@ const IMPORTS: Record<string, readonly string[]> = {
   // 시험 작업: 장부는 쓰기 입력의 꼴(input.ts)과 타입만, 참조·호출 ID는 envelopes.ts의 newUuid로.
   "test-job.ts": ["../../contract/v1/index.ts", "../../ledger/index.ts", "../../ledger/input.ts", "../dispatch/envelopes.ts", "../dispatch/ports.ts", "./protocol.ts", "./status.ts"],
   // 자리 풀기: 장부는 공개 면의 타입·입력 오류·포기 사유 목록과 입력의 꼴(input.ts)만. holds의 다음 행동은 수명 박자와 같은 확정
-  // outcome 식(life-loop.ts의 failedOutcome)을 쓴다.
+  // outcome 식(life-loop.ts의 failedOutcome)을 쓴다. 그 모듈에서 가져오는 런타임 바인딩은 RUNTIME_BINDINGS가 그 하나로 좁힌다.
   "release.ts": ["../../ledger/index.ts", "../../ledger/input.ts", "../dispatch/life-loop.ts", "./protocol.ts", "./status.ts"],
 };
+// import 경로마다 가져올 수 있는 런타임 바인딩(타입만 가져오는 것은 세지 않는다). 경로 표는 모듈만 보므로, 순수 판정 하나만 쓰는 모듈의
+// 박자 실행 함수(lifeTick 등)는 여기서 막는다. 이름공간·기본 import는 무엇이든 꺼낼 수 있어 거절한다.
+const RUNTIME_BINDINGS: Record<string, Record<string, readonly string[]>> = {
+  "release.ts": { "../dispatch/life-loop.ts": ["failedOutcome"] },
+};
+function bindingProblems(name: string, source: string): string[] {
+  const problems: string[] = [];
+  for (const [path, allowed] of Object.entries(RUNTIME_BINDINGS[name] ?? {})) {
+    const quoted = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    for (const match of source.matchAll(new RegExp(`\\b(?:import|export)\\s+(type\\s+)?([^;]*?)\\s*from\\s*["']${quoted}["']`, "g"))) {
+      if (match[1] !== undefined) continue;
+      const clause = match[2]!.trim();
+      const brace = clause.indexOf("{");
+      const head = (brace < 0 ? clause : clause.slice(0, brace)).replace(/,\s*$/, "").trim();
+      if (head.includes("*")) problems.push(`import * from ${path}`);
+      else if (head !== "") problems.push(`import default from ${path}`);
+      if (brace < 0) continue;
+      for (const part of clause.slice(brace + 1, clause.lastIndexOf("}")).split(",")) {
+        const spec = part.trim();
+        if (spec === "" || spec.startsWith("type ")) continue;
+        const imported = spec.split(/\s+as\s+/)[0]!.trim();
+        if (!allowed.includes(imported)) problems.push(`import ${imported} from ${path}`);
+      }
+    }
+  }
+  return problems;
+}
 // 효과를 낼 수 있는 글: 연결에 싣기·연결 닫기·내보내기 포트·송신 문·발급·도구 처리기의 포트·nonce 소비·소켓에 붙기.
 const EFFECTS = /\bwriteFrame\b|\bcloseConnection\b|\bsink\b|\bsendInstruction\b|\bissuance\b|\bcreateToolPorts\b|tools-adapter|\.tools\s*\(|\bnonceStore\b|\bBun\.connect\b/;
 
@@ -52,6 +79,7 @@ function adminProblems(name: string, source: string): string[] {
   const allowed = IMPORTS[name];
   if (allowed === undefined) return [`표에 없는 파일 ${name}`];
   for (const { path } of transpiler.scanImports(source)) if (!allowed.includes(path)) problems.push(`import ${path}`);
+  problems.push(...bindingProblems(name, source));
   const members = LEDGER_MEMBERS[name] ?? [];
   for (const match of source.matchAll(/\bledger\s*\.\s*([\w$]+)/g)) if (!members.includes(match[1]!)) problems.push(`ledger.${match[1]}`);
   // 장부 쓰기는 허용한 파일에서도 정확히 한 자리에서 꺼낸다(멤버 접근을 센다. 타입 Pick<Ledger, "recordToolRequest">는 세지 않는다).
@@ -213,7 +241,7 @@ test("정적: 관리 통로가 닿는 부품 쪽 읽기는 상태를 바꾸지 �
   expect(LEDGER_MUTATION.exec(slotHeld!)).toBeNull();
   expect(LEDGER_MUTATION.exec(runState!)).toBeNull();
   expect(LEDGER_MUTATION.exec(failedFacts!)).toBeNull();
-  expect(calls(holds!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#faults.at", "this.#db.query", "this.#db.query", "this.#db.query", "this.#failedFacts", "this.#db.query", "this.#slotHeld"]);
+  expect(calls(holds!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#faults.at", "this.#db.query", "this.#db.query", "this.#db.query", "this.#db.query", "this.#failedFacts", "this.#db.query", "this.#slotHeld"]);
   expect(calls(runState!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#faults.at", "this.#db.query"]);
   expect(calls(failedFacts!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#db.query"]);
   for (const mutated of ["this.#fail(reason);", "this.#grant = null;"]) expect(LEDGER_MUTATION.test(`${runState}\n${mutated}`), mutated).toBe(true);
@@ -249,4 +277,17 @@ test("정적: 관리 진입점에서 닿는 코드는 관리 통로의 말과 �
     expect(/\bBun\.(serve|listen|udpSocket)\b|\bcreateServer\b|\.listen\(/.test(source), relative(root, file)).toBe(false);
     expect(/\bprocess\.env\b|\bBun\.env\b|import\.meta\.env/.test(strip(source)), relative(root, file)).toBe(false);
   }
+});
+
+test("정적: release.ts가 수명 박자 모듈에서 가져오는 런타임 바인딩은 failedOutcome 하나다(박자 실행 함수 lifeTick 등은 거절)", async () => {
+  const source = await code(`${ADMIN_DIR}release.ts`);
+  expect(adminProblems("release.ts", source)).toEqual([]);
+  const probe = `${source}\nimport { lifeTick } from "../dispatch/life-loop.ts";\nexport const tick = lifeTick;`;
+  expect(adminProblems("release.ts", probe)).toEqual(["import lifeTick from ../dispatch/life-loop.ts"]);
+  // 대조군: 별칭·재수출·이름공간·기본 import도 잡고, 타입만 가져오는 것은 런타임 바인딩이 아니라 통과한다.
+  expect(adminProblems("release.ts", `${source}\nimport { failedOutcome as f, lifeTick as t } from "../dispatch/life-loop.ts";`)).toEqual(["import lifeTick from ../dispatch/life-loop.ts"]);
+  expect(adminProblems("release.ts", `${source}\nexport { lifeTick } from "../dispatch/life-loop.ts";`)).toEqual(["import lifeTick from ../dispatch/life-loop.ts"]);
+  expect(adminProblems("release.ts", `${source}\nimport * as loop from "../dispatch/life-loop.ts";`)).toEqual(["import * from ../dispatch/life-loop.ts"]);
+  expect(adminProblems("release.ts", `${source}\nimport loop from "../dispatch/life-loop.ts";`)).toEqual(["import default from ../dispatch/life-loop.ts"]);
+  expect(adminProblems("release.ts", `${source}\nimport type { LifeLoopPorts } from "../dispatch/life-loop.ts";\nimport { type RunOutcome } from "../dispatch/life-loop.ts";`)).toEqual([]);
 });

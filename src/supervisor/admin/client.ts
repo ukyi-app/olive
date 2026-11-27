@@ -232,7 +232,10 @@ export function commandOf(argv: readonly string[]): AdminCommand | null {
 const matches = (request: AdminCommand | AdminCall, command: (typeof RELEASE_COMMANDS)[number], answer: ReleaseAnswer): boolean => {
   if (typeof request === "string" || !("fields" in request)) return false;
   const expected = RELEASE_EXPECTED[command];
-  return request.fields.runId === answer.runId && answer.outcome === expected.outcome && answer.released === expected.released;
+  if (request.fields.runId !== answer.runId || answer.outcome !== expected.outcome || answer.released !== expected.released) return false;
+  // 포기한 실행은 failed_stopped로 자리를 쥐므로 같은 처리에서 읽은 자리는 false이거나 모름(null)이다. 닫기·점유 풀기는 다른 실행이
+  // 자리를 쥘 수 있어 세 값 모두 받는다.
+  return command !== "abandon-result" || answer.slotFree !== true;
 };
 
 export function exitFor(outcome: AskOutcome, request: AdminCommand | AdminCall = "status"): EntryResult {
@@ -252,6 +255,9 @@ export function exitFor(outcome: AskOutcome, request: AdminCommand | AdminCall =
     if (isReleaseCommand(command)) return reply.kind === "release" && matches(request, command, reply.release) ? ok(releaseLine(reply.release)) : unwritten("mismatched");
     return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(malformed)`);
   }
+  // 자리 풀기의 장부 거절은 거절 이름(refusal)이 필수다. 이름이 빠진 ledger_refused는 test-job과의 호환 꼴일 뿐이라, 자리 풀기 쓰기 뒤에
+  // 받으면 적혔는지 모른다. 그 밖의 거절(장부 이름이 없는 사유)과 test-job의 두 칸 거절은 그대로다.
+  if (reply.kind === "refused" && reply.reason === "ledger_refused" && reply.refusal === undefined && isReleaseCommand(command)) return unwritten("mismatched");
   if (reply.kind === "refused") return fail(ADMIN_EXIT.failed, `감독이 요청을 거절했다(${reply.refusal === undefined ? reply.reason : `${reply.reason}:${reply.refusal}`})`);
   if (reply.reason === "restore_not_done") return fail(ADMIN_EXIT.waiting, `${subject} 모름: 감독이 복원을 마치지 않았다(restore_not_done)`);
   // 시험 작업·자리 풀기의 write_unknown만 장부에 적혔을 수 있다(다시 부르는 법은 README "감독 관리 통로").

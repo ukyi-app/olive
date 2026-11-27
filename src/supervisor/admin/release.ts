@@ -231,6 +231,7 @@ export function nextFor(run: {
   readonly kind: string;
   readonly state: string;
   readonly stopReceiptId: string | null;
+  readonly finalizeCurrent: boolean;
   readonly failedStoppedAt: number | null;
   readonly failedFacts: Parameters<typeof failedOutcome>[0] | null;
 }): HoldAction {
@@ -240,6 +241,9 @@ export function nextFor(run: {
   if (run.state === "ready_result" || run.state === "cleanup_pending") return "wait_cleanup";
   // 실패 시각이 없는 failed_stopped(판 8 전에 실패한 줄)는 확정도 저장소 비움 닫기도 못 한다(D-162: 장부 초기화).
   if (run.state === "failed_stopped") {
+    // 지금 정지 세대의 확정이 이미 적혔으면 실행기가 그 정리 영수증을 낼 수 있다. 수명 박자도 already_recorded를 outcome·실패 시각보다
+    // 먼저 본다(life-loop.ts의 act). 세대를 합친 finalizeSent로 보면 옛 세대 확정만 있는 실행까지 기다리게 한다.
+    if (run.finalizeCurrent) return "wait_cleanup";
     if (run.failedStoppedAt === null) return "none";
     // 수명 박자가 확정을 보류하는 것과 같은 식(life-loop.ts의 failedOutcome): outcome을 정할 수 없으면 기다려도 풀리지 않는다.
     return run.failedFacts !== null && failedOutcome(run.failedFacts) !== null ? "wait_cleanup" : "close_store_reset";

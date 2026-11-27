@@ -92,8 +92,11 @@ export interface HoldRunPeek {
   readonly accepted: boolean;
   // 종료 확인 영수증 ID. 결과 포기(abandonResult)는 이 값을 그대로 넘겨야 버린다.
   readonly stopReceiptId: string | null;
-  // 그 실행의 확정 지시(result_finalize)가 적혔는가.
+  // 그 실행의 확정 지시(result_finalize)가 적혔는가. 정지 세대를 가리지 않는다.
   readonly finalizeSent: boolean;
+  // 지금 정지 세대(stop_state의 세대)의 확정 지시가 적혔는가. 수명 박자는 이것이면 새 확정보다 먼저 already_recorded로 멈추고, 실행기는 그
+  // 지시의 정리 영수증을 낼 수 있다. 옛 세대의 확정만 있으면 false다(새 세대를 적용한 실행기는 옛 확정으로 정리 영수증을 내지 않는다).
+  readonly finalizeCurrent: boolean;
   // failed_stopped가 된 장부 시각(판 8의 칸). 비면 null이고, 그 failed_stopped는 확정도 저장소 비움 닫기도 못 한다(D-162).
   readonly failedStoppedAt: number | null;
   // failed_stopped 작업자 줄의 확정 outcome 재료(failedStop과 같은 읽기). 그 밖의 줄은 null이다. 관리 통로가 수명 박자와 같은 식으로
@@ -2011,6 +2014,7 @@ export class Ledger {
         const issued = this.#db.query("SELECT MAX(issued_at) AS at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'run_renew')").get(row.run_id) as { at: number | null };
         const closable = starts.task !== 0 && starts.session === 0 && issued.at !== null;
         const finalized = this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'result_finalize' LIMIT 1").get(row.run_id) !== null;
+        const current = this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'result_finalize' AND stop_generation = (SELECT generation FROM stop_state WHERE id = 1) LIMIT 1").get(row.run_id) !== null;
         const failedAt = row.failed_stopped_at === undefined || row.failed_stopped_at === null ? null : safe(row.failed_stopped_at, "runs.failed_stopped_at");
         const failed = this.#failedFacts(row);
         return {
@@ -2022,6 +2026,7 @@ export class Ledger {
           accepted: row.accepted_receipt_id !== null,
           stopReceiptId: row.stop_receipt_id,
           finalizeSent: finalized,
+          finalizeCurrent: current,
           failedStoppedAt: failedAt,
           failedFacts: failed === null ? null : { requestedCancel: failed.requestedCancel, exit: failed.exit },
           closableAt: closable ? safe(issued.at, "instructions.issued_at") + OPERATOR_CLOSE_AFTER_MS : null,
