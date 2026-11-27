@@ -16,10 +16,10 @@ const code = async (file: string) => strip(await readText(file));
 const ADMIN_DIR = "src/supervisor/admin/";
 // 관리 통로 폴더가 꺼낼 수 있는 장부 멤버(부르든 꺼내든). 상태 읽기는 조립이 넘긴 view(복원기의 statusView → Ledger.peekStatus)라 없다.
 // test-job.ts는 조립이 담아 넘긴 셋을 꺼낸다: 쓰기 recordToolRequest, 소유자 입력과 대기 부탁이 배정될 수 있는지 볼 읽기 둘.
-// release.ts는 조립이 담아 넘긴 넷을 꺼낸다: 자리 풀기의 쓰기 셋과 고장을 표시하지 않는 읽기 peekHolds.
+// release.ts는 조립이 담아 넘긴 다섯을 꺼낸다: 자리 풀기의 쓰기 셋과 고장을 표시하지 않는 읽기 둘(peekHolds, 두 닫기의 앞 상태 peekRunState).
 const LEDGER_MEMBERS: Record<string, readonly string[]> = {
   "test-job.ts": ["recordToolRequest", "listInputs", "listWaitingToolRequests"],
-  "release.ts": ["closeRunByOperator", "abandonResult", "releaseSlotHold", "peekHolds"],
+  "release.ts": ["closeRunByOperator", "abandonResult", "releaseSlotHold", "peekHolds", "peekRunState"],
 };
 // 장부 쓰기. 허용한 파일에서도 쓰기마다 정확히 한 자리에서 꺼낸다.
 const LEDGER_WRITES = ["recordToolRequest", "closeRunByOperator", "abandonResult", "releaseSlotHold"] as const;
@@ -27,7 +27,7 @@ const LEDGER_WRITES = ["recordToolRequest", "closeRunByOperator", "abandonResult
 // 보지 못한다. test-job.ts는 포트 타입, 쓰기를 꺼내려는 별칭 하나, 쓰기를 부를 때의 this 하나만 둔다.
 const LEDGER_VALUES: Record<string, readonly string[]> = {
   "test-job.ts": ['readonly ledger: Pick<Ledger, "recordToolRequest" | "listInputs" | "listWaitingToolRequests">;', "const ledger = ports.ledger;", "record.call(ledger, input)"],
-  "release.ts": ['readonly ledger: Pick<Ledger, "closeRunByOperator" | "abandonResult" | "releaseSlotHold" | "peekHolds">;', "const ledger = ports.ledger;", ".call(ledger, input)"],
+  "release.ts": ['readonly ledger: Pick<Ledger, "closeRunByOperator" | "abandonResult" | "releaseSlotHold" | "peekHolds" | "peekRunState">;', "const ledger = ports.ledger;", ".call(ledger, input)"],
 };
 // 폴더 안에서 import할 수 있는 것. 장부는 상태 읽기(status.ts)만, 그것도 공개 면(index.ts)으로만 본다.
 const IMPORTS: Record<string, readonly string[]> = {
@@ -38,8 +38,9 @@ const IMPORTS: Record<string, readonly string[]> = {
   "client.ts": ["./protocol.ts"],
   // 시험 작업: 장부는 쓰기 입력의 꼴(input.ts)과 타입만, 참조·호출 ID는 envelopes.ts의 newUuid로.
   "test-job.ts": ["../../contract/v1/index.ts", "../../ledger/index.ts", "../../ledger/input.ts", "../dispatch/envelopes.ts", "../dispatch/ports.ts", "./protocol.ts", "./status.ts"],
-  // 자리 풀기: 장부는 공개 면의 타입·입력 오류·포기 사유 목록과 입력의 꼴(input.ts)만.
-  "release.ts": ["../../ledger/index.ts", "../../ledger/input.ts", "./protocol.ts", "./status.ts"],
+  // 자리 풀기: 장부는 공개 면의 타입·입력 오류·포기 사유 목록과 입력의 꼴(input.ts)만. holds의 다음 행동은 수명 박자와 같은 확정
+  // outcome 식(life-loop.ts의 failedOutcome)을 쓴다.
+  "release.ts": ["../../ledger/index.ts", "../../ledger/input.ts", "../dispatch/life-loop.ts", "./protocol.ts", "./status.ts"],
 };
 // 효과를 낼 수 있는 글: 연결에 싣기·연결 닫기·내보내기 포트·송신 문·발급·도구 처리기의 포트·nonce 소비·소켓에 붙기.
 const EFFECTS = /\bwriteFrame\b|\bcloseConnection\b|\bsink\b|\bsendInstruction\b|\bissuance\b|\bcreateToolPorts\b|tools-adapter|\.tools\s*\(|\bnonceStore\b|\bBun\.connect\b/;
@@ -156,7 +157,7 @@ test("정적: 조립이 시험 작업 넣기에 넘기는 묶음은 설정이 �
 // 조립이 자리 풀기에 넘기는 묶음(boot.ts의 const release). 설정 없이 늘 만들고, 부르는 것은 장부 쓰기 셋·고장을 표시하지 않는 읽기 peekHolds와
 // 박자 기한의 판정·단조 시계·기록 한 줄뿐이다. 문은 조립의 변수만 읽는다(끝낼 사유를 붙잡는 look()·haltReason()·박자 유효 문·장부 읽기를 부르지 않는다).
 const RELEASE_HEAD = "  const release: ReleasePorts = Object.freeze({\n";
-const RELEASE_BLOCK_CALLS = ["Object.freeze", "ledger.closeRunByOperator", "ledger.abandonResult", "ledger.releaseSlotHold", "ledger.peekHolds", "if", "if", "if", "pastLimit", "pastLimit", "log"];
+const RELEASE_BLOCK_CALLS = ["Object.freeze", "ledger.closeRunByOperator", "ledger.abandonResult", "ledger.releaseSlotHold", "ledger.peekHolds", "ledger.peekRunState", "if", "if", "if", "pastLimit", "pastLimit", "log"];
 function releaseBlockCalls(boot: string): string[] | null {
   const start = boot.indexOf(RELEASE_HEAD);
   if (start < 0 || boot.indexOf(RELEASE_HEAD, start + 1) >= 0) return null;
@@ -187,6 +188,8 @@ function body(source: string, head: string): string | null {
 const LEDGER_PEEK = "\n  peekStatus(cap: number, attempt: RestoreAttempt | null): Read<StatusPeek> {";
 const LEDGER_PEEK_HOLDS = "\n  peekHolds(cap: number): Read<HoldsPeek> {";
 const LEDGER_SLOT_HELD = "\n  #slotHeld(kind: RunKind): boolean {";
+const LEDGER_PEEK_RUN = "\n  peekRunState(runId: string): Read<LedgerRunState | null> {";
+const LEDGER_FAILED_FACTS = "\n  #failedFacts(row: RunRow): FailedStop | null {";
 const RESTORER_VIEW = "\n  statusView(cap: number): Read<StatusPeek> {";
 const CLOCK_PEEK = "\n    peek(): ClockReading {";
 // 장부의 고장 표시·허가·시도·쓰기를 바꾸는 글.
@@ -201,11 +204,19 @@ test("정적: 관리 통로가 닿는 부품 쪽 읽기는 상태를 바꾸지 �
   // 자리 풀기의 holds 읽기(peekHolds)와 그것이 부르는 자리 판정(#slotHeld)도 같은 규칙이다.
   const holds = body(ledgerSource, LEDGER_PEEK_HOLDS);
   const slotHeld = body(ledgerSource, LEDGER_SLOT_HELD);
-  expect([ledger, restorer, clock, holds, slotHeld].map((found) => found !== null)).toEqual([true, true, true, true, true]);
+  // 두 닫기의 앞 상태 읽기(peekRunState)와 holds가 부르는 확정 재료 읽기(#failedFacts, failedStop과 같은 식)도 같은 규칙이다.
+  const runState = body(ledgerSource, LEDGER_PEEK_RUN);
+  const failedFacts = body(ledgerSource, LEDGER_FAILED_FACTS);
+  expect([ledger, restorer, clock, holds, slotHeld, runState, failedFacts].map((found) => found !== null)).toEqual([true, true, true, true, true, true, true]);
   expect(LEDGER_MUTATION.exec(ledger!)).toBeNull();
   expect(LEDGER_MUTATION.exec(holds!)).toBeNull();
   expect(LEDGER_MUTATION.exec(slotHeld!)).toBeNull();
-  expect(calls(holds!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#faults.at", "this.#db.query", "this.#db.query", "this.#db.query", "this.#db.query", "this.#slotHeld"]);
+  expect(LEDGER_MUTATION.exec(runState!)).toBeNull();
+  expect(LEDGER_MUTATION.exec(failedFacts!)).toBeNull();
+  expect(calls(holds!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#faults.at", "this.#db.query", "this.#db.query", "this.#db.query", "this.#failedFacts", "this.#db.query", "this.#slotHeld"]);
+  expect(calls(runState!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#faults.at", "this.#db.query"]);
+  expect(calls(failedFacts!).filter((name) => name.startsWith("this.#"))).toEqual(["this.#db.query"]);
+  for (const mutated of ["this.#fail(reason);", "this.#grant = null;"]) expect(LEDGER_MUTATION.test(`${runState}\n${mutated}`), mutated).toBe(true);
   for (const mutated of ["this.#fail(reason);", "this.#grant = null;"]) expect(LEDGER_MUTATION.test(`${holds}\n${mutated}`), mutated).toBe(true);
   expect(calls(restorer!)).toEqual(["this.ledger.peekStatus"]);
   expect(/\bfloor\s*=(?!=)|\bjudge\(/.test(clock!)).toBe(false);

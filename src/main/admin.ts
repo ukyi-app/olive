@@ -25,7 +25,7 @@ const deps: ClientDeps = {
 
 async function main(): Promise<never> {
   const call = requestOf(process.argv.slice(2));
-  const result = call === null ? USAGE : exitFor(await ask(call, deps), call.command);
+  const result = call === null ? USAGE : exitFor(await ask(call, deps), call);
   // 출력을 다 쓴 뒤에 끝낸다(파이프에 쓰는 도중 exit로 잘리지 않게).
   if (result.stdout !== "") await Bun.write(Bun.stdout, result.stdout);
   if (result.stderr !== "") await Bun.write(Bun.stderr, result.stderr);

@@ -96,6 +96,9 @@ export interface HoldRunPeek {
   readonly finalizeSent: boolean;
   // failed_stopped가 된 장부 시각(판 8의 칸). 비면 null이고, 그 failed_stopped는 확정도 저장소 비움 닫기도 못 한다(D-162).
   readonly failedStoppedAt: number | null;
+  // failed_stopped 작업자 줄의 확정 outcome 재료(failedStop과 같은 읽기). 그 밖의 줄은 null이다. 관리 통로가 수명 박자와 같은 식으로
+  // 확정할 수 있는지 본다(finalize_withheld/outcome_unknown이면 기다려도 자리가 풀리지 않는다).
+  readonly failedFacts: Pick<FailedStop, "requestedCancel" | "exit"> | null;
   // 관리자 닫기가 닫을 수 있게 되는 시각(task_start·run_renew 발행 최댓값 + 31000, closeRunByOperator와 같은 식). task_start가 없거나
   // session_start가 있으면 null이다: 그 이력은 기다려도 닫히지 않는다(start_may_launch).
   readonly closableAt: number | null;
@@ -2009,6 +2012,7 @@ export class Ledger {
         const closable = starts.task !== 0 && starts.session === 0 && issued.at !== null;
         const finalized = this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'result_finalize' LIMIT 1").get(row.run_id) !== null;
         const failedAt = row.failed_stopped_at === undefined || row.failed_stopped_at === null ? null : safe(row.failed_stopped_at, "runs.failed_stopped_at");
+        const failed = this.#failedFacts(row);
         return {
           runId: row.run_id,
           kind: row.kind,
@@ -2019,6 +2023,7 @@ export class Ledger {
           stopReceiptId: row.stop_receipt_id,
           finalizeSent: finalized,
           failedStoppedAt: failedAt,
+          failedFacts: failed === null ? null : { requestedCancel: failed.requestedCancel, exit: failed.exit },
           closableAt: closable ? safe(issued.at, "instructions.issued_at") + OPERATOR_CLOSE_AFTER_MS : null,
         };
       });
@@ -2036,6 +2041,23 @@ export class Ledger {
       const workerHeld = this.#db.query(`SELECT 1 AS x FROM runs WHERE kind = 'worker' AND state NOT IN (${free}) LIMIT 1`).get(...SLOT_FREE);
       const value: HoldsPeek = { runs, slotHolds, more: runRows.length + holdRows.length > cap, workerSlotFree: workerHeld === null && !this.#slotHeld("worker") };
       return { known: true, value };
+    } catch (error) {
+      if (error instanceof LedgerInputError) throw error;
+      return { known: false, reason: classify(error) };
+    }
+  }
+
+  // 감독 관리 통로의 두 닫기가 쓰기 직전에 보는 실행 줄의 지금 상태. 없는 실행이면 null이다. peekHolds와 같이 실패해도 장부를 고장으로
+  // 표시하지 않고 허가를 버리지 않으며, 이미 고장으로 표시된 장부는 알려진 값을 내지 않는다. 함정: 이 값과 뒤의 쓰기 사이에 await가 끼면
+  // 대조가 무의미하다. 부르는 쪽(release.ts)이 같은 동기 구간에서 쓰기를 부른다.
+  peekRunState(runId: string): Read<LedgerRunState | null> {
+    const id = str(runId, UUID, "runId");
+    if (this.#closed) return { known: false, reason: "closed" };
+    if (this.#broken !== null) return { known: false, reason: this.#broken };
+    try {
+      this.#faults.at("read");
+      const row = this.#db.query("SELECT state FROM runs WHERE run_id = ?").get(id) as { state: LedgerRunState } | null;
+      return { known: true, value: row === null ? null : row.state };
     } catch (error) {
       if (error instanceof LedgerInputError) throw error;
       return { known: false, reason: classify(error) };
@@ -3823,14 +3845,19 @@ export class Ledger {
   failedStop(runId: string): Read<FailedStop | null> {
     return this.#read(() => {
       const row = this.#runRow(runId);
-      if (row === null || row.kind !== "worker" || row.state !== "failed_stopped" || row.stop_receipt_id === null) return null;
-      const reasons = (
-        this.#db.query(`SELECT ${this.#rebuildColumns ? "reason" : "NULL AS reason"} FROM instructions WHERE run_id = ? AND action = 'task_cancel'`).all(runId) as { reason: string | null }[]
-      ).map((cancel) => cancel.reason);
-      const requestedCancel = reasons.includes("requested") ? true : reasons.includes(null) ? null : false;
-      const { stoppedAt, exit } = stopFacts(row);
-      return { runId, stoppedAt, requestedCancel, exit };
+      return row === null ? null : this.#failedFacts(row);
     });
+  }
+
+  // failedStop과 peekHolds가 같은 식으로 읽는 확정 재료. failed_stopped 작업자 줄이 아니면 null이다. 장부를 바꾸지 않는다.
+  #failedFacts(row: RunRow): FailedStop | null {
+    if (row.kind !== "worker" || row.state !== "failed_stopped" || row.stop_receipt_id === null) return null;
+    const reasons = (
+      this.#db.query(`SELECT ${this.#rebuildColumns ? "reason" : "NULL AS reason"} FROM instructions WHERE run_id = ? AND action = 'task_cancel'`).all(row.run_id) as { reason: string | null }[]
+    ).map((cancel) => cancel.reason);
+    const requestedCancel = reasons.includes("requested") ? true : reasons.includes(null) ? null : false;
+    const { stoppedAt, exit } = stopFacts(row);
+    return { runId: row.run_id, stoppedAt, requestedCancel, exit };
   }
 
   // 결과 밖의 보고(세션 깨짐, 훅 사건)를 반영했다고 적는다. 결과 보고는 markResult의 reportId로 적는다.

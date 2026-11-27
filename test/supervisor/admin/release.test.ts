@@ -94,13 +94,19 @@ function portsOf(ledger: Ledger, gate: ReturnType<ReleasePorts["gate"]> = "open"
   const calls: string[] = [];
   const notes: ReleaseNote[] = [];
   const track =
-    <K extends "closeRunByOperator" | "abandonResult" | "releaseSlotHold" | "peekHolds">(key: K) =>
+    <K extends "closeRunByOperator" | "abandonResult" | "releaseSlotHold" | "peekHolds" | "peekRunState">(key: K) =>
     (...args: Parameters<Ledger[K]>) => {
       calls.push(key);
       return (ledger[key] as (...a: unknown[]) => unknown).apply(ledger, args);
     };
   const ports: ReleasePorts = {
-    ledger: { closeRunByOperator: track("closeRunByOperator"), abandonResult: track("abandonResult"), releaseSlotHold: track("releaseSlotHold"), peekHolds: track("peekHolds") } as never,
+    ledger: {
+      closeRunByOperator: track("closeRunByOperator"),
+      abandonResult: track("abandonResult"),
+      releaseSlotHold: track("releaseSlotHold"),
+      peekHolds: track("peekHolds"),
+      peekRunState: track("peekRunState"),
+    } as never,
     gate: () => gate,
     note: (fields) => notes.push(fields),
   };
@@ -114,8 +120,9 @@ function ask(sources: AdminSources, ports: ReleasePorts | null, request: Record<
   return parseReply(line.slice(0, -1));
 }
 
-const closeUnconfirmed = (runId: string, podStartedAt = NOW + 40_000) => ({ command: "close-unconfirmed", runId, podName: POD, podStartedAt: String(podStartedAt) });
-const storeReset = (runId: string, podStartedAt = NOW + 40_000) => ({ command: "close-store-reset", runId, podName: POD, podStartedAt: String(podStartedAt) });
+// fromState는 CLI가 holds로 본 앞 상태다. 두 닫기는 쓰기 직전에 지금 줄과 견준다(다르면 state_changed).
+const closeUnconfirmed = (runId: string, podStartedAt = NOW + 40_000, fromState = "unknown_running") => ({ command: "close-unconfirmed", runId, fromState, podName: POD, podStartedAt: String(podStartedAt) });
+const storeReset = (runId: string, fromState: string, podStartedAt = NOW + 40_000) => ({ command: "close-store-reset", runId, fromState, podName: POD, podStartedAt: String(podStartedAt) });
 const abandon = (runId: string, stopReceiptId: string, reason = "no_answer") => ({ command: "abandon-result", runId, reason, stopReceiptId });
 const releaseHold = (hold: { executorId: string; runId: string; runGeneration: number; observation: number }, podStartedAt = NOW + 1_000) => ({
   command: "release-hold",
@@ -137,9 +144,9 @@ describe("말의 꼴", () => {
   test("명령 표는 자리 풀기 다섯을 더하고, 칸 이름은 장부 연산의 입력 이름이며, 장부의 거절 이름·실행 상태와 같은 목록을 쓴다", () => {
     expect(ADMIN_COMMANDS).toEqual(["status", "test-job", "holds", "close-unconfirmed", "abandon-result", "close-store-reset", "release-hold"]);
     expect(RELEASE_FIELDS).toEqual({
-      "close-unconfirmed": ["runId", "podName", "podStartedAt"],
+      "close-unconfirmed": ["runId", "fromState", "podName", "podStartedAt"],
       "abandon-result": ["runId", "reason", "stopReceiptId"],
-      "close-store-reset": ["runId", "podName", "podStartedAt"],
+      "close-store-reset": ["runId", "fromState", "podName", "podStartedAt"],
       "release-hold": ["executorId", "runId", "runGeneration", "observation", "podName", "podStartedAt"],
     });
     expect([...LEDGER_REFUSALS]).toEqual([...REFUSALS]);
@@ -148,10 +155,10 @@ describe("말의 꼴", () => {
 
   test("요청: argv 차례의 값을 문자열 칸으로 싣고 감독이 같은 칸으로 읽는다. 수가 다르거나 빈 값·상한 넘는 줄은 사용법(64)이다", () => {
     const runId = id();
-    const call = requestOf(["close-unconfirmed", runId, POD, "1800000040000"]);
-    expect(call).toEqual({ command: "close-unconfirmed", fields: { runId, podName: POD, podStartedAt: "1800000040000" } });
-    expect(encodeRequest(call!)).toBe(`${JSON.stringify({ command: "close-unconfirmed", runId, podName: POD, podStartedAt: "1800000040000" })}\n`);
-    expect(parseRequest(encodeRequest(call!).slice(0, -1))).toEqual({ ok: true, command: "close-unconfirmed", args: { runId, podName: POD, podStartedAt: "1800000040000" } });
+    const call = requestOf(["close-unconfirmed", runId, "unknown_running", POD, "1800000040000"]);
+    expect(call).toEqual({ command: "close-unconfirmed", fields: { runId, fromState: "unknown_running", podName: POD, podStartedAt: "1800000040000" } });
+    expect(encodeRequest(call!)).toBe(`${JSON.stringify({ command: "close-unconfirmed", runId, fromState: "unknown_running", podName: POD, podStartedAt: "1800000040000" })}\n`);
+    expect(parseRequest(encodeRequest(call!).slice(0, -1))).toEqual({ ok: true, command: "close-unconfirmed", args: { runId, fromState: "unknown_running", podName: POD, podStartedAt: "1800000040000" } });
     for (const command of RELEASE_COMMANDS) {
       const values = RELEASE_FIELDS[command].map((field) => `v-${field}`);
       expect(requestOf([command, ...values])?.command, command).toBe(command);
@@ -162,7 +169,7 @@ describe("말의 꼴", () => {
     expect(requestOf(["holds"])).toEqual({ command: "holds" });
     expect(encodeRequest({ command: "holds" })).toBe('{"command":"holds"}\n');
     expect(requestOf(["holds", "x"])).toBeNull();
-    expect(requestOf(["close-unconfirmed", runId, "p".repeat(1_000), "1"])).toBeNull();
+    expect(requestOf(["close-unconfirmed", runId, "unknown_running", "p".repeat(1_000), "1"])).toBeNull();
     expect(USAGE.code).toBe(64);
     for (const command of ["holds", ...RELEASE_COMMANDS]) expect(USAGE.stderr).toContain(command);
   });
@@ -205,7 +212,8 @@ describe("말의 꼴", () => {
   test("종료 코드: 자리 풀기·holds는 0이면 stdout 한 줄뿐, 장부 거절은 1이고 stderr에 ledger_refused:<이름>, 복원 전 3, 적혔는지 모름 1", () => {
     const runId = id();
     const release = { outcome: "abandoned", runId, released: false, slotFree: false } as const;
-    expect(exitFor({ kind: "reply", reply: { kind: "release", release } }, "abandon-result")).toEqual({ code: 0, stdout: `${JSON.stringify({ schema: RELEASE_SCHEMA, ...release })}\n`, stderr: "" });
+    const abandonCall = requestOf(["abandon-result", runId, "no_answer", id()])!;
+    expect(exitFor({ kind: "reply", reply: { kind: "release", release } }, abandonCall)).toEqual({ code: 0, stdout: `${JSON.stringify({ schema: RELEASE_SCHEMA, ...release })}\n`, stderr: "" });
     const holds = { slotFree: true, runs: [], slotHolds: [], truncated: false };
     expect(exitFor({ kind: "reply", reply: { kind: "holds", holds } }, "holds")).toEqual({ code: 0, stdout: `${JSON.stringify({ schema: HOLDS_SCHEMA, ...holds })}\n`, stderr: "" });
     const refusedExit = exitFor({ kind: "reply", reply: { kind: "refused", reason: "ledger_refused", refusal: "pod_started_too_early" } }, "close-unconfirmed");
@@ -232,7 +240,7 @@ describe("쓰기 처리기: 실제 장부", () => {
       known: true,
       value: { runId: lost.runId, fromState: "unknown_running", checkedBy: "pod_replaced", podName: POD, podStartedAt: NOW + 40_000, stopGeneration: 0, closedAt: LATER },
     });
-    expect(calls).toEqual(["closeRunByOperator", "peekHolds"]);
+    expect(calls).toEqual(["peekRunState", "closeRunByOperator", "peekHolds"]);
     expect(notes).toEqual([{ command: "close-unconfirmed", runId: lost.runId, result: "closed", reason: null, slotFree: true }]);
     expect(JSON.stringify(notes)).not.toContain(POD);
   });
@@ -259,7 +267,7 @@ describe("쓰기 처리기: 실제 장부", () => {
     // 종료가 확인된 실행(checking)은 stop_confirmed다.
     const ledger2 = open(tempPath());
     const checking = checkingRun(ledger2);
-    expect(ask(sourcesOf(ledger2), portsOf(ledger2).ports, closeUnconfirmed(checking.runId))).toEqual(ledgerRefused("stop_confirmed"));
+    expect(ask(sourcesOf(ledger2), portsOf(ledger2).ports, closeUnconfirmed(checking.runId, undefined, "checking"))).toEqual(ledgerRefused("stop_confirmed"));
     expect(notes.map((note) => [note.result, note.reason])).toEqual([
       ["refused", "pod_started_too_early"],
       ["refused", "start_may_launch"],
@@ -274,7 +282,7 @@ describe("쓰기 처리기: 실제 장부", () => {
     expect(ask(sourcesOf(ledger), ports, closeUnconfirmed(lost.runId, LATER + 1))).toEqual({ kind: "refused", reason: "pod_started_later" });
     expect(calls).toEqual([]);
     expect(ask(sourcesOf(ledger), ports, { ...closeUnconfirmed(lost.runId), podName: "Bad_Pod" })).toEqual({ kind: "refused", reason: "malformed" });
-    expect(calls).toEqual(["closeRunByOperator"]);
+    expect(calls).toEqual(["peekRunState", "closeRunByOperator"]);
     expect(state(ledger, lost.runId)).toBe("unknown_running");
   });
 
@@ -315,11 +323,11 @@ describe("쓰기 처리기: 실제 장부", () => {
     stopped(ledger, s, "failed");
     expect(state(ledger, s.runId)).toBe("failed_stopped");
     const { ports } = portsOf(ledger);
-    expect(ask(sourcesOf(ledger), ports, storeReset(s.runId))).toEqual({ kind: "release", release: { outcome: "closed", runId: s.runId, released: true, slotFree: true } });
+    expect(ask(sourcesOf(ledger), ports, storeReset(s.runId, "failed_stopped"))).toEqual({ kind: "release", release: { outcome: "closed", runId: s.runId, released: true, slotFree: true } });
     expect(ledger.operatorClosure(s.runId)).toMatchObject({ known: true, value: { checkedBy: "store_reset", fromState: "failed_stopped" } });
     const ledger2 = open(tempPath());
     const lost = lostRun(ledger2);
-    expect(ask(sourcesOf(ledger2), portsOf(ledger2).ports, storeReset(lost.runId))).toEqual(ledgerRefused("stop_unconfirmed"));
+    expect(ask(sourcesOf(ledger2), portsOf(ledger2).ports, storeReset(lost.runId, "unknown_running"))).toEqual(ledgerRefused("stop_unconfirmed"));
   });
 
   test("release-hold: 관측 번호·세대를 그대로 넘겨 자리 막기를 내리고, 이미 푼 관측과 관측 전에 뜬 파드는 장부의 이름으로 거절한다", () => {
@@ -422,14 +430,26 @@ describe("문과 켜는 조건", () => {
 
 describe("holds", () => {
   test("다음 행동은 장부의 앞 상태로 정한다", () => {
-    const row = (state: string, over: Partial<{ kind: string; stopReceiptId: string | null; failedStoppedAt: number | null }> = {}) => ({ kind: "worker", state, stopReceiptId: null, failedStoppedAt: null, ...over });
+    type Facts = { requestedCancel: boolean | null; exit: "completed" | "failed" | "deadline" | "cancelled" | null };
+    const row = (state: string, over: Partial<{ kind: string; stopReceiptId: string | null; failedStoppedAt: number | null; failedFacts: Facts | null }> = {}) => ({
+      kind: "worker",
+      state,
+      stopReceiptId: null,
+      failedStoppedAt: null,
+      failedFacts: null,
+      ...over,
+    });
     expect(nextFor(row("unknown_running"))).toBe("close_unconfirmed");
     expect(nextFor(row("stopping"))).toBe("close_unconfirmed");
     expect(nextFor(row("stopping", { stopReceiptId: id() }))).toBe("none");
     expect(nextFor(row("checking", { stopReceiptId: id() }))).toBe("abandon_result");
     expect(nextFor(row("ready_result", { stopReceiptId: id() }))).toBe("wait_cleanup");
     expect(nextFor(row("cleanup_pending", { stopReceiptId: id() }))).toBe("wait_cleanup");
-    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), failedStoppedAt: NOW }))).toBe("wait_cleanup");
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), failedStoppedAt: NOW, failedFacts: { requestedCancel: false, exit: "failed" } }))).toBe("wait_cleanup");
+    // 확정 outcome을 정할 수 없으면(사유 없는 취소·exit 모름) 기다려도 풀리지 않는다: 저장소 비움 닫기로 간다.
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), failedStoppedAt: NOW, failedFacts: { requestedCancel: null, exit: "completed" } }))).toBe("close_store_reset");
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), failedStoppedAt: NOW, failedFacts: { requestedCancel: false, exit: null } }))).toBe("close_store_reset");
+    expect(nextFor(row("failed_stopped", { stopReceiptId: id(), failedStoppedAt: NOW }))).toBe("close_store_reset");
     // 판 8 전에 실패한 줄(실패 시각 없음)은 장부 초기화로 넘긴다(D-162).
     expect(nextFor(row("failed_stopped", { stopReceiptId: id() }))).toBe("none");
     expect(nextFor(row("preparing"))).toBe("none");

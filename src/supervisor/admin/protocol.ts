@@ -38,12 +38,15 @@ export type AdminCommand = (typeof ADMIN_COMMANDS)[number];
 // (abandonResult), 저장소 비움 닫기(closeRunByOperator, store_reset), 점유 관측 풀기(releaseSlotHold). 칸의 차례는 관리 진입점의 argv
 // 차례이고, 칸 이름은 장부 연산의 입력 이름 그대로다(CLI·통로·장부가 같은 이름을 쓴다). 확인 방법(checkedBy)은 명령이 정하고 시각(now)은
 // 감독이 읽으므로 칸이 아니다. 값은 모두 문자열로 싣고 감독이 장부의 꼴로 본다(release.ts). 이 파일은 장부를 import하지 않는다.
+// fromState는 장부 입력이 아니다: 두 닫기에서 CLI가 holds로 본 앞 상태(그 줄의 state)이고, 감독이 쓰기 직전 같은 동기 구간에서 지금
+// 줄과 견준다(다르면 state_changed, D-156의 재조회). 근거 줄의 fromState와 같은 이름이다. 결과 포기는 종료 영수증 ID, 점유 관측 풀기는
+// 관측 번호·세대로 이미 그 줄에 묶여 장부가 거절한다.
 export const RELEASE_COMMANDS = ["close-unconfirmed", "abandon-result", "close-store-reset", "release-hold"] as const;
 export type ReleaseCommand = (typeof RELEASE_COMMANDS)[number];
 export const RELEASE_FIELDS: { readonly [Command in ReleaseCommand]: readonly string[] } = {
-  "close-unconfirmed": ["runId", "podName", "podStartedAt"],
+  "close-unconfirmed": ["runId", "fromState", "podName", "podStartedAt"],
   "abandon-result": ["runId", "reason", "stopReceiptId"],
-  "close-store-reset": ["runId", "podName", "podStartedAt"],
+  "close-store-reset": ["runId", "fromState", "podName", "podStartedAt"],
   "release-hold": ["executorId", "runId", "runGeneration", "observation", "podName", "podStartedAt"],
 };
 export const isReleaseCommand = (value: unknown): value is ReleaseCommand => typeof value === "string" && (RELEASE_COMMANDS as readonly string[]).includes(value);
@@ -77,8 +80,10 @@ export type RunState = (typeof RUN_STATES)[number];
 export const RUN_KINDS = ["worker", "session"] as const;
 // holds가 자리를 쥔 줄마다 싣는 다음 행동(release.ts의 nextFor가 장부의 앞 상태로 정한다). close_unconfirmed: 파드를 바꾼 뒤
 // close-unconfirmed, abandon_result: abandon-result(결과를 버린다), wait_cleanup: 확정·정리 영수증을 기다린다(실행기가 영영 돌아오지
-// 않으면 저장소를 비운 뒤 close-store-reset), release_hold: 파드를 바꾼 뒤 release-hold, none: 이 통로의 명령이 없다(진행 중이거나 장부 초기화).
-export const HOLD_ACTIONS = ["close_unconfirmed", "abandon_result", "wait_cleanup", "release_hold", "none"] as const;
+// 않으면 저장소를 비운 뒤 close-store-reset), close_store_reset: 실패 시각은 있으나 확정 outcome을 장부 사실로 정할 수 없는 failed_stopped
+// (수명 박자의 finalize_withheld/outcome_unknown과 같은 계산)라 기다려도 확정·정리가 오지 않는다. D-158의 전제(실행기 저장소 비움·작업자
+// 파드 교체)를 확인한 뒤 close-store-reset, release_hold: 파드를 바꾼 뒤 release-hold, none: 이 통로의 명령이 없다(진행 중이거나 장부 초기화).
+export const HOLD_ACTIONS = ["close_unconfirmed", "abandon_result", "wait_cleanup", "close_store_reset", "release_hold", "none"] as const;
 export type HoldAction = (typeof HOLD_ACTIONS)[number];
 export interface HoldRun {
   readonly runId: string;
@@ -114,6 +119,13 @@ export interface Holds {
 // slotFree: 쓰기 뒤에 읽은 "작업자 자리를 쓸 수 있다". 다른 실행·점유 관측이 막으면 released가 true여도 false다. 읽지 못하면 null.
 export const RELEASE_OUTCOMES = ["closed", "abandoned", "hold_released"] as const;
 export type ReleaseOutcome = (typeof RELEASE_OUTCOMES)[number];
+// 쓰기 명령마다 성공 답이 가질 outcome·released. 관리 진입점이 답을 요청과 대조한다(client.ts의 exitFor): 다르면 적혔는지 모른다.
+export const RELEASE_EXPECTED: { readonly [Command in ReleaseCommand]: { readonly outcome: ReleaseOutcome; readonly released: boolean } } = {
+  "close-unconfirmed": { outcome: "closed", released: true },
+  "abandon-result": { outcome: "abandoned", released: false },
+  "close-store-reset": { outcome: "closed", released: true },
+  "release-hold": { outcome: "hold_released", released: true },
+};
 export interface ReleaseAnswer {
   readonly outcome: ReleaseOutcome;
   readonly runId: string;
@@ -136,7 +148,7 @@ export interface SupervisorStatus {
 export const UNKNOWN_REASONS = ["restore_not_done", "ledger_unreadable", "stop_unrecorded", "clock_unavailable", "out_of_range", "read_threw", "random_unavailable", "write_unknown"] as const;
 export type UnknownReason = (typeof UNKNOWN_REASONS)[number];
 // 요청을 처리하지 않은 사유. 어느 사유든 장부에 새로 적힌 것이 없다. disabled부터 ledger_refused까지는 시험 작업의 것이고, 자리 풀기는
-// 그 가운데 disabled(포트 없음)·not_alive·late·ledger_refused를 같은 뜻으로 쓴다. pod_started_later는 자리 풀기만 낸다(README "감독 관리 통로").
+// 그 가운데 disabled(포트 없음)·not_alive·late·ledger_refused를 같은 뜻으로 쓴다. pod_started_later·state_changed는 자리 풀기만 낸다(README "감독 관리 통로").
 export const REFUSED_REASONS = [
   "malformed",
   "unknown_command",
@@ -153,6 +165,9 @@ export const REFUSED_REASONS = [
   "ledger_refused",
   // 자리 풀기: 넘긴 파드가 뜬 시각이 감독 시계의 지금보다 늦다(시계 어긋남이거나 잘못 읽은 값). 장부를 부르지 않는다.
   "pod_started_later",
+  // 자리 풀기의 두 닫기: 쓰기 직전에 읽은 실행 줄의 상태가 요청의 fromState(CLI가 holds로 본 앞 상태)와 다르다. 장부를 부르지 않는다.
+  // CLI는 holds를 다시 읽고 절차를 다시 고른다.
+  "state_changed",
 ] as const;
 export type RefusedReason = (typeof REFUSED_REASONS)[number];
 

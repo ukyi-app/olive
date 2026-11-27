@@ -1,13 +1,18 @@
 // 관리자 자리 풀기(D-149 ④, D-156)의 감독 쪽 처리기. 읽기 하나(holds)와 장부 쓰기마다 명령 하나다: close-unconfirmed(관리자 닫기,
 // closeRunByOperator의 pod_replaced, D-91·D-96·D-97), abandon-result(결과 포기, abandonResult, D-148·D-157·D-168), close-store-reset(저장소
 // 비움 닫기, closeRunByOperator의 store_reset, D-158), release-hold(점유 관측 풀기, releaseSlotHold, D-161). CLI(homelab olive release, 뒤 작업)는
-// holds로 앞 상태를 읽어 절차를 고르고 쓰기 전에 다시 읽는다. 그 사이 상태가 바뀌면 장부가 거절하고, 처리기는 그 거절 이름을 그대로 낸다.
+// holds로 앞 상태를 읽어 절차를 고르고 쓰기 전에 다시 읽는다(D-156). 두 닫기는 CLI가 본 앞 상태(fromState)를 싣고, 처리기가 쓰기 직전
+// 같은 동기 구간에서 지금 줄과 견주어 다르면 장부를 부르지 않고 state_changed다. 결과 포기는 종료 영수증 ID, 점유 관측 풀기는 관측
+// 번호·세대로 장부가 그 줄을 대조한다. 장부가 거절하면 처리기는 그 거절 이름을 그대로 낸다.
 //
 // 켜기: 설정 스위치 없이 늘 받는다(운영 관리 기능, D-91의 CLI 전용). 접수 닫힘·정지 중에도 받는다(장부의 쓰기 모드 new가 막지 않는다).
 // 복원 5단계를 받아들이기 전에는 holds도 쓰기도 받지 않는다(restore_not_done, 3. 까닭은 README "감독 관리 통로"의 "자리 풀기").
 //
-// 쓰기의 차례(한 동기 구간): 칸 검사 → 상태 읽기(status.ts의 readStatus: 복원·살아 있음) → 시각(공유 시계 peek) → 파드 시각 대조 → 쓰기 함수
-// 꺼내기 → 문 한 번 → 호출 하나 → 답 대조 → 자리 읽기(peekHolds) → 기록 한 줄. 꺼내기와 호출 사이에는 문 한 번의 호출만 있다(test-job.ts와 같다).
+// 쓰기의 차례(한 동기 구간): 칸 검사 → 상태 읽기(status.ts의 readStatus: 복원·살아 있음) → 시각(공유 시계 peek) → 파드 시각 대조 → 두 닫기만
+// 앞 상태 대조(peekRunState) → 쓰기 함수 꺼내기 → 문 한 번 → 호출 하나 → 답 대조 → 자리 읽기(peekHolds) → 기록 한 줄. 꺼내기와 호출 사이에는
+// 문 한 번의 호출만 있다(test-job.ts와 같다).
+// - 앞 상태 대조가 쓰기와 같은 줄을 보는 까닭: 처리기는 동기 함수이고(await·then 없음, 시험이 본다) 장부를 쓰는 것은 이 프로세스 하나라,
+//   대조와 호출 사이에 다른 장부 쓰기가 끼지 않는다. 이 파일에 await를 들이면 이 보장이 깨진다.
 // 함정:
 // - 쓰기 뒤의 자리 읽기와 holds는 장부를 고장으로 표시하지 않는 peekHolds다. 관리 통로는 늘 켜져 있어, 사람이 부른 조회의 일시 오류가
 //   접수를 닫고 감독을 끝내면 안 된다. 쓰기 뒤 읽기가 실패해도 쓰기의 답은 그대로이고 slotFree만 모름(null)이다.
@@ -16,6 +21,7 @@
 // - 기록(note)에 파드 이름을 옮기지 않는다: 파드 이름은 운영 장부의 근거 줄에만 남는다(ledger.md "관리자 닫기를 부르는 쪽").
 import { type Ledger, LedgerInputError, RESULT_ABANDON_REASONS } from "../../ledger/index.ts";
 import { REF, UUID } from "../../ledger/input.ts";
+import { failedOutcome } from "../dispatch/life-loop.ts";
 import {
   ADMIN_LIMITS,
   type AdminArgs,
@@ -31,6 +37,8 @@ import {
   type ReleaseAnswer,
   type ReleaseCommand,
   type RefusedReason,
+  RUN_STATES,
+  type RunState,
   type UnknownReason,
 } from "./protocol.ts";
 import { type AdminSources, readStatus } from "./status.ts";
@@ -48,8 +56,9 @@ export type ReleaseNote = {
 
 // 조립(runtime/boot.ts)이 늘 만드는 포트.
 export interface ReleasePorts {
-  // 장부의 쓰기 셋과 장부를 고장으로 표시하지 않는 읽기 하나만 담은 객체. 처리기는 문을 보기 직전에 쓰기 칸을 꺼낸다.
-  readonly ledger: Pick<Ledger, "closeRunByOperator" | "abandonResult" | "releaseSlotHold" | "peekHolds">;
+  // 장부의 쓰기 셋과 장부를 고장으로 표시하지 않는 읽기 둘(holds의 peekHolds, 두 닫기의 앞 상태 peekRunState)만 담은 객체.
+  // 처리기는 문을 보기 직전에 쓰기 칸을 꺼낸다.
+  readonly ledger: Pick<Ledger, "closeRunByOperator" | "abandonResult" | "releaseSlotHold" | "peekHolds" | "peekRunState">;
   // 조립의 문 하나: 끝 차례·끝낼 사유(closed), 복원 5단계(restore_not_done), 박자 기한(closed)을 보고 맨 끝에 단조 시각으로 요청 기한
   // limit 정각 전인지 본다(late, 시각을 읽지 못해도 late). 장부를 읽지 않고 래치를 움직이지 않는다. 접수 허가는 보지 않는다.
   readonly gate: (limit: number) => "open" | "closed" | "restore_not_done" | "late";
@@ -71,7 +80,7 @@ const DECIMAL = /^(0|[1-9][0-9]{0,15})$/;
 const integer = (value: unknown): number | null => (fits(value, DECIMAL) && Number.isSafeInteger(Number(value)) ? Number(value) : null);
 
 type Parsed =
-  | { readonly command: "close-unconfirmed" | "close-store-reset"; readonly runId: string; readonly podName: string; readonly podStartedAt: number }
+  | { readonly command: "close-unconfirmed" | "close-store-reset"; readonly runId: string; readonly fromState: RunState; readonly podName: string; readonly podStartedAt: number }
   | { readonly command: "abandon-result"; readonly runId: string; readonly reason: (typeof RESULT_ABANDON_REASONS)[number]; readonly stopReceiptId: string }
   | {
       readonly command: "release-hold";
@@ -105,7 +114,9 @@ function parse(command: ReleaseCommand, args: AdminArgs): Parsed | null {
     if (!fits(args.executorId, REF) || runGeneration === null || observation === null) return null;
     return { command, executorId: args.executorId, runId, runGeneration, observation, podName, podStartedAt };
   }
-  return { command, runId, podName, podStartedAt };
+  const fromState = args.fromState;
+  if (!(RUN_STATES as readonly unknown[]).includes(fromState)) return null;
+  return { command, runId, fromState: fromState as RunState, podName, podStartedAt };
 }
 
 // 장부에 넘길 입력. 확인 방법은 명령이 정한다.
@@ -143,7 +154,9 @@ function verdictOf(written: unknown, parsed: Parsed, input: Record<string, unkno
     return { ok: true, answer: { outcome: "abandoned", runId, released: false } };
   }
   if (!same(written.run, { runId, state: "not_started" })) return fail(unknown("write_unknown"));
-  if (!same(written.closure, { runId, checkedBy: input.checkedBy, podName: parsed.podName, podStartedAt: parsed.podStartedAt, closedAt: input.now })) return fail(unknown("write_unknown"));
+  if (!same(written.closure, { runId, fromState: parsed.fromState, checkedBy: input.checkedBy, podName: parsed.podName, podStartedAt: parsed.podStartedAt, closedAt: input.now })) {
+    return fail(unknown("write_unknown"));
+  }
   return { ok: true, answer: { outcome: "closed", runId, released: true } };
 }
 
@@ -182,6 +195,12 @@ export function releaseHandler(command: ReleaseCommand, sources: AdminSources, p
       if (parsed.command !== "abandon-result" && parsed.podStartedAt > now) return { runId, reply: refused("pod_started_later") };
       const input = inputOf(parsed, now);
       const ledger = ports.ledger;
+      if (parsed.command === "close-unconfirmed" || parsed.command === "close-store-reset") {
+        const current = ledger.peekRunState(parsed.runId);
+        if (current.known !== true) return { runId, reply: unknown("ledger_unreadable") };
+        // 없는 실행은 장부의 이름(unknown_run)으로 거절되게 넘긴다. 있는 실행의 상태가 CLI가 본 앞 상태와 다르면 쓰지 않는다.
+        if (current.value !== null && current.value !== parsed.fromState) return { runId, reply: refused("state_changed") };
+      }
       const write = command === "abandon-result" ? ledger.abandonResult : command === "release-hold" ? ledger.releaseSlotHold : ledger.closeRunByOperator;
       if (typeof write !== "function") return { runId, reply: unknown("read_threw") };
       const gate = ports.gate(limit);
@@ -208,13 +227,23 @@ export function releaseHandler(command: ReleaseCommand, sources: AdminSources, p
 }
 
 // 자리를 쥔 실행 줄의 다음 행동(README "감독 관리 통로"의 holds 표). 세션은 이 통로의 명령이 없다.
-export function nextFor(run: { readonly kind: string; readonly state: string; readonly stopReceiptId: string | null; readonly failedStoppedAt: number | null }): HoldAction {
+export function nextFor(run: {
+  readonly kind: string;
+  readonly state: string;
+  readonly stopReceiptId: string | null;
+  readonly failedStoppedAt: number | null;
+  readonly failedFacts: Parameters<typeof failedOutcome>[0] | null;
+}): HoldAction {
   if (run.kind !== "worker") return "none";
   if ((run.state === "unknown_running" || run.state === "stopping") && run.stopReceiptId === null) return "close_unconfirmed";
   if (run.state === "checking") return "abandon_result";
   if (run.state === "ready_result" || run.state === "cleanup_pending") return "wait_cleanup";
   // 실패 시각이 없는 failed_stopped(판 8 전에 실패한 줄)는 확정도 저장소 비움 닫기도 못 한다(D-162: 장부 초기화).
-  if (run.state === "failed_stopped") return run.failedStoppedAt === null ? "none" : "wait_cleanup";
+  if (run.state === "failed_stopped") {
+    if (run.failedStoppedAt === null) return "none";
+    // 수명 박자가 확정을 보류하는 것과 같은 식(life-loop.ts의 failedOutcome): outcome을 정할 수 없으면 기다려도 풀리지 않는다.
+    return run.failedFacts !== null && failedOutcome(run.failedFacts) !== null ? "wait_cleanup" : "close_store_reset";
+  }
   return "none";
 }
 
