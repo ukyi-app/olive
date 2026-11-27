@@ -2,6 +2,8 @@
 // - C-1(D-171): 실행 기록은 접수한 파드의 UID(pod_uid)를 적는다. 기동 때 끝을 맺지 못한 기록(unknown_running 포함)의 pod_uid가 지금 파드와
 //   다르면 다시 세어, 지금 대리·프로세스의 계수가 0일 때만 종료 영수증을 내고 failed_stopped(보고가 있으면 ready_result)로 맺는다.
 //   칸이 없는 기록(칸을 쓰기 전의 판)과 같은 파드의 기록은 지금 동작 그대로다(unknown_running은 다시 세지 않는다).
+//   다른 파드의 기록에서 새로 내는 종료 사유: 보고 없는 completed는 failed, 옛 파드가 정한 cancelled·deadline과 이미 적힌 종료 영수증은 그대로다.
+// - 다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리를 예약하지 않는다. 같은 요청의 재전송이 그 실행이 끝난 뒤 정리한다.
 // - 확정되지 않은 기록이 STATUS_MAX_RUNS(8)개면 새 시작을 받지 않는다. 감독의 outcome failed 확정 하나가 그 기록을 정리해 finalized로 맺는다(C-2).
 // 같은 폴더를 새 저장소·다른 파드 UID로 다시 여는 것으로 파드 교체를 흉내 낸다.
 import { expect, test } from "bun:test";
@@ -10,7 +12,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { limits } from "../../src/contract/v1/index.ts";
 import { ExecutorStore, type RunRecord, type StoreError } from "../../src/executor/store.ts";
-import { fromSupervisor, POD_UID, type Rig, rig, start, sync } from "./support.ts";
+import { barrier, fromSupervisor, POD_UID, pause, type Rig, rig, start, sync, until } from "./support.ts";
 
 // 교체 뒤 새 파드의 UID. rig의 기본(POD_UID)이 교체 전 파드다.
 const POD_B = "3a9e6b1c-7d2f-4c8a-b5e0-9f1d2c3b4a56";
@@ -160,4 +162,156 @@ test(`확정되지 않은 기록이 ${limits.STATUS_MAX_RUNS}개면 새 시작�
   const next = await start(r, { runId: randomUUID() });
   expect(ofRun(r, "receipt_accepted", next.runId)).toHaveLength(1);
   await r.worker.idle();
+});
+
+// 끝을 맺지 못한 채 남은 기록. 시작 영수증까지 적혔고 결과 보고는 없다(stopped면 종료 영수증도 적혔지만 실행 기록이 따라오지 못했다).
+// 저장소의 낮은 입구(beginRun·commit)로 만든다. podUid가 null이면 칸을 쓰기 전의 판이 접수한 기록이다.
+async function seededRun(state: RunRecord["state"], exit: RunRecord["exit"], options: { podUid?: string | null; stopped?: boolean } = {}) {
+  const dir = (await rig()).dir;
+  const at = 1_800_000_000_000;
+  const seeded = await ExecutorStore.open(dir, { now: () => at });
+  const runId = randomUUID();
+  const record: RunRecord = {
+    run_id: runId,
+    run_generation: 1,
+    state: "preparing",
+    start_stop_generation: 0,
+    instruction_request_id: randomUUID(),
+    deadline_at: at + 600_000,
+    lease_until: at + 30_000,
+    credential_digest: "0".repeat(64),
+    exit: null,
+    last_receipt_id: null,
+  };
+  const podUid = options.podUid === undefined ? POD_UID : options.podUid;
+  if (podUid !== null) record.pod_uid = podUid;
+  expect(await seeded.beginRun(record)).toBe(true);
+  const startedId = randomUUID();
+  const event = (id: string, action: "receipt_started" | "receipt_stopped", body: Record<string, unknown>) => ({
+    entry: { id, action, run_id: runId, run_generation: 1, body: { receipt_id: id, run_id: runId, ...body }, acked: false },
+    digest: null,
+  });
+  const events = [event(startedId, "receipt_started", { instruction_request_id: record.instruction_request_id, started_at: at })];
+  const stoppedId = randomUUID();
+  if (options.stopped === true) events.push(event(stoppedId, "receipt_stopped", { remaining_processes: 0, exit, stopped_at: at }));
+  const last = options.stopped === true ? stoppedId : startedId;
+  expect((await seeded.commit(runId, { state, exit, last_receipt_id: last }, events)).saved).toBe(true);
+  return { dir, runId, stoppedId };
+}
+
+test("다른 파드의 끝을 맺지 못한 기록에서 보고 없이 종료를 처음 확인하면 기록의 completed도 failed로 낸다(D-171)", async () => {
+  for (const state of ["stopping", "checking", "unknown_running"] as const) {
+    const { dir, runId } = await seededRun(state, "completed");
+    const b = await reboot(dir, POD_B);
+    expect(b.cleanup.survivorChecks, state).toBe(1);
+    const stopped = ofRun(b, "receipt_stopped", runId);
+    expect(stopped, state).toHaveLength(1);
+    expect(stopped[0]?.body, state).toMatchObject({ remaining_processes: 0, exit: "failed" });
+    expect(b.store.run(runId), state).toMatchObject({ state: "failed_stopped", exit: "failed" });
+    expect(ofRun(b, "report_result", runId), state).toEqual([]);
+  }
+});
+
+test("다른 파드의 기록이어도 옛 파드가 정한 cancelled·deadline은 그대로 낸다(감독의 확정 outcome이 그 값을 읽는다, D-114)", async () => {
+  for (const exit of ["cancelled", "deadline"] as const) {
+    const { dir, runId } = await seededRun("unknown_running", exit);
+    const b = await reboot(dir, POD_B);
+    expect(ofRun(b, "receipt_stopped", runId)[0]?.body, exit).toMatchObject({ remaining_processes: 0, exit });
+    expect(b.store.run(runId), exit).toMatchObject({ state: "failed_stopped", exit });
+  }
+});
+
+test("다른 파드의 기록에 이미 적힌 종료 영수증이 있으면 다시 세지 않고 같은 ID·같은 본문으로 맺는다", async () => {
+  const { dir, runId, stoppedId } = await seededRun("stopping", "completed", { stopped: true });
+  const b = await reboot(dir, POD_B);
+  expect(b.cleanup.survivorChecks).toBe(0);
+  const stopped = b.store.validEvents(runId).filter((entry) => entry.action === "receipt_stopped");
+  expect(stopped.map((entry) => [entry.id, entry.body.exit])).toEqual([[stoppedId, "completed"]]);
+  expect(b.store.run(runId)).toMatchObject({ state: "failed_stopped", exit: "completed", last_receipt_id: stoppedId });
+});
+
+test("같은 파드의 기록과 칸이 없는 옛 기록은 지금 규칙 그대로: 기동 대조는 기록의 exit로, 회복 요청(D-104)은 보고 없는 completed를 failed로 낸다", async () => {
+  for (const [podUid, reopenAs] of [
+    [POD_UID, POD_UID],
+    [null, POD_B],
+  ] as const) {
+    const { dir, runId } = await seededRun("stopping", "completed", { podUid });
+    const b = await reboot(dir, reopenAs);
+    expect(ofRun(b, "receipt_stopped", runId)[0]?.body, String(podUid)).toMatchObject({ remaining_processes: 0, exit: "completed" });
+    expect(b.store.run(runId), String(podUid)).toMatchObject({ state: "failed_stopped", exit: "completed" });
+  }
+  const { dir, runId } = await seededRun("stopping", "completed");
+  const restarted = await rig({ dir, podUid: POD_UID, syncTo: null });
+  await restarted.worker.reclaimRestarted([runId]);
+  await restarted.worker.recover();
+  await sync(restarted, 0);
+  expect(ofRun(restarted, "receipt_stopped", runId)[0]?.body).toMatchObject({ remaining_processes: 0, exit: "failed" });
+  expect(restarted.store.run(runId)).toMatchObject({ state: "failed_stopped", exit: "failed" });
+});
+
+test("다른 실행이 시작 자리를 쥔 동안 온 버림 확정은 정리를 예약하지 않는다: 그 실행이 결과를 내고, 같은 요청의 재전송으로 한 번만 정리한다", async () => {
+  const r = await rig();
+  const first = await start(r);
+  await r.worker.idle();
+  expect(r.store.run(first.runId)?.state).toBe("ready_result");
+  const take = barrier();
+  const sweep = barrier();
+  r.credentials.before = take.pass;
+  r.space.cleanGate = sweep.pass();
+  const next = await start(r);
+  await take.entered;
+  const discard = failedFinalize(r, first.runId);
+  const cleaning = r.connection.receive(discard);
+  // 정리를 예약했다면 지우기가 cleanGate에서 멈춰 있다. 예약하지 않았으면 곧바로 돌아온다.
+  await Promise.race([cleaning, pause(50)]);
+  take.open();
+  await r.worker.idle();
+  const nextEvents = r.store.validEvents(next.runId).map((entry) => [entry.action, (entry.body as { exit?: string }).exit ?? null]);
+  const cleanedMeanwhile = r.space.cleaned.filter((runId) => runId === first.runId).length;
+  sweep.open();
+  await cleaning;
+  expect(cleanedMeanwhile).toBe(0);
+  expect(r.store.run(next.runId)?.state).toBe("ready_result");
+  expect(nextEvents).toEqual([
+    ["receipt_accepted", null],
+    ["receipt_started", null],
+    ["receipt_stopped", "completed"],
+    ["report_result", null],
+  ]);
+  // 미룬 확정은 의도도 남기지 않는다. 같은 요청 ID·같은 본문의 재전송이 처음부터 정리한다.
+  expect(r.store.run(first.runId)).toMatchObject({ state: "ready_result" });
+  expect(r.store.run(first.runId)?.cleanup ?? null).toBeNull();
+  const resend = () =>
+    fromSupervisor(r.clock, r.worker.name, "result_finalize", discard.body as never, { stop_generation: 0, run_generation: 1, request_id: discard.header.request_id });
+  await r.connection.receive(resend());
+  await r.worker.idle();
+  await r.connection.receive(resend());
+  expect(r.store.run(first.runId)?.state).toBe("finalized");
+  expect(r.space.cleaned.filter((runId) => runId === first.runId)).toHaveLength(1);
+  const receipts = ofRun(r, "receipt_cleaned", first.runId);
+  expect(new Set(receipts.map((e) => (e.body as { receipt_id: string }).receipt_id)).size).toBe(1);
+  expect((receipts[0]?.body as { instruction_request_id: string }).instruction_request_id).toBe(discard.header.request_id);
+});
+
+test("버림 확정의 정리가 도는 동안 온 시작은 기록·영수증 없이 버리고, 정리가 끝난 뒤 같은 시작 지시의 재전송을 받는다", async () => {
+  const r = await rig();
+  const first = await start(r);
+  await r.worker.idle();
+  const sweep = barrier();
+  r.space.cleanGate = sweep.pass();
+  const cleaning = r.connection.receive(failedFinalize(r, first.runId));
+  await until(() => r.space.cleaned.includes(first.runId));
+  const next = await start(r);
+  expect(r.store.run(next.runId)).toBeUndefined();
+  expect(ofRun(r, "receipt_accepted", next.runId)).toEqual([]);
+  expect(r.credentials.calls.filter((call) => call.runId === next.runId)).toEqual([]);
+  sweep.open();
+  await cleaning;
+  expect(r.store.run(first.runId)?.state).toBe("finalized");
+  await r.connection.receive(
+    fromSupervisor(r.clock, r.worker.name, "task_start", next.envelope.body as never, { stop_generation: 0, run_generation: 1, request_id: next.envelope.header.request_id }),
+  );
+  await r.worker.idle();
+  expect(ofRun(r, "receipt_accepted", next.runId)).toHaveLength(1);
+  expect(r.store.run(next.runId)?.state).toBe("ready_result");
 });

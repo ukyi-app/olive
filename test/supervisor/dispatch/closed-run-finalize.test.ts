@@ -10,7 +10,7 @@ import type { Ledger } from "../../../src/ledger/index.ts";
 import { lifeTick } from "../../../src/supervisor/dispatch/life-loop.ts";
 import { resendTick } from "../../../src/supervisor/dispatch/resend.ts";
 import { createAnswerEvidenceBook, createAnswerLines } from "../../../src/supervisor/runtime/answers.ts";
-import { executorKeys, fromSupervisor, type Rig, reconnect, rig, start, supervisorKeys, sync } from "../../executor/support.ts";
+import { barrier, executorKeys, fromSupervisor, pause, type Rig, reconnect, rig, start, supervisorKeys, sync } from "../../executor/support.ts";
 import { digest, id, must, NOW, open, ready, startedWorker, tempPath, WORKER_EXECUTOR, worker } from "../../ledger/helpers.ts";
 
 const POD = "worker-diagnosis-4c2d-q8mv";
@@ -375,4 +375,58 @@ test("실제 실행기: 다른 파드에서 물려받은 unknown_running을 다�
   const next = await start(b, { runId: randomUUID() });
   expect(runEvents(b, "receipt_accepted", next.runId)).toHaveLength(1);
   await b.worker.idle();
+});
+
+test("실제 실행기: 닫힌 실행의 확정이 새로 접수한 다른 실행의 자격 대기 중에 와도 그 실행은 결과를 내고, 재전송 박자의 같은 요청으로 닫힌 실행을 한 번 정리한다", async () => {
+  const r = await rig({ remote: {} });
+  const first = await start(r);
+  await r.worker.idle();
+  const ledger = ready(open(tempPath(), { clock: r.clock.now }));
+  const saved = must(ledger.admitRun(worker({ runId: first.runId, executorId: r.worker.name }))).run;
+  must(ledger.startRun({ runId: first.runId, requestId: first.envelope.header.request_id, stopGeneration: 0, now: r.clock.now() }));
+  must(
+    ledger.applyReceipt(
+      { action: "receipt_accepted", receiptId: id(), runId: first.runId, instructionRequestId: first.envelope.header.request_id, instruction: "task_start", bodyDigest: digest("accept"), now: r.clock.now() },
+      { sender: r.worker.name, runGeneration: saved.runGeneration },
+    ),
+  );
+  must(ledger.markLostFor({ executorId: r.worker.name, now: r.clock.now() + 1 }));
+  r.clock.t += 60_000;
+  must(ledger.closeRunByOperator({ runId: first.runId, checkedBy: "pod_replaced", podName: POD, podStartedAt: r.clock.now(), now: r.clock.now() }));
+  // 감독은 그 실행기에 다른 실행을 이미 접수시켰고, 그 실행은 자격을 기다린다. 그때 닫힌 실행의 확정이 닿는다.
+  const take = barrier();
+  const sweep = barrier();
+  r.credentials.before = take.pass;
+  r.space.cleanGate = sweep.pass();
+  const next = await start(r);
+  await take.entered;
+  const h = harness(ledger);
+  h.at.t = r.clock.now();
+  await h.life();
+  const [finalize] = finalizesOf(h.sent, first.runId);
+  expect(finalize).toBeDefined();
+  // 정리를 예약했다면 지우기가 cleanGate에서 멈춰 있다. 예약하지 않았으면 곧바로 돌아온다.
+  const delivered = r.connection.receive(finalize!);
+  await Promise.race([delivered, pause(50)]);
+  take.open();
+  await r.worker.idle();
+  const nextState = r.store.run(next.runId)?.state;
+  const nextActions = r.store.validEvents(next.runId).map((e) => e.action);
+  const cleanedMeanwhile = r.space.cleaned.includes(first.runId);
+  sweep.open();
+  await delivered;
+  expect(cleanedMeanwhile).toBe(false);
+  expect(nextState).toBe("ready_result");
+  expect(nextActions).toEqual(["receipt_accepted", "receipt_started", "receipt_stopped", "report_result"]);
+  // 실행기가 미룬 확정은 답이 없어 재전송 박자가 같은 요청 ID로 다시 낸다. 그 재전송이 한 번 정리한다.
+  r.clock.t += RESEND.resendEveryMs;
+  h.at.t = r.clock.now();
+  expect(forRun(await h.resend(), first.runId)[0]?.outcome).toBe("resent");
+  const sentAgain = finalizesOf(h.sent, first.runId);
+  expect(sentAgain.map((e) => e.header.request_id)).toEqual([finalize!.header.request_id, finalize!.header.request_id]);
+  await r.connection.receive(sentAgain[1]!);
+  await r.worker.idle();
+  expect(r.store.run(first.runId)?.state).toBe("finalized");
+  expect(r.space.cleaned.filter((runId) => runId === first.runId)).toHaveLength(1);
+  expect(r.store.validEvents(first.runId).filter((e) => e.action === "receipt_cleaned").map((e) => e.body.instruction_request_id)).toEqual([finalize!.header.request_id]);
 });
