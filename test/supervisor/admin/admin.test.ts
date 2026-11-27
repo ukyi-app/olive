@@ -675,7 +675,9 @@ describe("루프백: 실제 경로 유닉스 소켓", () => {
     for (const args of [[], ["status", "x"], ["queue"]]) {
       const result = run(...args);
       expect([result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([64, "", USAGE.stderr]);
-      expect(USAGE.stderr).toBe("olive admin: 사용법: bun src/main/admin.ts status | test-job <owner> <key> <role> <purpose> <sourceRef> <inputDigest>\n");
+      expect(USAGE.stderr).toBe(
+        "olive admin: 사용법: bun src/main/admin.ts status | holds | test-job <owner> <key> <role> <purpose> <sourceRef> <inputDigest> | close-unconfirmed <runId> <podName> <podStartedAt> | abandon-result <runId> <reason> <stopReceiptId> | close-store-reset <runId> <podName> <podStartedAt> | release-hold <executorId> <runId> <runGeneration> <observation> <podName> <podStartedAt>\n",
+      );
     }
     const result = run("status");
     expect([result.exitCode, result.stdout.toString(), result.stderr.toString()]).toEqual([1, "", "olive admin: 상태 모름: 감독에 닿지 못했다(no_socket)\n"]);

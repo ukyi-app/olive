@@ -9,7 +9,12 @@ import {
   type AdminCommand,
   type AdminReply,
   encodeRequest,
+  holdsLine,
+  isReleaseCommand,
   parseReply,
+  RELEASE_COMMANDS,
+  RELEASE_FIELDS,
+  releaseLine,
   statusLine,
   TEST_JOB_FIELDS,
   type TestJobRequest,
@@ -176,22 +181,32 @@ export interface EntryResult {
 
 const PREFIX = "olive admin";
 
+const form = (command: string, fields: readonly string[]) => [command, ...fields.map((field) => `<${field}>`)].join(" ");
+
 export const USAGE: EntryResult = {
   code: ADMIN_EXIT.usage,
   stdout: "",
-  stderr: `${PREFIX}: 사용법: bun src/main/admin.ts status | test-job ${TEST_JOB_FIELDS.map((field) => `<${field}>`).join(" ")}\n`,
+  stderr: `${PREFIX}: 사용법: bun src/main/admin.ts ${["status", "holds", form("test-job", TEST_JOB_FIELDS), ...RELEASE_COMMANDS.map((command) => form(command, RELEASE_FIELDS[command]))].join(" | ")}\n`,
 };
 
 const BYTES = new TextEncoder();
 
-// argv(실행 파일·진입점 뒤)에서 요청 하나. status는 인자가 없고, test-job은 TEST_JOB_FIELDS 차례의 값 여섯이다. 수가 다르거나,
-// 빈 값이 있거나, 요청 한 줄이 감독의 상한(requestMaxBytes)을 넘으면 null이다(넘는 줄은 감독이 답하지 않고 닫는다). 값의 꼴은 감독이 본다.
+// argv(실행 파일·진입점 뒤)에서 요청 하나. status·holds는 인자가 없고, test-job은 TEST_JOB_FIELDS 차례의 값 여섯, 자리 풀기 쓰기는
+// RELEASE_FIELDS 차례의 값이다. 수가 다르거나, 빈 값이 있거나, 요청 한 줄이 감독의 상한(requestMaxBytes)을 넘으면 null이다(넘는 줄은
+// 감독이 답하지 않고 닫는다). 값의 꼴은 감독이 본다.
 export function requestOf(argv: readonly string[]): AdminCall | null {
   const [word, ...rest] = argv;
-  if (word === "status") return rest.length === 0 ? { command: "status" } : null;
-  if (word !== "test-job" || rest.length !== TEST_JOB_FIELDS.length || rest.some((value) => value === "")) return null;
-  const job = Object.fromEntries(TEST_JOB_FIELDS.map((field, index) => [field, rest[index]!])) as TestJobRequest;
-  const call: AdminCall = { command: "test-job", job };
+  if (word === "status" || word === "holds") return rest.length === 0 ? { command: word } : null;
+  let call: AdminCall;
+  if (word === "test-job") {
+    if (rest.length !== TEST_JOB_FIELDS.length || rest.some((value) => value === "")) return null;
+    const job = Object.fromEntries(TEST_JOB_FIELDS.map((field, index) => [field, rest[index]!])) as TestJobRequest;
+    call = { command: "test-job", job };
+  } else if (isReleaseCommand(word)) {
+    const names = RELEASE_FIELDS[word];
+    if (rest.length !== names.length || rest.some((value) => value === "")) return null;
+    call = { command: word, fields: Object.fromEntries(names.map((field, index) => [field, rest[index]!])) };
+  } else return null;
   return BYTES.encode(encodeRequest(call)).length > ADMIN_LIMITS.requestMaxBytes ? null : call;
 }
 
@@ -201,21 +216,25 @@ export function commandOf(argv: readonly string[]): AdminCommand | null {
   return call?.command === "status" ? "status" : null;
 }
 
-// 명령마다 받을 수 있는 답이 다르다: status는 상태, test-job은 시험 작업. 다른 명령의 답이 오면 꼴이 틀린 답이다.
+// 명령마다 받을 수 있는 답이 다르다: status는 상태, test-job은 시험 작업, holds는 자리 목록, 자리 풀기 쓰기는 자리 풀기. 다른 명령의 답이
+// 오면 꼴이 틀린 답이다. 장부가 자리 풀기를 거절하면 stderr의 사유는 ledger_refused:<장부의 거절 이름>이다.
 export function exitFor(outcome: AskOutcome, command: AdminCommand = "status"): EntryResult {
-  const subject = command === "status" ? "상태" : "시험 작업";
+  const subject = command === "status" ? "상태" : command === "test-job" ? "시험 작업" : command === "holds" ? "자리 목록" : "자리 풀기";
   const fail = (code: number, message: string): EntryResult => ({ code, stdout: "", stderr: `${PREFIX}: ${message}\n` });
   if (outcome.kind === "unreachable") return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독에 닿지 못했다(${outcome.reason})`);
   if (outcome.kind === "failed") return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(${outcome.reason})`);
   const reply = outcome.reply;
-  if (reply.kind === "status" || reply.kind === "test_job") {
-    if (command === "status" && reply.kind === "status") return { code: ADMIN_EXIT.ok, stdout: `${statusLine(reply.status)}\n`, stderr: "" };
-    if (command === "test-job" && reply.kind === "test_job") return { code: ADMIN_EXIT.ok, stdout: `${testJobLine(reply)}\n`, stderr: "" };
+  if (reply.kind === "status" || reply.kind === "test_job" || reply.kind === "holds" || reply.kind === "release") {
+    const ok = (line: string): EntryResult => ({ code: ADMIN_EXIT.ok, stdout: `${line}\n`, stderr: "" });
+    if (command === "status" && reply.kind === "status") return ok(statusLine(reply.status));
+    if (command === "test-job" && reply.kind === "test_job") return ok(testJobLine(reply));
+    if (command === "holds" && reply.kind === "holds") return ok(holdsLine(reply.holds));
+    if (isReleaseCommand(command) && reply.kind === "release") return ok(releaseLine(reply.release));
     return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독의 답을 받지 못했다(malformed)`);
   }
-  if (reply.kind === "refused") return fail(ADMIN_EXIT.failed, `감독이 요청을 거절했다(${reply.reason})`);
+  if (reply.kind === "refused") return fail(ADMIN_EXIT.failed, `감독이 요청을 거절했다(${reply.refusal === undefined ? reply.reason : `${reply.reason}:${reply.refusal}`})`);
   if (reply.reason === "restore_not_done") return fail(ADMIN_EXIT.waiting, `${subject} 모름: 감독이 복원을 마치지 않았다(restore_not_done)`);
-  // 시험 작업의 write_unknown만 장부에 적혔을 수 있다(다시 부르는 법은 README "감독 관리 통로").
+  // 시험 작업·자리 풀기의 write_unknown만 장부에 적혔을 수 있다(다시 부르는 법은 README "감독 관리 통로").
   if (reply.reason === "write_unknown") return fail(ADMIN_EXIT.failed, `${subject} 모름: 장부에 적혔는지 모른다(write_unknown)`);
   return fail(ADMIN_EXIT.failed, `${subject} 모름: 감독이 상태를 읽지 못했다(${reply.reason})`);
 }

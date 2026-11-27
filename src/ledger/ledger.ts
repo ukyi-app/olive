@@ -81,6 +81,45 @@ export interface StatusPeek {
   readonly intakeOpen: boolean;
 }
 
+// 관리 통로의 holds 읽기(Ledger.peekHolds)가 내는 자리를 쥔 실행 줄 하나. 관리자가 자리 풀기의 다음 행동을 고를 사실만 싣는다.
+export interface HoldRunPeek {
+  readonly runId: string;
+  readonly kind: RunKind;
+  readonly state: LedgerRunState;
+  readonly executorId: string;
+  readonly runGeneration: number;
+  // 접수 영수증을 받았는가. 받은 적 없는 실행을 닫으면 D-90 자동 닫기보다 먼저 실패로 남는다(D-94의 안내).
+  readonly accepted: boolean;
+  // 종료 확인 영수증 ID. 결과 포기(abandonResult)는 이 값을 그대로 넘겨야 버린다.
+  readonly stopReceiptId: string | null;
+  // 그 실행의 확정 지시(result_finalize)가 적혔는가.
+  readonly finalizeSent: boolean;
+  // failed_stopped가 된 장부 시각(판 8의 칸). 비면 null이고, 그 failed_stopped는 확정도 저장소 비움 닫기도 못 한다(D-162).
+  readonly failedStoppedAt: number | null;
+  // 관리자 닫기가 닫을 수 있게 되는 시각(task_start·run_renew 발행 최댓값 + 31000, closeRunByOperator와 같은 식). task_start가 없거나
+  // session_start가 있으면 null이다: 그 이력은 기다려도 닫히지 않는다(start_may_launch).
+  readonly closableAt: number | null;
+}
+
+// peekHolds가 내는 점유 관측 하나(slot_holds에서 슬롯을 막는 줄). heldAt은 그 관측을 적은 감독 시각이고, 점유 관측 풀기의 새 파드는 그 뒤에 떠야 한다.
+export interface HoldSlotPeek {
+  readonly observation: number;
+  readonly executorId: string;
+  readonly runId: string;
+  readonly kind: RunKind;
+  readonly runGeneration: number;
+  readonly why: SlotHold["why"];
+  readonly heldAt: number;
+}
+
+// more: cap에서 멈췄다(실행 줄과 점유 관측을 합쳐 cap개 넘게 있다). workerSlotFree: 새 작업자 실행이 자리를 받을 수 있는가(slotFree("worker")와 같은 판정).
+export interface HoldsPeek {
+  readonly runs: readonly HoldRunPeek[];
+  readonly slotHolds: readonly HoldSlotPeek[];
+  readonly more: boolean;
+  readonly workerSlotFree: boolean;
+}
+
 export const REFUSALS = [
   "ledger_unwritable",
   "intake_closed",
@@ -1943,6 +1982,62 @@ export class Ledger {
       const rows = this.#db.query("SELECT run_id FROM runs WHERE kind = 'worker' AND state = 'checking' ORDER BY queue_seq").all() as { run_id: string }[];
       return { known: true, value: rows.map((row) => row.run_id) };
     } catch (error) {
+      return { known: false, reason: classify(error) };
+    }
+  }
+
+  // 감독 관리 통로의 holds 읽기 하나(README "감독 관리 통로"): 자리를 쥔 실행 줄(대기 순번 차례)과 슬롯을 막는 점유 관측(관측 번호 차례)을
+  // 합쳐 cap개까지, 그리고 작업자 자리를 쓸 수 있는가. peekStatus와 같이 실패해도 장부를 고장으로 표시하지 않고 허가를 버리지 않는다:
+  // 관리 통로는 설정 없이 늘 켜져 있어, 사람이 부른 조회의 일시 오류로 접수가 닫히고 감독이 끝나면 안 된다. 이미 고장으로 표시된 장부는
+  // 알려진 값을 내지 않는다. 한 동기 구간의 읽기라 그 사이 장부가 바뀌지 않는다.
+  peekHolds(cap: number): Read<HoldsPeek> {
+    if (!Number.isSafeInteger(cap) || cap < 1) throw new LedgerInputError("cap: 1 이상의 안전 정수여야 한다");
+    if (this.#closed) return { known: false, reason: "closed" };
+    if (this.#broken !== null) return { known: false, reason: this.#broken };
+    try {
+      this.#faults.at("read");
+      const free = SLOT_FREE.map(() => "?").join(", ");
+      const runRows = this.#db.query(`SELECT * FROM runs WHERE state NOT IN (${free}) ORDER BY queue_seq LIMIT ?`).all(...SLOT_FREE, cap + 1) as RunRow[];
+      const holdRows = this.#db
+        .query("SELECT observation, executor_id, run_id, kind, run_generation, why, held_at FROM slot_holds WHERE holds_slot = 1 ORDER BY observation LIMIT ?")
+        .all(cap + 1) as { observation: number; executor_id: string; run_id: string; kind: RunKind; run_generation: number; why: SlotHold["why"]; held_at: number }[];
+      const runs = runRows.slice(0, cap).map((row): HoldRunPeek => {
+        const starts = this.#db
+          .query("SELECT count(*) FILTER (WHERE action = 'task_start') AS task, count(*) FILTER (WHERE action = 'session_start') AS session FROM instructions WHERE run_id = ?")
+          .get(row.run_id) as { task: number; session: number };
+        const issued = this.#db.query("SELECT MAX(issued_at) AS at FROM instructions WHERE run_id = ? AND action IN ('task_start', 'run_renew')").get(row.run_id) as { at: number | null };
+        const closable = starts.task !== 0 && starts.session === 0 && issued.at !== null;
+        const finalized = this.#db.query("SELECT 1 AS x FROM instructions WHERE run_id = ? AND action = 'result_finalize' LIMIT 1").get(row.run_id) !== null;
+        const failedAt = row.failed_stopped_at === undefined || row.failed_stopped_at === null ? null : safe(row.failed_stopped_at, "runs.failed_stopped_at");
+        return {
+          runId: row.run_id,
+          kind: row.kind,
+          state: row.state,
+          executorId: row.executor_id,
+          runGeneration: safe(row.run_generation, "run_generation"),
+          accepted: row.accepted_receipt_id !== null,
+          stopReceiptId: row.stop_receipt_id,
+          finalizeSent: finalized,
+          failedStoppedAt: failedAt,
+          closableAt: closable ? safe(issued.at, "instructions.issued_at") + OPERATOR_CLOSE_AFTER_MS : null,
+        };
+      });
+      const slotHolds = holdRows.slice(0, cap - runs.length).map(
+        (row): HoldSlotPeek => ({
+          observation: safe(row.observation, "slot_holds.observation"),
+          executorId: row.executor_id,
+          runId: row.run_id,
+          kind: row.kind,
+          runGeneration: safe(row.run_generation, "slot_holds.run_generation"),
+          why: row.why,
+          heldAt: safe(row.held_at, "slot_holds.held_at"),
+        }),
+      );
+      const workerHeld = this.#db.query(`SELECT 1 AS x FROM runs WHERE kind = 'worker' AND state NOT IN (${free}) LIMIT 1`).get(...SLOT_FREE);
+      const value: HoldsPeek = { runs, slotHolds, more: runRows.length + holdRows.length > cap, workerSlotFree: workerHeld === null && !this.#slotHeld("worker") };
+      return { known: true, value };
+    } catch (error) {
+      if (error instanceof LedgerInputError) throw error;
       return { known: false, reason: classify(error) };
     }
   }

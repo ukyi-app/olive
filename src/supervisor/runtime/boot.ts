@@ -59,6 +59,7 @@ import { createSigning, SigningKeyError, type SupervisorSigning } from "./signer
 import { createWireSink, type WireSink } from "./sink.ts";
 import { createToolPorts } from "./tools-adapter.ts";
 import type { AdminSources } from "../admin/status.ts";
+import type { ReleaseNote, ReleasePorts } from "../admin/release.ts";
 import type { TestJobPorts } from "../admin/test-job.ts";
 
 // 종료 코드. 0은 요청된 멈춤(SIGTERM 등)을 끝 차례까지 마쳤을 때뿐이다. 64·69는 이미지의 다른 진입점, 81~89는 작업자 실행기가 쓴다.
@@ -201,6 +202,8 @@ export interface RunningSupervisor {
   readonly admin: AdminSources;
   // 관리 통로의 시험 작업 넣기 포트(장부 쓰기 recordToolRequest 하나와 그 문). 설정(testJobs)이 켜졌을 때만 있고, 꺼져 있으면 null이다.
   readonly testJob: TestJobPorts | null;
+  // 관리 통로의 자리 풀기 포트(장부 쓰기 셋, 고장을 표시하지 않는 holds 읽기, 그 문, 기록). 설정 없이 늘 있다(운영 관리 기능, D-91).
+  readonly release: ReleasePorts;
 }
 
 export type BootResult = { readonly ok: true; readonly running: RunningSupervisor } | { readonly ok: false; readonly step: BootStep; readonly code: number; readonly reason: string };
@@ -1156,5 +1159,25 @@ export async function bootSupervisor(settings: SupervisorSettings, deps: Supervi
           random: deps.random,
         })
       : null;
-  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools, admin, testJob } };
+  // 자리 풀기의 포트. 설정 없이 늘 만든다. 장부 객체를 넘기지 않고 쓰기 셋(closeRunByOperator·abandonResult·releaseSlotHold)과 고장을
+  // 표시하지 않는 읽기 peekHolds만 담는다. 문은 조립의 변수·박자 기한·요청 기한만 본다: look()·haltReason()을 부르지 않고(래치를 움직이지 않는다)
+  // 장부를 읽지 않는다. 접수 허가는 보지 않는다(장부의 쓰기 모드 new가 접수 닫힘·정지·사본 보류를 막지 않는다). 복원 5단계 전에는
+  // restore_not_done이다(README "감독 관리 통로"의 "자리 풀기"). 기록은 admin_release 한 줄이고 파드 이름을 싣지 않는다(release.ts의 ReleaseNote).
+  const release: ReleasePorts = Object.freeze({
+    ledger: Object.freeze({
+      closeRunByOperator: (input: Parameters<Ledger["closeRunByOperator"]>[0]) => ledger.closeRunByOperator(input),
+      abandonResult: (input: Parameters<Ledger["abandonResult"]>[0]) => ledger.abandonResult(input),
+      releaseSlotHold: (input: Parameters<Ledger["releaseSlotHold"]>[0]) => ledger.releaseSlotHold(input),
+      peekHolds: (cap: number) => ledger.peekHolds(cap),
+    }),
+    gate: (limit: number) => {
+      if (stopping || exitCode !== 0 || halted !== null) return "closed";
+      if (stage < 5) return "restore_not_done";
+      if (beatLimit !== null && pastLimit(deps, beatLimit)) return "closed";
+      // 요청 기한은 맨 끝에 본다: 위 판단에 쓴 시간까지 기한 비교에 든다. 정각이면 late, 시각을 읽지 못해도 late.
+      return pastLimit(deps, limit) ? "late" : "open";
+    },
+    note: (fields: ReleaseNote) => log("admin_release", fields),
+  });
+  return { ok: true, running: { stop: () => finish("stop"), done: settled, tools, admin, testJob, release } };
 }
