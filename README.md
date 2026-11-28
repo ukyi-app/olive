@@ -18,12 +18,13 @@
 - **하나의 이미지, 역할은 명령으로:** 감독과 작업자 실행기가 같은 이미지를 쓴다. 파드는 `command`로 역할을 고른다.
   - 감독: `["bun", "src/main/supervisor.ts"]`
   - 장부 초기화(감독을 처음 켜기 전 한 번): `["bun", "src/main/ledger-init.ts"]`. 빈 장부 볼륨에 감독 장부를 만든다(아래 "장부 초기화").
+  - 결과 폴더 준비(감독 파드의 init 컨테이너): `["bun", "src/main/result-dir-init.ts"]`. 결과 보관 폴더를 감독 uid 소유·0700으로 만들거나 확인한다(아래 "결과 보관 폴더 준비").
   - 작업자 실행기(제어 컨테이너): `["bun", "src/main/executor.ts"]`
   - 대리 설치(작업자 실행기 파드의 init 컨테이너): `["bun", "src/main/agent-install.ts"]`. 이미지의 `/opt/olive/olive-agent`를 공유 볼륨의 `/opt/olive-agent/olive-agent`에 놓는다(아래 "대리 설치").
   - 역할 컨테이너의 대리(PID 1): `/opt/olive-agent/olive-agent`(`src/main/role-agent.ts`를 컴파일한 파일). 역할 컨테이너는 다른 이미지(glibc 계열)이고 대리를 init이 놓는다(D-103·D-107).
   - 기본 명령(`src/main/no-role.ts`)은 역할을 고르라고 찍고 64로 끝난다. 이미지의 `ENTRYPOINT`는 비어 있어 `command`가 그대로 돈다.
-- **종료 코드:** 64는 역할을 고르지 않음, 69는 자리 진입점(지금 쓰는 역할 없음). 감독의 91~97은 아래 "감독 진입점", 실행기의 81~89, 대리의 75~82, 대리 설치의 90~93은 아래 "작업자 실행기 진입점".
-- **사용자와 파일시스템:** 비root uid·gid 65532. 루트 파일시스템은 읽기 전용 전제이고, 쓰기는 파드가 역할마다 붙인 볼륨에서만 된다: 모든 컨테이너의 `/tmp`(emptyDir), 작업자 실행기 파드 init 컨테이너의 `/opt/olive-agent`(emptyDir `agent-bin`, 대리 설치 대상. 역할 컨테이너에는 읽기 전용), 감독의 장부 폴더(`OLIVE_LEDGER_DIR`, PVC. SQLite 장부를 쓴다)와 결과 보관 폴더(`OLIVE_RESULT_DIR`).
+- **종료 코드:** 64는 역할을 고르지 않음, 69는 자리 진입점(지금 쓰는 역할 없음). 감독의 91~97은 아래 "감독 진입점", 실행기의 81~89, 대리의 75~82, 대리 설치의 90~93은 아래 "작업자 실행기 진입점", 결과 폴더 준비의 98은 아래 "결과 보관 폴더 준비".
+- **사용자와 파일시스템:** 비root uid·gid 65532. 루트 파일시스템은 읽기 전용 전제이고, 쓰기는 파드가 역할마다 붙인 볼륨에서만 된다: 모든 컨테이너의 `/tmp`(emptyDir), 작업자 실행기 파드 init 컨테이너의 `/opt/olive-agent`(emptyDir `agent-bin`, 대리 설치 대상. 역할 컨테이너에는 읽기 전용), 감독의 장부 폴더(`OLIVE_LEDGER_DIR`, PVC. SQLite 장부를 쓴다)와 결과 보관 폴더(`OLIVE_RESULT_DIR`, 감독 uid 소유·0700. 감독 파드의 init 컨테이너가 같은 PVC를 붙여 맞춘다).
 - **포트:** 이미지에 듣는 포트를 적지 않는다(`EXPOSE`·`PORT` 없음). 실행기는 TCP 포트를 듣지 않는다. 듣는 곳은 역할 컨테이너의 대리가 붙는 경로 유닉스 소켓 하나(`src/executor/agent-listener.ts`, D-102)뿐이고 abstract 소켓도 쓰지 않는다.
 - **들이지 않는 것:** hc 실행 파일, `/etc/claude-code`(관리 설정), 모델 CLI. 앞의 둘은 빌드가 확인한다.
 - **들이는 것: 대리 실행 파일 하나, glibc(D-107).** `/opt/olive/olive-agent`는 `src/main/role-agent.ts`를 `bun build --compile --target=bun-linux-x64`로 Bun 런타임째 묶은 파일이다(약 104MiB, 이미지가 그만큼 커진다). glibc 동적 링크(`/lib64/ld-linux-x86-64.so.2`)라 Alpine 같은 musl 이미지에서는 돌지 않는다. 실행 폴더의 `.env`·`bunfig.toml`을 읽지 않게 컴파일한다(대리는 역할 컨테이너의 작업 폴더에서 prepare 전에 뜬다). 이 이미지 안에서는 돌리지 않는다.
@@ -59,7 +60,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 대리를 glibc 대상으로 컴파일해 image-check가 본다(`dockerfile`), 대리 설치가 복사·sha256 대조·모드 0555·덮어쓰기를 하고 실패마다 정한 코드로 끝난다(`agent-install`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 두 진입점뿐이다(`entrypoints`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 대리를 glibc 대상으로 컴파일해 image-check가 본다(`dockerfile`), 대리 설치가 복사·sha256 대조·모드 0555·덮어쓰기를 하고 실패마다 정한 코드로 끝난다(`agent-install`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 `src/main/`의 다섯 진입점(`executor`·`ledger-init`·`result-dir-init`·`role-agent`·`supervisor`)뿐이다(`entrypoints`), 결과 폴더 준비가 결과 보관 폴더를 0700으로 만들거나 고치고 그 밖은 고치지 않고 정한 코드로 끝난다(`result-dir-init`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -103,6 +104,7 @@ src/main/
 ├── supervisor.ts   # 감독 진입점: 환경 → 조립(src/supervisor/runtime/boot.ts), 기동 뒤 관리 통로 소켓을 듣는다
 ├── ledger-init.ts  # 장부 초기화 진입점(D-110): 빈 장부 볼륨에 감독 장부를 create로 한 번 만든다(감독과 같은 환경 이름 하나만 읽는다)
 ├── ledger-path.ts  # 감독과 장부 초기화가 함께 쓰는 장부 자리(환경 이름, 파일 이름)
+├── result-dir-init.ts # 결과 보관 폴더 준비 진입점(D-177): 감독 파드 init 컨테이너에서 결과 폴더를 이 uid 소유·0700으로 맞춘다(감독과 같은 환경 이름 하나만 읽는다)
 ├── admin.ts        # 감독 관리 진입점: 감독 컨테이너에서 kubectl exec로 status(관리 소켓에 붙는다, 환경을 읽지 않고 듣지 않는다)
 ├── executor.ts     # 작업자 실행기(제어 컨테이너) 진입점: 환경 → 조립(src/executor/runtime.ts)
 ├── role-agent.ts   # 역할 컨테이너의 대리 진입점: 환경 → prepare → 제어 소켓에 붙음
@@ -328,7 +330,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 ## 감독 진입점
 
-감독 파드는 `bun src/main/supervisor.ts` 하나다. 감독 쪽에서 환경을 읽는 곳은 이 파일과 장부 초기화 진입점(아래 "장부 초기화")뿐이고(`test/entrypoints.test.ts`), 조립(`src/supervisor/runtime/boot.ts`의 `bootSupervisor`)은 값과 주입받은 파일 읽기·장부 열기·서버 시작·시계·타이머·CSPRNG로만 돈다. 조건 번호와 코드 자리, 모름·실패 표, 뒤 조각의 조건은 `src/supervisor/runtime/boot.md`다. 같은 컨테이너에서 관리 진입점 `bun src/main/admin.ts status`가 kubectl exec로 돈다(아래 "감독 관리 통로").
+감독 파드는 `bun src/main/supervisor.ts` 하나다. 감독 쪽에서 환경을 읽는 곳은 이 파일과 장부 초기화·결과 폴더 준비 진입점(아래 "장부 초기화"·"결과 보관 폴더 준비")뿐이고(`test/entrypoints.test.ts`), 조립(`src/supervisor/runtime/boot.ts`의 `bootSupervisor`)은 값과 주입받은 파일 읽기·장부 열기·서버 시작·시계·타이머·CSPRNG로만 돈다. 조건 번호와 코드 자리, 모름·실패 표, 뒤 조각의 조건은 `src/supervisor/runtime/boot.md`다. 같은 컨테이너에서 관리 진입점 `bun src/main/admin.ts status`가 kubectl exec로 돈다(아래 "감독 관리 통로").
 
 **운영 값에서는 지금 접수를 열지 못한다.** 현관(O08)이 없어 복원 1단계(권위 정지 기록)가 늘 "모름"이다. 감독은 듣고 서버 tick만 돌리며 맞춤 요청에 답하지 않는다(D-76대로 닫힌 채). 1단계를 같은 복원기로 주기마다 다시 부르고 재시작하지 않는다. 운영 차트는 감독을 아직 켜지 않고, 환경도 다 주지 않는다(아래 표의 "차트 짝"). 시험 클러스터는 시험 값에서만 켜는 시험 현관 대역(D-109, 아래 "시험 현관 대역")으로 접수를 연다.
 
@@ -386,6 +388,32 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 
 메시지는 stderr 한 줄이고 stdout은 비어 있다. 사유만 찍고 장부 모듈의 상세 글은 싣지 않는다(SQLite 오류 글에 경로가 섞일 수 있다).
 
+### 결과 보관 폴더 준비(D-177)
+
+결과 보관 폴더(`OLIVE_RESULT_DIR`)는 **감독 uid 소유·모드 0700인, 링크가 아닌 폴더**로 둔다. 감독(결과 보관소)은 폴더를 만들거나 소유·모드를 보지 않고 마지막 경로 요소가 링크 없는 실제 폴더인지만 본다(위 4). 폴더를 맞추는 일은 같은 이미지의 진입점 `bun src/main/result-dir-init.ts`(인자 없음)가 감독 파드의 init 컨테이너에서 감독과 같은 uid로 한다.
+
+- **왜 init인가:** 감독 파드는 장부 PVC의 하위 폴더 `results`를 subPath로 붙인다. kubelet은 그 폴더가 없으면 root 소유·볼륨 뿌리의 모드로 만들고(hostPath 계열 PV에서는 `fsGroup`이 듣지 않는다), 이미 있으면 만들지 않는다. 그래서 init이 감독 컨테이너보다 먼저 같은 PVC의 뿌리를 붙여 폴더를 만들어 두면 감독이 그 폴더를 그대로 쓴다. 파드가 뜰 때마다 다시 보므로 폴더가 사라져도 다음 기동에서 다시 0700으로 만든다.
+- **환경:** 감독과 같은 이름 `OLIVE_RESULT_DIR` 하나만 읽는다. 값은 **이 컨테이너에서 보이는 같은 폴더의 경로**다. init은 PVC 뿌리를 붙이므로 값이 감독과 다를 수 있다(예: 감독 `/var/lib/olive-results`, init `/var/lib/olive/results`). 꼴은 결과 보관소가 받는 것과 같다: 절대 경로, 정규화된 꼴(`..`·`.`·겹친 `/` 없음), 끝의 `/` 없음. 듣지 않고 어디에도 붙지 않는다.
+- **판정(uid는 이 프로세스의 uid):**
+  - 없으면: 상위 폴더가 있어야 한다(상위를 만들지 않는다). 0700으로 만들고 다시 `lstat`으로 본다. umask가 좁거나 상위에 setgid가 있어 0700이 아니면 0700으로 고친 뒤 다시 본다.
+  - 있으면: `lstat`(링크를 따라가지 않음)으로 보아 폴더이고 링크가 아니고 이 uid 소유이고 모드(setuid·setgid·sticky를 포함한 권한 비트 전체)가 0700이면 통과.
+  - 이 uid 소유이고 모드만 다르면 0700으로 고친 뒤 다시 본다.
+  - 그 밖(링크, 폴더가 아님, 다른 uid 소유는 모드가 0700이어도, 상위 폴더 없음, 확인 실패)은 더 고치지 않고 98로 끝난다. 만들기 경쟁(`EEXIST`)은 "있으면"의 판정으로 간다.
+  - **98은 디스크가 그대로라는 뜻이 아니다.** 처음 본 자리를 조건 밖이라 거절한 98은 아무것도 바꾸지 않았다. 폴더를 만들거나 모드를 고친 뒤에 난 98(만든 뒤의 `chmod:<오류>`, 다시 본 `lstat:<오류>`, `verify:…`)은 그 변경을 되돌리지 않아 폴더가 만들어졌거나 모드가 0700으로 바뀐 채 남을 수 있다. `lstat:<오류>`는 두 자리 모두에서 나오므로 98만으로는 어느 쪽인지 알 수 없다. 다시 돌리기 전에 폴더를 본다.
+  - 결과 폴더 이름 하나만 건드린다. 장부 파일과 다른 이름은 보지도 바꾸지도 않는다.
+- **이미 root 소유인 폴더:** 감독 uid로는 고칠 수 없어 98(`uid_mismatch:0:<모드>`)로 멈추고 파드는 init에서 멈춘다. 관리자가 따로 바로잡는다. 이 진입점은 폴더를 옮기거나 지우지 않는다.
+- **막지 않는 것:** 모드를 고치는 `chmod`는 링크를 따라간다. 바로 앞의 `lstat`과 그 호출 사이의 바꿔치기는 막지 못한다. 뒤의 `lstat`은 그때 보이는 자리만 본다. 조건 밖 상태(링크, 다른 uid, 모드 다름)가 남아 있으면 98(`verify:…`)이고, 맞는 폴더가 보이면 0이다. 그 사이 어느 대상이 바뀌었는지는 알 수 없고, 이미 다른 대상에 적용된 모드 변경은 되돌리지 않는다. 상위 폴더에 쓰는 것이 감독과 같은 uid뿐이라는 배포 전제에 기댄다. 상위 경로의 링크는 감독처럼 보지 않는다.
+- **차트(homelab, 뒤 PR):** 감독 파드에 이 진입점의 init 컨테이너 하나를 둔다(같은 이미지·같은 uid, Secret 없음, 장부 PVC 뿌리를 쓰기로 붙임). 이 진입점이 든 이미지 digest가 먼저 있어야 한다.
+
+| 코드 | 뜻 |
+|---|---|
+| 0 | 결과 폴더가 이 uid 소유·0700이다. 만들었다·이미 맞다·모드를 고쳤다 중 무엇인지 찍는다 |
+| 64 | 인자가 있다(사용법) |
+| 91 | `OLIVE_RESULT_DIR`이 없거나 빈 값이거나 꼴이 틀렸다(파일을 보기 전) |
+| 98 | 결과 폴더에서 멈췄다. 사유: `symlink`, `not_directory:<종류>`, `uid_mismatch:<uid>:<모드>`, `parent_missing`, `parent_not_directory`, `lstat:<오류>`·`mkdir:<오류>`·`chmod:<오류>`(오류 이름, 예 `EACCES`·`EROFS`), `lstat:malformed`, `verify:<사유>`(만들거나 고친 뒤 다시 본 것이 조건과 다르다, 예 `verify:mode:0500`), `uid:unknown`, `deps:threw`, `threw`. 처음 본 자리를 거절한 98은 아무것도 바꾸지 않았다. 만들거나 고친 뒤의 98(만든 뒤의 `chmod:<오류>`, 다시 본 `lstat:<오류>`, `verify:…`)은 폴더가 만들어졌거나 모드가 바뀐 채 남을 수 있어, 98만으로는 디스크가 바뀌었는지 알 수 없다. 다시 돌리기 전에 폴더를 본다 |
+
+메시지는 stderr 한 줄이고 stdout은 비어 있다. 경로는 싣지 않는다. 98은 다른 진입점이 쓰지 않는 값이다.
+
 ### 기한이 있는 기다림
 
 판정은 시각이 한다. 일을 함수로 받아 **부르기 전에** 절대 기한을 정하고(`boot.ts`의 `deadline` → `runBy`), 결과(성공·실패)를 받아들이는 자리마다 단조 시계(`monoNow`, 제품은 `performance.now`)로 그 기한과 견준다. 정각(`monoNow() >= 기한`) 이후면 콜백 차례와 상관없이 만료다(`waitUntil`). 일의 동기 비용도 기한 안에 든다. 상한 타이머는 깨우는 수단이라 정각 전에 불리면 남은 시간으로 다시 건다. 시각을 읽지 못하면 기한이 지난 것으로 보고, 기한을 정하지 못하면 일을 부르지 않는다(닫기만은 부르고 `unarmed`로 끝낸다).
@@ -419,7 +447,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | `OLIVE_ENVIRONMENT` | 등록표의 `environment`와 같아야 하는 클러스터 이름 | 차트 짝(N5c) | 91 |
 | `OLIVE_TARGETS` | 대상 표 JSON 배열 `[{ "target", "namespace", "roles" }]`(등록표와 배정이 같은 배열을 쓴다) | 차트 짝(N5c) | 91 |
 | `OLIVE_POLICY_REVISION` | 실행기의 인사에서 기대하는 정책 revision(v1 revision 꼴). 복원 2단계의 정책 대조 | 차트 짝(N5c) | 91 |
-| `OLIVE_RESULT_DIR` | 결과 보관 폴더(미리 만든 실제 폴더, 그 폴더를 쓰는 감독은 하나). 기동은 마지막 경로 요소만 본다. 상위 경로에 링크가 없는 것은 배포 전제(N5c) | 차트 짝(N5c) | 91, 마지막 요소가 링크이거나 실제 폴더가 아니면 94 |
+| `OLIVE_RESULT_DIR` | 결과 보관 폴더(미리 만든 실제 폴더, 그 폴더를 쓰는 감독은 하나). 감독 uid 소유·0700은 감독 파드의 init 컨테이너가 맞춘다(위 "결과 보관 폴더 준비", 감독은 소유·모드를 보지 않는다). 기동은 마지막 경로 요소만 본다. 상위 경로에 링크가 없는 것은 배포 전제(N5c) | 차트 짝(N5c) | 91, 마지막 요소가 링크이거나 실제 폴더가 아니면 94 |
 | `OLIVE_ACCOUNT_NAME` | 고정 계정의 별칭(D-126). 계정 폴더 아래 `<별칭>` 폴더의 이름이고, 배정이 고르는 계정 하나(`subscription` 방식)가 된다. 꼴은 계정 폴더 이름 규칙 `^[a-z0-9][a-z0-9-]{0,31}$`(`src/supervisor/accounts/fixed.ts`의 `ACCOUNT_NAME`) | 차트(homelab 차트 `supervisor.account.name`이 렌더. 계정 Secret을 붙이는 같은 값이고, 차트 스키마는 끝의 `-`까지 막아 더 좁다) | 계정 없음: 배정이 `no_account`로 보류하고 자격 파일을 읽지 않는다. 꼴이 틀리면 91 |
 | `OLIVE_ACCOUNT_REVISION` | 고정 계정 자격의 판(D-111, v1 revision 꼴). 배정이 고른 계정의 자격 참조(`credential`의 `revision`)에 싣는다. 계정 Secret을 바꾸는 사람 PR이 이 값을 함께 올린다 | 차트(homelab이 렌더할 이름. 값 자리는 `supervisor.account.revision`, D-111) | 모름: 자격 참조를 만들지 않아(파일을 열지 않는다) 새 실행 0. 별칭(`OLIVE_ACCOUNT_NAME`)과 판이 함께 있어야 자격 참조가 생긴다. 꼴이 틀리면 91 |
 | `OLIVE_PROFILE_REVISIONS` | 역할별 기대 프로필 revision의 JSON 객체 `{ "<v1 역할>": "<revision>" }`. 실행기 인사의 `profile_revision`과 견준다. 칸이 없는 역할은 배정하지 않고, 칸의 값이 모두 같을 때만 쓴다(아래 "이 진입점에 없는 것"의 배정 정책) | 차트(homelab 역할 프로필 조각이 렌더할 이름) | 기대값 없음: 모든 연결이 보류. JSON 객체가 아니거나 모르는 역할·꼴이 틀린 revision·거듭된 역할 칸이면 91 |
