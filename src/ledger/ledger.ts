@@ -105,6 +105,11 @@ export interface HoldRunPeek {
   // 관리자 닫기가 닫을 수 있게 되는 시각(task_start·run_renew 발행 최댓값 + 31000, closeRunByOperator와 같은 식). task_start가 없거나
   // session_start가 있으면 null이다: 그 이력은 기다려도 닫히지 않는다(start_may_launch).
   readonly closableAt: number | null;
+  // 종료 확인 영수증(stop_receipt_id가 가리키는 deliveries의 receipt_stopped 줄)을 받은 장부 시각. 종료 확인이 없으면 null이다.
+  // completed로 checking이 된 실행은 그 영수증을 적는 같은 쓰기에서 checking이 되므로 결과를 기다리기 시작한 시각이다. 그 줄은 고칠 수
+  // 없고(deliveries_fixed) 실행 줄의 stop_receipt_id도 한 번만 채워져(runs_evidence) 재시작 뒤에도 같다. updated_at은 recordBudget
+  // 같은 쓰기가 바꾸므로 쓰지 않는다.
+  readonly stopReceivedAt: number | null;
 }
 
 // peekHolds가 내는 점유 관측 하나(slot_holds에서 슬롯을 막는 줄). heldAt은 그 관측을 적은 감독 시각이고, 점유 관측 풀기의 새 파드는 그 뒤에 떠야 한다.
@@ -2014,7 +2019,10 @@ export class Ledger {
     try {
       this.#faults.at("read");
       const free = SLOT_FREE.map(() => "?").join(", ");
-      const runRows = this.#db.query(`SELECT * FROM runs WHERE state NOT IN (${free}) ORDER BY queue_seq LIMIT ?`).all(...SLOT_FREE, cap + 1) as RunRow[];
+      const runSql = `SELECT r.*, d.received_at AS stop_received_at FROM runs r
+        LEFT JOIN deliveries d ON d.id = r.stop_receipt_id AND d.run_id = r.run_id AND d.action = 'receipt_stopped'
+        WHERE r.state NOT IN (${free}) ORDER BY r.queue_seq LIMIT ?`;
+      const runRows = this.#db.query(runSql).all(...SLOT_FREE, cap + 1) as (RunRow & { stop_received_at: number | null })[];
       const holdRows = this.#db
         .query("SELECT observation, executor_id, run_id, kind, run_generation, why, held_at FROM slot_holds WHERE holds_slot = 1 ORDER BY observation LIMIT ?")
         .all(cap + 1) as { observation: number; executor_id: string; run_id: string; kind: RunKind; run_generation: number; why: SlotHold["why"]; held_at: number }[];
@@ -2041,6 +2049,7 @@ export class Ledger {
           failedStoppedAt: failedAt,
           failedFacts: failed === null ? null : { requestedCancel: failed.requestedCancel, exit: failed.exit },
           closableAt: closable ? safe(issued.at, "instructions.issued_at") + OPERATOR_CLOSE_AFTER_MS : null,
+          stopReceivedAt: row.stop_received_at === null ? null : safe(row.stop_received_at, "deliveries.received_at"),
         };
       });
       const slotHolds = holdRows.slice(0, cap - runs.length).map(
