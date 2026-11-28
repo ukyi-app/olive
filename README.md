@@ -60,7 +60,7 @@ bun run check   # 타입 검사
 bun run test    # 시험과 실행된 시험 수 확인(Dockerfile의 test 단계와 같은 명령)
 ```
 
-`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 대리를 glibc 대상으로 컴파일해 image-check가 본다(`dockerfile`), 대리 설치가 복사·sha256 대조·모드 0555·덮어쓰기를 하고 실패마다 정한 코드로 끝난다(`agent-install`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 두 진입점뿐이다(`entrypoints`), 결과 폴더 준비가 결과 보관 폴더를 0700으로 만들거나 고치고 그 밖은 고치지 않고 정한 코드로 끝난다(`result-dir-init`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
+`test/`가 지금 지키는 계약: 고정한 버전이 서로 같다(`pins`), Dockerfile에 단계와 확인 줄이 있다(`dockerfile`), 대리를 glibc 대상으로 컴파일해 image-check가 본다(`dockerfile`), 대리 설치가 복사·sha256 대조·모드 0555·덮어쓰기를 하고 실패마다 정한 코드로 끝난다(`agent-install`), 진입점이 정해진 코드로 끝나고 실행기 쪽 코드의 듣는 API는 `agent-listener.ts`의 경로 유닉스 소켓 하나뿐이며 대리 쪽은 듣지 않고 환경을 읽는 곳은 `src/main/`의 다섯 진입점(`executor`·`ledger-init`·`result-dir-init`·`role-agent`·`supervisor`)뿐이다(`entrypoints`), 결과 폴더 준비가 결과 보관 폴더를 0700으로 만들거나 고치고 그 밖은 고치지 않고 정한 코드로 끝난다(`result-dir-init`), `CODEOWNERS`·`build.yaml`·Renovate 정책(`repo`), 계약 `olive-control/v1`과 그 fixture(`contract/`), 작업자 실행기의 지시 처리·지속 상태·연결 수명·정리(`executor/`).
 
 **`bun test`가 아니라 `bun run test`다.** `bun test`는 시험이 0개인 파일(빈 파일, 블록 주석으로 감싼 파일)을 결과에서 빼고 0으로 끝난다. `bun run test`는 `test/run.ts`를 돌린다. 이것이 `bun test --reporter=junit`의 결과 파일을 읽어 다음이면 실패한다.
 
@@ -398,10 +398,11 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
   - 없으면: 상위 폴더가 있어야 한다(상위를 만들지 않는다). 0700으로 만들고 다시 `lstat`으로 본다. umask가 좁거나 상위에 setgid가 있어 0700이 아니면 0700으로 고친 뒤 다시 본다.
   - 있으면: `lstat`(링크를 따라가지 않음)으로 보아 폴더이고 링크가 아니고 이 uid 소유이고 모드(setuid·setgid·sticky를 포함한 권한 비트 전체)가 0700이면 통과.
   - 이 uid 소유이고 모드만 다르면 0700으로 고친 뒤 다시 본다.
-  - 그 밖(링크, 폴더가 아님, 다른 uid 소유는 모드가 0700이어도, 상위 폴더 없음, 확인 실패)은 고치지 않고 98로 끝난다. 만들기 경쟁(`EEXIST`)은 "있으면"의 판정으로 간다.
+  - 그 밖(링크, 폴더가 아님, 다른 uid 소유는 모드가 0700이어도, 상위 폴더 없음, 확인 실패)은 더 고치지 않고 98로 끝난다. 만들기 경쟁(`EEXIST`)은 "있으면"의 판정으로 간다.
+  - **98은 디스크가 그대로라는 뜻이 아니다.** 처음 본 자리를 조건 밖이라 거절한 98은 아무것도 바꾸지 않았다. 폴더를 만들거나 모드를 고친 뒤에 난 98(만든 뒤의 `chmod:<오류>`, 다시 본 `lstat:<오류>`, `verify:…`)은 그 변경을 되돌리지 않아 폴더가 만들어졌거나 모드가 0700으로 바뀐 채 남을 수 있다. `lstat:<오류>`는 두 자리 모두에서 나오므로 98만으로는 어느 쪽인지 알 수 없다. 다시 돌리기 전에 폴더를 본다.
   - 결과 폴더 이름 하나만 건드린다. 장부 파일과 다른 이름은 보지도 바꾸지도 않는다.
 - **이미 root 소유인 폴더:** 감독 uid로는 고칠 수 없어 98(`uid_mismatch:0:<모드>`)로 멈추고 파드는 init에서 멈춘다. 관리자가 따로 바로잡는다. 이 진입점은 폴더를 옮기거나 지우지 않는다.
-- **막지 않는 것:** 모드를 고치는 `chmod`는 링크를 따라간다. 바로 앞의 `lstat`과 그 호출 사이의 바꿔치기는 막지 못하고, 뒤의 `lstat`이 98(`verify:…`)로 드러낸다. 상위 폴더에 쓰는 것이 감독과 같은 uid뿐이라는 배포 전제에 기댄다. 상위 경로의 링크는 감독처럼 보지 않는다.
+- **막지 않는 것:** 모드를 고치는 `chmod`는 링크를 따라간다. 바로 앞의 `lstat`과 그 호출 사이의 바꿔치기는 막지 못한다. 뒤의 `lstat`은 그때 보이는 자리만 본다. 조건 밖 상태(링크, 다른 uid, 모드 다름)가 남아 있으면 98(`verify:…`)이고, 맞는 폴더가 보이면 0이다. 그 사이 어느 대상이 바뀌었는지는 알 수 없고, 이미 다른 대상에 적용된 모드 변경은 되돌리지 않는다. 상위 폴더에 쓰는 것이 감독과 같은 uid뿐이라는 배포 전제에 기댄다. 상위 경로의 링크는 감독처럼 보지 않는다.
 - **차트(homelab, 뒤 PR):** 감독 파드에 이 진입점의 init 컨테이너 하나를 둔다(같은 이미지·같은 uid, Secret 없음, 장부 PVC 뿌리를 쓰기로 붙임). 이 진입점이 든 이미지 digest가 먼저 있어야 한다.
 
 | 코드 | 뜻 |
@@ -409,7 +410,7 @@ init 컨테이너(`bun src/main/agent-install.ts`, 올리브 이미지)가 역�
 | 0 | 결과 폴더가 이 uid 소유·0700이다. 만들었다·이미 맞다·모드를 고쳤다 중 무엇인지 찍는다 |
 | 64 | 인자가 있다(사용법) |
 | 91 | `OLIVE_RESULT_DIR`이 없거나 빈 값이거나 꼴이 틀렸다(파일을 보기 전) |
-| 98 | 결과 폴더에서 멈췄다. 사유: `symlink`, `not_directory:<종류>`, `uid_mismatch:<uid>:<모드>`, `parent_missing`, `parent_not_directory`, `lstat:<오류>`·`mkdir:<오류>`·`chmod:<오류>`(오류 이름, 예 `EACCES`·`EROFS`), `lstat:malformed`, `verify:<사유>`(만들거나 고친 뒤 다시 본 것이 조건과 다르다, 예 `verify:mode:0500`), `uid:unknown`, `deps:threw`, `threw`. 거절한 자리는 바꾸지 않았다 |
+| 98 | 결과 폴더에서 멈췄다. 사유: `symlink`, `not_directory:<종류>`, `uid_mismatch:<uid>:<모드>`, `parent_missing`, `parent_not_directory`, `lstat:<오류>`·`mkdir:<오류>`·`chmod:<오류>`(오류 이름, 예 `EACCES`·`EROFS`), `lstat:malformed`, `verify:<사유>`(만들거나 고친 뒤 다시 본 것이 조건과 다르다, 예 `verify:mode:0500`), `uid:unknown`, `deps:threw`, `threw`. 처음 본 자리를 거절한 98은 아무것도 바꾸지 않았다. 만들거나 고친 뒤의 98(만든 뒤의 `chmod:<오류>`, 다시 본 `lstat:<오류>`, `verify:…`)은 폴더가 만들어졌거나 모드가 바뀐 채 남을 수 있어, 98만으로는 디스크가 바뀌었는지 알 수 없다. 다시 돌리기 전에 폴더를 본다 |
 
 메시지는 stderr 한 줄이고 stdout은 비어 있다. 경로는 싣지 않는다. 98은 다른 진입점이 쓰지 않는 값이다.
 

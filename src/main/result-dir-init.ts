@@ -138,7 +138,8 @@ function prepare(files: DirPort, path: string, uid: number): ResultDirInitResult
   // 권한 비트 전체로 견준다. setgid 상위 아래에서 만든 폴더는 setgid를 물려받고, umask가 좁으면 0700보다 좁다.
   if (seen === RESULT_DIR_MODE) return say(RESULT_DIR_INIT_EXIT.ready, created ? "결과 폴더를 만들었다(0700)" : "결과 폴더가 이미 맞다(0700)");
   // 함정: chmod는 링크를 따라간다. 바로 앞의 lstat과 이 호출 사이의 바꿔치기는 막지 못한다. 상위 폴더에 쓰는 것이 이 uid뿐이라는 배포 전제에 기댄다
-  // (같은 uid는 어차피 자기 파일의 모드를 바꿀 수 있다). 뒤의 lstat이 링크로 바뀐 자리를 98로 드러낸다.
+  // (같은 uid는 어차피 자기 파일의 모드를 바꿀 수 있다). 뒤의 lstat은 그때 보이는 자리만 본다. 조건 밖 상태가 남아 있으면 98이고 맞는 폴더가 보이면 0이다.
+  // 그 사이 어느 대상이 바뀌었는지는 알 수 없고, 이미 다른 대상에 적용된 모드 변경은 되돌리지 않는다.
   try {
     files.chmod(path, RESULT_DIR_MODE);
   } catch (error) {
